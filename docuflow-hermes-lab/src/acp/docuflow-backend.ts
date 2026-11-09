@@ -1,6 +1,8 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ExecutionCoordinator } from "../orchestrator/execution-coordinator.js";
-import type { AgentRuntimeEvent, AgentTaskInput } from "../types/adapter.js";
+import type { PolicySnapshot } from "../policy/permission-policy.js";
+import type { TaskExecutionService } from "../tasks/task-execution-service.js";
+import type { AgentRuntimeEvent, AgentExecution, AgentTaskInput } from "../types/adapter.js";
 import type { AcpBackend, AcpSessionNewParams, AcpSessionUpdate, AcpStopReason } from "./protocol.js";
 
 /**
@@ -39,10 +41,22 @@ export interface DocuFlowAcpBackendOptions {
   idFactory?: () => string;
   runIdFactory?: () => string;
   /**
+   * Optional snapshot-backed path. When present, prompts go through `TaskExecutionService` so the
+   * editor run gets context/policy/prompt snapshots and audit entries like a platform run. Without it
+   * the backend falls back to a bare coordinator start (journal only).
+   */
+  snapshots?: {
+    taskService: TaskExecutionService;
+    policyFor: (context: { cwd: string; taskId: string }) => PolicySnapshot | Promise<PolicySnapshot>;
+    template?: { name: string; version: string; contentHash: string };
+  };
+  /**
    * Asked when Hermes raises a permission request. Without it the request stays pending in the adapter
    * and the run waits, which is the same fail-closed behavior as the API path.
    */
   requestPermission?: (request: AcpPermissionRequest) => Promise<AcpPermissionOutcome>;
+  /** Non-fatal problems (snapshot capture skipped); the ACP session continues. */
+  onWarning?: (message: string) => void;
 }
 
 interface AcpSession {
@@ -57,6 +71,49 @@ export function createDocuFlowAcpBackend(options: DocuFlowAcpBackendOptions): Ac
   const idFactory = options.idFactory ?? (() => `sess_${randomUUID()}`);
   const runIdFactory = options.runIdFactory ?? (() => `run_acp_${randomUUID()}`);
   const timeoutSeconds = options.defaults.timeoutSeconds ?? 300;
+
+  async function startExecution(
+    taskInput: AgentTaskInput,
+    text: string,
+    cwd: string,
+    taskId: string,
+    timeout: number
+  ): Promise<AgentExecution> {
+    const snapshotPath = options.snapshots;
+    if (!snapshotPath) return options.coordinator.start(taskInput);
+
+    try {
+      const policy = await snapshotPath.policyFor({ cwd, taskId });
+      const result = await snapshotPath.taskService.startTask({
+        projectId: taskInput.projectId,
+        taskId,
+        prompt: text,
+        worktreePath: cwd,
+        documents: [],
+        selectedFiles: [],
+        architectureVersion: "acp",
+        policy,
+        template: snapshotPath.template ?? {
+          name: "zed-acp",
+          version: "1.0.0",
+          contentHash: createHash("sha256").update("zed-acp").digest("hex")
+        },
+        modelConfig: {},
+        correlationId: taskInput.correlationId,
+        timeoutSeconds: timeout,
+        allowedTools: taskInput.allowedTools
+      });
+      return result.execution;
+    } catch (error) {
+      // A cwd that is not a git repository cannot be snapshotted. Degrade with a warning rather than
+      // blocking the editor session, but never pretend a snapshot was taken.
+      if (!isContextCaptureFailure(error)) throw error;
+      options.onWarning?.(
+        `ACP snapshots skipped for ${cwd}: ${error instanceof Error ? error.message : String(error)}`
+      );
+      return options.coordinator.start(taskInput);
+    }
+  }
 
   async function answerPermission(
     executionId: string,
@@ -102,9 +159,10 @@ export function createDocuFlowAcpBackend(options: DocuFlowAcpBackendOptions): Ac
       const session = sessions.get(sessionId);
       if (!session) throw new Error(`Unknown ACP session ${sessionId}`);
 
+      const taskId = `acp-${sessionId}`;
       const taskInput: AgentTaskInput = {
         projectId: options.defaults.projectId,
-        taskId: `acp-${sessionId}`,
+        taskId,
         runId: runIdFactory(),
         prompt: text,
         contextSnapshotId: options.defaults.contextSnapshotId,
@@ -116,7 +174,7 @@ export function createDocuFlowAcpBackend(options: DocuFlowAcpBackendOptions): Ac
         correlationId: `acp-${sessionId}`
       };
 
-      const execution = await options.coordinator.start(taskInput);
+      const execution = await startExecution(taskInput, text, session.cwd, taskId, timeoutSeconds);
       session.executions.push(execution.executionId);
       session.current = execution.executionId;
 
@@ -220,4 +278,11 @@ export function permissionRequestId(event: AgentRuntimeEvent): string {
     if (typeof value === "string" && value !== "") return value;
   }
   return event.externalEventId ?? event.eventId;
+}
+
+function isContextCaptureFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /Cannot read context file|not a git repository|unknown revision|rev-parse|escapes the worktree/i.test(
+    message
+  );
 }

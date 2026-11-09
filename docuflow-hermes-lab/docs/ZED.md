@@ -57,11 +57,12 @@ Each prompt starts a new execution because the Hermes HTTP adapter cannot contin
 
 ## Scope and gaps (read before relying on it)
 
-- **No snapshot records yet.** This path goes through the coordinator directly, so context/policy
-  snapshots are not captured for ACP-driven executions.
-- **No policy enforcement yet.** `allowedTools` is advisory here; real enforcement happens in the Code
-  Engine when a change is applied. Confinement therefore depends on Hermes running inside the sandbox
-  that `validate:security` verifies — not on this endpoint.
+- **Snapshots are captured.** Prompts go through `TaskExecutionService`, so the editor run gets a
+  context snapshot (git base SHA of `cwd`), a policy snapshot scoped to `cwd`, a prompt snapshot and the
+  matching `*.snapshot` audit entries. A `cwd` that is not a git repository cannot be snapshotted: the
+  run degrades to journal-only with a stderr warning rather than inventing a snapshot.
+- **Policy is recorded, not enforced here.** The snapshot grants read/search/generate-diff and limits
+  paths to `cwd`; real enforcement still happens in the Code Engine and the sandbox.
 - **Framing is newline-delimited only.** If a Zed release negotiates Content-Length framing, the reader
   must be extended.
 - **Approvals are bridged.** A Hermes `permission.requested` event becomes an ACP

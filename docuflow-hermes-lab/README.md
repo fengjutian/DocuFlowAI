@@ -439,10 +439,10 @@ That writes only `agent_servers.docuflow` into Zed's settings, backs the file up
 idempotent. See [`docs/CLIENT.md`](docs/CLIENT.md) for why this is an integration rather than a Zed
 fork, and [`docs/ZED.md`](docs/ZED.md) for the protocol details.
 
-Current gaps, stated up front: this path does not yet capture snapshots or enforce the policy
-snapshot. Approvals **are** bridged: a Hermes permission request becomes an ACP
-`session/request_permission` prompt, and no answer (closed editor or timeout) denies instead of leaving
-the runtime waiting. Confinement still depends on the verified sandbox.
+Current gaps, stated up front: snapshots **are** captured per prompt through `TaskExecutionService`
+(git base SHA of `cwd`, a cwd-scoped policy snapshot, prompt snapshot, audit entries), but policy is
+recorded rather than enforced at this layer — enforcement still happens in the Code Engine and the
+sandbox. Approvals are bridged through `session/request_permission`, and an unanswered prompt denies.
 
 ## Test status vocabulary
 

@@ -266,3 +266,13 @@ blocks the run forever, and silently approving it would defeat the approval.
 Decision: the agent sends `session/request_permission` and maps only `allow` to approve. Any other
 answer, a missing client handler, a timeout or an ACP error denies and records why. The same
 fail-closed rule as `HermesAdapter`: no handler means the request stays pending rather than approved.
+
+## D-034: ACP runs go through the task service, or degrade honestly
+Status: accepted
+Context: routing editor prompts straight to the coordinator left ACP-driven executions without
+context/policy/prompt snapshots, so they were auditable but not evidence-complete.
+Decision: when the backend is given a `TaskExecutionService`, every prompt starts through `startTask`
+and gets the full snapshot set plus audit entries. A `cwd` that is not a git repository cannot be
+snapshotted; that case warns on stderr and falls back to a journal-only execution instead of inventing
+a base SHA. Policy enforcement remains in the Code Engine and sandbox — the ACP layer records the
+snapshot, it does not pretend to enforce it.

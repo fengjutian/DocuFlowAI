@@ -1,50 +1,58 @@
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { HermesAdapter } from "../adapters/hermes-adapter.js";
 import { createDocuFlowAcpBackend } from "../acp/docuflow-backend.js";
 import { AcpAgentServer } from "../acp/server.js";
-import { HermesHttpClient } from "../clients/http/hermes-http-client.js";
-import { JsonlJournalStore } from "../journal/journal.js";
-import { ExecutionCoordinator } from "../orchestrator/execution-coordinator.js";
+import { createRuntime, loadConfigFromEnv } from "../server/runtime.js";
+import type { PolicySnapshot } from "../policy/permission-policy.js";
 
 /**
  * ACP agent endpoint for Zed (`agent_servers` spawns this command and talks JSON-RPC over stdio).
  *
  * Zed → ACP → DocuFlow → Hermes, per design 4.4. Sessions are workspace-scoped; each prompt starts a
- * DocuFlow execution that is journaled like any platform run.
- *
- * Scope note: this entry does not yet create context/policy snapshot records or enforce the policy
- * snapshot — the agent's confinement depends on Hermes running inside the verified sandbox. Treat it as
- * an editor-integration skeleton until those pieces are wired.
+ * DocuFlow execution through `TaskExecutionService`, so the editor run gets context/policy/prompt
+ * snapshots and audit entries like any platform run. A cwd that is not a git repository degrades to a
+ * journal-only run with a warning, because a snapshot that cannot be captured must not be invented.
  */
 async function main(): Promise<void> {
-  const baseUrl = process.env["HERMES_HTTP_BASE_URL"];
-  if (!baseUrl) {
-    process.stderr.write("HERMES_HTTP_BASE_URL is required to run the ACP endpoint\n");
+  let config;
+  try {
+    config = loadConfigFromEnv();
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;
     return;
   }
-  const dataDir = resolve(process.env["DOCUFLOW_DATA_DIR"] ?? ".docuflow-data");
-  const client = new HermesHttpClient({
-    baseUrl,
-    ...(process.env["HERMES_API_KEY"] ? { apiKey: process.env["HERMES_API_KEY"] } : {}),
-    timeoutMs: Number(process.env["HERMES_TIMEOUT_MS"] ?? 30_000)
-  });
-  const coordinator = new ExecutionCoordinator({
-    adapter: new HermesAdapter(client),
-    journal: new JsonlJournalStore(resolve(dataDir, "journal"))
+
+  const runtime = createRuntime(config);
+  await runtime.ready();
+
+  const projectId = process.env["DOCUFLOW_ACP_PROJECT_ID"] ?? "zed";
+  const timeoutSeconds = Number(process.env["DOCUFLOW_ACP_TIMEOUT_SECONDS"] ?? 300);
+
+  const policyFor = ({ cwd, taskId }: { cwd: string; taskId: string }): PolicySnapshot => ({
+    snapshotId: `pol_acp_${taskId}`,
+    projectId,
+    taskId,
+    executionId: "",
+    worktreeId: taskId,
+    policyVersion: "acp-default-1",
+    grantedCapabilities: ["read_file", "search_code", "generate_diff"],
+    allowedPaths: [cwd],
+    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
   });
 
   let server: AcpAgentServer | undefined;
   const backend = createDocuFlowAcpBackend({
-    coordinator,
+    coordinator: runtime.deps.coordinator,
     defaults: {
-      projectId: process.env["DOCUFLOW_ACP_PROJECT_ID"] ?? "zed",
-      contextSnapshotId: process.env["DOCUFLOW_ACP_CONTEXT_SNAPSHOT"] ?? "ctx-zed",
-      policySnapshotId: process.env["DOCUFLOW_ACP_POLICY_SNAPSHOT"] ?? "pol-zed",
+      projectId,
+      contextSnapshotId: "acp-context",
+      policySnapshotId: "acp-policy",
       allowedTools: ["read_file", "search_code", "generate_diff"],
-      timeoutSeconds: Number(process.env["DOCUFLOW_ACP_TIMEOUT_SECONDS"] ?? 300)
+      timeoutSeconds
     },
+    snapshots: { taskService: runtime.deps.taskService, policyFor },
+    onWarning: message => process.stderr.write(`[acp] ${message}\n`),
     requestPermission: async request => {
       if (!server) return "cancelled";
       const result = await server.request("session/request_permission", {
@@ -68,8 +76,8 @@ async function main(): Promise<void> {
   process.stderr.write("DocuFlow ACP endpoint ready on stdio\n");
 
   const shutdown = async (): Promise<void> => {
-    server.stop();
-    await coordinator.stopAll().catch(() => undefined);
+    server?.stop();
+    await runtime.close().catch(() => undefined);
     process.exit(0);
   };
   process.on("SIGINT", () => void shutdown());
