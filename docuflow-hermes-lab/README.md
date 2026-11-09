@@ -17,6 +17,8 @@ This repository provides:
   approval gates, atomic patch application, and immutable change records.
 - An append-only execution journal with checkpoints and a recovery planner (compensate / resume /
   rebuild) for gaps and crashes.
+- Immutable context / policy / prompt snapshots and change records, with traceability queries
+  (commit → agent run, execution → everything, task → executions).
 - Unit tests that run without a Hermes server.
 - Opt-in integration tests against a locally configured Hermes server.
 - Security-test fixture layout and a structured JSON result format.
@@ -225,6 +227,21 @@ recovery rebuilds with the checkpoint instead of pretending. See
 executes the plan — including a rebuild that injects `[DOCUFLOW CHECKPOINT]` and records
 `recovery.rebuild` against the new execution.
 
+## Snapshots and traceability
+
+`src/persistence/` stores context, policy and prompt snapshots plus change records as one immutable
+JSON file each: an existing id is a conflict, never an overwrite, and prompt snapshots keep hashes
+instead of plaintext. `TraceabilityQuery` answers the design-15 questions:
+
+```ts
+byCommit(sha)        // commit → agent run → context/policy/prompt/change
+byExecution(id)      // one execution's full evidence bundle
+byTask(taskId)       // every execution that worked on a task
+```
+
+Context snapshots have no execution id, so they are resolved through the prompt snapshot that
+consumed them. See [`docs/PERSISTENCE.md`](docs/PERSISTENCE.md).
+
 ## Test status vocabulary
 
 - `passed`: assertion verified by executable evidence.
@@ -245,6 +262,7 @@ src/
   code-engine/        Worktrees, diff analysis, change pipeline, change records
   journal/            Append-only execution journal, checkpoints, recovery planner
   orchestrator/       ExecutionCoordinator: adapter + journal + recovery wiring
+  persistence/        Immutable snapshot/change stores + traceability queries
   policy/             Permission evaluation from a policy snapshot
   security/           Sandbox boundary specification and probes
   tests/unit/         Offline tests

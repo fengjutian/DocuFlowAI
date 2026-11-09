@@ -111,3 +111,12 @@ Decision: `ExecutionCoordinator.rebuild()` creates a new run with a new run id, 
 `[DOCUFLOW CHECKPOINT]` block listing applied change records with an explicit instruction not to
 re-apply them, and writes a `recovery.rebuild` audit entry on the new execution that points at the
 previous execution id.
+
+## D-016: Snapshot records are immutable files, prompts are stored by hash
+Status: accepted
+Context: design 11.8 says prompt snapshots must not keep a mutable "current" value, and 15 says the
+audit trail must not be rewritable.
+Decision: every record is a JSON file created with `wx`; a duplicate id is a conflict. Prompt
+snapshots carry template and rendered-prompt hashes only, and `assertPromptSnapshot` rejects a
+record that includes plaintext. The `RecordStore` interface is the seam for a future database, and
+`list()` scans the directory until then.
