@@ -224,7 +224,9 @@ async function describeExecution(executionId: string, deps: ApiDependencies): Pr
     executionId,
     status: status ?? (checkpoint.terminal ? checkpoint.terminalEventType : "unknown"),
     checkpoint,
-    pendingApprovals: deps.coordinator.getAdapter().getPendingPermissions?.(executionId) ?? []
+    pendingApprovals: deps.coordinator.getAdapter().getPendingPermissions?.(executionId) ?? [],
+    // AT-204 surfaced to the caller: "completed" is a claim that needs a passing evaluation.
+    completion: await deps.taskService.completionGate(executionId)
   };
 }
 

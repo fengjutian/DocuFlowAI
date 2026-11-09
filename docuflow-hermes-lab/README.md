@@ -23,6 +23,8 @@ This repository provides:
 - A `startTask` entry point that ties snapshots, execution, change application and tracing together.
 - An HTTP API with bearer auth, journal-backed event replay and an SSE live stream using the design-13
   event envelope.
+- An Evaluation Engine with an independent-process check runner and a completion gate that refuses to
+  certify a change without a passing evaluation.
 - Unit tests that run without a Hermes server.
 - Opt-in integration tests against a locally configured Hermes server.
 - Security-test fixture layout and a structured JSON result format.
@@ -307,6 +309,18 @@ const server = await createApiServer({ registry, coordinator, taskService, journ
 `since` / `Last-Event-ID`, because the stream is a notification channel, not the source of truth.
 See [`docs/API.md`](docs/API.md).
 
+## Evaluation
+
+```ts
+const result = await service.evaluateChange(executionId, checks, { changeRecordId })
+const gate = await service.completionGate(executionId)   // { allowed, reason }
+```
+
+Checks are real processes (no shell). A failing check, a check that cannot run, or **no checks at
+all** denies completion — `GET /api/v1/executions/{id}` reports that gate as `completion`, so "done"
+cannot be inferred from a terminal event. Results are immutable records and journaled as
+`evaluation.completed`. See [`docs/EVALUATION.md`](docs/EVALUATION.md).
+
 ## Running the lab server
 
 ```bash
@@ -347,6 +361,7 @@ src/
   clients/gateway/    JSON-RPC primitives + stdio process transport
   code-engine/        Worktrees, diff analysis, change pipeline, change records
   context/            Context snapshot capture and drift verification
+  evaluation/         Check runner, verdicts, completion gate
   journal/            Append-only execution journal, checkpoints, recovery planner
   orchestrator/       ExecutionCoordinator: adapter + journal + recovery wiring
   persistence/        Immutable snapshot/change stores + traceability queries

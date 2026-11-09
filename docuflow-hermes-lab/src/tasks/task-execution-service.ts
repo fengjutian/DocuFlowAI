@@ -3,6 +3,14 @@ import { captureContextSnapshot } from "../context/context-snapshot.js";
 import { CodeChangePipeline, type ApplyOutcome } from "../code-engine/code-change-pipeline.js";
 import { buildRevertRecord, type ApprovalRecord, type ChangeRecord } from "../code-engine/change-record.js";
 import type { GitRunner } from "../code-engine/git-runner.js";
+import type { CommandRunner } from "../evaluation/command-runner.js";
+import {
+  completionGate as evaluateCompletionGate,
+  evaluateChecks,
+  type CompletionGate,
+  type EvaluationCheckSpec,
+  type EvaluationResult
+} from "../evaluation/evaluation.js";
 import type { ExecutionCoordinator } from "../orchestrator/execution-coordinator.js";
 import type { RecordStore } from "../persistence/record-store.js";
 import {
@@ -218,10 +226,42 @@ export class TaskExecutionService {
     return outcome;
   }
 
+  /**
+   * Runs the evaluation checks for an execution and records the result.
+   *
+   * Checks are independent processes, not the agent's own claim: a change is only complete when an
+   * external command says so (AT-204). The result lands in the immutable store and in the journal.
+   */
+  async evaluateChange(
+    executionId: string,
+    checks: readonly EvaluationCheckSpec[],
+    options: { changeRecordId?: string; commitSha?: string; runner?: CommandRunner } = {}
+  ): Promise<EvaluationResult> {
+    const result = await evaluateChecks(executionId, checks, options.runner, {
+      ...(options.changeRecordId ? { changeRecordId: options.changeRecordId } : {}),
+      ...(options.commitSha ? { commitSha: options.commitSha } : {})
+    });
+    await this.options.stores.evaluations.put(result);
+    await this.options.coordinator.recordAuditFact(executionId, "evaluation.completed", {
+      evaluationId: result.id,
+      verdict: result.verdict,
+      checks: result.checks.length,
+      ...(options.changeRecordId ? { changeRecordId: options.changeRecordId } : {})
+    });
+    return result;
+  }
+
+  /** Latest evaluation for an execution, gated: no result or a failing result denies completion. */
+  async completionGate(executionId: string): Promise<CompletionGate> {
+    const results = (await this.options.stores.evaluations.list())
+      .filter(result => result.executionId === executionId)
+      .sort((a, b) => a.finishedAt.localeCompare(b.finishedAt));
+    return evaluateCompletionGate(results.at(-1));
+  }
+
   async trace(executionId: string) {
     return this.options.traceability.byExecution(executionId);
   }
-
   async traceCommit(commitSha: string) {
     return this.options.traceability.byCommit(commitSha);
   }

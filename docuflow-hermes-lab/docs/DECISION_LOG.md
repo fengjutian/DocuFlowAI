@@ -162,3 +162,11 @@ Decision: `createRuntime` requires `HERMES_HTTP_BASE_URL` but does not probe it 
 endpoint returns 503 and executions fail with `runtime_unreachable` (502). Data lives under
 `DOCUFLOW_DATA_DIR` (snapshots at the root, journal under `journal/`). Auth is opt-in via
 `DOCUFLOW_API_TOKEN`; without it the server is loopback-only by default, which the startup banner says.
+
+## D-022: No checks is a blocked evaluation, not a pass
+Status: accepted
+Context: AT-204 says a failed test must not mark a task complete; the same reasoning applies to a task
+that was never tested.
+Decision: `evaluateChecks` returns `blocked` for an empty check list, and `completionGate` denies
+completion unless a result exists and every check passed. Checks are configured server-side and are
+never accepted from an API body, because that would expose arbitrary command execution.

@@ -21,6 +21,7 @@ import {
 import { TraceabilityQuery } from "../persistence/traceability.js";
 import { TaskExecutionService } from "../tasks/task-execution-service.js";
 import type { ChangeRecord } from "../code-engine/change-record.js";
+import type { EvaluationResult } from "../evaluation/evaluation.js";
 
 /**
  * Composition root.
@@ -86,7 +87,8 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     promptSnapshots: new ImmutableRecordStore<PromptSnapshotRecord>(
       config.dataDir, "prompts", assertPromptSnapshot
     ),
-    changeRecords: new ImmutableRecordStore<ChangeRecord>(config.dataDir, "changes")
+    changeRecords: new ImmutableRecordStore<ChangeRecord>(config.dataDir, "changes"),
+    evaluations: new ImmutableRecordStore<EvaluationResult>(config.dataDir, "evaluations")
   };
   const journal = new JsonlJournalStore(resolve(config.dataDir, "journal"));
   const bus = new EventBus();

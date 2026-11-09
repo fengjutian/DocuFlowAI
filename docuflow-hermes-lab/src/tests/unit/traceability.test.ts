@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildApplyRecord, type ChangeRecord } from "../../code-engine/change-record.js";
 import { ImmutableRecordStore } from "../../persistence/record-store.js";
+import type { EvaluationResult } from "../../evaluation/evaluation.js";
 import {
   assertContextSnapshot,
   assertPolicySnapshot,
@@ -23,7 +24,8 @@ async function setup() {
     changeRecords: new ImmutableRecordStore<ChangeRecord>(join(root, "changes"), "changes"),
     contextSnapshots: new ImmutableRecordStore<ContextSnapshotRecord>(root, "contexts", assertContextSnapshot),
     promptSnapshots: new ImmutableRecordStore<PromptSnapshotRecord>(root, "prompts", assertPromptSnapshot),
-    policySnapshots: new ImmutableRecordStore<PolicySnapshotRecord>(root, "policies", assertPolicySnapshot)
+    policySnapshots: new ImmutableRecordStore<PolicySnapshotRecord>(root, "policies", assertPolicySnapshot),
+    evaluations: new ImmutableRecordStore<EvaluationResult>(root, "evaluations")
   };
 
   await stores.contextSnapshots.put({
@@ -121,7 +123,8 @@ test("groups executions by task and returns nothing for an unknown task", async 
       changeRecords: [],
       contextSnapshots: [],
       promptSnapshots: [],
-      policySnapshots: []
+      policySnapshots: [],
+      evaluations: []
     });
   } finally {
     await rm(root, { recursive: true, force: true });

@@ -106,6 +106,9 @@ async function harness(options: { token?: string } = {}): Promise<Harness> {
       return sha === "c".repeat(40)
         ? { changeRecord: { id: "chg-1", executionId: "exec-1" }, trace: { executionId: "exec-1" } }
         : undefined;
+    },
+    async completionGate() {
+      return { allowed: false, reason: "not evaluated yet" };
     }
   } as unknown as TaskExecutionService;
 
@@ -234,9 +237,10 @@ test("returns the checkpoint and cancels through the coordinator", async () => {
     });
 
     const detail = await fetch(`${app.url}/api/v1/executions/exec-1`);
-    const body = await detail.json() as { checkpoint: { lastSequence: number; eventCount: number } };
+    const body = await detail.json() as { checkpoint: { lastSequence: number; eventCount: number }; completion: { allowed: boolean } };
     assert.equal(detail.status, 200);
     assert.ok(body.checkpoint.eventCount >= 1);
+    assert.equal(body.completion.allowed, false);
 
     const cancel = await fetch(`${app.url}/api/v1/executions/exec-1/cancel`, { method: "POST" });
     assert.equal(cancel.status, 202);

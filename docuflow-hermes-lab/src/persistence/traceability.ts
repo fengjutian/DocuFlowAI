@@ -1,4 +1,5 @@
 import type { ChangeRecord } from "../code-engine/change-record.js";
+import type { EvaluationResult } from "../evaluation/evaluation.js";
 import type {
   ContextSnapshotRecord,
   PolicySnapshotRecord,
@@ -11,6 +12,7 @@ export interface TraceStores {
   contextSnapshots: RecordStore<ContextSnapshotRecord>;
   promptSnapshots: RecordStore<PromptSnapshotRecord>;
   policySnapshots: RecordStore<PolicySnapshotRecord>;
+  evaluations: RecordStore<EvaluationResult>;
 }
 
 /**
@@ -23,6 +25,7 @@ export interface ExecutionTrace {
   contextSnapshots: ContextSnapshotRecord[];
   promptSnapshots: PromptSnapshotRecord[];
   policySnapshots: PolicySnapshotRecord[];
+  evaluations: EvaluationResult[];
 }
 
 export interface CommitTrace {
@@ -34,10 +37,11 @@ export class TraceabilityQuery {
   constructor(private readonly stores: TraceStores) {}
 
   async byExecution(executionId: string): Promise<ExecutionTrace> {
-    const [changes, prompts, policies] = await Promise.all([
+    const [changes, prompts, policies, evaluations] = await Promise.all([
       this.stores.changeRecords.list(),
       this.stores.promptSnapshots.list(),
-      this.stores.policySnapshots.list()
+      this.stores.policySnapshots.list(),
+      this.stores.evaluations.list()
     ]);
     const executionPrompts = prompts.filter(record => record.executionId === executionId);
     return {
@@ -45,7 +49,8 @@ export class TraceabilityQuery {
       changeRecords: changes.filter(record => record.executionId === executionId),
       contextSnapshots: await this.resolveContexts(executionPrompts),
       promptSnapshots: executionPrompts,
-      policySnapshots: policies.filter(record => record.executionId === executionId)
+      policySnapshots: policies.filter(record => record.executionId === executionId),
+      evaluations: evaluations.filter(record => record.executionId === executionId)
     };
   }
 

@@ -26,6 +26,7 @@ import {
   type AgentRuntimeEvent
 } from "../../types/adapter.js";
 import type { ChangeRecord } from "../../code-engine/change-record.js";
+import type { EvaluationResult } from "../../evaluation/evaluation.js";
 
 async function setup() {
   const repo = await mkdtemp(join(tmpdir(), "docuflow-task-"));
@@ -44,7 +45,8 @@ async function setup() {
     contextSnapshots: new ImmutableRecordStore<ContextSnapshotRecord>(storeRoot, "contexts", assertContextSnapshot),
     policySnapshots: new ImmutableRecordStore<PolicySnapshotRecord>(storeRoot, "policies", assertPolicySnapshot),
     promptSnapshots: new ImmutableRecordStore<PromptSnapshotRecord>(storeRoot, "prompts", assertPromptSnapshot),
-    changeRecords: new ImmutableRecordStore<ChangeRecord>(storeRoot, "changes")
+    changeRecords: new ImmutableRecordStore<ChangeRecord>(storeRoot, "changes"),
+    evaluations: new ImmutableRecordStore<EvaluationResult>(storeRoot, "evaluations")
   };
 
   const journal = new InMemoryJournalStore();
@@ -205,6 +207,64 @@ test("holds a risky change for approval without recording it", async () => {
 
     assert.equal(outcome.status, "awaiting_approval");
     assert.deepEqual(await stores.changeRecords.list(), []);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("records an evaluation and denies completion while a check fails", async () => {
+  const { repo, stores, journal, coordinator, service, request } = await setup();
+  try {
+    await service.startTask(request);
+    const failing = {
+      async run() {
+        return { code: 1, stdout: "", stderr: "1 test failed", timedOut: false };
+      }
+    };
+
+    const result = await service.evaluateChange("exec-1", [{
+      id: "unit",
+      name: "npm test",
+      command: "npm",
+      args: ["run", "test:unit"]
+    }], { runner: failing });
+
+    assert.equal(result.verdict, "failed");
+    assert.equal((await stores.evaluations.list()).length, 1);
+
+    const gate = await service.completionGate("exec-1");
+    assert.equal(gate.allowed, false);
+    assert.match(gate.reason, /failed/);
+
+    const trace = await service.trace("exec-1");
+    assert.equal(trace.evaluations.length, 1);
+
+    await coordinator.flush("exec-1");
+    assert.ok((await journal.read("exec-1")).some(entry => entry.category === "evaluation.completed"));
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("allows completion once every evaluation check passes", async () => {
+  const { repo, service, request } = await setup();
+  try {
+    await service.startTask(request);
+    const passing = {
+      async run() {
+        return { code: 0, stdout: "ok", stderr: "", timedOut: false };
+      }
+    };
+
+    await service.evaluateChange("exec-1", [{
+      id: "unit",
+      name: "npm test",
+      command: "npm",
+      args: ["run", "test:unit"]
+    }], { runner: passing });
+
+    const gate = await service.completionGate("exec-1");
+    assert.equal(gate.allowed, true);
   } finally {
     await rm(repo, { recursive: true, force: true });
   }
