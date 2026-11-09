@@ -16,8 +16,22 @@ if (Test-Path (Join-Path $Destination "Cargo.toml")) {
 }
 
 $url = "https://codeload.github.com/zed-industries/zed/tar.gz/refs/tags/$Tag"
-Write-Host "Downloading $Tag (resumable) to $Archive"
-& curl.exe -L --fail --retry 10 --retry-delay 5 --retry-all-errors -C - -o $Archive $url
+Write-Host "Downloading $Tag to $Archive"
+
+$attempt = 0
+while ($attempt -lt 3) {
+  $attempt += 1
+  & curl.exe -L --fail --retry 10 --retry-delay 5 --retry-all-errors -C - -o $Archive $url
+  if ($LASTEXITCODE -eq 0) { break }
+  if ($LASTEXITCODE -eq 33) {
+    # codeload does not support byte ranges; a partial file can never resume.
+    Write-Host "Server does not support resume; restarting the download from zero"
+    Remove-Item $Archive -Force -ErrorAction SilentlyContinue
+    continue
+  }
+  if ($attempt -ge 3) { throw "curl exited with $LASTEXITCODE after $attempt attempts" }
+  Start-Sleep -Seconds 5
+}
 if ($LASTEXITCODE -ne 0) { throw "curl exited with $LASTEXITCODE" }
 
 $staging = Join-Path $env:TEMP "zed-extract-$([guid]::NewGuid().ToString('N'))"

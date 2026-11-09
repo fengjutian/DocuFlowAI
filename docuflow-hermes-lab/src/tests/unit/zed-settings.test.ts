@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mergeAgentServer, removeAgentServer } from "../../client/zed-settings.js";
+import { applyAgentServerToText, mergeAgentServer, removeAgentServer } from "../../client/zed-settings.js";
+import { parse } from "jsonc-parser";
 import { defaultZedSettingsPath, installZedAgent } from "../../runners/install-zed.js";
 
 const entry = {
@@ -110,10 +111,50 @@ test("refuses to overwrite a settings file that is not valid JSON", async () => 
   const settingsPath = join(root, "settings.json");
   try {
     await writeFile(settingsPath, "{ // comments }", "utf8");
-    await assert.rejects(installZedAgent({ settingsPath, name: "docuflow", entry }), /not valid JSON/);
+    await assert.rejects(installZedAgent({ settingsPath, name: "docuflow", entry }), /not valid JSONC/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("preserves comments, trailing commas and formatting in a JSONC settings file", () => {
+  const text = [
+    "// Zed settings",
+    "{",
+    "  // editor",
+    '  "theme": "One Dark",',
+    '  "vim_mode": true, // trailing comma below is legal JSONC',
+    "}"
+  ].join("\n");
+
+  const result = applyAgentServerToText(text, "docuflow", entry);
+
+  assert.equal(result.changed, true);
+  assert.match(result.text, /\/\/ Zed settings/);
+  assert.match(result.text, /\/\/ editor/);
+  assert.match(result.text, /trailing comma below is legal JSONC/);
+  assert.match(result.text, /"vim_mode": true/);
+  const parsed = parse(result.text, [], { allowTrailingComma: true }) as Record<string, unknown>;
+  assert.deepEqual(
+    (parsed["agent_servers"] as Record<string, unknown>)["docuflow"],
+    entry
+  );
+});
+
+test("text edits are idempotent and leave the file byte-identical", () => {
+  const first = applyAgentServerToText("{\n  \"theme\": \"One Dark\"\n}\n", "docuflow", entry);
+  const second = applyAgentServerToText(first.text, "docuflow", entry);
+
+  assert.equal(second.changed, false);
+  assert.equal(second.text, first.text);
+});
+
+test("builds a settings file from empty text", () => {
+  const result = applyAgentServerToText("", "docuflow", entry);
+
+  assert.equal(result.changed, true);
+  const parsed = JSON.parse(result.text) as Record<string, unknown>;
+  assert.deepEqual((parsed["agent_servers"] as Record<string, unknown>)["docuflow"], entry);
 });
 
 test("resolves the platform settings path and honors an override", () => {

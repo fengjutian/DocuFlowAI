@@ -1,14 +1,16 @@
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { mergeAgentServer, type AgentServerEntry } from "../client/zed-settings.js";
+import { applyAgentServerToText, type AgentServerEntry } from "../client/zed-settings.js";
 
 /**
  * Registers DocuFlow as a Zed external agent.
  *
- * Zed spawns the command from `agent_servers` and speaks ACP over stdio. This installer touches only
- * that one key, backs the settings file up first, and supports `--dry-run` so the diff can be reviewed.
+ * Zed spawns the command from `agent_servers` and speaks ACP over stdio. The settings file is JSONC, so
+ * edits preserve comments and formatting; only that one key changes, the file is backed up first, and
+ * `--dry-run` reports the change without writing.
  */
+
 export interface InstallOptions {
   settingsPath: string;
   name: string;
@@ -24,23 +26,15 @@ export interface InstallResult {
 }
 
 export async function installZedAgent(options: InstallOptions): Promise<InstallResult> {
-  let settings: Record<string, unknown> = {};
   let raw = "";
   try {
     raw = await readFile(options.settingsPath, "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  if (raw.trim()) {
-    try {
-      settings = JSON.parse(raw) as Record<string, unknown>;
-    } catch {
-      throw new Error(`${options.settingsPath} is not valid JSON; fix it before running the installer`);
-    }
-  }
 
-  const merged = mergeAgentServer(settings, options.name, options.entry);
-  if (!merged.changed) return { settingsPath: options.settingsPath, changed: false };
+  const edited = applyAgentServerToText(raw, options.name, options.entry);
+  if (!edited.changed) return { settingsPath: options.settingsPath, changed: false };
   if (options.dryRun) return { settingsPath: options.settingsPath, changed: true };
 
   await mkdir(dirname(options.settingsPath), { recursive: true });
@@ -50,7 +44,7 @@ export async function installZedAgent(options: InstallOptions): Promise<InstallR
     backupPath = `${options.settingsPath}.bak-${stamp}`;
     await copyFile(options.settingsPath, backupPath);
   }
-  await writeFile(options.settingsPath, `${JSON.stringify(merged.settings, null, 2)}\n`, "utf8");
+  await writeFile(options.settingsPath, edited.text, "utf8");
   return { settingsPath: options.settingsPath, changed: true, ...(backupPath ? { backupPath } : {}) };
 }
 
