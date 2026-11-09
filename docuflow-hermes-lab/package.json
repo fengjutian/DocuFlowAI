@@ -11,6 +11,7 @@
     "validate:http": "npm run build && node dist/runners/http-phase0.js",
     "validate:gateway": "npm run build && node dist/runners/gateway-phase0.js",
     "report:phase0": "npm run build && node dist/runners/aggregate-phase0.js",
+    "check:hermes": "npm run build && node dist/runners/check-hermes-version.js",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

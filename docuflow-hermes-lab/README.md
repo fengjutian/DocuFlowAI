@@ -18,8 +18,8 @@ against the pinned Hermes release. Do not treat a successful HTTP response as pr
 filesystem isolation.
 
 The upstream contract facts already confirmed from official documentation are recorded in
-[`docs/UPSTREAM_CONTRACT.md`](docs/UPSTREAM_CONTRACT.md). A concrete Hermes release or commit must
-still be pinned before Phase 0 evidence is accepted.
+[`docs/UPSTREAM_CONTRACT.md`](docs/UPSTREAM_CONTRACT.md). Phase 0 is pinned by
+[`hermes.lock.json`](hermes.lock.json); run `npm run check:hermes` before accepting evidence.
 
 ## Requirements
 

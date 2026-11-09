@@ -1,8 +1,8 @@
 # Verified Hermes Upstream Contract
 
-Verified against the official `NousResearch/hermes-agent` documentation on 2026-11-09.
-Pin a concrete Hermes release or commit before recording Phase 0 results; upstream `main` is not a
-reproducible test target.
+Verified against the official `NousResearch/hermes-agent` documentation on 2026-11-09. Phase 0 is
+pinned to release `v0.23.0`, commit `2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`, in
+`hermes.lock.json`. Upstream `main` is not a reproducible test target.
 
 ## HTTP API
 
