@@ -16,6 +16,7 @@ export interface JsonRpcStdioClientOptions {
   framing?: "ndjson" | "content-length";
   maxMessageBytes?: number;
   onNotification?: (notification: JsonRpcNotification) => void;
+  onRequest?: (request: JsonRpcRequest) => unknown | Promise<unknown>;
   onStderr?: (chunk: string) => void;
 }
 
@@ -141,9 +142,15 @@ export class JsonRpcStdioClient {
       this.handleTermination(new Error("JSON-RPC process emitted an invalid message"));
       return;
     }
-    if (typeof message.method === "string" && !("id" in message)) {
-      this.options.onNotification?.(message as unknown as JsonRpcNotification);
-      return;
+    if (typeof message.method === "string") {
+      if (!("id" in message)) {
+        this.options.onNotification?.(message as unknown as JsonRpcNotification);
+        return;
+      }
+      if (typeof message.id === "string" || typeof message.id === "number") {
+        void this.handleServerRequest(message as unknown as JsonRpcRequest);
+        return;
+      }
     }
     if ((typeof message.id === "string" || typeof message.id === "number") &&
         ("result" in message || "error" in message)) {
@@ -158,6 +165,30 @@ export class JsonRpcStdioClient {
       throw new Error("JSON-RPC stdio client is not running");
     }
     return this.child;
+  }
+
+  private async handleServerRequest(request: JsonRpcRequest): Promise<void> {
+    const child = this.child;
+    if (!child) return;
+    try {
+      if (!this.options.onRequest) {
+        await this.writeMessage(child, JSON.stringify({
+          jsonrpc: "2.0",
+          id: request.id,
+          error: { code: -32601, message: `No client handler for server request: ${request.method}` }
+        } satisfies JsonRpcResponse));
+        return;
+      }
+      const result = await this.options.onRequest(request);
+      await this.writeMessage(child, JSON.stringify({ jsonrpc: "2.0", id: request.id, result } satisfies JsonRpcResponse));
+    } catch (error) {
+      if (!this.child) return;
+      await this.writeMessage(child, JSON.stringify({
+        jsonrpc: "2.0",
+        id: request.id,
+        error: { code: -32000, message: error instanceof Error ? error.message : String(error) }
+      } satisfies JsonRpcResponse));
+    }
   }
 
   private handleContentLengthData(chunk: Buffer): void {

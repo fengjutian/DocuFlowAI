@@ -8,12 +8,15 @@ export interface HermesRunCreateRequest {
 }
 
 export interface HermesRun {
-  id: string;
+  run_id: string;
   status?: string;
   [key: string]: unknown;
 }
 
 export interface HermesCapabilities {
+  object?: string;
+  platform?: string;
+  features?: Record<string, boolean | string>;
   [key: string]: unknown;
 }
 

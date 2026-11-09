@@ -34,6 +34,30 @@ const contentLengthEchoServer = `
   });
 `;
 
+const peerServer = `
+  const readline = require("node:readline");
+  const lines = readline.createInterface({ input: process.stdin });
+  let originalId;
+  lines.on("line", line => {
+    const message = JSON.parse(line);
+    if (message.method === "prompt.submit") {
+      originalId = message.id;
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0",
+        id: "srq-1",
+        method: "approval",
+        params: { command: "echo safe" }
+      }) + "\\n");
+    } else if (message.id === "srq-1") {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: "2.0",
+        id: originalId,
+        result: { accepted: message.result.choice }
+      }) + "\\n");
+    }
+  });
+`;
+
 test("exchanges JSON-RPC requests and receives notifications over stdio", async () => {
   const notifications: string[] = [];
   let notificationReceived!: () => void;
@@ -67,6 +91,26 @@ test("exchanges Content-Length framed JSON-RPC messages", async () => {
   try {
     const result = await client.request<{ text: string }>("echo", { text: "你好 Hermes" });
     assert.deepEqual(result, { text: "你好 Hermes" });
+  } finally {
+    await client.stop();
+  }
+});
+
+test("answers server-to-client JSON-RPC requests", async () => {
+  const requests: string[] = [];
+  const client = new JsonRpcStdioClient({
+    command: process.execPath,
+    args: ["-e", peerServer],
+    onRequest: request => {
+      requests.push(request.method);
+      return { choice: "once" };
+    }
+  });
+  client.start();
+  try {
+    const result = await client.request<{ accepted: string }>("prompt.submit", { text: "run" });
+    assert.deepEqual(result, { accepted: "once" });
+    assert.deepEqual(requests, ["approval"]);
   } finally {
     await client.stop();
   }

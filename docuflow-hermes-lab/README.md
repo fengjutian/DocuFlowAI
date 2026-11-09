@@ -17,6 +17,10 @@ event names, approval semantics, resume behavior and Gateway method schemas must
 against the pinned Hermes release. Do not treat a successful HTTP response as proof of safe
 filesystem isolation.
 
+The upstream contract facts already confirmed from official documentation are recorded in
+[`docs/UPSTREAM_CONTRACT.md`](docs/UPSTREAM_CONTRACT.md). A concrete Hermes release or commit must
+still be pinned before Phase 0 evidence is accepted.
+
 ## Requirements
 
 - Node.js 22+

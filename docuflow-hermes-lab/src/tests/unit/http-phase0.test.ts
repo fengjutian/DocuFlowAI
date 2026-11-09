@@ -5,8 +5,11 @@ import type { HermesSseEvent } from "../../types/hermes.js";
 
 function clientWith(events: HermesSseEvent[]): HttpPhase0Client {
   return {
-    async createRun() { return { id: "run-1", status: "queued" }; },
-    async getRun(runId) { return { id: runId, status: "running" }; },
+    async capabilities() {
+      return { platform: "hermes-agent", features: { run_submission: true, run_events_sse: true } };
+    },
+    async createRun() { return { run_id: "run-1", status: "queued" }; },
+    async getRun(runId) { return { run_id: runId, status: "running" }; },
     async *streamRunEvents() {
       for (const event of events) yield event;
     }
@@ -22,7 +25,7 @@ test("records successful HTTP and SSE Phase 0 checks", async () => {
     ["P0-001", "passed"],
     ["P0-002", "passed"]
   ]);
-  assert.match(results[0]!.evidence[0]!, /run-1/);
+  assert.ok(results[0]!.evidence.some(item => /run-1/.test(item)));
   assert.match(results[1]!.evidence[0]!, /run\.started/);
 });
 
@@ -43,4 +46,18 @@ test("fails SSE verification when the stream has no events", async () => {
   assert.equal(results[0]!.status, "passed");
   assert.equal(results[1]!.status, "failed");
   assert.match(results[1]!.notes ?? "", /without any events/);
+});
+
+test("fails before run creation when required capabilities are absent", async () => {
+  const client = clientWith([]);
+  client.capabilities = async () => ({
+    platform: "hermes-agent",
+    features: { run_submission: false, run_events_sse: false }
+  });
+
+  const results = await executeHttpPhase0(client);
+
+  assert.equal(results[0]!.status, "failed");
+  assert.match(results[0]!.notes ?? "", /run_submission/);
+  assert.equal(results[1]!.status, "blocked");
 });

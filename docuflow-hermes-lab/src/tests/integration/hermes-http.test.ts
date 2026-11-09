@@ -14,8 +14,8 @@ test("Hermes HTTP API creates a run and returns an identifier", { skip: !baseUrl
     input: "Reply with exactly: DOCUFLOW_PHASE0_OK",
     ...(process.env.HERMES_MODEL ? { model: process.env.HERMES_MODEL } : {})
   });
-  assert.equal(typeof run.id, "string", "response must include a run id");
-  assert.ok(run.id.length > 0);
-  const status = await client.getRun(run.id);
-  assert.equal(status.id, run.id);
+  assert.equal(typeof run.run_id, "string", "response must include a run_id");
+  assert.ok(run.run_id.length > 0);
+  const status = await client.getRun(run.run_id);
+  assert.equal(status.run_id, run.run_id);
 });

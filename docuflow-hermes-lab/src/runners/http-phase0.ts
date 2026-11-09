@@ -2,9 +2,10 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { HermesHttpClient } from "../clients/http/hermes-http-client.js";
 import { writeTestReport } from "../reporting/report-writer.js";
-import type { HermesRun, HermesRunCreateRequest, HermesSseEvent, TestResult } from "../types/hermes.js";
+import type { HermesCapabilities, HermesRun, HermesRunCreateRequest, HermesSseEvent, TestResult } from "../types/hermes.js";
 
 export interface HttpPhase0Client {
+  capabilities(): Promise<HermesCapabilities>;
   createRun(payload: HermesRunCreateRequest): Promise<HermesRun>;
   getRun(runId: string): Promise<HermesRun>;
   streamRunEvents(runId: string, signal?: AbortSignal): AsyncGenerator<HermesSseEvent>;
@@ -27,15 +28,23 @@ export async function executeHttpPhase0(
   const createStarted = now().toISOString();
   let run: HermesRun;
   try {
+    const capabilities = await client.capabilities();
+    if (capabilities.features?.run_submission !== true) {
+      throw new Error("Hermes capabilities do not advertise run_submission");
+    }
+    if (capabilities.features.run_events_sse !== true) {
+      throw new Error("Hermes capabilities do not advertise run_events_sse");
+    }
     run = await client.createRun({
       input: options.input ?? "Reply with exactly: DOCUFLOW_PHASE0_OK",
       ...(options.model ? { model: options.model } : {})
     });
-    if (!run.id) throw new Error("Hermes create-run response did not contain an id");
-    const fetched = await client.getRun(run.id);
-    if (fetched.id !== run.id) throw new Error("Hermes get-run response returned a different id");
+    if (!run.run_id) throw new Error("Hermes create-run response did not contain run_id");
+    const fetched = await client.getRun(run.run_id);
+    if (fetched.run_id !== run.run_id) throw new Error("Hermes get-run response returned a different run_id");
     results.push(result("P0-001", "HTTP create run", "passed", createStarted, now(), [
-      `run_id=${run.id}`,
+      `platform=${String(capabilities.platform ?? "unknown")}`,
+      `run_id=${run.run_id}`,
       `status=${String(fetched.status ?? "unknown")}`
     ]));
   } catch (error) {
@@ -50,7 +59,7 @@ export async function executeHttpPhase0(
   const eventTimeoutMs = options.eventTimeoutMs ?? 10_000;
   const signal = AbortSignal.timeout(eventTimeoutMs);
   try {
-    for await (const event of client.streamRunEvents(run.id, signal)) {
+    for await (const event of client.streamRunEvents(run.run_id, signal)) {
       events.push(event);
       if (events.length >= (options.maxEvents ?? 100)) break;
     }
