@@ -239,3 +239,12 @@ Decision: join through bindings, count only the latest evaluation per execution,
 without any evaluation as `evaluated: 0` with `passRate: null`. Multiple skills bound to one execution
 each receive that execution's verdict, which over-credits only when skills are bound together; call
 it out rather than inventing a split.
+
+## D-031: Contract tests use a mock server and say so
+Status: accepted
+Context: the real runtime is unavailable (0.15.1 installed, 0.23.0 pinned), but the client, SSE parser
+and Phase 0 runner still need executable evidence.
+Decision: `src/tests/support/mock-hermes-server.ts` serves the documented endpoints, and contract tests
+assert run creation, SSE ordering/ids, aborts, stop/approval payloads, auth and capability gating. Test
+names start with `contract:` and the docs state explicitly that a green contract suite says nothing
+about the pinned runtime's real event names or approval semantics.

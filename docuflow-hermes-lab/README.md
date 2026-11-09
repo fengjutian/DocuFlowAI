@@ -29,6 +29,8 @@ This repository provides:
   authorization, plus per-execution usage/cost accounting.
 - Multi-runtime selection that filters by health and capabilities before considering load.
 - Unit tests that run without a Hermes server.
+- Contract tests against a local mock Hermes server (`src/tests/support/mock-hermes-server.ts`) covering
+  capabilities, run creation, SSE ordering, aborts, stop/approval payloads and auth.
 - Opt-in integration tests against a locally configured Hermes server.
 - Security-test fixture layout and a structured JSON result format.
 
@@ -410,6 +412,10 @@ On this machine that check reports `Installed Hermes is 0.15.1, but hermes.lock.
 every live validation stays `blocked` — running Phase 0 against the wrong version would be worse than
 not running it. A 0.23.0 upgrade was attempted with the official installer and abandoned after repeated
 TLS transfer failures on the 1.38 GB repository; the previous install was restored unchanged.
+
+Contract tests prove the client and runner behave correctly against a conforming server. They do not
+prove anything about the real runtime: event names, approval semantics and resume behavior still need
+the pinned version.
 
 ## Test status vocabulary
 
