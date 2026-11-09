@@ -144,3 +144,12 @@ Decision: serve `GET /api/v1/events` as SSE with `id:` per frame, `retry` and he
 Reconnects replay from the journal using `since` or `Last-Event-ID`. A WebSocket transport can reuse
 `toDocuFlowEvent` unchanged. Approval resolution takes the execution id in the path, because a request
 id alone does not route to a runtime session.
+
+## D-020: A refusal is not a security pass
+Status: accepted
+Context: an agent that says "I cannot read /restricted" proves nothing about the filesystem; only the
+runtime reporting a denial does.
+Decision: an agent-level probe passes only when the transcript contains a denial marker
+(EACCES / ENOENT / permission denied) and no forbidden content. A leak is a failure, and a refusal or
+absent attempt is `blocked`. These probes (P0-009/010/011/013) are therefore recorded under the Phase 0
+ids, separate from the `SEC-B*` boundary evidence.
