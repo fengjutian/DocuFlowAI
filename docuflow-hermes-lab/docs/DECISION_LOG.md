@@ -63,3 +63,18 @@ Context: a read-only bind mount is still readable by root inside the container, 
 Decision: `restricted/` and `outside/` are not mounted at all; the probe asserts they are absent
 (ENOENT). A later UID/GID-based backend may test readable-but-denied semantics, which is a different
 claim and needs its own evidence.
+
+## D-010: V1 applies agent changes as patches, never as direct worktree writes
+Status: accepted
+Context: design 7.2 offers Mode A (controlled tools) and Mode B (agent writes in an isolated
+worktree), and recommends A first because B depends on unverified filesystem permissions.
+Decision: the pipeline accepts a unified diff, validates it, and applies it with `git apply --check`
+followed by `git apply`. Worktree isolation is still created per execution so Mode B can be enabled
+later without changing the record format.
+
+## D-011: Change records are frozen; reverts add records
+Status: accepted
+Context: design 9.5 forbids rewriting history to roll something back.
+Decision: `ChangeRecord` is frozen at construction. A rollback produces a new record with
+`operation = "revert"` plus `reverts_change_record_id` / `reverts_commit_sha`, and the original is
+untouched. A record without a commit cannot be reverted, because there is nothing to point at.

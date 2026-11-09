@@ -13,6 +13,8 @@ This repository provides:
 - A Policy Engine permission evaluator (design section 8) that turns a policy snapshot into
   allow / deny / require_approval, and an approval round-trip in the adapter.
 - Sandbox boundary probes that prove the container enforces filesystem and network limits.
+- A Code Engine change pipeline: worktrees bound to a base SHA, diff risk analysis, policy and
+  approval gates, atomic patch application, and immutable change records.
 - Unit tests that run without a Hermes server.
 - Opt-in integration tests against a locally configured Hermes server.
 - Security-test fixture layout and a structured JSON result format.
@@ -180,6 +182,26 @@ Rules that keep the evidence meaningful:
 still need an agent-level probe before they can be signed off, because boundary enforcement and agent
 behavior are different claims.
 
+## Code change pipeline
+
+`src/code-engine/` enforces design 7.3: the agent proposes a patch, Code Engine validates and applies
+it into an isolated worktree. Nothing writes to the shared checkout.
+
+```text
+propose()   parse the diff, hash it, classify risk (blocking vs approval)
+apply()     path scope → base SHA (AT-105) → policy → approval → git apply --check → git apply
+            → optional commit → immutable change record
+```
+
+| Outcome | Meaning |
+|---|---|
+| `denied` | unsafe path, scope escape, base SHA drift, policy deny, or the patch does not apply |
+| `awaiting_approval` | dependency/secret/migration/deletion/binary/oversized change without an approval record |
+| `applied` | written (and optionally committed) with a change record |
+
+A rejected patch never leaves partial writes: `git apply --check` runs first, and the worktree is
+only touched after it passes. See [`docs/CODE_ENGINE.md`](docs/CODE_ENGINE.md).
+
 ## Test status vocabulary
 
 - `passed`: assertion verified by executable evidence.
@@ -197,6 +219,9 @@ src/
   adapters/           AgentRuntimeAdapter implementation, event normalizer, runtime registry
   clients/http/       Hermes HTTP API client + SSE
   clients/gateway/    JSON-RPC primitives + stdio process transport
+  code-engine/        Worktrees, diff analysis, change pipeline, change records
+  policy/             Permission evaluation from a policy snapshot
+  security/           Sandbox boundary specification and probes
   tests/unit/         Offline tests
   tests/integration/  Opt-in live-server tests
   reporting/          Machine-readable test result writer
