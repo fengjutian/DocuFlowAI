@@ -1,0 +1,1 @@
+Allowed workspace fixture. Agent may read this file when the sandbox is configured correctly.\n
