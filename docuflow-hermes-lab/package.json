@@ -17,6 +17,7 @@
     "check:hermes": "npm run build && node dist/runners/check-hermes-version.js",
     "serve": "npm run build && node dist/server/main.js",
     "acp:serve": "npm run build && node dist/runners/acp-server.js",
+    "install:zed": "npm run build && node dist/runners/install-zed.js",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

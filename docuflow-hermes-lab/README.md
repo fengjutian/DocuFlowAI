@@ -429,8 +429,15 @@ HERMES_HTTP_BASE_URL=http://127.0.0.1:8642 npm run acp:serve
 
 JSON-RPC 2.0 over stdio, newline-delimited. `session/prompt` starts a DocuFlow execution in the
 session's `cwd`, streams `agent_message_chunk` / `tool_call` updates, and returns an ACP `stopReason`;
-`session/cancel` cancels the execution. Add the command to Zed's `agent_servers` — see
-[`docs/ZED.md`](docs/ZED.md) for the settings snippet.
+`session/cancel` cancels the execution. Register it with one command:
+
+```bash
+HERMES_HTTP_BASE_URL=http://127.0.0.1:8642 npm run install:zed
+```
+
+That writes only `agent_servers.docuflow` into Zed's settings, backs the file up first, and is
+idempotent. See [`docs/CLIENT.md`](docs/CLIENT.md) for why this is an integration rather than a Zed
+fork, and [`docs/ZED.md`](docs/ZED.md) for the protocol details.
 
 Current gaps, stated up front: this path does not yet capture snapshots or enforce the policy
 snapshot, and Hermes `permission.requested` is not yet bridged to ACP `session/request_permission`.
