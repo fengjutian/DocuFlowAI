@@ -402,22 +402,61 @@ because "runtime is down" is a state the API must be able to describe.
 
 ## Real Hermes status
 
-`npm run check:hermes` compares the installed runtime with `hermes.lock.json` (v0.23.0). Newer Hermes
-CLIs initialize a provider before parsing flags, so `hermes --version` prints a startup error instead
-of a version. Point the check at the interpreter and it reads the package metadata instead:
+The pinned runtime is now installed and reachable. `scripts/install-hermes.ps1` installs the version
+in `hermes.lock.json` (v0.23.0, commit `2bd378ed`) into an isolated profile under
+`%LOCALAPPDATA%\hermes\hermes-agent-0.23.0`, and the API server answers on `127.0.0.1:8642`.
 
-```bash
-HERMES_PYTHON=/path/to/hermes/venv/bin/python npm run check:hermes
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/install-hermes.ps1 -StartGateway
 ```
 
-On this machine that check reports `Installed Hermes is 0.15.1, but hermes.lock.json pins 0.23.0`, so
-every live validation stays `blocked` — running Phase 0 against the wrong version would be worse than
-not running it. A 0.23.0 upgrade was attempted with the official installer and abandoned after repeated
-TLS transfer failures on the 1.38 GB repository; the previous install was restored unchanged.
+Three facts about the install are worth knowing before touching it:
 
-Contract tests prove the client and runner behave correctly against a conforming server. They do not
-prove anything about the real runtime: event names, approval semantics and resume behavior still need
-the pinned version.
+- PyPI publishes `hermes-agent` only up to 0.19.0, so the pinned release comes from the GitHub tag
+  tarball, not from pip.
+- The release tarball ships `version = "0.0.0"` in pyproject.toml; the runtime's real identity is in
+  `install-stamp.json`, which the install writes with the locked commit. `npm run check:hermes`
+  reads the stamp first and treats `0.0.0` as the placeholder it is.
+- Every runtime dependency is declared as `python_version >= '3.14'`. On an older interpreter pip
+  installs the package and none of its dependencies, and the failure only shows up later as a
+  missing module.
+
+Against that install, the checklist is no longer empty:
+
+| Check | Result | Evidence |
+|---|---|---|
+| P0-001 HTTP create run | passed | `run_id`, `status=queued` |
+| P0-002 HTTP SSE event stream | passed | `run.failed` event with `id` and `seq` |
+| P0-003 TUI Gateway session | passed | `session.create` → `session_id`, `stored_session_id`, `cwd` |
+
+The runs above failed on purpose — no model provider was configured — which is exactly what the
+evidence is supposed to show: the protocol works end to end against the pinned runtime, and the
+model credential is the only thing missing.
+
+Contract tests still prove only that the client behaves correctly against a conforming server. They
+say nothing about the pinned runtime's approval semantics or resume behaviour.
+
+## Runtime candidates
+
+Two runtimes are evaluated against the same `AgentRuntimeAdapter` contract:
+
+| | Hermes | Pi |
+|---|---|---|
+| Shape | remote HTTP + SSE | in-process TypeScript library |
+| Install | tag tarball, Python 3.14, install stamp | `npm install` of two pinned packages |
+| Evidence so far | P0-001/002/003 against the pinned 0.23.0 | 5/5 runtime probes, 7/7 adapter tests |
+| Cancellation | not available over HTTP (D-005) | `AbortSignal` on the running turn |
+| Resume | not available over HTTP | transcript continues on the same agent |
+| Policy enforcement | sandbox plus tool gating | `beforeToolCall` denial, before the tool runs |
+
+See [`docs/PI.md`](docs/PI.md) for the Pi evaluation, and
+[`scripts/probe-pi-agent.mjs`](scripts/probe-pi-agent.mjs) for the standalone probe that drives a
+real `pi-agent-core` agent without a model.
+
+Neither runtime is retired yet: the 24-item checklist has to be signed off against whichever is
+chosen. DocuFlow's own layers — policy, Code Engine, journal, evaluation, skills, API, ACP — do not
+depend on the choice.
+
 
 ## Zed (ACP)
 

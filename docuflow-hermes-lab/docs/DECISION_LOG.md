@@ -302,3 +302,74 @@ Decision: the full tree (1.29.0, 4,404 files, 91.5 MB) lives at `client/zed`, gi
 `client/PIN.json` records the version, toolchain, file count, size and a SHA-256 digest over
 `relative-path\0size`. Re-provisioning is a local copy (`fetch-zed.ps1 -FromPath`) or the pinned tarball.
 A real fork, if needed, is a repository fork plus a submodule — not a committed copy.
+
+## D-038: Phase 0 evidence comes before Phase 1+ implementation
+Status: accepted
+Context: on 2026-11-09 the Phase 0 report showed 0 of 24 checks passed, 3 blocked and 21 not run,
+because the pinned runtime was never installed — while the last eleven commits had all moved to the
+Zed/ACP client line and Phase 1/2/3 subsystems (Code Engine, journal, evaluation, skills, subagents,
+scheduler, API) were already implemented. Every one of those subsystems rests on the unverified
+assumption that the mock server behaves like the real runtime.
+Decision: the client line is frozen and Phase 0 evidence is the only active work. The install path is
+now real: Hermes 0.23.0 is installed from the pinned tag, and P0-001 (HTTP create run), P0-002 (SSE
+event stream) and P0-003 (TUI Gateway session) pass against it. Downstream work resumes only when the
+checklist is signed off, not before. The deviation itself is recorded here rather than deleted: the
+mistake was letting unverified downstream code imply a verified upstream.
+
+## D-039: The pinned runtime identifies itself through `install-stamp.json`
+Status: accepted
+Context: the 0.23.0 release tarball ships `version = "0.0.0"` in pyproject.toml, so
+`importlib.metadata` reports 0.0.0 and the old version check could only ever say "wrong version".
+Upstream's own resolution order is install stamp, then live git, then unknown, and the stamp is
+written at build time by `scripts/write_install_stamp.py`.
+Decision: the install writes the stamp with the locked commit and base version, and
+`check:hermes` reads the stamp first and falls back to package metadata. A reported 0.0.0 is
+reported as the release placeholder it is, with the command that fixes it, instead of a version
+mismatch. The install directory can be overridden with `HERMES_INSTALL_DIR`.
+
+## D-040: The pinned release requires a Python 3.14 interpreter
+Status: accepted
+Context: every runtime dependency in 0.23.0 is declared as `python_version >= '3.14'`. On Python 3.11
+pip installs the package and none of its dependencies, and the failure surfaces later as
+`ModuleNotFoundError: ruamel`, which reads like a broken package rather than a wrong interpreter.
+Decision: the install creates the virtual environment with Python 3.14 and the API server's
+`aiohttp` adapter dependency is installed explicitly. The interpreter path is what `HERMES_PYTHON`
+must point at.
+
+## D-041: The pinned release is only installable from the GitHub tag tarball
+Status: accepted
+Context: PyPI publishes `hermes-agent` only up to 0.19.0, so the pinned 0.23.0 exists solely as a
+GitHub tag. On this network `git clone` of the repository stalls (its .git alone is ~1 GB), and a
+single-stream download from codeload measured ~1 MB/min, which is ~90 minutes for the 90 MB tarball.
+A GitHub proxy that supports byte ranges measured ~1.6 MB/s.
+Decision: the install script resolves the tag to the locked commit, downloads the tarball with
+parallel ranged chunks when the host honours `Range` and falls back to a single stream when it does
+not, then verifies the artifact by size and gzip integrity before extracting. The deployment script
+(`scripts/install-hermes.ps1`) is a Phase 0 deliverable in its own right: it used to be missing.
+
+## D-042: The runtime candidate is not fixed by the first adapter
+Status: accepted
+Context: Hermes was chosen as a *remote* runtime, so its adapter speaks HTTP and SSE. Pi
+(`earendil-works/pi`, MIT, `pi-agent-core` 1.5.0) is an in-process TypeScript harness whose
+primitives map one-to-one onto DocuFlow's adapter contract. Measured on 2026-11-09 against the
+installed package: a native lifecycle event stream (`agent_start`, `turn_start`, `message_start`,
+`message_update`, `message_end`, `turn_end`, `agent_end`), tool interception that blocks execution
+before the tool runs, `AbortSignal` cancellation, and a transcript that survives across prompts.
+Hermes' HTTP surface offers none of these natively, which is why D-005 had to declare cancellation
+and resume as unavailable capabilities.
+Decision: Pi is evaluated as the primary runtime candidate while Hermes remains the remote-runtime
+reference. The adapter contract is the seam, so DocuFlow's own layers — policy, code engine,
+journal, evaluation, skills, API and the ACP endpoint — are unchanged by this choice. Nothing is
+retired before the 24-item checklist is signed off against the chosen runtime. The tool hook also
+closes a gap the earlier design could only approximate: D-003 and D-020 require enforcement outside
+the model, and a `beforeToolCall` denial is enforcement, because the tool never executes.
+
+## D-043: A runtime claim must come from the runtime, not from a test double
+Status: accepted
+Context: the Pi adapter's first version claimed a tool was executed while the tool list was empty,
+because the test used a hand-written fake agent. The mock hid the defect that the real runtime
+rejected the model ("Unknown provider: unknown") and never reached the tool.
+Decision: the Pi adapter's tests drive a real `pi-agent-core` agent through Pi's own faux provider —
+no model, no network, but the actual runtime. The same rule applies to the standalone probe
+(`scripts/probe-pi-agent.mjs`): a statement about a runtime's behaviour is only evidence if the
+runtime produced it.
