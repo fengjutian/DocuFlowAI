@@ -264,3 +264,126 @@ test("acp mapping: tool and terminal events map to stable update shapes", () => 
     payload: {}
   }), "cancelled");
 });
+
+test("acp: agent requests resolve when the client answers", async () => {
+  const app = harness(fakeBackend());
+  try {
+    const pending = app.server.request("session/request_permission", { sessionId: "s1" }, 2_000);
+    await waitFor(() => app.frames.some(frame => frame["method"] === "session/request_permission"));
+    const frame = app.frames.find(item => item["method"] === "session/request_permission")!;
+    app.send({
+      jsonrpc: "2.0",
+      id: frame["id"],
+      result: { outcome: { outcome: "selected", optionId: "allow" } }
+    });
+
+    assert.deepEqual(await pending, { outcome: { outcome: "selected", optionId: "allow" } });
+  } finally {
+    app.close();
+  }
+});
+
+function permissionAdapter(options: {
+  requestId?: string;
+} = {}): AgentRuntimeAdapter & {
+  permissions: Array<{ executionId: string; requestId: string; decision: string }>;
+} {
+  const permissions: Array<{ executionId: string; requestId: string; decision: string }> = [];
+  const events: AgentRuntimeEvent[] = [
+    {
+      eventId: "p1",
+      executionId: "exec-1",
+      projectId: "proj-1",
+      taskId: "task-1",
+      sequence: 1,
+      eventType: "permission.requested",
+      timestamp: "2026-11-09T00:00:00.000Z",
+      payload: { request_id: options.requestId ?? "req-1", tool: "shell", command: "rm -rf build" }
+    },
+    {
+      eventId: "p2",
+      executionId: "exec-1",
+      projectId: "proj-1",
+      taskId: "task-1",
+      sequence: 2,
+      eventType: "execution.completed",
+      timestamp: "2026-11-09T00:00:01.000Z",
+      payload: {}
+    }
+  ];
+  return {
+    permissions,
+    async getCapabilities() { return NO_CAPABILITIES; },
+    async healthCheck() { return true; },
+    async start() {
+      return { executionId: "exec-1", runtimeType: "hermes", status: "running", externalRunId: "run-1" };
+    },
+    async getStatus() { return "running"; },
+    async cancel() { return undefined; },
+    async resume() { throw new Error("not used"); },
+    async subscribe(_id, handler) {
+      for (const event of events) handler(event);
+      return async () => undefined;
+    },
+    async terminate() { return undefined; },
+    getPendingPermissions() {
+      return [{ requestId: options.requestId ?? "req-1", executionId: "exec-1", payload: {} }];
+    },
+    async respondToPermission(executionId, requestId, response) {
+      permissions.push({ executionId, requestId, decision: response.decision });
+    }
+  };
+}
+
+test("acp backend: a permission event becomes a session/request_permission round-trip", async () => {
+  const adapter = permissionAdapter();
+  const coordinator = new ExecutionCoordinator({ adapter, journal: new InMemoryJournalStore() });
+  const asked: string[] = [];
+  const backend = createDocuFlowAcpBackend({
+    coordinator,
+    defaults: { projectId: "zed", contextSnapshotId: "ctx", policySnapshotId: "pol", timeoutSeconds: 5 },
+    requestPermission: async request => {
+      asked.push(request.title);
+      return { optionId: "allow" };
+    }
+  });
+
+  const session = await backend.createSession({ cwd: "C:\\work" });
+  await backend.prompt(session.sessionId, "run it", () => undefined);
+
+  assert.deepEqual(asked, ["shell"]);
+  assert.deepEqual(adapter.permissions, [
+    { executionId: "exec-1", requestId: "req-1", decision: "approve" }
+  ]);
+});
+
+test("acp backend: a cancelled prompt denies instead of leaving the runtime waiting", async () => {
+  const adapter = permissionAdapter();
+  const coordinator = new ExecutionCoordinator({ adapter, journal: new InMemoryJournalStore() });
+  const backend = createDocuFlowAcpBackend({
+    coordinator,
+    defaults: { projectId: "zed", contextSnapshotId: "ctx", policySnapshotId: "pol", timeoutSeconds: 5 },
+    requestPermission: async () => "cancelled"
+  });
+
+  const session = await backend.createSession({ cwd: "C:\\work" });
+  await backend.prompt(session.sessionId, "run it", () => undefined);
+
+  assert.deepEqual(adapter.permissions, [
+    { executionId: "exec-1", requestId: "req-1", decision: "deny" }
+  ]);
+});
+
+test("acp backend: without a permission handler nothing is auto-approved", async () => {
+  const adapter = permissionAdapter();
+  const coordinator = new ExecutionCoordinator({ adapter, journal: new InMemoryJournalStore() });
+  const backend = createDocuFlowAcpBackend({
+    coordinator,
+    defaults: { projectId: "zed", contextSnapshotId: "ctx", policySnapshotId: "pol", timeoutSeconds: 5 }
+  });
+
+  const session = await backend.createSession({ cwd: "C:\\work" });
+  await backend.prompt(session.sessionId, "run it", () => undefined);
+
+  assert.deepEqual(adapter.permissions, []);
+});

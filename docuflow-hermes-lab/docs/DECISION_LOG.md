@@ -258,3 +258,11 @@ sessions and prompts to DocuFlow executions and maps runtime events to `session/
 scheduling, policy and audit stay in DocuFlow's own layer. Each prompt starts a new execution because
 the HTTP adapter cannot continue a finished run. The endpoint is explicitly a skeleton: snapshots,
 policy enforcement and `session/request_permission` bridging are not wired yet, and the docs list them.
+
+## D-033: ACP permission prompts must fail closed
+Status: accepted
+Context: an editor can close, hang, or answer late; a runtime permission request that is never answered
+blocks the run forever, and silently approving it would defeat the approval.
+Decision: the agent sends `session/request_permission` and maps only `allow` to approve. Any other
+answer, a missing client handler, a timeout or an ACP error denies and records why. The same
+fail-closed rule as `HermesAdapter`: no handler means the request stays pending rather than approved.

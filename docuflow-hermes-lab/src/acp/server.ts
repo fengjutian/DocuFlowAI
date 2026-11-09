@@ -21,6 +21,11 @@ import {
 export class AcpAgentServer {
   private buffer = "";
   private started = false;
+  private nextRequestId = 1000;
+  private readonly pending = new Map<number, {
+    resolve: (value: unknown) => void;
+    reject: (error: Error) => void;
+  }>();
 
   constructor(
     private readonly backend: AcpBackend,
@@ -36,10 +41,36 @@ export class AcpAgentServer {
 
   stop(): void {
     this.streams.input.removeAllListeners("data");
+    for (const [, pending] of this.pending) {
+      pending.reject(new Error("ACP server stopped before the client answered"));
+    }
+    this.pending.clear();
+  }
+
+  /**
+   * Agent → client request (ACP permission prompts). Resolves with the client's `result`; rejects when
+   * the client answers with an error or never answers before the server stops.
+   */
+  request(method: string, params: unknown, timeoutMs = 300_000): Promise<unknown> {
+    this.nextRequestId += 1;
+    const id = this.nextRequestId;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`ACP client did not answer ${method} within ${timeoutMs}ms`));
+      }, timeoutMs);
+      timer.unref?.();
+
+      this.pending.set(id, {
+        resolve: value => { clearTimeout(timer); resolve(value); },
+        reject: error => { clearTimeout(timer); reject(error); }
+      });
+      this.send({ jsonrpc: "2.0", id, method, params });
+    });
   }
 
   /** Writes one JSON-RPC frame; exposed for tests and for backend-driven notifications. */
-  send(message: JsonRpcResponse | JsonRpcNotification): void {
+  send(message: JsonRpcResponse | JsonRpcNotification | JsonRpcRequest): void {
     this.streams.output.write(`${JSON.stringify(message)}\n`);
   }
 
@@ -59,19 +90,32 @@ export class AcpAgentServer {
   }
 
   private async dispatch(line: string): Promise<void> {
-    let message: JsonRpcRequest | JsonRpcNotification;
+    let message: JsonRpcRequest | JsonRpcNotification | JsonRpcResponse;
     try {
-      message = JSON.parse(line) as JsonRpcRequest | JsonRpcNotification;
+      message = JSON.parse(line) as JsonRpcRequest | JsonRpcNotification | JsonRpcResponse;
     } catch {
       this.send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } });
       return;
     }
 
+    // A response to one of our own requests: id present, no method.
+    if ("id" in message && message.id !== undefined && !("method" in message)) {
+      const pending = this.pending.get(Number(message.id));
+      if (pending) {
+        this.pending.delete(Number(message.id));
+        const error = (message as JsonRpcResponse).error;
+        if (error) pending.reject(new Error(error.message));
+        else pending.resolve((message as JsonRpcResponse).result);
+      }
+      return;
+    }
+
     const hasId = "id" in message && message.id !== undefined;
     if (!hasId) {
+      const notification = message as JsonRpcNotification;
       // Notifications must never receive a response, but cancellation still has to reach the backend.
-      if (message.method === "session/cancel") {
-        const params = message.params as { sessionId?: string } | undefined;
+      if (notification.method === "session/cancel") {
+        const params = notification.params as { sessionId?: string } | undefined;
         if (params?.sessionId) await this.backend.cancel(params.sessionId).catch(() => undefined);
       }
       return;

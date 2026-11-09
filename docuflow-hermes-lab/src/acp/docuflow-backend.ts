@@ -18,11 +18,31 @@ export interface AcpBackendDefaults {
   timeoutSeconds?: number;
 }
 
+export interface AcpPermissionOption {
+  optionId: string;
+  name: string;
+  kind?: "allow_once" | "allow_always" | "reject_once" | "reject_always";
+}
+
+export interface AcpPermissionRequest {
+  sessionId: string;
+  toolCallId: string;
+  title: string;
+  options: AcpPermissionOption[];
+}
+
+export type AcpPermissionOutcome = { optionId: string } | "cancelled";
+
 export interface DocuFlowAcpBackendOptions {
   coordinator: ExecutionCoordinator;
   defaults: AcpBackendDefaults;
   idFactory?: () => string;
   runIdFactory?: () => string;
+  /**
+   * Asked when Hermes raises a permission request. Without it the request stays pending in the adapter
+   * and the run waits, which is the same fail-closed behavior as the API path.
+   */
+  requestPermission?: (request: AcpPermissionRequest) => Promise<AcpPermissionOutcome>;
 }
 
 interface AcpSession {
@@ -37,6 +57,39 @@ export function createDocuFlowAcpBackend(options: DocuFlowAcpBackendOptions): Ac
   const idFactory = options.idFactory ?? (() => `sess_${randomUUID()}`);
   const runIdFactory = options.runIdFactory ?? (() => `run_acp_${randomUUID()}`);
   const timeoutSeconds = options.defaults.timeoutSeconds ?? 300;
+
+  async function answerPermission(
+    executionId: string,
+    sessionId: string,
+    event: AgentRuntimeEvent
+  ): Promise<void> {
+    const ask = options.requestPermission;
+    const adapter = options.coordinator.getAdapter();
+    if (!ask || !adapter.respondToPermission) return; // fail closed: leave the request pending
+
+    const requestId = permissionRequestId(event);
+    try {
+      const outcome = await ask({
+        sessionId,
+        toolCallId: String(event.payload["toolCallId"] ?? requestId),
+        title: String(event.payload["tool"] ?? event.payload["command"] ?? "permission requested"),
+        options: [
+          { optionId: "allow", name: "Allow", kind: "allow_once" },
+          { optionId: "reject", name: "Reject", kind: "reject_once" }
+        ]
+      });
+      const decision = outcome !== "cancelled" && outcome.optionId === "allow" ? "approve" : "deny";
+      await adapter.respondToPermission(executionId, requestId, { decision });
+    } catch {
+      // The editor closed or timed out: deny rather than leaving the runtime waiting forever.
+      await adapter
+        .respondToPermission(executionId, requestId, {
+          decision: "deny",
+          reason: "ACP client did not answer the permission request"
+        })
+        .catch(() => undefined);
+    }
+  }
 
   return {
     async createSession(params: AcpSessionNewParams) {
@@ -73,6 +126,9 @@ export function createDocuFlowAcpBackend(options: DocuFlowAcpBackendOptions): Ac
       const unsubscribe = await options.coordinator.getAdapter().subscribe(execution.executionId, event => {
         const update = toSessionUpdate(event);
         if (update) emit(update);
+        if (event.eventType === "permission.requested") {
+          void answerPermission(execution.executionId, sessionId, event);
+        }
         const reason = toStopReason(event);
         if (reason) settle(reason);
       });
@@ -155,4 +211,13 @@ function payloadText(payload: Record<string, unknown>): string {
     if (typeof value === "string" && value) return value;
   }
   return "";
+}
+
+/** Hermes may carry the approval id at a few keys; the adapter uses the same order. */
+export function permissionRequestId(event: AgentRuntimeEvent): string {
+  for (const key of ["request_id", "requestId", "approval_id", "id"]) {
+    const value = event.payload[key];
+    if (typeof value === "string" && value !== "") return value;
+  }
+  return event.externalEventId ?? event.eventId;
 }

@@ -72,7 +72,7 @@ Restart Zed and DocuFlow appears in the agent panel. See [`ZED.md`](ZED.md) for 
 | Event streaming to `session/update` | done |
 | One-command registration with backup and idempotency | done |
 | Embedded UI, custom panels, Zed-side keybindings | not started; would need a Zed extension or a fork |
-| Approval dialog in the editor (`session/request_permission`) | not bridged yet |
+| Approval dialog in the editor (`session/request_permission`) | done: allow/reject round-trip, timeout denies |
 | Snapshots/policy enforcement on the ACP path | not wired yet |
 
 ## Extending later

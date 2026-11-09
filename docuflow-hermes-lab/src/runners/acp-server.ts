@@ -35,6 +35,7 @@ async function main(): Promise<void> {
     journal: new JsonlJournalStore(resolve(dataDir, "journal"))
   });
 
+  let server: AcpAgentServer | undefined;
   const backend = createDocuFlowAcpBackend({
     coordinator,
     defaults: {
@@ -43,10 +44,26 @@ async function main(): Promise<void> {
       policySnapshotId: process.env["DOCUFLOW_ACP_POLICY_SNAPSHOT"] ?? "pol-zed",
       allowedTools: ["read_file", "search_code", "generate_diff"],
       timeoutSeconds: Number(process.env["DOCUFLOW_ACP_TIMEOUT_SECONDS"] ?? 300)
+    },
+    requestPermission: async request => {
+      if (!server) return "cancelled";
+      const result = await server.request("session/request_permission", {
+        sessionId: request.sessionId,
+        toolCall: {
+          toolCallId: request.toolCallId,
+          title: request.title,
+          kind: "other",
+          status: "pending"
+        },
+        options: request.options
+      }) as { outcome?: { outcome?: string; optionId?: string } } | undefined;
+      const outcome = result?.outcome;
+      if (outcome?.outcome === "selected" && outcome.optionId) return { optionId: outcome.optionId };
+      return "cancelled";
     }
   });
 
-  const server = new AcpAgentServer(backend, { input: process.stdin, output: process.stdout });
+  server = new AcpAgentServer(backend, { input: process.stdin, output: process.stdout });
   server.start();
   process.stderr.write("DocuFlow ACP endpoint ready on stdio\n");
 

@@ -440,8 +440,9 @@ idempotent. See [`docs/CLIENT.md`](docs/CLIENT.md) for why this is an integratio
 fork, and [`docs/ZED.md`](docs/ZED.md) for the protocol details.
 
 Current gaps, stated up front: this path does not yet capture snapshots or enforce the policy
-snapshot, and Hermes `permission.requested` is not yet bridged to ACP `session/request_permission`.
-Confinement therefore still depends on the verified sandbox.
+snapshot. Approvals **are** bridged: a Hermes permission request becomes an ACP
+`session/request_permission` prompt, and no answer (closed editor or timeout) denies instead of leaving
+the runtime waiting. Confinement still depends on the verified sandbox.
 
 ## Test status vocabulary
 

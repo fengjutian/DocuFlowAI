@@ -55,5 +55,7 @@ Each prompt starts a new execution because the Hermes HTTP adapter cannot contin
   that `validate:security` verifies — not on this endpoint.
 - **Framing is newline-delimited only.** If a Zed release negotiates Content-Length framing, the reader
   must be extended.
-- **Approvals are not bridged yet**: a Hermes `permission.requested` event is journaled but not turned
-  into ACP `session/request_permission`, so the editor will not prompt.
+- **Approvals are bridged.** A Hermes `permission.requested` event becomes an ACP
+  `session/request_permission` request with `allow` / `reject` options; choosing allow calls
+  `respondToPermission(approve)`, anything else (including a closed editor or a timeout) denies so the
+  runtime never waits forever. Without a client handler the request stays pending, same as the API path.
