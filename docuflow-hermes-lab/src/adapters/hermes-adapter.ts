@@ -8,7 +8,9 @@ import {
   type AgentExecutionStatus,
   type AgentRuntimeAdapter,
   type AgentRuntimeEvent,
-  type AgentTaskInput
+  type AgentTaskInput,
+  type RuntimePermissionRequest,
+  type RuntimePermissionResponse
 } from "../types/adapter.js";
 import type {
   HermesCapabilities,
@@ -27,6 +29,7 @@ export interface HermesAdapterClient {
   createRun(payload: HermesRunCreateRequest): Promise<HermesRun>;
   getRun(runId: string): Promise<HermesRun>;
   stopRun(runId: string): Promise<unknown>;
+  approveRun?(runId: string, payload: Record<string, unknown>): Promise<unknown>;
   streamRunEvents(runId: string, signal?: AbortSignal): AsyncGenerator<HermesSseEvent>;
 }
 
@@ -38,6 +41,12 @@ export interface HermesAdapterOptions {
    * the design forbids turning `blocked` into `passed`.
    */
   verifiedCapabilities?: Partial<AgentCapability>;
+  /**
+   * Optional policy hook. When present, every `permission.requested` event is answered with the
+   * decision this function returns. When absent, requests stay pending: the adapter never
+   * auto-approves a runtime request (upstream contract requires an explicit handler).
+   */
+  permissionHandler?: (request: RuntimePermissionRequest) => Promise<RuntimePermissionResponse>;
   now?: () => Date;
   executionIdFactory?: () => string;
 }
@@ -55,6 +64,7 @@ interface ExecutionState {
   subscribers: Set<Subscriber>;
   sequence: number;
   seenExternalEventIds: Set<string>;
+  pendingPermissions: Map<string, RuntimePermissionRequest>;
   terminal: boolean;
   controller: AbortController;
   pump?: Promise<void>;
@@ -81,6 +91,7 @@ const RUN_STATUS_MAP: Readonly<Record<string, AgentExecutionStatus>> = {
 
 const EVENT_STATUS: Partial<Record<AgentRuntimeEvent["eventType"], AgentExecutionStatus>> = {
   "execution.started": "running",
+  "permission.requested": "waiting_approval",
   "execution.waiting": "waiting_approval",
   "execution.completed": "succeeded",
   "execution.failed": "failed",
@@ -159,6 +170,7 @@ export class HermesAdapter implements AgentRuntimeAdapter {
       subscribers: new Set(),
       sequence: 0,
       seenExternalEventIds: new Set(),
+      pendingPermissions: new Map(),
       terminal: false,
       controller: new AbortController()
     };
@@ -255,6 +267,26 @@ export class HermesAdapter implements AgentRuntimeAdapter {
     return async () => {
       state.subscribers.delete(subscriber);
     };
+  }
+
+  getPendingPermissions(executionId: string): RuntimePermissionRequest[] {
+    return [...this.requireState(executionId).pendingPermissions.values()];
+  }
+
+  /**
+   * Answers a pending runtime permission request. DocuFlow's Policy Engine decides; the adapter only
+   * transmits the decision. Nothing is sent without an explicit call.
+   */
+  async respondToPermission(
+    executionId: string,
+    requestId: string,
+    response: RuntimePermissionResponse
+  ): Promise<void> {
+    const state = this.requireState(executionId);
+    if (!state.pendingPermissions.has(requestId)) {
+      throw new AgentAdapterError("invalid_state", `No pending permission request ${requestId}`);
+    }
+    await this.sendPermissionResponse(state, requestId, response);
   }
 
   async terminate(executionId: string): Promise<void> {
@@ -365,6 +397,65 @@ export class HermesAdapter implements AgentRuntimeAdapter {
         }
       }
     }
+    if (event.eventType === "permission.requested") this.onPermissionRequested(state, event);
+  }
+
+  private onPermissionRequested(state: ExecutionState, event: AgentRuntimeEvent): void {
+    const requestId = extractPermissionRequestId(event);
+    if (state.pendingPermissions.has(requestId)) return;
+    const tool = typeof event.payload["tool"] === "string" ? event.payload["tool"] : undefined;
+    const request: RuntimePermissionRequest = {
+      requestId,
+      executionId: state.execution.executionId,
+      payload: event.payload,
+      ...(tool ? { tool } : {})
+    };
+    state.pendingPermissions.set(requestId, request);
+
+    // Fail closed: without a policy handler the request stays pending and the runtime keeps waiting.
+    if (!this.options.permissionHandler) return;
+    void this.answerPermission(state, request).catch(() => undefined);
+  }
+
+  private async answerPermission(
+    state: ExecutionState,
+    request: RuntimePermissionRequest
+  ): Promise<void> {
+    const handler = this.options.permissionHandler;
+    if (!handler) return;
+    const response = await handler(request);
+    // A concurrent respondToPermission() may have answered it while the policy ran.
+    if (!state.pendingPermissions.has(request.requestId)) return;
+    await this.sendPermissionResponse(state, request.requestId, response);
+  }
+
+  private async sendPermissionResponse(
+    state: ExecutionState,
+    requestId: string,
+    response: RuntimePermissionResponse
+  ): Promise<void> {
+    const externalRunId = state.execution.externalRunId;
+    if (!externalRunId) throw new AgentAdapterError("invalid_state", "Execution has no external run id");
+    const approve = this.client.approveRun;
+    if (!approve) {
+      throw new AgentAdapterError("unsupported_capability", "Hermes client cannot send approval responses");
+    }
+    try {
+      await approve.call(this.client, externalRunId, {
+        request_id: requestId,
+        decision: response.decision,
+        ...(response.reason ? { reason: response.reason } : {})
+      });
+    } catch (error) {
+      throw new AgentAdapterError("runtime_unreachable", `Hermes approval request failed for ${requestId}`, {
+        cause: error
+      });
+    }
+    state.pendingPermissions.delete(requestId);
+    if (!state.terminal) {
+      state.status = "running";
+      state.execution.status = "running";
+    }
   }
 
   private requireState(executionId: string): ExecutionState {
@@ -387,4 +478,13 @@ export class HermesAdapter implements AgentRuntimeAdapter {
 function mapRunStatus(status: unknown): AgentExecutionStatus | undefined {
   if (typeof status !== "string") return undefined;
   return RUN_STATUS_MAP[status.toLowerCase()];
+}
+
+/** Hermes may carry the approval id at a few documented-looking keys; check them in order. */
+function extractPermissionRequestId(event: AgentRuntimeEvent): string {
+  for (const key of ["request_id", "requestId", "approval_id", "id"]) {
+    const value = event.payload[key];
+    if (typeof value === "string" && value !== "") return value;
+  }
+  return event.externalEventId ?? event.eventId;
 }

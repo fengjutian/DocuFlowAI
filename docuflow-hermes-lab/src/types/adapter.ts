@@ -114,6 +114,23 @@ export type AgentAdapterErrorCode =
   | "execution_not_found"
   | "invalid_state";
 
+/** A permission question raised by the runtime, to be answered by DocuFlow policy. */
+export interface RuntimePermissionRequest {
+  requestId: string;
+  executionId: string;
+  payload: Record<string, unknown>;
+  tool?: string;
+}
+
+/**
+ * The adapter never invents an answer. `respondToPermission` sends exactly what the caller decided,
+ * and a runtime request without a handler stays pending instead of being auto-approved.
+ */
+export interface RuntimePermissionResponse {
+  decision: "approve" | "deny";
+  reason?: string;
+}
+
 export class AgentAdapterError extends Error {
   constructor(
     public readonly code: AgentAdapterErrorCode,

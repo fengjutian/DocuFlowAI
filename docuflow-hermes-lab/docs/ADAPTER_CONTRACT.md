@@ -60,6 +60,20 @@ captured transcript before it is added.
   half of event compensation (AT-008). Durable persistence remains the Audit Engine's job.
 - The SSE pump is created lazily on the first `subscribe()` and shared by all subscribers.
 
+## Permission round-trip
+
+A `permission.requested` event moves the execution to `waiting_approval` and is recorded in
+`pendingPermissions`. The adapter then does one of two things:
+
+- with `permissionHandler` configured, it awaits the decision and posts it to
+  `POST /v1/runs/{id}/approval` as `{ request_id, decision, reason? }`;
+- without a handler, it sends nothing. The request stays pending and the runtime stays waiting.
+
+`respondToPermission(executionId, requestId, response)` answers a pending request explicitly, and
+`getPendingPermissions(executionId)` lists what is waiting. Responding for an unknown request id is
+`invalid_state`. Decisions are computed by `src/policy/permission-policy.ts` from the policy
+snapshot, never guessed by the adapter.
+
 ## Failure behavior
 
 | Situation | Result |
@@ -76,6 +90,6 @@ captured transcript before it is added.
 
 - Durable event persistence and audit timeline (Phase 3).
 - Resume via checkpoint injection (Recovery Engine, Phase 3).
-- Approval round-trip: `permission.requested` is forwarded but the adapter does not answer it. The
-  Policy Engine must own that decision before `permissionEvents` can be declared.
+- `permissionEvents` capability stays `false` until P0-012 evidence exists, even though the
+  round-trip is implemented; the flag describes verified runtime behavior, not our code.
 - TUI Gateway transport as an alternative adapter backend; the client exists, the adapter does not.

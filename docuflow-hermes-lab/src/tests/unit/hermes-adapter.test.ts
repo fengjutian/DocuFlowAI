@@ -9,6 +9,7 @@ interface FakeClient extends HermesAdapterClient {
   lastCreate: HermesRunCreateRequest | undefined;
   runStatus: string;
   streamError: Error | undefined;
+  approvals: Array<{ runId: string; payload: Record<string, unknown> }>;
 }
 
 function makeClient(events: HermesSseEvent[]): FakeClient {
@@ -17,6 +18,7 @@ function makeClient(events: HermesSseEvent[]): FakeClient {
     lastCreate: undefined,
     runStatus: "running",
     streamError: undefined,
+    approvals: [],
     async capabilities() {
       return { platform: "hermes-agent", features: { run_submission: true, run_events_sse: true } };
     },
@@ -31,6 +33,11 @@ function makeClient(events: HermesSseEvent[]): FakeClient {
     },
     async stopRun(runId: string) {
       client.calls.push(`stopRun:${runId}`);
+      return {};
+    },
+    async approveRun(runId: string, payload: Record<string, unknown>) {
+      client.calls.push(`approveRun:${runId}`);
+      client.approvals.push({ runId, payload });
       return {};
     },
     async *streamRunEvents(): AsyncGenerator<HermesSseEvent> {
@@ -247,4 +254,101 @@ test("surfaces an unknown execution instead of guessing", async () => {
     assert.equal(error.code, "execution_not_found");
     return true;
   });
+});
+
+test("leaves a permission request pending when no policy handler is configured", async () => {
+  const client = makeClient([
+    { event: "approval.requested", data: { request_id: "req-1", tool: "shell", command: "rm -rf build" }, id: "p1" },
+    { event: "run.completed", data: {}, id: "2" }
+  ]);
+  const adapter = new HermesAdapter(client);
+
+  const execution = await adapter.start(input);
+  const received: AgentRuntimeEvent[] = [];
+  await adapter.subscribe(execution.executionId, event => received.push(event));
+  await waitFor(() => received.some(item => item.eventType === "execution.completed"));
+
+  const pending = adapter.getPendingPermissions(execution.executionId);
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0]!.requestId, "req-1");
+  assert.equal(pending[0]!.tool, "shell");
+  assert.equal(client.approvals.length, 0);
+});
+
+test("answers a runtime permission request with the policy decision", async () => {
+  const client = makeClient([
+    { event: "approval.requested", data: { request_id: "req-1", tool: "shell" }, id: "p1" },
+    { event: "run.completed", data: {}, id: "2" }
+  ]);
+  const adapter = new HermesAdapter(client, {
+    permissionHandler: async request => ({
+      decision: "deny",
+      reason: `operation ${String(request.payload["tool"])} needs human approval`
+    })
+  });
+
+  const execution = await adapter.start(input);
+  await adapter.subscribe(execution.executionId, () => undefined);
+  await waitFor(() => client.approvals.length === 1);
+
+  assert.equal(client.approvals[0]!.runId, "run-1");
+  assert.deepEqual(client.approvals[0]!.payload, {
+    request_id: "req-1",
+    decision: "deny",
+    reason: "operation shell needs human approval"
+  });
+  assert.equal(adapter.getPendingPermissions(execution.executionId).length, 0);
+});
+
+test("sends an explicit response to a pending permission request", async () => {
+  const client = makeClient([
+    { event: "approval.requested", data: { request_id: "req-7", tool: "install_dependency" } }
+  ]);
+  const adapter = new HermesAdapter(client);
+  const execution = await adapter.start(input);
+
+  await adapter.subscribe(execution.executionId, () => undefined);
+  await waitFor(() => adapter.getPendingPermissions(execution.executionId).length === 1);
+
+  await adapter.respondToPermission(execution.executionId, "req-7", { decision: "approve" });
+
+  assert.deepEqual(client.approvals[0]!.payload, { request_id: "req-7", decision: "approve" });
+});
+
+test("rejects a permission response for an unknown request id", async () => {
+  const client = makeClient([]);
+  const adapter = new HermesAdapter(client);
+  const execution = await adapter.start(input);
+
+  await assert.rejects(
+    adapter.respondToPermission(execution.executionId, "req-missing", { decision: "approve" }),
+    (error: unknown) => {
+      assert.ok(error instanceof AgentAdapterError);
+      assert.equal(error.code, "invalid_state");
+      return true;
+    }
+  );
+});
+
+test("marks the execution as waiting for approval when a request arrives", async () => {
+  const client = makeClient([]);
+  client.runStatus = "waiting_approval";
+  // Hold the stream open after the approval request, the way a runtime waits for an answer.
+  client.streamRunEvents = async function* (runId: string, signal?: AbortSignal) {
+    yield { event: "approval.requested", data: { request_id: "req-1", tool: "shell" }, id: "p1" };
+    await new Promise<void>(resolve => {
+      if (signal?.aborted) return resolve();
+      signal?.addEventListener("abort", () => resolve(), { once: true });
+    });
+  };
+
+  const adapter = new HermesAdapter(client);
+  const execution = await adapter.start(input);
+  const received: AgentRuntimeEvent[] = [];
+  await adapter.subscribe(execution.executionId, event => received.push(event));
+  await waitFor(() => received.some(item => item.eventType === "permission.requested"));
+
+  assert.equal(await adapter.getStatus(execution.executionId), "waiting_approval");
+
+  await adapter.terminate(execution.executionId);
 });

@@ -10,6 +10,8 @@ This repository provides:
 - Generic JSON-RPC request tracking and a newline-delimited stdio process client for TUI Gateway validation.
 - The DocuFlow `AgentRuntimeAdapter` contract, a Hermes adapter over the HTTP client, and a runtime
   registry with aggregated health checks.
+- A Policy Engine permission evaluator (design section 8) that turns a policy snapshot into
+  allow / deny / require_approval, and an approval round-trip in the adapter.
 - Unit tests that run without a Hermes server.
 - Opt-in integration tests against a locally configured Hermes server.
 - Security-test fixture layout and a structured JSON result format.
@@ -117,6 +119,28 @@ Two rules keep this honest:
 `AgentRuntimeRegistry` holds runtime registrations and produces an aggregated health report; a
 runtime that throws or exceeds the health timeout is reported unhealthy rather than blocking the
 caller. See [`docs/ADAPTER_CONTRACT.md`](docs/ADAPTER_CONTRACT.md) for the full mapping.
+
+## Permission decisions
+
+`src/policy/permission-policy.ts` is the executable form of design 8.1. A decision is made from the
+operation, the policy snapshot and the current time — never from the prompt or the runtime's own
+approval UI (D-003).
+
+| Level | Operations | Default |
+|---|---|---|
+| P0 | `read_file`, `search_code`, `query_gitnexus` | allow |
+| P1 | `generate_diff` | allow |
+| P1 | `modify_worktree` | allow only inside `allowedPaths` and the worktree; no paths means require approval |
+| P2 | `delete_file`, `install_dependency`, `modify_public_api`, `modify_database_schema` | require approval unless `autoApprovedOperations` names it |
+| P3 | `git_merge`, `deploy_production` | require approval |
+| P3 | `access_production_data` | deny |
+
+Unknown operations, unexpired-but-ungranted operations and expired snapshots are all denied.
+
+The adapter consumes this through `permissionHandler` (or an explicit `respondToPermission()` call):
+a `permission.requested` event is forwarded, the execution moves to `waiting_approval`, and nothing
+is sent back until a decision exists. With no handler the request stays pending, which is the
+fail-closed behavior the upstream contract requires.
 
 ## Test status vocabulary
 

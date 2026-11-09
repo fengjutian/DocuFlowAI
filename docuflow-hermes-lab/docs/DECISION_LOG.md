@@ -38,3 +38,12 @@ Context: AT-008 requires event compensation after a disconnect, and subscribers 
 an execution has already started.
 Decision: the adapter keeps a bounded-by-execution in-memory event history, deduplicates by the SSE
 id, and replays from sequence 0 on subscribe. Durable persistence stays with the Audit Engine.
+
+## D-007: Permission decisions live in code, behind an explicit handler
+Status: accepted
+Context: the upstream contract forbids auto-approving server requests, and design 8.2 forbids
+enforcing permissions through the prompt.
+Decision: `evaluatePermission()` answers from operation, policy snapshot and expiry; the adapter
+only transports that decision. Without `permissionHandler` no answer is sent and the request stays
+pending. Production data access is denied outright rather than routed to approval, because "默认禁止"
+must not be unwound by one click.
