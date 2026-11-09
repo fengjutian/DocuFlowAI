@@ -20,6 +20,7 @@ This repository provides:
 - Immutable context / policy / prompt snapshots and change records, with traceability queries
   (commit → agent run, execution → everything, task → executions).
 - Context snapshot capture with a deterministic, content-addressed hash and drift verification.
+- A `startTask` entry point that ties snapshots, execution, change application and tracing together.
 - Unit tests that run without a Hermes server.
 - Opt-in integration tests against a locally configured Hermes server.
 - Security-test fixture layout and a structured JSON result format.
@@ -257,6 +258,21 @@ verifyContextSnapshot(record, current)
 Every path is resolved inside the worktree and re-read before hashing, so a caller cannot assert a
 file is unchanged. See [`docs/CONTEXT.md`](docs/CONTEXT.md).
 
+## Task flow
+
+`TaskExecutionService` is the one entry point that knows the order:
+
+```ts
+const { execution } = await service.startTask(request)       // context + policy + prompt snapshots
+const outcome = await service.applyProposedChange(execution.executionId, patch)
+await service.trace(execution.executionId)                   // context, policy, prompt, changes
+await service.traceCommit(outcome.record.gitCommitSha)       // commit → agent run
+```
+
+An applied change lands in the immutable change store, the journal (`change.applied`, so checkpoints
+know it must not be re-applied) and the trace. `awaiting_approval` and `denied` write nothing.
+See [`docs/TASK_FLOW.md`](docs/TASK_FLOW.md).
+
 ## Test status vocabulary
 
 - `passed`: assertion verified by executable evidence.
@@ -281,6 +297,7 @@ src/
   persistence/        Immutable snapshot/change stores + traceability queries
   policy/             Permission evaluation from a policy snapshot
   security/           Sandbox boundary specification and probes
+  tasks/              startTask / applyProposedChange / trace entry point
   tests/unit/         Offline tests
   tests/integration/  Opt-in live-server tests
   reporting/          Machine-readable test result writer

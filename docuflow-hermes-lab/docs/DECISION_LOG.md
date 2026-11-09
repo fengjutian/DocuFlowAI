@@ -128,3 +128,10 @@ Decision: `context_hash` is SHA-256 over canonical JSON (sorted keys, sorted fil
 base SHA, document hashes, selected-file hashes and the version fields. Paths are resolved inside the
 worktree and re-read before hashing; file contents are not duplicated into the record.
 `verifyContextSnapshot()` recomputes the hash and lists which documents drifted.
+
+## D-018: Snapshot ids are reserved before start, records written after
+Status: accepted
+Context: `policy_snapshots` and `prompt_snapshots` both carry an execution id, but the task input must
+reference them before the runtime has created the execution.
+Decision: reserve both ids first, pass them in the task input, and persist the two records right after
+`start()` returns. Records stay immutable; nothing is written with a placeholder execution id.
