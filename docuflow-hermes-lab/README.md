@@ -44,6 +44,17 @@ Use `HERMES_REPORT_PATH`, `HERMES_EVENT_TIMEOUT_MS` and `HERMES_MAX_EVENTS` to a
 the report destination and SSE capture limits. Missing server configuration is recorded as
 `blocked`; verified protocol failures are recorded as `failed` and return a non-zero exit code.
 
+After pinning the Hermes Gateway command and confirming its method schema, configure
+`HERMES_GATEWAY_COMMAND`, `HERMES_GATEWAY_METHOD` and optional JSON parameters, then run:
+
+```bash
+npm run validate:gateway
+```
+
+`HERMES_GATEWAY_ARGS` must be a JSON array of strings and `HERMES_GATEWAY_PARAMS` must be valid
+JSON. The runner does not invoke a shell, which keeps command arguments explicit and avoids shell
+expansion. Its report defaults to `reports/phase0-gateway.json`.
+
 The integration test creates a run and checks that a run identifier is returned. It is
 skipped when `HERMES_HTTP_BASE_URL` is not configured. Never point security tests at a
 production workspace.
