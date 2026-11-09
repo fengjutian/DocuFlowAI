@@ -5,7 +5,15 @@ import { mergePhase0Results } from "../reporting/phase0-checklist.js";
 import { writeTestReport } from "../reporting/report-writer.js";
 import type { TestResult, TestStatus } from "../types/hermes.js";
 
-const defaultInputs = ["reports/phase0-http.json", "reports/phase0-gateway.json"];
+// The agent-security report maps onto P0-009/010/011/013. It is included by default so a probe
+// that ran and was blocked is reported as `blocked` rather than `not_run`: the two mean different
+// things and only the first one tells a reader that the probe was actually attempted.
+// The security-boundary report is not merged: its SEC-B* ids are a separate series.
+const defaultInputs = [
+  "reports/phase0-http.json",
+  "reports/phase0-gateway.json",
+  "reports/phase0-agent-security.json"
+];
 
 async function main(): Promise<void> {
   const inputs = process.env.PHASE0_REPORT_INPUTS
