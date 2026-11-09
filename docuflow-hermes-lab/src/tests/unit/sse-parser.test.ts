@@ -12,9 +12,41 @@ test("joins multiline data and preserves non-JSON payload", () => {
   assert.deepEqual(result, { event: "message", data: "first\nsecond" });
 });
 
+test("parses CRLF fields and a valid retry delay", () => {
+  const result = parseSseBlock("event: reconnect\r\nretry: 1500\r\ndata: later");
+  assert.deepEqual(result, { event: "reconnect", data: "later", retry: 1500 });
+});
+
+test("streams CRLF-delimited events across response chunks", async () => {
+  const encoder = new TextEncoder();
+  const chunks = ["event: run.started\r\ndata: {\"run_id\":\"r1\"}\r", "\n\r", "\n"];
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      controller.close();
+    }
+  });
+  const client = new HermesHttpClient({
+    baseUrl: "http://localhost:3000",
+    fetchImpl: async () => new Response(body, { status: 200 })
+  });
+
+  const events = [];
+  for await (const event of client.streamRunEvents("run-1")) events.push(event);
+
+  assert.deepEqual(events, [{ event: "run.started", data: { run_id: "r1" } }]);
+});
+
 test("ignores heartbeat/comment blocks", () => {
   assert.equal(parseSseBlock(": keep-alive"), null);
   assert.equal(parseSseBlock(""), null);
+});
+
+test("keeps data fields that follow a comment in the same block", () => {
+  assert.deepEqual(parseSseBlock(": metadata\ndata: ready"), {
+    event: "message",
+    data: "ready"
+  });
 });
 
 test("omits an absent abort signal from the SSE request", async () => {

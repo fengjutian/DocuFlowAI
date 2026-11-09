@@ -1,4 +1,4 @@
-import type { HermesCapabilities, HermesRun, HermesRunCreateRequest } from "../../types/hermes.js";
+import type { HermesCapabilities, HermesRun, HermesRunCreateRequest, HermesSseEvent } from "../../types/hermes.js";
 
 export interface HermesHttpClientOptions {
   baseUrl: string;
@@ -57,7 +57,7 @@ export class HermesHttpClient {
     });
   }
 
-  async *streamRunEvents(runId: string, signal?: AbortSignal): AsyncGenerator<{event: string; data: unknown; id?: string}> {
+  async *streamRunEvents(runId: string, signal?: AbortSignal): AsyncGenerator<HermesSseEvent> {
     const init: RequestInit = {
       headers: this.headers({ Accept: "text/event-stream" }),
       ...(signal ? { signal } : {})
@@ -77,16 +77,16 @@ export class HermesHttpClient {
         const { value, done } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
-        let boundary: number;
-        while ((boundary = buffer.indexOf("\n\n")) >= 0) {
-          const block = buffer.slice(0, boundary).replace(/\r/g, "");
-          buffer = buffer.slice(boundary + 2);
+        let boundary: RegExpExecArray | null;
+        while ((boundary = /\r?\n\r?\n/.exec(buffer)) !== null) {
+          const block = buffer.slice(0, boundary.index);
+          buffer = buffer.slice(boundary.index + boundary[0].length);
           const parsed = parseSseBlock(block);
           if (parsed) yield parsed;
         }
       }
       buffer += decoder.decode();
-      const finalEvent = parseSseBlock(buffer.replace(/\r/g, ""));
+      const finalEvent = parseSseBlock(buffer);
       if (finalEvent) yield finalEvent;
     } finally {
       reader.releaseLock();
@@ -120,23 +120,30 @@ export class HermesHttpClient {
   }
 }
 
-export function parseSseBlock(block: string): {event: string; data: unknown; id?: string} | null {
-  if (!block.trim() || block.startsWith(":")) return null;
+export function parseSseBlock(block: string): HermesSseEvent | null {
+  if (!block.trim()) return null;
   let event = "message";
   let id: string | undefined;
+  let retry: number | undefined;
   const dataLines: string[] = [];
-  for (const line of block.split("\n")) {
+  for (const line of block.split(/\r?\n/)) {
     if (!line || line.startsWith(":")) continue;
     const colon = line.indexOf(":");
     const field = colon < 0 ? line : line.slice(0, colon);
     const value = colon < 0 ? "" : line.slice(colon + 1).replace(/^ /, "");
     if (field === "event") event = value;
     if (field === "id") id = value;
+    if (field === "retry" && /^\d+$/.test(value)) retry = Number(value);
     if (field === "data") dataLines.push(value);
   }
   if (dataLines.length === 0) return null;
   const raw = dataLines.join("\n");
   let data: unknown = raw;
   try { data = JSON.parse(raw); } catch { /* keep plain text */ }
-  return { event, data, ...(id !== undefined ? { id } : {}) };
+  return {
+    event,
+    data,
+    ...(id !== undefined ? { id } : {}),
+    ...(retry !== undefined ? { retry } : {})
+  };
 }

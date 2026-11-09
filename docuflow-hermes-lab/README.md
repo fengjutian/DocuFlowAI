@@ -7,7 +7,7 @@ Phase 0 validation scaffold for evaluating Hermes as a pluggable Agent Runtime.
 This repository provides:
 - Typed HTTP client for Hermes' documented run-oriented API.
 - SSE event reader for `/v1/runs/{id}/events`.
-- Generic JSON-RPC transport primitives for a future TUI Gateway adapter.
+- Generic JSON-RPC request tracking and a newline-delimited stdio process client for TUI Gateway validation.
 - Unit tests that run without a Hermes server.
 - Opt-in integration tests against a locally configured Hermes server.
 - Security-test fixture layout and a structured JSON result format.
@@ -48,7 +48,7 @@ production workspace.
 2. Run unit tests.
 3. Validate HTTP `/v1/capabilities`, `/v1/models`, `/v1/runs`.
 4. Validate SSE event delivery and terminal event behavior.
-5. Implement and test TUI Gateway JSON-RPC over stdio against the pinned version.
+5. Configure the stdio client and validate TUI Gateway method schemas against the pinned version.
 6. Run security tests only inside a disposable OS/container boundary.
 7. Verify cancellation, process crash, reconnect, resume and duplicate-run behavior.
 8. Export a signed-off Phase 0 report before starting the production Adapter.
@@ -68,7 +68,7 @@ layer, not merely a Hermes permission prompt.
 ```text
 src/
   clients/http/       Hermes HTTP API client + SSE
-  clients/gateway/    JSON-RPC primitives (protocol adapter workbench)
+  clients/gateway/    JSON-RPC primitives + stdio process transport
   tests/unit/         Offline tests
   tests/integration/  Opt-in live-server tests
   reporting/          Machine-readable test result writer
