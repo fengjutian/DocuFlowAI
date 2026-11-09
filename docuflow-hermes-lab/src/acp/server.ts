@@ -1,4 +1,5 @@
 import type { Readable, Writable } from "node:stream";
+import { AcpFrameReader, serializeFrame, type AcpFraming } from "./framing.js";
 import {
   ACP_PROTOCOL_VERSION,
   type AcpBackend,
@@ -19,7 +20,7 @@ import {
  * transport.
  */
 export class AcpAgentServer {
-  private buffer = "";
+  private readonly reader: AcpFrameReader;
   private started = false;
   private nextRequestId = 1000;
   private readonly pending = new Map<number, {
@@ -29,14 +30,17 @@ export class AcpAgentServer {
 
   constructor(
     private readonly backend: AcpBackend,
-    private readonly streams: { input: Readable; output: Writable }
-  ) {}
+    private readonly streams: { input: Readable; output: Writable },
+    options: { framing?: "auto" | AcpFraming } = {}
+  ) {
+    this.reader = new AcpFrameReader(options.framing ?? "auto");
+  }
 
   start(): void {
     if (this.started) return;
     this.started = true;
-    this.streams.input.setEncoding?.("utf8");
-    this.streams.input.on("data", (chunk: string) => this.consume(chunk));
+    // Keep raw bytes: Content-Length counts bytes, and decoding chunks would split multibyte characters.
+    this.streams.input.on("data", (chunk: Buffer) => this.consume(chunk));
   }
 
   stop(): void {
@@ -69,23 +73,18 @@ export class AcpAgentServer {
     });
   }
 
-  /** Writes one JSON-RPC frame; exposed for tests and for backend-driven notifications. */
+  /** Writes one JSON-RPC frame in the framing the client negotiated (ndjson by default). */
   send(message: JsonRpcResponse | JsonRpcNotification | JsonRpcRequest): void {
-    this.streams.output.write(`${JSON.stringify(message)}\n`);
+    this.streams.output.write(serializeFrame(message, this.reader.framing ?? "ndjson"));
   }
 
   notifySessionUpdate(sessionId: string, update: AcpSessionUpdate): void {
     this.send({ jsonrpc: "2.0", method: "session/update", params: { sessionId, update } });
   }
 
-  private consume(chunk: string): void {
-    this.buffer += chunk;
-    let newline = this.buffer.indexOf("\n");
-    while (newline >= 0) {
-      const line = this.buffer.slice(0, newline).trim();
-      this.buffer = this.buffer.slice(newline + 1);
-      if (line) void this.dispatch(line);
-      newline = this.buffer.indexOf("\n");
+  private consume(chunk: string | Buffer): void {
+    for (const frame of this.reader.push(chunk)) {
+      if (frame.trim()) void this.dispatch(frame);
     }
   }
 

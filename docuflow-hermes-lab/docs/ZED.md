@@ -64,8 +64,9 @@ Each prompt starts a new execution because the Hermes HTTP adapter cannot contin
   so the missing snapshot is visible to an auditor instead of silently absent.
 - **Policy is recorded, not enforced here.** The snapshot grants read/search/generate-diff and limits
   paths to `cwd`; real enforcement still happens in the Code Engine and the sandbox.
-- **Framing is newline-delimited only.** If a Zed release negotiates Content-Length framing, the reader
-  must be extended.
+- **Framing is detected, not assumed.** The reader accepts newline-delimited JSON and LSP-style
+  `Content-Length` framing, decided by the first frame, and answers in the same framing. Content-Length
+  is counted in bytes, so multibyte prompts split across chunks still parse.
 - **Approvals are bridged.** A Hermes `permission.requested` event becomes an ACP
   `session/request_permission` request with `allow` / `reject` options; choosing allow calls
   `respondToPermission(approve)`, anything else (including a closed editor or a timeout) denies so the

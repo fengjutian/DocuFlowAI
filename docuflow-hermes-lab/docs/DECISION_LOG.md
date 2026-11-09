@@ -285,3 +285,11 @@ Decision: `cancel` attempts the runtime stop; on `unsupported_capability` (or an
 the local subscription, journals `execution.cancel_unsupported` with the reason, and settles the turn as
 `cancelled`. The editor always gets an immediate answer, and the journal records that the remote run may
 still be alive.
+
+## D-036: ACP framing follows the client, byte-counted
+Status: accepted
+Context: ACP over stdio is newline-delimited, but some clients speak LSP-style `Content-Length` framing;
+assuming one format breaks the other.
+Decision: the reader detects the framing from the first frame and the writer answers in the same one.
+`Content-Length` is measured in bytes and the reader works on raw Buffers, so a multibyte prompt split
+across chunks is not corrupted by UTF-8 decoding at chunk boundaries.
