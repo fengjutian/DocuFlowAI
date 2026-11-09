@@ -650,6 +650,101 @@ DocuFlow Context Engine 负责项目级正式事实。
 
 某次 Agent 修改代码时，实际读取的是哪个版本的需求和技术设计？
 
+## 9.4 Prompt 与代码变更绑定
+
+Prompt 与代码变更不能分别作为两个独立、可覆盖的配置管理。每次 Agent Run 必须作为二者的绑定单元，形成以下不可变追溯链：
+
+```text
+Task
+└── Agent Run
+    ├── Prompt Snapshot
+    ├── Context Snapshot
+    ├── Git Base SHA
+    ├── Change Record / Diff
+    ├── Git Commit SHA
+    └── Evaluation Result
+```
+
+Prompt 必须区分以下三个概念：
+
+1. `prompt_template_version`：Prompt 模板的发布版本，例如 `coding-agent@1.4.2`。
+2. `rendered_prompt`：模板与任务、需求、架构约束和选定上下文合成后的实际输入。
+3. `prompt_snapshot`：执行时 Prompt 的不可变快照，保存模板版本、内容哈希、上下文引用和模型参数。
+
+每次执行至少记录：
+
+```json
+{
+  "execution_id": "run-123",
+  "prompt_template_version": "coding-agent@1.4.2",
+  "prompt_content_hash": "sha256:...",
+  "rendered_prompt_hash": "sha256:...",
+  "context_snapshot_id": "ctx-456",
+  "git_base_sha": "abc123",
+  "change_record_id": "chg-789",
+  "git_commit_sha": "def456",
+  "evaluation_id": "eval-321"
+}
+```
+
+约束：
+
+- Prompt Snapshot 和 Context Snapshot 创建后不可修改。
+- `git_base_sha` 表示 Agent 开始修改前的代码状态。
+- 每个已应用 Diff 必须生成 Change Record，并关联产生它的 Agent Run。
+- 进入 Git 历史的变更必须保存 `git_commit_sha`，并支持从 Commit 反查 Agent Run。
+- Prompt 中不得保存明文密钥；完整 Prompt 应加密或按访问权限受控保存，哈希用于一致性验证。
+- Prompt 模板升级必须创建新版本，不能覆盖已被历史执行引用的版本。
+
+该绑定必须能够回答：
+
+- 某个 Commit 由哪次 Agent Run、哪版 Prompt 和哪些上下文产生？
+- 某次 Agent Run 实际向模型提交了什么内容？
+- Prompt 或上下文变化后产生了哪些代码变更？
+- 某次回退针对的是代码、Prompt 配置，还是两者？
+
+## 9.5 回退策略
+
+回退必须通过新增可审计记录恢复到目标状态，不允许删除、覆盖或篡改历史 Agent Run、Prompt Snapshot、Change Record 和审计事件。
+
+### 9.5.1 仅回退代码
+
+对于已经进入共享分支的代码，使用反向提交，不使用 `git reset --hard` 改写历史：
+
+```bash
+git revert <git_commit_sha>
+```
+
+回退操作必须创建新的 Change Record，并记录：
+
+- `operation = revert`
+- `reverts_change_record_id`
+- `reverts_commit_sha`
+- 新的 `git_commit_sha`
+- 发起人、原因、审批和 Evaluation 结果
+
+原 Agent Run 及其 Prompt Snapshot 保持不变。
+
+### 9.5.2 仅回退 Prompt 配置
+
+Prompt 回退通过切换当前激活的模板版本完成，例如从 `coding-agent@1.4.2` 切换到 `coding-agent@1.3.8`。不得覆盖或删除 `1.4.2`。
+
+切换后创建新的 Agent Run 和 Prompt Snapshot。历史 Agent Run 继续引用执行当时的 Prompt 版本，不受当前激活版本影响。
+
+### 9.5.3 Prompt 与代码联合回退
+
+联合回退流程：
+
+1. 选择目标历史 Agent Run，读取其 Prompt Snapshot、Context Snapshot 和 Git SHA。
+2. 对目标状态之后需要撤销的 Commit 生成反向提交。
+3. 将 Prompt 激活版本切换到目标版本。
+4. 从目标 Git 状态创建新的隔离 Worktree。
+5. 创建新的恢复 Agent Run，不复用或修改历史执行。
+6. 重新执行测试、独立审查和 Evaluation。
+7. 保存恢复前后状态、反向 Change Record 和完整审计记录。
+
+如果只需要重现历史结果，而不是改变当前状态，应使用历史快照和 Git SHA 创建临时 Worktree，执行只读重放，不切换生产配置。
+
 ---
 
 # 10. Skills 集成设计
@@ -743,6 +838,7 @@ Skill 可能包含：
 | agent_id | UUID | Agent |
 | runtime_id | UUID | Runtime |
 | context_snapshot_id | UUID | 上下文快照 |
+| prompt_snapshot_id | UUID | Prompt 快照 |
 | policy_snapshot_id | UUID | 权限快照 |
 | worktree_id | UUID | Worktree |
 | external_session_id | VARCHAR(255) | 外部 Session |
@@ -837,7 +933,46 @@ Agent 与 Skill 绑定。
 | context_hash | VARCHAR(128) | 上下文哈希 |
 | created_at | DATETIME | 创建时间 |
 
-## 11.8 表关系
+## 11.8 prompt_snapshots
+
+保存 Agent 执行时实际使用的 Prompt，不保存可被覆盖的“当前值”。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID | 主键 |
+| project_id | UUID | 项目 |
+| task_id | UUID | 任务 |
+| execution_id | UUID | 执行实例 |
+| template_name | VARCHAR(100) | Prompt 模板名称 |
+| template_version | VARCHAR(50) | Prompt 模板版本 |
+| template_content_hash | VARCHAR(128) | 模板内容哈希 |
+| rendered_prompt | ENCRYPTED TEXT | 实际提交内容，按权限加密保存 |
+| rendered_prompt_hash | VARCHAR(128) | 实际提交内容哈希 |
+| context_snapshot_id | UUID | 上下文快照 |
+| model_config | JSON | 模型、参数及运行配置 |
+| created_at | DATETIME | 创建时间 |
+
+## 11.9 change_records
+
+保存每次 Diff 应用、提交和回退的不可变记录。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| id | UUID | 主键 |
+| project_id | UUID | 项目 |
+| task_id | UUID | 任务 |
+| execution_id | UUID | 产生变更的执行实例 |
+| operation | VARCHAR(30) | apply、revert 或 restore |
+| git_base_sha | VARCHAR(64) | 应用前 Git 基线 |
+| diff_hash | VARCHAR(128) | Diff 内容哈希 |
+| diff_content | ENCRYPTED TEXT | 受控保存的 Diff |
+| git_commit_sha | VARCHAR(64) | 对应 Git Commit |
+| reverts_change_record_id | UUID | 被回退的 Change Record |
+| reverts_commit_sha | VARCHAR(64) | 被回退的 Commit |
+| approval_record | JSON | 审批人、原因和结果 |
+| created_at | DATETIME | 创建时间 |
+
+## 11.10 表关系
 
 ```mermaid
 erDiagram
@@ -847,8 +982,11 @@ erDiagram
     AGENT_EXECUTIONS ||--o{ AGENT_RUNTIME_EVENTS : emits
     AGENT_EXECUTIONS ||--o{ AGENT_RUNTIME_SESSIONS : owns
     AGENT_EXECUTIONS }o--|| CONTEXT_SNAPSHOTS : uses
+    AGENT_EXECUTIONS }o--|| PROMPT_SNAPSHOTS : uses
     AGENT_EXECUTIONS }o--|| POLICY_SNAPSHOTS : uses
     AGENT_EXECUTIONS }o--o| WORKTREES : runs_in
+    AGENT_EXECUTIONS ||--o{ CHANGE_RECORDS : produces
+    CHANGE_RECORDS o|--o| CHANGE_RECORDS : reverts
     AGENTS ||--o{ AGENT_EXECUTIONS : assigned
 ```
 
