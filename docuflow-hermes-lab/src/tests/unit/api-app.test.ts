@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { AgentRuntimeRegistry } from "../../adapters/runtime-registry.js";
 import { createApiServer, type ApiDependencies } from "../../api/app.js";
 import { EventBus } from "../../api/event-bus.js";
+import { UsageLedger } from "../../accounting/usage.js";
 import { InMemoryJournalStore } from "../../journal/journal.js";
 import { ExecutionCoordinator } from "../../orchestrator/execution-coordinator.js";
 import type { TaskExecutionService, StartTaskRequest } from "../../tasks/task-execution-service.js";
@@ -22,7 +23,7 @@ interface Harness {
   coordinator: ExecutionCoordinator;
 }
 
-async function harness(options: { token?: string } = {}): Promise<Harness> {
+async function harness(options: { token?: string; usage?: UsageLedger } = {}): Promise<Harness> {
   const starts: StartTaskRequest[] = [];
   const cancelled: string[] = [];
   const approvals: Array<{ executionId: string; requestId: string; decision: string }> = [];
@@ -118,7 +119,8 @@ async function harness(options: { token?: string } = {}): Promise<Harness> {
     taskService,
     journal,
     bus,
-    ...(options.token ? { token: options.token } : {})
+    ...(options.token ? { token: options.token } : {}),
+    ...(options.usage ? { usage: options.usage } : {})
   };
   const server = await createApiServer(deps).listen(0);
   return {
@@ -302,6 +304,43 @@ test("returns 404 for an unknown route and for an unknown commit", async () => {
 
     const found = await fetch(`${app.url}/api/v1/trace/commits/${"c".repeat(40)}`);
     assert.equal(found.status, 200);
+  } finally {
+    await app.close();
+  }
+});
+
+test("reports usage when accounting is wired and 501 when it is not", async () => {
+  const bare = await harness();
+  try {
+    const response = await fetch(`${bare.url}/api/v1/executions/exec-1/usage`);
+    assert.equal(response.status, 501);
+  } finally {
+    await bare.close();
+  }
+
+  const usage = new UsageLedger();
+  usage.record({
+    id: "u1",
+    executionId: "exec-1",
+    model: "hermes-small",
+    promptTokens: 10,
+    completionTokens: 5,
+    totalTokens: 15,
+    durationMs: 2_000
+  });
+  const app = await harness({ usage });
+  try {
+    const one = await fetch(`${app.url}/api/v1/executions/exec-1/usage`);
+    const body = await one.json() as { usage: { totalTokens: number; model: string } };
+    assert.equal(one.status, 200);
+    assert.equal(body.usage.totalTokens, 15);
+    assert.equal(body.usage.model, "hermes-small");
+
+    assert.equal((await fetch(`${app.url}/api/v1/executions/exec-2/usage`)).status, 404);
+
+    const summary = await fetch(`${app.url}/api/v1/usage`);
+    const summaryBody = await summary.json() as { summary: { executions: number; totalTokens: number } };
+    assert.equal(summaryBody.summary.totalTokens, 15);
   } finally {
     await app.close();
   }

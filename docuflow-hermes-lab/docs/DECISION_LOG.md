@@ -170,3 +170,21 @@ that was never tested.
 Decision: `evaluateChecks` returns `blocked` for an empty check list, and `completionGate` denies
 completion unless a result exists and every check passed. Checks are configured server-side and are
 never accepted from an API body, because that would expose arbitrary command execution.
+
+## D-023: Skills must declare, and declarations are checked against policy
+Status: accepted
+Context: design 10.3 warns that a Markdown skill can contain shell commands, file edits and network
+calls, so its mere presence is not evidence of safety.
+Decision: a manifest declares permissions, allowed runtimes, risk level and approval policy; the
+registry rejects unknown permissions and empty runtime lists, and authorization denies when a
+permission is missing from the execution's policy snapshot or the snapshot expired. High risk,
+`require_approval` and deprecated versions become `require_approval` rather than `allow`.
+
+## D-024: Usage is recorded only when the runtime reported it
+Status: accepted
+Context: AT-206 needs token and time accounting, but runtimes differ in payload shape and some omit
+usage entirely.
+Decision: `recordFromEvent` accepts several field names and derives the total when possible; a payload
+without any token data produces no record, because a zero would look like a free run. Duration is
+computed by the server from `execution.started` to the terminal event, not trusted from the payload.
+The ledger is in-memory in this lab.

@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { AgentAdapterError } from "../types/adapter.js";
 import type { AgentRuntimeRegistry } from "../adapters/runtime-registry.js";
 import type { JournalStore } from "../journal/journal.js";
+import type { UsageLedger } from "../accounting/usage.js";
 import type { ExecutionCoordinator } from "../orchestrator/execution-coordinator.js";
 import type { TaskExecutionService, StartTaskRequest } from "../tasks/task-execution-service.js";
 import { EventBus, formatSseFrame, journalEntryToEvent } from "./event-bus.js";
@@ -20,6 +21,8 @@ export interface ApiDependencies {
   taskService: TaskExecutionService;
   journal: JournalStore;
   bus: EventBus;
+  /** Optional: without it the usage endpoint reports that accounting is not configured. */
+  usage?: UsageLedger;
   /** When set, every request must present `Authorization: Bearer <token>`. */
   token?: string;
   now?: () => Date;
@@ -196,6 +199,23 @@ async function route(
       );
     }
     return { status: 200, body: { execution: result.execution, plan: result.plan } };
+  }
+
+  if (method === "GET" && matches(segments, ["api", "v1", "executions", ":id", "usage"])) {
+    const id = segments[3]!;
+    if (!deps.usage) {
+      throw new ApiError(501, "usage_not_configured", "Usage accounting is not wired into this server");
+    }
+    const record = deps.usage.forExecution(id);
+    if (!record) throw new ApiError(404, "usage_not_found", `No usage recorded for execution ${id}`);
+    return { status: 200, body: { usage: record } };
+  }
+
+  if (method === "GET" && matches(segments, ["api", "v1", "usage"])) {
+    if (!deps.usage) {
+      throw new ApiError(501, "usage_not_configured", "Usage accounting is not wired into this server");
+    }
+    return { status: 200, body: { summary: deps.usage.summary(), records: deps.usage.list() } };
   }
 
   if (method === "GET" && matches(segments, ["api", "v1", "trace", "commits", ":sha"])) {

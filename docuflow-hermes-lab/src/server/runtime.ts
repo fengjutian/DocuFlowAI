@@ -3,6 +3,7 @@ import { HermesAdapter } from "../adapters/hermes-adapter.js";
 import { AgentRuntimeRegistry } from "../adapters/runtime-registry.js";
 import { createApiServer, type ApiDependencies } from "../api/app.js";
 import { EventBus } from "../api/event-bus.js";
+import { UsageLedger } from "../accounting/usage.js";
 import { HermesHttpClient } from "../clients/http/hermes-http-client.js";
 import { CodeChangePipeline } from "../code-engine/code-change-pipeline.js";
 import { SpawnGitRunner } from "../code-engine/git-runner.js";
@@ -22,6 +23,7 @@ import { TraceabilityQuery } from "../persistence/traceability.js";
 import { TaskExecutionService } from "../tasks/task-execution-service.js";
 import type { ChangeRecord } from "../code-engine/change-record.js";
 import type { EvaluationResult } from "../evaluation/evaluation.js";
+import type { AgentRuntimeEvent } from "../types/adapter.js";
 
 /**
  * Composition root.
@@ -92,6 +94,24 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   };
   const journal = new JsonlJournalStore(resolve(config.dataDir, "journal"));
   const bus = new EventBus();
+  const usage = new UsageLedger();
+  const startedAt = new Map<string, string>();
+
+  const TERMINAL = new Set(["execution.completed", "execution.failed", "execution.cancelled"]);
+  const recordUsage = (event: AgentRuntimeEvent): void => {
+    if (event.eventType === "execution.started") {
+      if (!startedAt.has(event.executionId)) startedAt.set(event.executionId, event.timestamp);
+      return;
+    }
+    if (!TERMINAL.has(event.eventType)) return;
+    const began = startedAt.get(event.executionId);
+    const durationMs = began ? Math.max(0, Date.parse(event.timestamp) - Date.parse(began)) : 0;
+    usage.recordFromEvent(event, {
+      durationMs,
+      ...(began ? { startedAt: began } : {}),
+      finishedAt: event.timestamp
+    });
+  };
 
   const client = new HermesHttpClient({
     baseUrl: config.hermesBaseUrl,
@@ -105,7 +125,10 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   const coordinator = new ExecutionCoordinator({
     adapter,
     journal,
-    onEvent: event => bus.publishRuntimeEvent(event)
+    onEvent: event => {
+      bus.publishRuntimeEvent(event);
+      recordUsage(event);
+    }
   });
 
   const git = new SpawnGitRunner();
@@ -121,6 +144,7 @@ export function createRuntime(config: RuntimeConfig): Runtime {
       taskService,
       journal,
       bus,
+      usage,
       ...(config.token ? { token: config.token } : {})
     },
     close: () => coordinator.stopAll()

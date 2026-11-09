@@ -25,6 +25,8 @@ This repository provides:
   event envelope.
 - An Evaluation Engine with an independent-process check runner and a completion gate that refuses to
   certify a change without a passing evaluation.
+- A Skill registry with immutable versions, declared permissions, runtime restrictions and policy-based
+  authorization, plus per-execution usage/cost accounting.
 - Unit tests that run without a Hermes server.
 - Opt-in integration tests against a locally configured Hermes server.
 - Security-test fixture layout and a structured JSON result format.
@@ -321,6 +323,22 @@ all** denies completion — `GET /api/v1/executions/{id}` reports that gate as `
 cannot be inferred from a terminal event. Results are immutable records and journaled as
 `evaluation.completed`. See [`docs/EVALUATION.md`](docs/EVALUATION.md).
 
+## Skills and cost
+
+```ts
+registry.register(manifest)                       // immutable versions, duplicate is a conflict
+registry.authorize(manifest, { runtimeId, policy })  // allow / deny / require_approval
+bindings.bind({ executionId, manifest, policyId, authorization })
+```
+
+A skill must declare every permission it needs and the runtimes it may run on; authorization is decided
+against the execution's policy snapshot, and high-risk or deprecated skills require approval. See
+[`docs/SKILLS.md`](docs/SKILLS.md).
+
+`UsageLedger` records model, tokens and duration per execution; `GET /api/v1/executions/{id}/usage` and
+`GET /api/v1/usage` expose it. An event with no usage data records nothing rather than a fake zero.
+See [`docs/COST.md`](docs/COST.md).
+
 ## Running the lab server
 
 ```bash
@@ -355,6 +373,7 @@ layer, not merely a Hermes permission prompt.
 
 ```text
 src/
+  accounting/         Usage/cost ledger and aggregation
   adapters/           AgentRuntimeAdapter implementation, event normalizer, runtime registry
   api/                HTTP routes and the design-13 event envelope / SSE stream
   clients/http/       Hermes HTTP API client + SSE
@@ -368,6 +387,7 @@ src/
   policy/             Permission evaluation from a policy snapshot
   security/           Sandbox boundary specification and probes
   server/             Composition root: config validation, wiring, `npm run serve`
+  skills/             Manifests, immutable version registry, authorization, bindings
   tasks/              startTask / applyProposedChange / trace entry point
   tests/unit/         Offline tests
   tests/integration/  Opt-in live-server tests
