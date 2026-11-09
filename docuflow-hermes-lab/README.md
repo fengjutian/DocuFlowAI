@@ -19,6 +19,7 @@ This repository provides:
   rebuild) for gaps and crashes.
 - Immutable context / policy / prompt snapshots and change records, with traceability queries
   (commit → agent run, execution → everything, task → executions).
+- Context snapshot capture with a deterministic, content-addressed hash and drift verification.
 - Unit tests that run without a Hermes server.
 - Opt-in integration tests against a locally configured Hermes server.
 - Security-test fixture layout and a structured JSON result format.
@@ -242,6 +243,20 @@ byTask(taskId)       // every execution that worked on a task
 Context snapshots have no execution id, so they are resolved through the prompt snapshot that
 consumed them. See [`docs/PERSISTENCE.md`](docs/PERSISTENCE.md).
 
+## Context snapshots
+
+`captureContextSnapshot()` reads the worktree itself: git base SHA, content hashes of the authoritative
+documents, and hashes of every selected file, folded into a canonical `context_hash`. Two captures of
+the same bytes produce the same hash; one changed byte produces a different one.
+
+```ts
+verifyContextSnapshot(record, current)
+// → { matches: false, actualHash, differences: ["document changed: spec.md"] }
+```
+
+Every path is resolved inside the worktree and re-read before hashing, so a caller cannot assert a
+file is unchanged. See [`docs/CONTEXT.md`](docs/CONTEXT.md).
+
 ## Test status vocabulary
 
 - `passed`: assertion verified by executable evidence.
@@ -260,6 +275,7 @@ src/
   clients/http/       Hermes HTTP API client + SSE
   clients/gateway/    JSON-RPC primitives + stdio process transport
   code-engine/        Worktrees, diff analysis, change pipeline, change records
+  context/            Context snapshot capture and drift verification
   journal/            Append-only execution journal, checkpoints, recovery planner
   orchestrator/       ExecutionCoordinator: adapter + journal + recovery wiring
   persistence/        Immutable snapshot/change stores + traceability queries

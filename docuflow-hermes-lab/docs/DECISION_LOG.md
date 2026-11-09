@@ -120,3 +120,11 @@ Decision: every record is a JSON file created with `wx`; a duplicate id is a con
 snapshots carry template and rendered-prompt hashes only, and `assertPromptSnapshot` rejects a
 record that includes plaintext. The `RecordStore` interface is the seam for a future database, and
 `list()` scans the directory until then.
+
+## D-017: Context hash is content-addressed and re-derived from disk
+Status: accepted
+Context: design 9.3 requires a context hash that makes "what did the run actually see" answerable.
+Decision: `context_hash` is SHA-256 over canonical JSON (sorted keys, sorted file lists) covering the
+base SHA, document hashes, selected-file hashes and the version fields. Paths are resolved inside the
+worktree and re-read before hashing; file contents are not duplicated into the record.
+`verifyContextSnapshot()` recomputes the hash and lists which documents drifted.
