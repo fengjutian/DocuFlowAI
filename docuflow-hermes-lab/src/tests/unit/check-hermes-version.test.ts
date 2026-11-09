@@ -42,3 +42,14 @@ test("extracts the first dotted version from any output shape", () => {
   assert.equal(extractVersion("v1.2.3-rc.1 extra"), "1.2.3-rc.1");
   assert.equal(extractVersion("no version here"), undefined);
 });
+
+test("explains the release-tarball placeholder instead of reporting a version mismatch", () => {
+  assert.throws(() => verifyHermesVersion("0.0.0", lock), /install-stamp\.json/);
+  assert.throws(() => verifyHermesVersion("0.0.0", lock), /write_install_stamp/);
+});
+
+test("accepts the stamp-shaped version and commit pair", () => {
+  assert.doesNotThrow(() =>
+    verifyHermesVersion("0.23.0 2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19", lock)
+  );
+});

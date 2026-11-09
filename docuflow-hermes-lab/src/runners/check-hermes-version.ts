@@ -14,6 +14,47 @@ export interface HermesVersionLock {
   releasedAt: string;
 }
 
+/**
+ * Release tarballs of the pinned Hermes ship `version = "0.0.0"` in pyproject.toml; the real
+ * identity lives in `install-stamp.json` at the install root (upstream's own resolution order:
+ * stamp -> live git -> unknown). Reporting 0.0.0 means the stamp was not written or not found.
+ */
+const RELEASE_PLACEHOLDER_VERSION = "0.0.0";
+
+/**
+ * Reads the installed version and, when the install carries one, the release commit.
+ *
+ * The pinned release ships `version = "0.0.0"` in pyproject.toml, so package metadata alone
+ * cannot answer "which Hermes is this?". Upstream keeps the real identity in
+ * `install-stamp.json` at the install root, and resolves it before git. This snippet mirrors
+ * that order: stamp first, package metadata as the fallback for a plain pip install.
+ *
+ * Prints `<version> <commit>`; the commit is empty when no stamp was found.
+ */
+const VERSION_SNIPPET = [
+  "import json, os, pathlib, sys",
+  "version = ''",
+  "commit = ''",
+  "try:",
+  "    import importlib.metadata as metadata",
+  "    version = metadata.version('hermes-agent')",
+  "except Exception:",
+  "    pass",
+  "root = os.environ.get('HERMES_INSTALL_DIR', '').strip()",
+  "if not root:",
+  "    executable = pathlib.Path(sys.executable).resolve()",
+  "    root = str(executable.parent.parent.parent) if executable.parent.name.lower() == 'scripts' else str(executable.parent)",
+  "stamp = pathlib.Path(root) / 'install-stamp.json'",
+  "if stamp.is_file():",
+  "    try:",
+  "        data = json.loads(stamp.read_text(encoding='utf-8-sig'))",
+  "        version = data.get('baseVersion') or version",
+  "        commit = data.get('commit') or ''",
+  "    except Exception:",
+  "        pass",
+  "print(version, commit)"
+].join("\n");
+
 export function verifyHermesVersion(output: string, lock: HermesVersionLock): void {
   const normalized = output.trim();
   const reported = extractVersion(normalized);
@@ -26,6 +67,15 @@ export function verifyHermesVersion(output: string, lock: HermesVersionLock): vo
       );
     }
     throw new Error(`Expected Hermes ${lock.tag}, received: ${normalized || "empty version output"}`);
+  }
+  if (reported === RELEASE_PLACEHOLDER_VERSION) {
+    throw new Error(
+      `Hermes reported ${RELEASE_PLACEHOLDER_VERSION}, which is the placeholder the release ` +
+        `tarball ships in pyproject.toml, not a version. The pinned runtime states its identity in ` +
+        `install-stamp.json at the install root: write it with ` +
+        `scripts/write_install_stamp.py --base-version ${lock.version} --commit ${lock.commit} ` +
+        `--update-mechanism self, or point HERMES_INSTALL_DIR at that root.`
+    );
   }
   if (reported !== lock.version) {
     throw new Error(`Installed Hermes is ${reported}, but hermes.lock.json pins ${lock.version} (${lock.tag})`);
@@ -54,10 +104,10 @@ async function main(): Promise<void> {
     if (override) {
       ({ stdout } = await execFileAsync(override, [], { encoding: "utf8", windowsHide: true }));
     } else if (python) {
-      ({ stdout } = await execFileAsync(python, [
-        "-c",
-        "import importlib.metadata as m; print(m.version('hermes-agent'))"
-      ], { encoding: "utf8", windowsHide: true }));
+      ({ stdout } = await execFileAsync(python, ["-c", VERSION_SNIPPET], {
+        encoding: "utf8",
+        windowsHide: true
+      }));
     } else {
       ({ stdout } = await execFileAsync(command, ["--version"], { encoding: "utf8", windowsHide: true }));
     }
