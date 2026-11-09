@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import { resolveEventName } from "../adapters/hermes-event-normalizer.js";
 import { HermesHttpClient } from "../clients/http/hermes-http-client.js";
 import { writeTestReport } from "../reporting/report-writer.js";
 import type { HermesCapabilities, HermesRun, HermesRunCreateRequest, HermesSseEvent, TestResult } from "../types/hermes.js";
@@ -17,6 +18,26 @@ export interface HttpPhase0Options {
   eventTimeoutMs?: number;
   maxEvents?: number;
   now?: () => Date;
+}
+
+/**
+ * Events that end a run. The SSE stream is only evidence when it reaches one of them: while a run
+ * is in flight the runtime sends only `: keepalive` comments, which carry no run information.
+ */
+const TERMINAL_RUN_EVENTS = new Set([
+  "run.completed",
+  "run.failed",
+  "run.cancelled",
+  "run.interrupted"
+]);
+
+/**
+ * Hermes sends the event name inside the JSON payload (`data.event`) and leaves the SSE frame name
+ * at its `message` default, so the terminal check has to resolve the name the same way the adapter
+ * does. Checking the frame name alone would miss a terminal event that was really received.
+ */
+export function isTerminalRunEvent(event: HermesSseEvent): boolean {
+  return TERMINAL_RUN_EVENTS.has(resolveEventName(event));
 }
 
 export async function executeHttpPhase0(
@@ -56,33 +77,44 @@ export async function executeHttpPhase0(
 
   const eventStarted = now().toISOString();
   const events: HermesSseEvent[] = [];
-  const eventTimeoutMs = options.eventTimeoutMs ?? 10_000;
+  // A run that reaches a thinking model produces no data event until the model answers, so the
+  // default has to outlast a full model turn.
+  const eventTimeoutMs = options.eventTimeoutMs ?? 180_000;
   const signal = AbortSignal.timeout(eventTimeoutMs);
   try {
     for await (const event of client.streamRunEvents(run.run_id, signal)) {
       events.push(event);
+      if (isTerminalRunEvent(event)) break;
       if (events.length >= (options.maxEvents ?? 100)) break;
     }
+    const terminal = events.find(isTerminalRunEvent);
     results.push(result(
       "P0-002",
       "HTTP SSE event stream",
-      events.length > 0 ? "passed" : "failed",
+      terminal ? "passed" : "failed",
       eventStarted,
       now(),
       events.map(event => JSON.stringify(event)),
-      events.length > 0 ? undefined : "The SSE stream ended without any events"
+      terminal
+        ? undefined
+        : events.length > 0
+          ? `Event capture ended without a terminal run event: ${events.map(e => resolveEventName(e)).join(", ")}`
+          : `No data event within ${eventTimeoutMs}ms (the runtime sends only ": keepalive" comments while a run is in flight)`
     ));
   } catch (error) {
+    const terminal = events.find(isTerminalRunEvent);
     results.push(result(
       "P0-002",
       "HTTP SSE event stream",
-      events.length > 0 ? "passed" : "failed",
+      terminal ? "passed" : "failed",
       eventStarted,
       now(),
       events.map(event => JSON.stringify(event)),
-      events.length > 0
-        ? `Event capture ended before stream completion: ${errorMessage(error)}`
-        : errorMessage(error)
+      terminal
+        ? `Event capture ended after the terminal event: ${errorMessage(error)}`
+        : events.length > 0
+          ? `Event capture ended before stream completion: ${errorMessage(error)}`
+          : errorMessage(error)
     ));
   }
   return results;
@@ -106,7 +138,7 @@ async function main(): Promise<void> {
     });
     results = await executeHttpPhase0(client, {
       ...(process.env.HERMES_MODEL ? { model: process.env.HERMES_MODEL } : {}),
-      eventTimeoutMs: numberFromEnv("HERMES_EVENT_TIMEOUT_MS", 10_000),
+      eventTimeoutMs: numberFromEnv("HERMES_EVENT_TIMEOUT_MS", 180_000),
       maxEvents: numberFromEnv("HERMES_MAX_EVENTS", 100)
     });
   }

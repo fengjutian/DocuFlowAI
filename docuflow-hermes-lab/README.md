@@ -420,18 +420,28 @@ Three facts about the install are worth knowing before touching it:
 - Every runtime dependency is declared as `python_version >= '3.14'`. On an older interpreter pip
   installs the package and none of its dependencies, and the failure only shows up later as a
   missing module.
+- The Anthropic SDK is an optional extra that Hermes resolves *lazily, on the first agent turn*.
+  Left missing, every turn blocks on a package download instead of failing fast, so the install
+  script puts `anthropic==0.125.0` in the venv next to `aiohttp` (D-044).
 
-Against that install, the checklist is no longer empty:
+Against that install, with a real MiniMax China key in the isolated profile, the checklist is no
+longer empty:
 
 | Check | Result | Evidence |
 |---|---|---|
 | P0-001 HTTP create run | passed | `run_id`, `status=queued` |
-| P0-002 HTTP SSE event stream | passed | `run.failed` event with `id` and `seq` |
+| P0-002 HTTP SSE event stream | passed | `message.delta` events plus a terminal `run.completed` |
 | P0-003 TUI Gateway session | passed | `session.create` → `session_id`, `stored_session_id`, `cwd` |
+| AT-001 Runtime registration and health | passed | live `/v1/capabilities` |
+| AT-002 Task submission | passed | `externalRunId` from a real run |
+| AT-003 Execution event reception | passed | runtime events delivered through the adapter |
+| AT-004 Terminal status recognition | passed | `execution.completed` + `status=succeeded` |
 
-The runs above failed on purpose — no model provider was configured — which is exactly what the
-evidence is supposed to show: the protocol works end to end against the pinned runtime, and the
-model credential is the only thing missing.
+A real run against MiniMax M3 answers in about ten seconds and streams the reply as
+`message.delta` events. Two things about that stream are worth keeping in mind: the runtime sends
+only `: keepalive` comments while a turn is in flight, so the SSE timeout has to outlast a full
+thinking-model turn; and the event name travels inside the JSON payload (`data.event`) rather than
+in the SSE `event:` field (D-045).
 
 Contract tests still prove only that the client behaves correctly against a conforming server. They
 say nothing about the pinned runtime's approval semantics or resume behaviour.
@@ -444,7 +454,7 @@ Two runtimes are evaluated against the same `AgentRuntimeAdapter` contract:
 |---|---|---|
 | Shape | remote HTTP + SSE | in-process TypeScript library |
 | Install | tag tarball, Python 3.14, install stamp | `npm install` of two pinned packages |
-| Evidence so far | P0-001/002/003 against the pinned 0.23.0 | 5/5 runtime probes, 7/7 adapter tests |
+| Evidence so far | P0-001/002/003 + AT-001..004 against the pinned 0.23.0, real MiniMax M3 | 5/5 runtime probes, 7/7 adapter tests, real MiniMax M3 |
 | Cancellation | not available over HTTP (D-005) | `AbortSignal` on the running turn |
 | Resume | not available over HTTP | transcript continues on the same agent |
 | Policy enforcement | sandbox plus tool gating | `beforeToolCall` denial, before the tool runs |
@@ -452,6 +462,9 @@ Two runtimes are evaluated against the same `AgentRuntimeAdapter` contract:
 See [`docs/PI.md`](docs/PI.md) for the Pi evaluation, and
 [`scripts/probe-pi-agent.mjs`](scripts/probe-pi-agent.mjs) for the standalone probe that drives a
 real `pi-agent-core` agent without a model.
+[`scripts/probe-pi-minimax.mjs`](scripts/probe-pi-minimax.mjs) runs the same adapter against the
+real MiniMax China model (`MINIMAX_CN_API_KEY` from the environment, never from a file in the
+repository).
 
 Neither runtime is retired yet: the 24-item checklist has to be signed off against whichever is
 chosen. DocuFlow's own layers — policy, Code Engine, journal, evaluation, skills, API, ACP — do not

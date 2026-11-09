@@ -24,6 +24,24 @@ test("contract: the Phase 0 HTTP runner passes against a conforming server", asy
   }
 });
 
+test("contract: the Phase 0 HTTP runner recognizes a terminal event carried in the payload", async () => {
+  // The real 0.23.0 API server sends no SSE `event:` field: the frame name stays at the
+  // default `message` and the runtime event name travels in `data.event`.
+  const server = await startMockHermes({ payloadNamedEvents: true });
+  try {
+    const client = new HermesHttpClient({ baseUrl: server.url });
+    const results = await executeHttpPhase0(client);
+
+    assert.deepEqual(results.map(item => [item.id, item.status]), [
+      ["P0-001", "passed"],
+      ["P0-002", "passed"]
+    ]);
+    assert.match(results[1]!.evidence[3]!, /run\.completed/);
+  } finally {
+    await server.close();
+  }
+});
+
 test("contract: the client surfaces HTTP errors with status and body", async () => {
   const server = await startMockHermes();
   try {

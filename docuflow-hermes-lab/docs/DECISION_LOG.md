@@ -373,3 +373,29 @@ Decision: the Pi adapter's tests drive a real `pi-agent-core` agent through Pi's
 no model, no network, but the actual runtime. The same rule applies to the standalone probe
 (`scripts/probe-pi-agent.mjs`): a statement about a runtime's behaviour is only evidence if the
 runtime produced it.
+
+## D-044: An optional runtime dependency must be installed before the first turn
+Status: accepted
+Context: on 2026-11-09 a real Hermes run stayed `running` for over four minutes with only
+`: keepalive` comments on the SSE stream, while the same MiniMax key answered a direct request in
+about two seconds. The cause was not the model, the provider or the SSE parser: `py-spy` showed
+every agent turn parked in `agent/anthropic_adapter.py::_get_anthropic_sdk` -> `pm.ensure_import("anthropic")`,
+with the runtime's `hermes-download_*` worker threads blocked in an SSL read. The Anthropic SDK is
+an optional extra that Hermes resolves lazily on the first agent turn, so a missing SDK turns every
+turn into a package download instead of a fast failure. On this network that download stalls.
+Decision: the deployment script installs the pinned `anthropic==0.125.0` extra up front, next to
+`aiohttp`. A runtime that resolves optional dependencies during a request is a deployment hazard,
+not a configuration detail, so it belongs in the install script rather than in a runbook.
+
+## D-045: The event name lives in the payload, not in the SSE frame name
+Status: accepted
+Context: the 0.23.0 API server sends no SSE `event:` field. The frame name stays at the SSE default
+`message` and the runtime event name travels inside the JSON payload as `data.event`. The Phase 0
+runner compared the terminal-event names against the frame name, so a `run.completed` event that
+had really arrived was reported as a missing terminal event and P0-002 was failed against a healthy
+runtime. The adapter already resolved the name correctly; the runner had a second, weaker copy of
+the rule.
+Decision: one resolver, `resolveEventName()`, decides where the event name lives, and both the
+adapter and the Phase 0 runner use it. The mock server can emit either shape so the contract test
+covers the real one. The rule generalises: when one layer already knows how to read a runtime frame,
+a second implementation of the same rule is a defect waiting to happen.

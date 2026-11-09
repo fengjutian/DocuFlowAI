@@ -13,12 +13,20 @@ export interface MockEvent {
   id?: string;
   /** Delay before writing this frame, to exercise streaming and aborts. */
   delayMs?: number;
+  /**
+   * Emit the event name inside the JSON payload instead of as an SSE `event:` field.
+   * The real 0.23.0 API server does exactly this: the frame name stays at the SSE
+   * default `message` and the runtime event name travels in `data.event`.
+   */
+  nameInPayload?: boolean;
 }
 
 export interface MockHermesOptions {
   token?: string;
   capabilities?: Record<string, boolean | string>;
   events?: MockEvent[];
+  /** Emit the runtime event name inside the JSON payload, the way the real API server does. */
+  payloadNamedEvents?: boolean;
   runStatus?: string;
 }
 
@@ -45,12 +53,28 @@ const DEFAULT_EVENTS: MockEvent[] = [
   }
 ];
 
+/**
+ * The event shape the real 0.23.0 API server produces: no SSE `event:` field, and the runtime
+ * event name inside the JSON payload.
+ */
+const PAYLOAD_NAMED_EVENTS: MockEvent[] = [
+  { event: "run.started", data: { run_id: "placeholder" }, id: "1", nameInPayload: true },
+  { event: "message.delta", data: { event: "message.delta", delta: "hello " }, id: "2", nameInPayload: true },
+  { event: "message.delta", data: { event: "message.delta", delta: "world" }, id: "3", nameInPayload: true },
+  {
+    event: "run.completed",
+    data: { event: "run.completed", output: "hello world", completed: true },
+    id: "4",
+    nameInPayload: true
+  }
+];
+
 export async function startMockHermes(options: MockHermesOptions = {}): Promise<MockHermes> {
   const requests: MockHermes["requests"] = [];
   const runs = new Map<string, { status: string }>();
   const approvals: Array<Record<string, unknown>> = [];
   let counter = 0;
-  const events = options.events ?? DEFAULT_EVENTS;
+  const events = options.events ?? (options.payloadNamedEvents ? PAYLOAD_NAMED_EVENTS : DEFAULT_EVENTS);
 
   const server = createServer((request, response) => {
     void handle(request, response);
@@ -133,9 +157,10 @@ export async function startMockHermes(options: MockHermesOptions = {}): Promise<
       const data = event.event === "run.started" && isRecord(event.data)
         ? { ...event.data, run_id: runId }
         : event.data;
-      response.write(
-        `${event.id ? `id: ${event.id}\n` : ""}event: ${event.event}\ndata: ${JSON.stringify(data)}\n\n`
-      );
+      const frame = event.nameInPayload
+        ? `${event.id ? `id: ${event.id}\n` : ""}data: ${JSON.stringify(data)}\n\n`
+        : `${event.id ? `id: ${event.id}\n` : ""}event: ${event.event}\ndata: ${JSON.stringify(data)}\n\n`;
+      response.write(frame);
     }
     response.end();
   }

@@ -184,7 +184,7 @@ async function main(): Promise<void> {
     const registry = new AgentRuntimeRegistry();
     registry.register({ id: "hermes-local", runtimeType: "hermes", adapter, version: "pinned" });
 
-    const timeoutMs = positiveNumber("HERMES_PHASE1_TIMEOUT_MS", 60_000);
+    const timeoutMs = positiveNumber("HERMES_PHASE1_TIMEOUT_MS", 300_000);
     results = await executeAdapterPhase1({
       registry,
       runtimeId: "hermes-local",

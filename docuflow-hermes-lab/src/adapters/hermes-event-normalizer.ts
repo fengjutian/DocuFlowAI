@@ -107,7 +107,7 @@ export function normalizeHermesEvent(
  * SSE frames default to the `message` event name, so the real event name may live in the JSON
  * payload instead. Check the frame name first, then the payload's `event` / `type` field.
  */
-function resolveEventName(raw: HermesSseEvent): string {
+export function resolveEventName(raw: HermesSseEvent): string {
   if (raw.event && raw.event !== "message") return raw.event;
   const data = raw.data;
   if (data && typeof data === "object" && !Array.isArray(data)) {

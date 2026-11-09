@@ -15,6 +15,9 @@ Why it is not just "pip install hermes-agent":
   * Every runtime dependency is declared as python_version >= '3.14'. On an older interpreter pip
     installs the package and none of its dependencies, which fails later at import time.
   * The API server needs aiohttp, which is not a core dependency.
+  * The Anthropic SDK is an optional extra that Hermes resolves lazily on the first agent
+    turn. Left missing, every turn blocks on a runtime package download, so it is installed
+    up front.
 
 The install lives in %LOCALAPPDATA%\hermes\hermes-agent-<version> and uses its own virtual
 environment, so an existing Hermes installation is never touched. Configuration goes to a separate
@@ -197,10 +200,16 @@ try {
     # The API server adapter needs aiohttp, which is not a core dependency.
     & $uv pip install --python $venvPython aiohttp --quiet
     if ($LASTEXITCODE -ne 0) { throw 'Installing aiohttp failed' }
+    # The Anthropic SDK is an optional extra. Hermes resolves it lazily on the first
+    # agent turn (pm.ensure_import), so a missing SDK makes every turn stall in a
+    # runtime package download instead of failing fast. Pre-install it.
+    & $uv pip install --python $venvPython 'anthropic==0.125.0' --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Installing the anthropic SDK failed' }
   } else {
     & $venvPython -m pip install -e . --quiet
     if ($LASTEXITCODE -ne 0) { throw 'pip install failed' }
     & $venvPython -m pip install aiohttp --quiet
+    & $venvPython -m pip install 'anthropic==0.125.0' --quiet
   }
 } finally { Pop-Location }
 
