@@ -12,6 +12,7 @@ This repository provides:
   registry with aggregated health checks.
 - A Policy Engine permission evaluator (design section 8) that turns a policy snapshot into
   allow / deny / require_approval, and an approval round-trip in the adapter.
+- Sandbox boundary probes that prove the container enforces filesystem and network limits.
 - Unit tests that run without a Hermes server.
 - Opt-in integration tests against a locally configured Hermes server.
 - Security-test fixture layout and a structured JSON result format.
@@ -154,6 +155,30 @@ submission, AT-003 runtime event reception, AT-004 terminal status recognition. 
 `reports/phase1-adapter.json`; without `HERMES_HTTP_BASE_URL` every check is recorded as `blocked`,
 not passed. AT-005 (cancellation) is deliberately not run here because cancellation is gated on
 P0-018 evidence.
+
+## Security boundary probes
+
+```bash
+HERMES_SECURITY_LAB_CONFIRM=I_UNDERSTAND_THE_RISK npm run validate:security
+```
+
+Runs six probes inside a container built from the declared spec: allowed workspace read, restricted
+directory absent, outside directory absent, workspace write, path traversal denied, network egress
+denied. The report goes to `reports/phase0-security-boundary.json` with `SEC-B*` ids.
+
+Rules that keep the evidence meaningful:
+
+- Only `workspace/` is mounted. `restricted/` and `outside/` are deliberately **absent**, so their
+  probes fail with "no such file" — a read-only mount would still be readable by root in-container.
+- Network is `--network none`, capabilities are dropped, `no-new-privileges` is set, and memory, CPU
+  and PID limits come from the spec.
+- Without the confirmation flag nothing runs; that state is recorded as `blocked`.
+- A missing Docker daemon is `blocked`, a denied probe that *succeeds* is `failed` and flagged as a
+  boundary breach. Never convert either into `passed`.
+
+`SEC-B*` results support but do not replace the Phase 0 checklist: P0-009, P0-010, P0-013 and P0-017
+still need an agent-level probe before they can be signed off, because boundary enforcement and agent
+behavior are different claims.
 
 ## Test status vocabulary
 

@@ -47,3 +47,19 @@ Decision: `evaluatePermission()` answers from operation, policy snapshot and exp
 only transports that decision. Without `permissionHandler` no answer is sent and the request stays
 pending. Production data access is denied outright rather than routed to approval, because "默认禁止"
 must not be unwound by one click.
+
+## D-008: Boundary evidence is separate from agent evidence
+Status: accepted
+Context: a sandbox that denies a probe does not prove that Hermes, running inside it, behaves. The
+reverse is also true: a compliant model response is not evidence of enforcement (D-003).
+Decision: sandbox probes report under `SEC-B*` in `reports/phase0-security-boundary.json` and are
+never merged into the 24-item Phase 0 report. `supports=P0-0xx` records which checklist item the
+evidence feeds; that item still needs an agent-level probe before sign-off.
+
+## D-009: Mount only the workspace; absence is the boundary
+Status: accepted
+Context: a read-only bind mount is still readable by root inside the container, so mounting
+`restricted/` read-only would not deny reads.
+Decision: `restricted/` and `outside/` are not mounted at all; the probe asserts they are absent
+(ENOENT). A later UID/GID-based backend may test readable-but-denied semantics, which is a different
+claim and needs its own evidence.
