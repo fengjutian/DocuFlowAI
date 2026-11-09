@@ -293,3 +293,12 @@ assuming one format breaks the other.
 Decision: the reader detects the framing from the first frame and the writer answers in the same one.
 `Content-Length` is measured in bytes and the reader works on raw Buffers, so a multibyte prompt split
 across chunks is not corrupted by UTF-8 decoding at chunk boundaries.
+
+## D-037: Zed source is provisioned in place, identified by a tree digest
+Status: accepted
+Context: the project needs Zed's source to build features on, but the clone stalls on this network and
+the supplied archive has no `.git`, so neither a submodule nor a commit pin is available.
+Decision: the full tree (1.29.0, 4,404 files, 91.5 MB) lives at `client/zed`, gitignored, and
+`client/PIN.json` records the version, toolchain, file count, size and a SHA-256 digest over
+`relative-path\0size`. Re-provisioning is a local copy (`fetch-zed.ps1 -FromPath`) or the pinned tarball.
+A real fork, if needed, is a repository fork plus a submodule — not a committed copy.

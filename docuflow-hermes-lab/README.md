@@ -421,7 +421,10 @@ the pinned version.
 
 ## Zed (ACP)
 
-Zed is the client base; DocuFlow is the ACP agent behind it:
+Zed is the client base; DocuFlow is the ACP agent behind it. The full Zed source tree (**1.29.0**) is
+provisioned at `client/zed`, gitignored, with `client/PIN.json` recording the version, size and tree
+digest; build it with `client/build-zed.ps1` (Rust 1.98.1). Register DocuFlow as an agent and run the
+endpoint with:
 
 ```bash
 HERMES_HTTP_BASE_URL=http://127.0.0.1:8642 npm run acp:serve

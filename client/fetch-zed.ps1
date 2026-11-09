@@ -1,17 +1,63 @@
-# Fetches the pinned Zed source tree into client/zed.
+# Provisions the pinned Zed source tree into client/zed.
 #
-# GitHub bulk transfers are unreliable on this network (measured ~11 KB/s), so this script is
-# resumable: run it again and curl continues from the partial file.
+# Two sources are supported:
+#   -FromPath <dir>   copy a local extracted archive (offline, preferred on this network)
+#   (default)         download the pinned tag tarball, resuming is impossible on codeload
+#
+# The tree itself stays gitignored; client/PIN.json records what was provisioned so a clone can be
+# rebuilt without guessing.
 param(
   [string]$Tag = "v1.27.0",
+  [string]$FromPath,
   [string]$Destination = (Join-Path $PSScriptRoot "zed"),
   [string]$Archive = (Join-Path $env:TEMP "zed-$Tag.tar.gz")
 )
 
 $ErrorActionPreference = "Stop"
 
+function Write-Pin {
+  param([string]$Mode)
+  $version = $null
+  $toolchain = $null
+  $crateManifest = Join-Path $Destination "crates/zed/Cargo.toml"
+  if (Test-Path $crateManifest) {
+    $versionLine = Select-String -Path $crateManifest -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+    if ($versionLine) { $version = $versionLine.Matches[0].Groups[1].Value }
+  }
+  $toolchainFile = Join-Path $Destination "rust-toolchain.toml"
+  if (Test-Path $toolchainFile) {
+    $channel = Select-String -Path $toolchainFile -Pattern 'channel\s*=\s*"([^"]+)"' | Select-Object -First 1
+    if ($channel) { $toolchain = $channel.Matches[0].Groups[1].Value }
+  }
+  $files = Get-ChildItem $Destination -Recurse -File -Force
+  @{
+    source = "https://github.com/zed-industries/zed"
+    tag = $Tag
+    mode = $Mode
+    zedVersion = $version
+    rustToolchain = $toolchain
+    files = $files.Count
+    sizeBytes = ($files | Measure-Object Length -Sum).Sum
+    fetchedAt = (Get-Date).ToUniversalTime().ToString("o")
+    note = "Tree is gitignored; re-provision with client/fetch-zed.ps1. No .git in the archive, so there is no commit to pin."
+  } | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $PSScriptRoot "PIN.json") -Encoding utf8
+}
+
 if (Test-Path (Join-Path $Destination "Cargo.toml")) {
   Write-Host "Zed source already present at $Destination"
+  exit 0
+}
+
+if ($FromPath) {
+  if (-not (Test-Path (Join-Path $FromPath "Cargo.toml"))) {
+    throw "$FromPath does not look like a Zed checkout (no Cargo.toml)"
+  }
+  Write-Host "Copying $FromPath to $Destination"
+  New-Item -ItemType Directory -Force -Path (Split-Path $Destination -Parent) | Out-Null
+  & robocopy $FromPath $Destination /E /NFL /NDL /NJH /NJS /R:1 /W:1 | Out-Null
+  if ($LASTEXITCODE -ge 8) { throw "robocopy failed with $LASTEXITCODE" }
+  Write-Pin -Mode "local-copy"
+  Write-Host "Zed source copied; PIN.json written"
   exit 0
 }
 
@@ -46,21 +92,5 @@ if (-not $root) { throw "archive did not contain a source directory" }
 if (Test-Path $Destination) { Remove-Item $Destination -Recurse -Force }
 Move-Item $root.FullName $Destination
 
-$commit = $null
-try {
-  $release = Invoke-RestMethod -Uri "https://api.github.com/repos/zed-industries/zed/git/ref/tags/$Tag" `
-    -Headers @{ "User-Agent" = "docuflow-client" } -TimeoutSec 30
-  $commit = $release.object.sha
-} catch {
-  Write-Warning "Could not resolve $Tag to a commit: $($_.Exception.Message)"
-}
-
-@{
-  tag = $Tag
-  commit = $commit
-  source = "https://github.com/zed-industries/zed"
-  fetchedAt = (Get-Date).ToUniversalTime().ToString("o")
-  note = "Fetched as a tarball because bulk git transfers fail on this network; the tree is not tracked by git."
-} | ConvertTo-Json -Depth 3 | Set-Content (Join-Path $PSScriptRoot "PIN.json") -Encoding utf8
-
+Write-Pin -Mode "tarball"
 Write-Host "Zed $Tag source is at $Destination"

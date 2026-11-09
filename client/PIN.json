@@ -1,0 +1,12 @@
+﻿{
+    "source":  "https://github.com/zed-industries/zed",
+    "tag":  "main (local archive)",
+    "mode":  "local-copy",
+    "zedVersion":  "1.29.0",
+    "rustToolchain":  "1.98.1",
+    "files":  4404,
+    "sizeBytes":  91466266,
+    "treeSha256":  "f7438f1f138105039a00a92c84c0bbfa89c187c687cf4d9d9647d9c7903712cd",
+    "fetchedAt":  "2026-11-09T11:37:36.3026367Z",
+    "note":  "Tree is gitignored; re-provision with client/fetch-zed.ps1 -FromPath. The archive had no .git, so version comes from crates/zed/Cargo.toml."
+}

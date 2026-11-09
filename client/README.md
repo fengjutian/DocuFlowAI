@@ -1,47 +1,57 @@
 # Client base: Zed (source)
 
-Zed is the project's client base. Its source is provisioned from a pinned release rather than vendored
-into git, because a 500 MB tree would bloat every clone and risk GitHub's push limits.
+Zed is the project's client base. Its full source tree lives at `client/zed` and is **gitignored**;
+`client/PIN.json` records exactly what was provisioned so a fresh clone can be rebuilt without
+guessing.
 
-## Provision
+## What is provisioned
+
+| Field | Value |
+|---|---|
+| Source | https://github.com/zed-industries/zed |
+| Archive | local download, `main` branch (no `.git`) |
+| Zed version | **1.29.0** (`crates/zed/Cargo.toml`) |
+| Rust toolchain | **1.98.1** (`rust-toolchain.toml`) |
+| Files | 4,404 · 91.5 MB |
+| Tree digest | `f7438f1f138105039a00a92c84c0bbfa89c187c687cf4d9d9647d9c7903712cd` |
+
+The digest is SHA-256 over `relative-path\0size` for every file, so re-provisioning can be verified
+without trusting timestamps.
+
+## Re-provision
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File client/fetch-zed.ps1
+# from a local archive (offline, preferred here)
+powershell -ExecutionPolicy Bypass -File client/fetch-zed.ps1 -FromPath C:\path\to\zed-main
+
+# or download the pinned tag (slow on this network; codeload cannot resume)
+powershell -ExecutionPolicy Bypass -File client/fetch-zed.ps1 -Tag v1.27.0
 ```
 
-- Resumable: rerun after an interruption and curl continues.
-- Writes the tree to `client/zed` and records the pin in `client/PIN.json`.
-- `client/zed` is gitignored; the pin file is tracked.
-
-| | |
-|---|---|
-| Upstream | https://github.com/zed-industries/zed |
-| Pin | `v1.27.0` |
-| License | GPL-3.0 — distributing a product that embeds it brings GPL obligations |
-
-## Why not a submodule or a copied tree
-
-- **Submodule**: preferred in principle, but the clone stalled at a zero-byte pack on this network twice.
-  When the network allows it, `git submodule add --depth 1` at the same tag is a drop-in replacement.
-- **Copied tree in git**: hundreds of MB in history, push failures, and no supply-chain boundary.
-
-## Build (after provisioning)
-
-Zed is a Rust workspace pinned to Rust **1.98.1** by its own `rust-toolchain.toml`; this machine runs
-1.96.0, so the first build installs the pinned toolchain and the wasm targets.
+## Build
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File client/build-zed.ps1 -Release
 ```
 
-Expect a long first build (toolchain download, hundreds of crates, tens of minutes, GBs of artifacts
-under `client/zed/target`). Nothing here is part of `npm test`.
+Zed is a large Rust workspace (300+ crates, edition 2024). Prerequisites present on this machine:
+Visual Studio 2022 Build Tools with the C++ workload, rustup. The pinned toolchain 1.98.1 and the
+`wasm32-wasip2` / `wasm32-unknown-unknown` targets are installed by the first run.
 
-Prerequisites already present on this machine: Visual Studio 2022 Build Tools with the C++ workload,
-and rustup. Missing until the script runs: Rust 1.98.1, `wasm32-wasip2`, `wasm32-unknown-unknown`.
+Expect a long first build: hundreds of crates from crates.io plus a full Rust compile. Artifacts land
+in `client/zed/target` (GBs).
 
-## Status
+## Why the tree is not committed
 
-Source provisioning is in progress/blocked on bulk transfer speed (~11 KB/s measured from GitHub on this
-machine). The DocuFlow ACP endpoint (`npm run acp:serve`) already works with the **installed** Zed; the
-vendored tree is for features that cannot be expressed through settings or an extension.
+- 91.5 MB and 4,400 files on every clone and every CI checkout.
+- The upstream archive has no `.git`, so there is no commit to pin; the tree digest is the identity.
+- Zed is GPL-3.0; keeping the boundary visible matters for licensing even when the code sits in the
+  working tree.
+
+If a real fork is needed later, the clean move is a repository fork plus this directory as a
+submodule, not a copy.
+
+## What DocuFlow uses it for
+
+Nothing yet at runtime: the installed Zed already talks to DocuFlow over ACP (`npm run install:zed`).
+The source is here for features that settings or an extension cannot express.

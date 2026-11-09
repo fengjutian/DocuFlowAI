@@ -17,7 +17,8 @@ if (-not (Test-Path (Join-Path $zed "Cargo.toml"))) {
 Push-Location $zed
 try {
   Write-Host "Installing the pinned Rust toolchain (1.98.1) and wasm targets"
-  & rustup toolchain install 1.98.1 --profile minimal --component rustfmt clippy rust-analyzer rust-src `
+  & rustup toolchain install 1.98.1 --profile minimal `
+    --component rustfmt,clippy,rust-analyzer,rust-src `
     --target wasm32-wasip2,wasm32-unknown-unknown
   if ($LASTEXITCODE -ne 0) { throw "rustup failed with $LASTEXITCODE" }
 

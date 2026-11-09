@@ -17,21 +17,17 @@ documented extension point (external ACP agents) gets the same user-visible resu
 
 ## Zed source
 
-The Zed tree is provisioned from a pinned release, not vendored into git:
+The full tree is provisioned at `client/zed` from the local archive (Zed **1.29.0**, Rust 1.98.1) and
+is gitignored; `client/PIN.json` records the version, file count, size and a SHA-256 tree digest.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File client/fetch-zed.ps1
+powershell -ExecutionPolicy Bypass -File client/fetch-zed.ps1 -FromPath C:\path\to\zed-main
+powershell -ExecutionPolicy Bypass -File client/build-zed.ps1 -Release
 ```
 
-| | |
-|---|---|
-| Pin | `v1.27.0` |
-| Target | `client/zed` |
-| Record | `client/PIN.json` (tag, commit, fetch time) |
-
-A git submodule was the first choice, but the clone stalled at a zero-byte pack on this network; the
-tarball fetch is resumable and records the same pin. `client/zed` is gitignored so a 500 MB tree cannot
-be committed by accident.
+A git submodule was the first choice, but the clone stalled at a zero-byte pack on this network and the
+supplied archive has no `.git`. The digest is the identity of the tree; if a real fork is needed later,
+use a repository fork plus a submodule rather than a copy.
 
 ## Register DocuFlow
 
