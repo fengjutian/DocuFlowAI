@@ -276,3 +276,12 @@ and gets the full snapshot set plus audit entries. A `cwd` that is not a git rep
 snapshotted; that case warns on stderr, journals `context.snapshot.skipped` with the reason, and falls
 back to a journal-only execution instead of inventing a base SHA. Policy enforcement remains in the
 Code Engine and sandbox — the ACP layer records the snapshot, it does not pretend to enforce it.
+
+## D-035: ACP cancel must end the turn even when the runtime cannot stop
+Status: accepted
+Context: Hermes over HTTP advertises no verified cancellation, so forwarding `session/cancel` alone
+left the editor waiting until the prompt timeout after the user pressed stop.
+Decision: `cancel` attempts the runtime stop; on `unsupported_capability` (or any failure) it terminates
+the local subscription, journals `execution.cancel_unsupported` with the reason, and settles the turn as
+`cancelled`. The editor always gets an immediate answer, and the journal records that the remote run may
+still be alive.

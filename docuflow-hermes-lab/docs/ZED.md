@@ -41,7 +41,7 @@ Restart Zed after editing settings; the agent appears as an available external a
 | `agent_message_chunk` | `message.delta` / `message.completed` events |
 | `tool_call` / `tool_call_update` | `tool.started` / `tool.completed` / `tool.failed` |
 | `stopReason` | `end_turn` (completed), `cancelled` (cancelled), `refusal` (failed) |
-| `session/cancel` | `coordinator.cancel(executionId)` |
+| `session/cancel` | `coordinator.cancel(executionId)`; if the runtime cannot cancel, the local subscription is terminated, `execution.cancel_unsupported` is journaled, and the turn still ends `cancelled` |
 
 Each prompt starts a new execution because the Hermes HTTP adapter cannot continue a finished run
 (D-015). The session keeps the workspace; the execution ids stay journaled.

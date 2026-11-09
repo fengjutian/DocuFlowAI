@@ -64,6 +64,8 @@ interface AcpSession {
   cwd: string;
   executions: string[];
   current?: string;
+  /** Set while a prompt is in flight so a cancel can settle it immediately. */
+  settle?: (reason: AcpStopReason) => void;
 }
 
 export function createDocuFlowAcpBackend(options: DocuFlowAcpBackendOptions): AcpBackend {
@@ -184,6 +186,7 @@ export function createDocuFlowAcpBackend(options: DocuFlowAcpBackendOptions): Ac
 
       let settle: (reason: AcpStopReason) => void = () => undefined;
       const terminal = new Promise<AcpStopReason>(resolve => { settle = resolve; });
+      session.settle = settle;
 
       const unsubscribe = await options.coordinator.getAdapter().subscribe(execution.executionId, event => {
         const update = toSessionUpdate(event);
@@ -206,13 +209,29 @@ export function createDocuFlowAcpBackend(options: DocuFlowAcpBackendOptions): Ac
         clearTimeout(timer);
         await unsubscribe().catch(() => undefined);
         delete session.current;
+        delete session.settle;
       }
     },
 
     async cancel(sessionId) {
       const session = sessions.get(sessionId);
-      if (!session?.current) return;
-      await options.coordinator.cancel(session.current);
+      const executionId = session?.current;
+      if (!session || !executionId) return;
+
+      try {
+        await options.coordinator.cancel(executionId);
+      } catch (error) {
+        // The runtime may not support remote cancellation. Stop listening locally and make that
+        // explicit in the journal; the editor still gets a cancelled turn instead of a hang.
+        await options.coordinator
+          .recordAuditFact(executionId, "execution.cancel_unsupported", {
+            reason: error instanceof Error ? error.message : String(error)
+          })
+          .catch(() => undefined);
+        await options.coordinator.getAdapter().terminate(executionId).catch(() => undefined);
+      } finally {
+        session.settle?.("cancelled");
+      }
     }
   };
 }
