@@ -52,8 +52,10 @@ npm run validate:gateway
 ```
 
 `HERMES_GATEWAY_ARGS` must be a JSON array of strings and `HERMES_GATEWAY_PARAMS` must be valid
-JSON. The runner does not invoke a shell, which keeps command arguments explicit and avoids shell
-expansion. Its report defaults to `reports/phase0-gateway.json`.
+JSON. Set `HERMES_GATEWAY_FRAMING` to `ndjson` or `content-length` after confirming the pinned
+Hermes protocol. The runner does not invoke a shell, which keeps command arguments explicit and
+avoids shell expansion. Incoming frame size is bounded by `HERMES_GATEWAY_MAX_MESSAGE_BYTES`, and
+the report defaults to `reports/phase0-gateway.json`.
 
 Merge the HTTP and Gateway evidence into the complete 24-item checklist with:
 

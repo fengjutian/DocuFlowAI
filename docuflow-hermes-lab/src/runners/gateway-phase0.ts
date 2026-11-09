@@ -49,6 +49,8 @@ async function main(): Promise<void> {
     const client = new JsonRpcStdioClient({
       command,
       args: parseStringArray("HERMES_GATEWAY_ARGS", process.env.HERMES_GATEWAY_ARGS ?? "[]"),
+      framing: parseFraming(process.env.HERMES_GATEWAY_FRAMING ?? "ndjson"),
+      maxMessageBytes: positiveNumber("HERMES_GATEWAY_MAX_MESSAGE_BYTES", 10 * 1024 * 1024),
       requestTimeoutMs: positiveNumber("HERMES_GATEWAY_TIMEOUT_MS", 30_000),
       onStderr: chunk => process.stderr.write(chunk)
     });
@@ -110,6 +112,11 @@ function positiveNumber(name: string, fallback: number): number {
   const value = Number(process.env[name] ?? fallback);
   if (!Number.isFinite(value) || value <= 0) throw new Error(`${name} must be a positive number`);
   return value;
+}
+
+function parseFraming(value: string): "ndjson" | "content-length" {
+  if (value === "ndjson" || value === "content-length") return value;
+  throw new Error("HERMES_GATEWAY_FRAMING must be ndjson or content-length");
 }
 
 function errorMessage(error: unknown): string {

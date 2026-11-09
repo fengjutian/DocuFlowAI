@@ -13,6 +13,8 @@ export interface JsonRpcStdioClientOptions {
   cwd?: string;
   env?: NodeJS.ProcessEnv;
   requestTimeoutMs?: number;
+  framing?: "ndjson" | "content-length";
+  maxMessageBytes?: number;
   onNotification?: (notification: JsonRpcNotification) => void;
   onStderr?: (chunk: string) => void;
 }
@@ -28,6 +30,7 @@ export class JsonRpcStdioClient {
   private lines: ReadLineInterface | undefined;
   private nextId = 1;
   private stopping = false;
+  private frameBuffer = Buffer.alloc(0);
 
   constructor(private readonly options: JsonRpcStdioClientOptions) {}
 
@@ -41,8 +44,12 @@ export class JsonRpcStdioClient {
     };
     const child = spawn(this.options.command, this.options.args ?? [], spawnOptions);
     this.child = child;
-    this.lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
-    this.lines.on("line", line => this.handleLine(line));
+    if ((this.options.framing ?? "ndjson") === "ndjson") {
+      this.lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+      this.lines.on("line", line => this.handleMessage(line));
+    } else {
+      child.stdout.on("data", chunk => this.handleContentLengthData(Buffer.from(chunk)));
+    }
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", chunk => this.options.onStderr?.(String(chunk)));
     child.once("error", error => this.handleTermination(error));
@@ -85,7 +92,7 @@ export class JsonRpcStdioClient {
     };
     requestOptions.signal?.addEventListener("abort", abort, { once: true });
     try {
-      await writeLine(child, JSON.stringify(request));
+      await this.writeMessage(child, JSON.stringify(request));
       return await response;
     } catch (error) {
       this.pending.reject(id, error instanceof Error ? error : new Error(String(error)));
@@ -102,7 +109,7 @@ export class JsonRpcStdioClient {
       method,
       ...(params !== undefined ? { params } : {})
     };
-    return writeLine(this.requireRunningChild(), JSON.stringify(notification));
+    return this.writeMessage(this.requireRunningChild(), JSON.stringify(notification));
   }
 
   async stop(): Promise<void> {
@@ -112,6 +119,7 @@ export class JsonRpcStdioClient {
     this.lines?.close();
     this.lines = undefined;
     this.child = undefined;
+    this.frameBuffer = Buffer.alloc(0);
     this.pending.rejectAll(new Error("JSON-RPC stdio client stopped"));
     if (child.exitCode !== null || child.signalCode !== null) return;
     await new Promise<void>(resolve => {
@@ -120,11 +128,11 @@ export class JsonRpcStdioClient {
     });
   }
 
-  private handleLine(line: string): void {
-    if (!line.trim()) return;
+  private handleMessage(text: string): void {
+    if (!text.trim()) return;
     let message: unknown;
     try {
-      message = JSON.parse(line);
+      message = JSON.parse(text);
     } catch {
       this.handleTermination(new Error("JSON-RPC process emitted invalid JSON"));
       return;
@@ -152,19 +160,57 @@ export class JsonRpcStdioClient {
     return this.child;
   }
 
+  private handleContentLengthData(chunk: Buffer): void {
+    this.frameBuffer = Buffer.concat([this.frameBuffer, chunk]);
+    const maxMessageBytes = this.options.maxMessageBytes ?? 10 * 1024 * 1024;
+    while (this.frameBuffer.length > 0) {
+      const headerEnd = this.frameBuffer.indexOf("\r\n\r\n");
+      if (headerEnd < 0) {
+        if (this.frameBuffer.length > 8_192) this.handleTermination(new Error("JSON-RPC frame headers are too large"));
+        return;
+      }
+      const headers = this.frameBuffer.subarray(0, headerEnd).toString("ascii");
+      const match = /^Content-Length:\s*(\d+)\s*$/im.exec(headers);
+      if (!match?.[1]) {
+        this.handleTermination(new Error("JSON-RPC frame is missing Content-Length"));
+        return;
+      }
+      const contentLength = Number(match[1]);
+      if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > maxMessageBytes) {
+        this.handleTermination(new Error(`JSON-RPC frame exceeds the ${maxMessageBytes}-byte limit`));
+        return;
+      }
+      const bodyStart = headerEnd + 4;
+      const frameEnd = bodyStart + contentLength;
+      if (this.frameBuffer.length < frameEnd) return;
+      const body = this.frameBuffer.subarray(bodyStart, frameEnd).toString("utf8");
+      this.frameBuffer = this.frameBuffer.subarray(frameEnd);
+      this.handleMessage(body);
+      if (!this.child) return;
+    }
+  }
+
+  private writeMessage(child: ChildProcessWithoutNullStreams, message: string): Promise<void> {
+    if ((this.options.framing ?? "ndjson") === "content-length") {
+      return writeChunk(child, `Content-Length: ${Buffer.byteLength(message, "utf8")}\r\n\r\n${message}`);
+    }
+    return writeChunk(child, `${message}\n`);
+  }
+
   private handleTermination(error: Error): void {
     const child = this.child;
     this.lines?.close();
     this.lines = undefined;
     this.child = undefined;
+    this.frameBuffer = Buffer.alloc(0);
     this.pending.rejectAll(error);
     if (child && child.exitCode === null && child.signalCode === null) child.kill();
   }
 }
 
-function writeLine(child: ChildProcessWithoutNullStreams, line: string): Promise<void> {
+function writeChunk(child: ChildProcessWithoutNullStreams, chunk: string): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    child.stdin.write(`${line}\n`, "utf8", error => error ? reject(error) : resolve());
+    child.stdin.write(chunk, "utf8", error => error ? reject(error) : resolve());
   });
 }
 

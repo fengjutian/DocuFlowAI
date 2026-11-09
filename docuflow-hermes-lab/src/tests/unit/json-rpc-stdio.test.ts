@@ -15,6 +15,25 @@ const echoServer = `
   });
 `;
 
+const contentLengthEchoServer = `
+  let buffer = Buffer.alloc(0);
+  process.stdin.on("data", chunk => {
+    buffer = Buffer.concat([buffer, chunk]);
+    while (true) {
+      const headerEnd = buffer.indexOf("\\r\\n\\r\\n");
+      if (headerEnd < 0) return;
+      const header = buffer.subarray(0, headerEnd).toString("ascii");
+      const length = Number(/Content-Length:\\s*(\\d+)/i.exec(header)[1]);
+      const bodyStart = headerEnd + 4;
+      if (buffer.length < bodyStart + length) return;
+      const message = JSON.parse(buffer.subarray(bodyStart, bodyStart + length).toString("utf8"));
+      buffer = buffer.subarray(bodyStart + length);
+      const response = JSON.stringify({ jsonrpc: "2.0", id: message.id, result: message.params });
+      process.stdout.write("Content-Length: " + Buffer.byteLength(response) + "\\r\\n\\r\\n" + response);
+    }
+  });
+`;
+
 test("exchanges JSON-RPC requests and receives notifications over stdio", async () => {
   const notifications: string[] = [];
   let notificationReceived!: () => void;
@@ -33,6 +52,21 @@ test("exchanges JSON-RPC requests and receives notifications over stdio", async 
     assert.deepEqual(result, { value: 42 });
     await notification;
     assert.deepEqual(notifications, ["observed"]);
+  } finally {
+    await client.stop();
+  }
+});
+
+test("exchanges Content-Length framed JSON-RPC messages", async () => {
+  const client = new JsonRpcStdioClient({
+    command: process.execPath,
+    args: ["-e", contentLengthEchoServer],
+    framing: "content-length"
+  });
+  client.start();
+  try {
+    const result = await client.request<{ text: string }>("echo", { text: "你好 Hermes" });
+    assert.deepEqual(result, { text: "你好 Hermes" });
   } finally {
     await client.stop();
   }
