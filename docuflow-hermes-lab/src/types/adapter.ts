@@ -105,6 +105,17 @@ export interface AgentRuntimeAdapter {
     handler: (event: AgentRuntimeEvent) => void
   ): Promise<() => Promise<void>>;
   terminate(executionId: string): Promise<void>;
+
+  /**
+   * Optional approval surface. An adapter that cannot express approvals simply omits these; the API
+   * layer then reports no pending approvals instead of inventing an answer.
+   */
+  getPendingPermissions?(executionId: string): RuntimePermissionRequest[];
+  respondToPermission?(
+    executionId: string,
+    requestId: string,
+    response: RuntimePermissionResponse
+  ): Promise<void>;
 }
 
 export type AgentAdapterErrorCode =

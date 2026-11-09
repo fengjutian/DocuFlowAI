@@ -21,6 +21,8 @@ This repository provides:
   (commit → agent run, execution → everything, task → executions).
 - Context snapshot capture with a deterministic, content-addressed hash and drift verification.
 - A `startTask` entry point that ties snapshots, execution, change application and tracing together.
+- An HTTP API with bearer auth, journal-backed event replay and an SSE live stream using the design-13
+  event envelope.
 - Unit tests that run without a Hermes server.
 - Opt-in integration tests against a locally configured Hermes server.
 - Security-test fixture layout and a structured JSON result format.
@@ -273,6 +275,19 @@ An applied change lands in the immutable change store, the journal (`change.appl
 know it must not be re-applied) and the trace. `awaiting_approval` and `denied` write nothing.
 See [`docs/TASK_FLOW.md`](docs/TASK_FLOW.md).
 
+## API
+
+```ts
+const server = await createApiServer({ registry, coordinator, taskService, journal, bus, token })
+  .listen(8787);
+```
+
+`POST /api/v1/tasks/{taskId}/executions`, `GET /api/v1/executions/{id}`, `POST .../cancel`,
+`.../retry`, `.../resume`, `.../approvals/{requestId}`, `GET /api/v1/trace/commits/{sha}`, and
+`GET /api/v1/events` for a live SSE stream. Reconnecting clients replay from the journal with
+`since` / `Last-Event-ID`, because the stream is a notification channel, not the source of truth.
+See [`docs/API.md`](docs/API.md).
+
 ## Test status vocabulary
 
 - `passed`: assertion verified by executable evidence.
@@ -288,6 +303,7 @@ layer, not merely a Hermes permission prompt.
 ```text
 src/
   adapters/           AgentRuntimeAdapter implementation, event normalizer, runtime registry
+  api/                HTTP routes and the design-13 event envelope / SSE stream
   clients/http/       Hermes HTTP API client + SSE
   clients/gateway/    JSON-RPC primitives + stdio process transport
   code-engine/        Worktrees, diff analysis, change pipeline, change records

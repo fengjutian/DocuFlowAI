@@ -135,3 +135,12 @@ Context: `policy_snapshots` and `prompt_snapshots` both carry an execution id, b
 reference them before the runtime has created the execution.
 Decision: reserve both ids first, pass them in the task input, and persist the two records right after
 `start()` returns. Records stay immutable; nothing is written with a placeholder execution id.
+
+## D-019: SSE first, WebSocket later, one envelope
+Status: accepted
+Context: design 13 specifies WebSocket, but a WS server without dependencies is significant work and
+the client contract is the envelope plus replay-by-sequence, not the transport.
+Decision: serve `GET /api/v1/events` as SSE with `id:` per frame, `retry` and heartbeat comments.
+Reconnects replay from the journal using `since` or `Last-Event-ID`. A WebSocket transport can reuse
+`toDocuFlowEvent` unchanged. Approval resolution takes the execution id in the path, because a request
+id alone does not route to a runtime session.

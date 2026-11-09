@@ -150,6 +150,11 @@ export class ExecutionCoordinator {
     });
   }
 
+  /** The adapter this coordinator drives; the API layer uses it for approval round-trips. */
+  getAdapter(): AgentRuntimeAdapter {
+    return this.options.adapter;
+  }
+
   /** Waits until every journal write queued for this execution has been attempted. */
   async flush(executionId: string): Promise<void> {
     await this.sessions.get(executionId)?.chain;
