@@ -27,15 +27,18 @@ powershell -ExecutionPolicy Bypass -File client/fetch-zed.ps1
 
 ## Build (after provisioning)
 
-Zed is a Rust workspace:
+Zed is a Rust workspace pinned to Rust **1.98.1** by its own `rust-toolchain.toml`; this machine runs
+1.96.0, so the first build installs the pinned toolchain and the wasm targets.
 
 ```powershell
-cd client/zed
-cargo build -p zed --release
+powershell -ExecutionPolicy Bypass -File client/build-zed.ps1 -Release
 ```
 
-Expect a long first build (tens of minutes, GBs of artifacts under `client/zed/target`). Nothing here is
-part of `npm test`.
+Expect a long first build (toolchain download, hundreds of crates, tens of minutes, GBs of artifacts
+under `client/zed/target`). Nothing here is part of `npm test`.
+
+Prerequisites already present on this machine: Visual Studio 2022 Build Tools with the C++ workload,
+and rustup. Missing until the script runs: Rust 1.98.1, `wasm32-wasip2`, `wasm32-unknown-unknown`.
 
 ## Status
 
