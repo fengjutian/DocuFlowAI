@@ -78,3 +78,18 @@ Context: design 9.5 forbids rewriting history to roll something back.
 Decision: `ChangeRecord` is frozen at construction. A rollback produces a new record with
 `operation = "revert"` plus `reverts_change_record_id` / `reverts_commit_sha`, and the original is
 untouched. A record without a commit cannot be reverted, because there is nothing to point at.
+
+## D-012: The journal is append-only and tolerates gaps
+Status: accepted
+Context: event compensation must detect missing events, and an audit trail must not be rewritable.
+Decision: `append` rejects a duplicate sequence but allows gaps; `detectGaps` reports them and
+`mergeCompensated` fills them while rejecting conflicting content. No update or delete API exists.
+A corrupted line fails the read with its line number rather than being skipped.
+
+## D-013: Recovery is a four-way decision
+Status: accepted
+Context: design 14.1/14.2 warns against retrying every failure by calling the model again.
+Decision: `planRecovery` returns stop / compensate / resume / rebuild from the checkpoint and the
+runtime's declared capabilities. `resume` requires both `sessionResume` and a live session; Hermes
+HTTP has neither, so it rebuilds with the checkpoint. Applied change records are carried in the
+checkpoint so a rebuild never re-applies a diff that already landed.

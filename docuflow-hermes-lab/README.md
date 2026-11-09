@@ -15,6 +15,8 @@ This repository provides:
 - Sandbox boundary probes that prove the container enforces filesystem and network limits.
 - A Code Engine change pipeline: worktrees bound to a base SHA, diff risk analysis, policy and
   approval gates, atomic patch application, and immutable change records.
+- An append-only execution journal with checkpoints and a recovery planner (compensate / resume /
+  rebuild) for gaps and crashes.
 - Unit tests that run without a Hermes server.
 - Opt-in integration tests against a locally configured Hermes server.
 - Security-test fixture layout and a structured JSON result format.
@@ -202,6 +204,22 @@ apply()     path scope → base SHA (AT-105) → policy → approval → git app
 A rejected patch never leaves partial writes: `git apply --check` runs first, and the worktree is
 only touched after it passes. See [`docs/CODE_ENGINE.md`](docs/CODE_ENGINE.md).
 
+## Execution journal and recovery
+
+Every execution can be recorded in an append-only journal (`src/journal/`), one JSONL file per
+execution, with runtime events and DocuFlow audit facts in one timeline. From it:
+
+```text
+buildCheckpoint()  last sequence, terminal state, applied change records, unresolved approvals,
+                   snapshot ids, base SHA, and any gaps
+planRecovery()     stop | compensate | resume | rebuild — a decision, not a retry
+```
+
+A gap means compensate first (re-fetch and `mergeCompensated()`, which refuses conflicting content).
+`resume` requires both an advertised capability and a live session; Hermes over HTTP has neither, so
+recovery rebuilds with the checkpoint instead of pretending. See
+[`docs/RECOVERY.md`](docs/RECOVERY.md).
+
 ## Test status vocabulary
 
 - `passed`: assertion verified by executable evidence.
@@ -220,6 +238,7 @@ src/
   clients/http/       Hermes HTTP API client + SSE
   clients/gateway/    JSON-RPC primitives + stdio process transport
   code-engine/        Worktrees, diff analysis, change pipeline, change records
+  journal/            Append-only execution journal, checkpoints, recovery planner
   policy/             Permission evaluation from a policy snapshot
   security/           Sandbox boundary specification and probes
   tests/unit/         Offline tests
