@@ -18,7 +18,24 @@ authenticates, validates, delegates and maps errors; decisions stay in the servi
 | GET | `/api/v1/executions/{id}/approvals` | pending runtime permission requests |
 | POST | `/api/v1/executions/{id}/approvals/{requestId}` | `{decision: "approve"\|"deny", reason?}` |
 | GET | `/api/v1/trace/commits/{sha}` | commit → change record → execution trace |
+| GET | `/api/v1/usage` | usage summary and all records |
+| GET | `/api/v1/executions/{id}/usage` | one execution's usage, 404 if none |
+| GET | `/api/v1/skills` | registered skill versions with `deprecated` flags |
+| POST | `/api/v1/skills` | register a manifest (400 invalid, 409 duplicate) |
+| GET | `/api/v1/executions/{id}/skills` | skill bindings for the execution |
 | GET | `/api/v1/events` | SSE stream, optional `?executionId=` |
+
+`POST /api/v1/tasks/{taskId}/executions` also accepts:
+
+```json
+{
+  "skills": [{ "skillId": "react-dev", "version": "1.0.0" }],
+  "approvedSkills": ["deploy@1.0.0"]
+}
+```
+
+A denied skill returns **403 `skill_denied`** and no execution is started; a skill needing approval but
+absent from `approvedSkills` is also 403.
 
 ## Auth
 

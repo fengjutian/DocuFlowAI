@@ -342,6 +342,24 @@ listed in `approvedSkills`. Bindings are journaled as `skill.bound` and exposed 
 `GET /api/v1/executions/{id}/skills`. Register skills with `POST /api/v1/skills` and list them with
 `GET /api/v1/skills`.
 
+`service.skillEffectiveness()` joins bindings with evaluation verdicts per `skillId@version`
+(executions, evaluated, passed/failed/blocked, pass rate). An execution that was never evaluated counts
+as unproven, not as a success.
+
+## Subagents
+
+```ts
+const child = await subagents.spawn({
+  parentExecutionId, taskInput, worktree: "isolated", baseSha, label: "explorer"
+})
+subagents.rootOf(child.execution.executionId)   // → the task tree's root execution
+```
+
+A child is a full execution with its own journal and events; the manager adds lineage and the worktree
+decision (isolated by default, shared only when asked). Both sides are journaled
+(`subagent.spawned` on the parent, `subagent.parent` on the child), so an event stays attributed to the
+execution that produced it while still being traceable to the root task.
+
 `UsageLedger` records model, tokens and duration per execution; `GET /api/v1/executions/{id}/usage` and
 `GET /api/v1/usage` expose it. An event with no usage data records nothing rather than a fake zero.
 Records persist under `<data>/usage/` and are reloaded at startup. See [`docs/COST.md`](docs/COST.md).

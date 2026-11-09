@@ -155,6 +155,11 @@ export class ExecutionCoordinator {
     return this.options.adapter;
   }
 
+  /** The task input this coordinator started, for lineage and subagent spawning. */
+  getTaskInput(executionId: string): AgentTaskInput | undefined {
+    return this.sessions.get(executionId)?.input;
+  }
+
   /** Waits until every journal write queued for this execution has been attempted. */
   async flush(executionId: string): Promise<void> {
     await this.sessions.get(executionId)?.chain;

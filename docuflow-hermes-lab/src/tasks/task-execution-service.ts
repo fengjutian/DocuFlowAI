@@ -25,6 +25,7 @@ import {
 import type { TraceStores, TraceabilityQuery } from "../persistence/traceability.js";
 import type { PolicySnapshot } from "../policy/permission-policy.js";
 import type { SkillBinding, SkillBindingStore } from "../skills/skill-bindings.js";
+import { summarizeSkillEffectiveness, type SkillEffectiveness } from "../skills/skill-effectiveness.js";
 import type { SkillRegistry, SkillAuthorization } from "../skills/skill-registry.js";
 import type { SkillManifest } from "../skills/skill.js";
 import type { AgentExecution, AgentTaskInput } from "../types/adapter.js";
@@ -331,6 +332,15 @@ export class TaskExecutionService {
       resolved.push({ manifest, authorization });
     }
     return resolved;
+  }
+
+  /** Aggregates evaluation verdicts per bound skill version (Phase 4). */
+  async skillEffectiveness(): Promise<SkillEffectiveness[]> {
+    if (!this.options.skills) return [];
+    return summarizeSkillEffectiveness(
+      this.options.skills.bindings.list(),
+      await this.options.stores.evaluations.list()
+    );
   }
 
   async trace(executionId: string) {

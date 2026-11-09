@@ -221,3 +221,21 @@ Decision: `startTask` resolves and authorizes every requested skill against the 
 first. `deny` aborts; `require_approval` aborts unless the exact `skillId@version` appears in
 `approvedSkills`. Accepted skills are bound and journaled as `skill.bound`; nothing is silently
 downgraded.
+
+## D-029: A subagent is a full execution with lineage, not a nested session
+Status: accepted
+Context: design 10 leaves parent/child execution shape open, and nesting sessions would make event
+attribution and recovery ambiguous.
+Decision: every child goes through the same coordinator with its own execution id, run id and journal.
+Lineage is recorded on both sides (`subagent.spawned` / `subagent.parent`) and answered by `rootOf()`.
+Worktrees are isolated by default; sharing the parent worktree requires `worktree: "shared"` and no base
+SHA, because two agents editing one tree is a deliberate decision.
+
+## D-030: Skill effectiveness is per execution, latest evaluation only
+Status: accepted
+Context: evaluations attach to executions, skills attach to executions, and a rerun produces a second
+evaluation for the same execution.
+Decision: join through bindings, count only the latest evaluation per execution, and report executions
+without any evaluation as `evaluated: 0` with `passRate: null`. Multiple skills bound to one execution
+each receive that execution's verdict, which over-credits only when skills are bound together; call
+it out rather than inventing a split.
