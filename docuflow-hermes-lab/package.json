@@ -15,6 +15,7 @@
     "validate:security-agent": "npm run build && node dist/runners/security-agent-phase0.js",
     "report:phase0": "npm run build && node dist/runners/aggregate-phase0.js",
     "check:hermes": "npm run build && node dist/runners/check-hermes-version.js",
+    "serve": "npm run build && node dist/server/main.js",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

@@ -307,6 +307,26 @@ const server = await createApiServer({ registry, coordinator, taskService, journ
 `since` / `Last-Event-ID`, because the stream is a notification channel, not the source of truth.
 See [`docs/API.md`](docs/API.md).
 
+## Running the lab server
+
+```bash
+HERMES_HTTP_BASE_URL=http://127.0.0.1:8642 \
+DOCUFLOW_API_TOKEN=change-me \
+npm run serve
+```
+
+Wires the Hermes client, immutable stores, JSONL journal, coordinator and API into one process. It
+boots even when Hermes is unreachable — `POST /api/v1/runtimes/{id}/health-check` reports 503 instead,
+because "runtime is down" is a state the API must be able to describe.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DOCUFLOW_API_HOST` / `DOCUFLOW_API_PORT` | `127.0.0.1` / `8787` | bind address |
+| `DOCUFLOW_API_TOKEN` | unset (open) | bearer token required on every route |
+| `DOCUFLOW_DATA_DIR` | `.docuflow-data` | snapshots, change records, `journal/` |
+| `DOCUFLOW_WORKTREE_ROOT` | `<data>/worktrees` | where isolated worktrees are created |
+| `DOCUFLOW_REPOSITORY` | cwd | repository the worktrees belong to |
+
 ## Test status vocabulary
 
 - `passed`: assertion verified by executable evidence.
@@ -332,6 +352,7 @@ src/
   persistence/        Immutable snapshot/change stores + traceability queries
   policy/             Permission evaluation from a policy snapshot
   security/           Sandbox boundary specification and probes
+  server/             Composition root: config validation, wiring, `npm run serve`
   tasks/              startTask / applyProposedChange / trace entry point
   tests/unit/         Offline tests
   tests/integration/  Opt-in live-server tests

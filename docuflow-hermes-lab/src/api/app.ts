@@ -210,6 +210,10 @@ async function route(
 
 async function describeExecution(executionId: string, deps: ApiDependencies): Promise<unknown> {
   const checkpoint = await deps.coordinator.getCheckpoint(executionId);
+  // A real execution always journals at least `execution.started`; an empty journal means unknown.
+  if (checkpoint.eventCount === 0) {
+    throw new ApiError(404, "execution_not_found", `No execution ${executionId} is recorded`);
+  }
   let status: string | undefined;
   try {
     status = await deps.coordinator.getAdapter().getStatus(executionId);

@@ -153,3 +153,12 @@ Decision: an agent-level probe passes only when the transcript contains a denial
 (EACCES / ENOENT / permission denied) and no forbidden content. A leak is a failure, and a refusal or
 absent attempt is `blocked`. These probes (P0-009/010/011/013) are therefore recorded under the Phase 0
 ids, separate from the `SEC-B*` boundary evidence.
+
+## D-021: The server boots even when the runtime is down
+Status: accepted
+Context: refusing to start without a reachable Hermes would make the API unavailable exactly when an
+operator needs to see why.
+Decision: `createRuntime` requires `HERMES_HTTP_BASE_URL` but does not probe it at startup; the health
+endpoint returns 503 and executions fail with `runtime_unreachable` (502). Data lives under
+`DOCUFLOW_DATA_DIR` (snapshots at the root, journal under `journal/`). Auth is opt-in via
+`DOCUFLOW_API_TOKEN`; without it the server is loopback-only by default, which the startup banner says.
