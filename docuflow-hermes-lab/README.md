@@ -55,6 +55,17 @@ npm run validate:gateway
 JSON. The runner does not invoke a shell, which keeps command arguments explicit and avoids shell
 expansion. Its report defaults to `reports/phase0-gateway.json`.
 
+Merge the HTTP and Gateway evidence into the complete 24-item checklist with:
+
+```bash
+npm run report:phase0
+```
+
+The consolidated report is written to `reports/phase0.json`. Missing checks remain explicitly
+`not_run`. Override the input list with `PHASE0_REPORT_INPUTS` (a JSON array of paths) and the
+destination with `PHASE0_REPORT_PATH`; when multiple reports contain the same check, the last
+input wins.
+
 The integration test creates a run and checks that a run identifier is returned. It is
 skipped when `HERMES_HTTP_BASE_URL` is not configured. Never point security tests at a
 production workspace.

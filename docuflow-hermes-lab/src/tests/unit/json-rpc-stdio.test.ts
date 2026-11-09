@@ -47,3 +47,31 @@ test("rejects a JSON-RPC request after its timeout", async () => {
     await client.stop();
   }
 });
+
+test("cancels a pending JSON-RPC request with an AbortSignal", async () => {
+  const client = new JsonRpcStdioClient({ command: process.execPath, args: ["-e", echoServer] });
+  const controller = new AbortController();
+  client.start();
+  try {
+    const request = client.request("slow", undefined, { timeoutMs: 1_000, signal: controller.signal });
+    controller.abort(new Error("cancelled by caller"));
+    await assert.rejects(request, /cancelled by caller/);
+  } finally {
+    await client.stop();
+  }
+});
+
+test("rejects pending requests when the child process crashes", async () => {
+  const crashServer = `
+    const readline = require("node:readline");
+    readline.createInterface({ input: process.stdin }).once("line", () => process.exit(7));
+  `;
+  const client = new JsonRpcStdioClient({ command: process.execPath, args: ["-e", crashServer] });
+  client.start();
+  try {
+    await assert.rejects(client.request("crash"), /code 7/);
+    await assert.rejects(client.request("after-crash"), /not running/);
+  } finally {
+    await client.stop();
+  }
+});

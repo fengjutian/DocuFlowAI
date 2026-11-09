@@ -17,6 +17,11 @@ export interface JsonRpcStdioClientOptions {
   onStderr?: (chunk: string) => void;
 }
 
+export interface JsonRpcRequestOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
 export class JsonRpcStdioClient {
   private readonly pending = new JsonRpcPendingRequests();
   private child: ChildProcessWithoutNullStreams | undefined;
@@ -48,10 +53,22 @@ export class JsonRpcStdioClient {
     });
   }
 
-  async request<T>(method: string, params?: unknown, timeoutMs = this.options.requestTimeoutMs ?? 30_000): Promise<T> {
+  async request<T>(
+    method: string,
+    params?: unknown,
+    timeoutOrOptions: number | JsonRpcRequestOptions = this.options.requestTimeoutMs ?? 30_000
+  ): Promise<T> {
     const child = this.requireRunningChild();
+    const requestOptions = typeof timeoutOrOptions === "number"
+      ? { timeoutMs: timeoutOrOptions }
+      : timeoutOrOptions;
+    const timeoutMs = requestOptions.timeoutMs ?? this.options.requestTimeoutMs ?? 30_000;
+    requestOptions.signal?.throwIfAborted();
     const id = this.nextId++;
     const response = this.pending.register<T>(id);
+    // Cancellation or process exit can reject while stdin is still flushing.
+    // Observe the internal promise immediately; the awaited promise below still propagates it.
+    void response.catch(() => {});
     const request: JsonRpcRequest = {
       jsonrpc: "2.0",
       id,
@@ -62,6 +79,11 @@ export class JsonRpcStdioClient {
       this.pending.reject(id, new Error(`JSON-RPC request timed out after ${timeoutMs}ms: ${method}`));
     }, timeoutMs);
     timer.unref();
+    const abort = () => {
+      const reason = requestOptions.signal?.reason;
+      this.pending.reject(id, reason instanceof Error ? reason : new Error(`JSON-RPC request aborted: ${method}`));
+    };
+    requestOptions.signal?.addEventListener("abort", abort, { once: true });
     try {
       await writeLine(child, JSON.stringify(request));
       return await response;
@@ -70,6 +92,7 @@ export class JsonRpcStdioClient {
       throw error;
     } finally {
       clearTimeout(timer);
+      requestOptions.signal?.removeEventListener("abort", abort);
     }
   }
 
@@ -130,7 +153,12 @@ export class JsonRpcStdioClient {
   }
 
   private handleTermination(error: Error): void {
+    const child = this.child;
+    this.lines?.close();
+    this.lines = undefined;
+    this.child = undefined;
     this.pending.rejectAll(error);
+    if (child && child.exitCode === null && child.signalCode === null) child.kill();
   }
 }
 
