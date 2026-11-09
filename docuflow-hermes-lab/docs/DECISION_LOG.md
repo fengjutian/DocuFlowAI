@@ -273,6 +273,6 @@ Context: routing editor prompts straight to the coordinator left ACP-driven exec
 context/policy/prompt snapshots, so they were auditable but not evidence-complete.
 Decision: when the backend is given a `TaskExecutionService`, every prompt starts through `startTask`
 and gets the full snapshot set plus audit entries. A `cwd` that is not a git repository cannot be
-snapshotted; that case warns on stderr and falls back to a journal-only execution instead of inventing
-a base SHA. Policy enforcement remains in the Code Engine and sandbox — the ACP layer records the
-snapshot, it does not pretend to enforce it.
+snapshotted; that case warns on stderr, journals `context.snapshot.skipped` with the reason, and falls
+back to a journal-only execution instead of inventing a base SHA. Policy enforcement remains in the
+Code Engine and sandbox — the ACP layer records the snapshot, it does not pretend to enforce it.

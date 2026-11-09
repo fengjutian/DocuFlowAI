@@ -108,10 +108,14 @@ export function createDocuFlowAcpBackend(options: DocuFlowAcpBackendOptions): Ac
       // A cwd that is not a git repository cannot be snapshotted. Degrade with a warning rather than
       // blocking the editor session, but never pretend a snapshot was taken.
       if (!isContextCaptureFailure(error)) throw error;
-      options.onWarning?.(
-        `ACP snapshots skipped for ${cwd}: ${error instanceof Error ? error.message : String(error)}`
-      );
-      return options.coordinator.start(taskInput);
+      const reason = error instanceof Error ? error.message : String(error);
+      options.onWarning?.(`ACP snapshots skipped for ${cwd}: ${reason}`);
+      const execution = await options.coordinator.start(taskInput);
+      // The skip itself is evidence: an auditor must see that this run has no snapshot, and why.
+      await options.coordinator
+        .recordAuditFact(execution.executionId, "context.snapshot.skipped", { cwd, reason })
+        .catch(() => undefined);
+      return execution;
     }
   }
 

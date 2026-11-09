@@ -29,85 +29,97 @@ import {
   type AgentRuntimeEvent
 } from "../../types/adapter.js";
 
-test("acp snapshots: a prompt creates context, policy and prompt records plus audit entries", async () => {
-  const repo = await mkdtemp(join(tmpdir(), "docuflow-acp-snap-"));
-  const storeRoot = await mkdtemp(join(tmpdir(), "docuflow-acp-snap-store-"));
+function adapter(): AgentRuntimeAdapter {
+  const completed: AgentRuntimeEvent = {
+    eventId: "e1",
+    executionId: "exec-1",
+    projectId: "zed",
+    taskId: "acp-sess-1",
+    sequence: 1,
+    eventType: "execution.completed",
+    timestamp: "2026-11-09T00:00:00.000Z",
+    payload: {}
+  };
+  return {
+    async getCapabilities() { return NO_CAPABILITIES; },
+    async healthCheck() { return true; },
+    async start() {
+      return { executionId: "exec-1", runtimeType: "hermes", status: "running", externalRunId: "run-1" };
+    },
+    async getStatus() { return "succeeded"; },
+    async cancel() { return undefined; },
+    async resume() { throw new Error("not used"); },
+    async subscribe(_id, handler) {
+      handler(completed);
+      return async () => undefined;
+    },
+    async terminate() { return undefined; }
+  };
+}
+
+async function harness(repo: string, storeRoot: string) {
   const git = new SpawnGitRunner();
+  const stores = {
+    contextSnapshots: new ImmutableRecordStore<ContextSnapshotRecord>(storeRoot, "contexts", assertContextSnapshot),
+    policySnapshots: new ImmutableRecordStore<PolicySnapshotRecord>(storeRoot, "policies", assertPolicySnapshot),
+    promptSnapshots: new ImmutableRecordStore<PromptSnapshotRecord>(storeRoot, "prompts", assertPromptSnapshot),
+    changeRecords: new ImmutableRecordStore<ChangeRecord>(storeRoot, "changes"),
+    evaluations: new ImmutableRecordStore<EvaluationResult>(storeRoot, "evaluations")
+  };
+  const journal = new InMemoryJournalStore();
+  const coordinator = new ExecutionCoordinator({ adapter: adapter(), journal });
+  const worktrees = new WorktreeManager(git, join(repo, ".worktrees"), { repository: repo });
+  const taskService = new TaskExecutionService({
+    git,
+    coordinator,
+    changes: new CodeChangePipeline(git, worktrees),
+    stores,
+    traceability: new TraceabilityQuery(stores)
+  });
+
+  const warnings: string[] = [];
+  const backend = createDocuFlowAcpBackend({
+    coordinator,
+    defaults: { projectId: "zed", contextSnapshotId: "ctx", policySnapshotId: "pol", timeoutSeconds: 5 },
+    idFactory: () => "sess-1",
+    runIdFactory: () => "run-acp-1",
+    onWarning: message => warnings.push(message),
+    snapshots: {
+      taskService,
+      policyFor: ({ cwd, taskId }): PolicySnapshot => ({
+        snapshotId: `pol_acp_${taskId}`,
+        projectId: "zed",
+        taskId,
+        executionId: "",
+        worktreeId: taskId,
+        policyVersion: "acp-default-1",
+        grantedCapabilities: ["read_file", "search_code", "generate_diff"],
+        allowedPaths: [cwd],
+        expiresAt: new Date(Date.now() + 86_400_000).toISOString()
+      })
+    }
+  });
+
+  return { stores, journal, backend, warnings };
+}
+
+async function gitRepo(): Promise<string> {
+  const repo = await mkdtemp(join(tmpdir(), "docuflow-acp-snap-"));
+  const git = new SpawnGitRunner();
+  await gitOrThrow(git, ["init", "-b", "main"], { cwd: repo });
+  await gitOrThrow(git, ["config", "user.name", "DocuFlow Test"], { cwd: repo });
+  await gitOrThrow(git, ["config", "user.email", "test@docuflow.local"], { cwd: repo });
+  await writeFile(join(repo, "app.ts"), "export const value = 1;\n", "utf8");
+  await gitOrThrow(git, ["add", "-A"], { cwd: repo });
+  await gitOrThrow(git, ["commit", "-m", "initial"], { cwd: repo });
+  return repo;
+}
+
+test("acp snapshots: a prompt creates context, policy and prompt records plus audit entries", async () => {
+  const repo = await gitRepo();
+  const storeRoot = await mkdtemp(join(tmpdir(), "docuflow-acp-snap-store-"));
   try {
-    await gitOrThrow(git, ["init", "-b", "main"], { cwd: repo });
-    await gitOrThrow(git, ["config", "user.name", "DocuFlow Test"], { cwd: repo });
-    await gitOrThrow(git, ["config", "user.email", "test@docuflow.local"], { cwd: repo });
-    await writeFile(join(repo, "app.ts"), "export const value = 1;\n", "utf8");
-    await gitOrThrow(git, ["add", "-A"], { cwd: repo });
-    await gitOrThrow(git, ["commit", "-m", "initial"], { cwd: repo });
-
-    const stores = {
-      contextSnapshots: new ImmutableRecordStore<ContextSnapshotRecord>(storeRoot, "contexts", assertContextSnapshot),
-      policySnapshots: new ImmutableRecordStore<PolicySnapshotRecord>(storeRoot, "policies", assertPolicySnapshot),
-      promptSnapshots: new ImmutableRecordStore<PromptSnapshotRecord>(storeRoot, "prompts", assertPromptSnapshot),
-      changeRecords: new ImmutableRecordStore<ChangeRecord>(storeRoot, "changes"),
-      evaluations: new ImmutableRecordStore<EvaluationResult>(storeRoot, "evaluations")
-    };
-    const journal = new InMemoryJournalStore();
-
-    const completed: AgentRuntimeEvent = {
-      eventId: "e1",
-      executionId: "exec-1",
-      projectId: "zed",
-      taskId: "acp-sess-1",
-      sequence: 1,
-      eventType: "execution.completed",
-      timestamp: "2026-11-09T00:00:00.000Z",
-      payload: {}
-    };
-    const adapter: AgentRuntimeAdapter = {
-      async getCapabilities() { return NO_CAPABILITIES; },
-      async healthCheck() { return true; },
-      async start() {
-        return { executionId: "exec-1", runtimeType: "hermes", status: "running", externalRunId: "run-1" };
-      },
-      async getStatus() { return "succeeded"; },
-      async cancel() { return undefined; },
-      async resume() { throw new Error("not used"); },
-      async subscribe(_id, handler) {
-        handler(completed);
-        return async () => undefined;
-      },
-      async terminate() { return undefined; }
-    };
-
-    const coordinator = new ExecutionCoordinator({ adapter, journal });
-    const worktrees = new WorktreeManager(git, join(repo, ".worktrees"), { repository: repo });
-    const changes = new CodeChangePipeline(git, worktrees);
-    const taskService = new TaskExecutionService({
-      git,
-      coordinator,
-      changes,
-      stores,
-      traceability: new TraceabilityQuery(stores)
-    });
-
-    const backend = createDocuFlowAcpBackend({
-      coordinator,
-      defaults: { projectId: "zed", contextSnapshotId: "ctx", policySnapshotId: "pol", timeoutSeconds: 5 },
-      idFactory: () => "sess-1",
-      runIdFactory: () => "run-acp-1",
-      snapshots: {
-        taskService,
-        policyFor: ({ cwd, taskId }): PolicySnapshot => ({
-          snapshotId: `pol_acp_${taskId}`,
-          projectId: "zed",
-          taskId,
-          executionId: "",
-          worktreeId: taskId,
-          policyVersion: "acp-default-1",
-          grantedCapabilities: ["read_file", "search_code", "generate_diff"],
-          allowedPaths: [cwd],
-          expiresAt: new Date(Date.now() + 86_400_000).toISOString()
-        })
-      }
-    });
-
+    const { stores, journal, backend } = await harness(repo, storeRoot);
     const session = await backend.createSession({ cwd: repo });
     const stopReason = await backend.prompt(session.sessionId, "do the thing", () => undefined);
     assert.equal(stopReason, "end_turn");
@@ -124,13 +136,37 @@ test("acp snapshots: a prompt creates context, policy and prompt records plus au
     assert.equal(policy.executionId, "exec-1");
     assert.deepEqual(policy.allowedPaths, [repo]);
 
-    const entries = await journal.read("exec-1");
-    const categories = entries.map(entry => entry.category);
+    const categories = (await journal.read("exec-1")).map(entry => entry.category);
     assert.ok(categories.includes("context.snapshot"));
     assert.ok(categories.includes("policy.snapshot"));
     assert.ok(categories.includes("prompt.snapshot"));
   } finally {
     await rm(repo, { recursive: true, force: true });
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("acp snapshots: a non-git cwd degrades to a journaled skip instead of a fake snapshot", async () => {
+  const plain = await mkdtemp(join(tmpdir(), "docuflow-acp-plain-"));
+  const storeRoot = await mkdtemp(join(tmpdir(), "docuflow-acp-plain-store-"));
+  try {
+    const { stores, journal, backend, warnings } = await harness(plain, storeRoot);
+    const session = await backend.createSession({ cwd: plain });
+    const stopReason = await backend.prompt(session.sessionId, "do the thing", () => undefined);
+
+    assert.equal(stopReason, "end_turn");
+    assert.equal((await stores.contextSnapshots.list()).length, 0);
+    assert.equal((await stores.policySnapshots.list()).length, 0);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!, /snapshots skipped/);
+
+    const entries = await journal.read("exec-1");
+    const skipped = entries.find(entry => entry.category === "context.snapshot.skipped");
+    assert.ok(skipped, "the skip must be auditable, not just a stderr line");
+    assert.equal(skipped?.payload["cwd"], plain);
+    assert.match(String(skipped?.payload["reason"]), /not a git repository/i);
+  } finally {
+    await rm(plain, { recursive: true, force: true });
     await rm(storeRoot, { recursive: true, force: true });
   }
 });
