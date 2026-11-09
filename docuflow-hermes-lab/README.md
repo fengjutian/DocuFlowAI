@@ -27,6 +27,7 @@ This repository provides:
   certify a change without a passing evaluation.
 - A Skill registry with immutable versions, declared permissions, runtime restrictions and policy-based
   authorization, plus per-execution usage/cost accounting.
+- Multi-runtime selection that filters by health and capabilities before considering load.
 - Unit tests that run without a Hermes server.
 - Opt-in integration tests against a locally configured Hermes server.
 - Security-test fixture layout and a structured JSON result format.
@@ -337,7 +338,19 @@ against the execution's policy snapshot, and high-risk or deprecated skills requ
 
 `UsageLedger` records model, tokens and duration per execution; `GET /api/v1/executions/{id}/usage` and
 `GET /api/v1/usage` expose it. An event with no usage data records nothing rather than a fake zero.
-See [`docs/COST.md`](docs/COST.md).
+Records persist under `<data>/usage/` and are reloaded at startup. See [`docs/COST.md`](docs/COST.md).
+
+## Multi-runtime scheduling
+
+```ts
+const scheduler = new RuntimeScheduler(registry, { strategy: "least_loaded" })
+const { runtimeId, adapter } = await scheduler.select({ requiredCapabilities: { streaming: true } })
+```
+
+Order matters: unhealthy runtimes are dropped, then capability requirements, and only then does the
+strategy (`round_robin`, `least_loaded`, `first_healthy`) choose. No candidate is an error, never a
+silent fallback to a runtime that cannot do the job.
+
 
 ## Running the lab server
 
@@ -358,6 +371,20 @@ because "runtime is down" is a state the API must be able to describe.
 | `DOCUFLOW_DATA_DIR` | `.docuflow-data` | snapshots, change records, `journal/` |
 | `DOCUFLOW_WORKTREE_ROOT` | `<data>/worktrees` | where isolated worktrees are created |
 | `DOCUFLOW_REPOSITORY` | cwd | repository the worktrees belong to |
+
+## Real Hermes status
+
+`npm run check:hermes` compares the installed runtime with `hermes.lock.json` (v0.23.0). Newer Hermes
+CLIs initialize a provider before parsing flags, so `hermes --version` prints a startup error instead
+of a version. Point the check at the interpreter and it reads the package metadata instead:
+
+```bash
+HERMES_PYTHON=/path/to/hermes/venv/bin/python npm run check:hermes
+```
+
+On this machine that check reports `Installed Hermes is 0.15.1, but hermes.lock.json pins 0.23.0`, so
+every live validation stays `blocked` — running Phase 0 against the wrong version would be worse than
+not running it.
 
 ## Test status vocabulary
 

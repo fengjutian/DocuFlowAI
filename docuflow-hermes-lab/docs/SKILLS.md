@@ -50,8 +50,9 @@ blank.
 under. Binding a denied authorization throws; binding is idempotent per execution and version;
 `setEnabled()` keeps the record and flips the flag, mirroring design 11.5.
 
-Bindings are in-memory in this lab. They are not yet journaled, so a restart loses the mapping — the
-journal still holds every execution, so the gap is a restore problem, not lost evidence.
+Bindings persist as an **append-only event log** (`bind` / `enable` / `disable`) under
+`<data>/bindings/`, and `load()` folds the log back into current state. That keeps the file store
+immutable while still supporting the mutable `enabled` flag.
 
 ## Not implemented
 

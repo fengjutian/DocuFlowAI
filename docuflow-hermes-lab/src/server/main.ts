@@ -14,6 +14,7 @@ import { createRuntime, loadConfigFromEnv } from "./runtime.js";
 async function main(): Promise<void> {
   const config = loadConfigFromEnv();
   const runtime = createRuntime(config);
+  await runtime.ready();
   const server = await createApiServer(runtime.deps).listen(config.port, config.host);
 
   console.log(`DocuFlow lab server: ${server.url}`);

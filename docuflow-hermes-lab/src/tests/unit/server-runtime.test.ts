@@ -48,6 +48,7 @@ test("boots the API even when Hermes is unreachable", async () => {
     HERMES_HTTP_BASE_URL: unreachable,
     DOCUFLOW_DATA_DIR: dataDir
   }));
+  await runtime.ready();
   const server = await createApiServer(runtime.deps).listen(0);
   try {
     const runtimes = await fetch(`${server.url}/api/v1/runtimes`);
@@ -77,6 +78,8 @@ test("applies the configured bearer token to every route", async () => {
     DOCUFLOW_DATA_DIR: dataDir,
     DOCUFLOW_API_TOKEN: "t0ken"
   }));
+
+  await runtime.ready();
   const server = await createApiServer(runtime.deps).listen(0);
   try {
     assert.equal((await fetch(`${server.url}/api/v1/runtimes`)).status, 401);

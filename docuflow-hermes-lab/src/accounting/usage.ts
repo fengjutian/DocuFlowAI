@@ -1,11 +1,15 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { AgentRuntimeEvent } from "../types/adapter.js";
+import type { RecordStore } from "../persistence/record-store.js";
 
 /**
  * Cost and usage accounting (design 19 / AT-206).
  *
  * Runtime payloads differ, so extraction is tolerant: the first recognized token field wins, and an
  * event without usage data produces no record rather than a zero that would look like a free run.
+ *
+ * When a store is supplied the ledger is durable: one record per execution, keyed by the execution id,
+ * rehydrated with `load()` after a restart.
  */
 export interface UsageRecord {
   id: string;
@@ -31,9 +35,25 @@ export interface UsageSummary {
 export class UsageLedger {
   private readonly records = new Map<string, UsageRecord>();
 
-  record(record: UsageRecord): UsageRecord {
+  constructor(
+    private readonly store?: RecordStore<UsageRecord>,
+    private readonly options: { idFactory?: () => string } = {}
+  ) {}
+
+  /** Rehydrates the in-memory index from the store. Safe to call more than once. */
+  async load(): Promise<void> {
+    if (!this.store) return;
+    for (const record of await this.store.list()) {
+      this.records.set(record.executionId, record);
+    }
+  }
+
+  async record(record: UsageRecord): Promise<UsageRecord> {
     if (!Number.isFinite(record.totalTokens) || record.totalTokens < 0) {
       throw new Error("totalTokens must be a non-negative number");
+    }
+    if (this.store && !this.records.has(record.executionId)) {
+      await this.store.put(record);
     }
     this.records.set(record.executionId, record);
     return record;
@@ -45,10 +65,10 @@ export class UsageLedger {
    * `durationMs` comes from the caller because the coordinator knows when the run started; the event
    * only carries token counters, and treating a missing duration as zero would understate cost.
    */
-  recordFromEvent(
+  async recordFromEvent(
     event: AgentRuntimeEvent,
     timing: { durationMs: number; startedAt?: string; finishedAt?: string }
-  ): UsageRecord | undefined {
+  ): Promise<UsageRecord | undefined> {
     const payload = event.payload as Record<string, unknown>;
     const usage = (payload["usage"] ?? payload["token_usage"] ?? payload) as Record<string, unknown>;
     const promptTokens = pickNumber(usage, ["prompt_tokens", "input_tokens", "tokens_in", "promptTokens"]);
@@ -65,8 +85,10 @@ export class UsageLedger {
         ? usage["model"]
         : "unknown";
 
+    const existing = this.records.get(event.executionId);
     return this.record({
-      id: `use_${randomUUID()}`,
+      // One usage row per execution: the record id is the execution id so a restart can find it.
+      id: existing?.id ?? this.options.idFactory?.() ?? usageRecordId(event.executionId),
       executionId: event.executionId,
       model,
       promptTokens: promptTokens ?? 0,
@@ -116,10 +138,19 @@ export class UsageLedger {
   }
 }
 
+function usageRecordId(executionId: string): string {
+  return `use_${createHash("sha256").update(executionId).digest("hex").slice(0, 24)}`;
+}
+
 function pickNumber(source: Record<string, unknown>, keys: readonly string[]): number | undefined {
   for (const key of keys) {
     const value = source[key];
     if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
   }
   return undefined;
+}
+
+/** Kept for callers that want an id without an execution id (tests, ad-hoc records). */
+export function newUsageId(): string {
+  return `use_${randomUUID()}`;
 }

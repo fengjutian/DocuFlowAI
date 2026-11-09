@@ -187,4 +187,28 @@ usage entirely.
 Decision: `recordFromEvent` accepts several field names and derives the total when possible; a payload
 without any token data produces no record, because a zero would look like a free run. Duration is
 computed by the server from `execution.started` to the terminal event, not trusted from the payload.
-The ledger is in-memory in this lab.
+The ledger persists one record per execution and reloads at startup.
+
+## D-025: Scheduling filters before it balances
+Status: accepted
+Context: an unbalanced queue is a nuisance; sending work to a runtime that cannot stream or is down is
+a failure.
+Decision: `RuntimeScheduler` removes unhealthy runtimes, then checks required capabilities, then applies
+`round_robin` / `least_loaded` / `first_healthy`. No candidate raises `runtime_unreachable` or
+`unsupported_capability` instead of falling back to a runtime that cannot serve the request.
+
+## D-026: Mutable binding state is stored as an append-only event log
+Status: accepted
+Context: design 11.5 gives bindings an `enabled` flag, but the record store is immutable.
+Decision: bindings are `bind` / `enable` / `disable` events under `<data>/bindings/`; `load()` folds
+them in creation order. The current state is derived, the history is preserved, and no file is
+rewritten.
+
+## D-027: Detect the Hermes version from package metadata when the CLI cannot answer
+Status: accepted
+Context: Hermes 0.15.1 initializes an LLM provider before parsing flags, so `hermes --version` prints a
+startup failure rather than a version, and `check:hermes` could not tell "old runtime" from "broken
+command".
+Decision: `HERMES_PYTHON` reads `importlib.metadata` (and `HERMES_VERSION_COMMAND` overrides entirely);
+the error message names the trap. On this machine the check reports 0.15.1 installed against the pinned
+0.23.0, which correctly keeps live validation blocked.

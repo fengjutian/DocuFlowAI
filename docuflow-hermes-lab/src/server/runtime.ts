@@ -3,7 +3,7 @@ import { HermesAdapter } from "../adapters/hermes-adapter.js";
 import { AgentRuntimeRegistry } from "../adapters/runtime-registry.js";
 import { createApiServer, type ApiDependencies } from "../api/app.js";
 import { EventBus } from "../api/event-bus.js";
-import { UsageLedger } from "../accounting/usage.js";
+import { UsageLedger, type UsageRecord } from "../accounting/usage.js";
 import { HermesHttpClient } from "../clients/http/hermes-http-client.js";
 import { CodeChangePipeline } from "../code-engine/code-change-pipeline.js";
 import { SpawnGitRunner } from "../code-engine/git-runner.js";
@@ -75,6 +75,8 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Runtime
 
 export interface Runtime {
   deps: ApiDependencies;
+  /** Loads durable indexes (usage) before serving; safe to call once at startup. */
+  ready(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -94,11 +96,13 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   };
   const journal = new JsonlJournalStore(resolve(config.dataDir, "journal"));
   const bus = new EventBus();
-  const usage = new UsageLedger();
+  const usage = new UsageLedger(
+    new ImmutableRecordStore<UsageRecord>(config.dataDir, "usage")
+  );
   const startedAt = new Map<string, string>();
 
   const TERMINAL = new Set(["execution.completed", "execution.failed", "execution.cancelled"]);
-  const recordUsage = (event: AgentRuntimeEvent): void => {
+  const recordUsage = async (event: AgentRuntimeEvent): Promise<void> => {
     if (event.eventType === "execution.started") {
       if (!startedAt.has(event.executionId)) startedAt.set(event.executionId, event.timestamp);
       return;
@@ -106,7 +110,7 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     if (!TERMINAL.has(event.eventType)) return;
     const began = startedAt.get(event.executionId);
     const durationMs = began ? Math.max(0, Date.parse(event.timestamp) - Date.parse(began)) : 0;
-    usage.recordFromEvent(event, {
+    await usage.recordFromEvent(event, {
       durationMs,
       ...(began ? { startedAt: began } : {}),
       finishedAt: event.timestamp
@@ -127,7 +131,7 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     journal,
     onEvent: event => {
       bus.publishRuntimeEvent(event);
-      recordUsage(event);
+      void recordUsage(event).catch(() => undefined);
     }
   });
 
@@ -146,6 +150,9 @@ export function createRuntime(config: RuntimeConfig): Runtime {
       bus,
       usage,
       ...(config.token ? { token: config.token } : {})
+    },
+    ready: async () => {
+      await usage.load();
     },
     close: () => coordinator.stopAll()
   };

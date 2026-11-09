@@ -1,9 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   SkillBindingError,
-  SkillBindingStore
+  SkillBindingStore,
+  type SkillBindingEvent
 } from "../../skills/skill-bindings.js";
+import { ImmutableRecordStore } from "../../persistence/record-store.js";
 import {
   SkillConflictError,
   SkillNotFoundError,
@@ -150,25 +155,24 @@ test("denies authorization when the policy snapshot expired", () => {
   assert.match(result.reasons[0]!, /expired/);
 });
 
-test("binds allowed skills immutably and refuses denied ones", () => {
+test("binds allowed skills immutably and refuses denied ones", async () => {
   const registry = new SkillRegistry();
   const store = new SkillBindingStore();
   const skill = manifest();
   registry.register(skill);
   const allowed = registry.authorize(skill, { runtimeId: "hermes-local", policy: policy() });
 
-  const binding = store.bind({
+  const binding = await store.bind({
     executionId: "exec-1",
     manifest: skill,
     policyId: "pol-1",
     authorization: allowed,
-    now: () => new Date("2026-11-09T00:00:00.000Z"),
     idFactory: () => "bind-1"
   });
   assert.equal(binding.skillVersion, "1.0.0");
   assert.equal(Object.isFrozen(binding), true);
 
-  const again = store.bind({
+  const again = await store.bind({
     executionId: "exec-1",
     manifest: skill,
     policyId: "pol-1",
@@ -177,8 +181,8 @@ test("binds allowed skills immutably and refuses denied ones", () => {
   assert.equal(again.id, "bind-1");
   assert.equal(store.forExecution("exec-1").length, 1);
 
-  assert.throws(
-    () => store.bind({
+  await assert.rejects(
+    store.bind({
       executionId: "exec-2",
       manifest: skill,
       policyId: "pol-1",
@@ -187,7 +191,31 @@ test("binds allowed skills immutably and refuses denied ones", () => {
     (error: unknown) => error instanceof SkillBindingError
   );
 
-  const disabled = store.setEnabled("exec-1", "react-dev", "1.0.0", false);
+  const disabled = await store.setEnabled("exec-1", "react-dev", "1.0.0", false);
   assert.equal(disabled.enabled, false);
   assert.equal(store.forExecution("exec-1")[0]!.enabled, false);
+});
+
+test("restores bindings from the event log after a restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "docuflow-bindings-"));
+  try {
+    const events = new ImmutableRecordStore<SkillBindingEvent>(root, "bindings");
+    const skill = manifest();
+    const first = new SkillBindingStore(events);
+    await first.bind({
+      executionId: "exec-1",
+      manifest: skill,
+      policyId: "pol-1",
+      authorization: { decision: "allow", reasons: [] }
+    });
+    await first.setEnabled("exec-1", "react-dev", "1.0.0", false);
+
+    const second = new SkillBindingStore(events);
+    await second.load();
+    const restored = second.forExecution("exec-1");
+    assert.equal(restored.length, 1);
+    assert.equal(restored[0]!.enabled, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

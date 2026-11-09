@@ -34,7 +34,7 @@ Both return **501** when usage accounting is not wired into the server, rather t
 
 ## Limits
 
-- The ledger is in-memory: restarting the server loses usage history. Persisting it is the same
-  pattern as the other immutable stores and is not done yet.
+- One usage row per execution, persisted under `<data>/usage/` and reloaded by `UsageLedger.load()`;
+  a second terminal event for the same execution updates memory without rewriting the record.
 - No price table: tokens and time are recorded, currency is not.
 - Streaming runs that report usage per chunk are not summed; only the terminal event is used.
