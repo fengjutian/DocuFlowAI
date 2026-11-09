@@ -36,7 +36,13 @@ Set `HERMES_HTTP_BASE_URL` and optional `HERMES_API_KEY`, then run:
 
 ```bash
 npm run test:integration
+npm run validate:http
 ```
+
+`validate:http` writes a machine-readable report to `reports/phase0-http.json` by default.
+Use `HERMES_REPORT_PATH`, `HERMES_EVENT_TIMEOUT_MS` and `HERMES_MAX_EVENTS` to adjust
+the report destination and SSE capture limits. Missing server configuration is recorded as
+`blocked`; verified protocol failures are recorded as `failed` and return a non-zero exit code.
 
 The integration test creates a run and checks that a run identifier is returned. It is
 skipped when `HERMES_HTTP_BASE_URL` is not configured. Never point security tests at a
