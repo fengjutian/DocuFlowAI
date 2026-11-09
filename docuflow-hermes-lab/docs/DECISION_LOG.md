@@ -248,3 +248,13 @@ Decision: `src/tests/support/mock-hermes-server.ts` serves the documented endpoi
 assert run creation, SSE ordering/ids, aborts, stop/approval payloads, auth and capability gating. Test
 names start with `contract:` and the docs state explicitly that a green contract suite says nothing
 about the pinned runtime's real event names or approval semantics.
+
+## D-032: Zed is the client; DocuFlow sits in the ACP path
+Status: accepted
+Context: Zed is the project's client base, and design 4.4 says ACP is editor-facing and must not become
+the task-scheduling protocol.
+Decision: DocuFlow exposes an ACP agent over stdio (`Zed → ACP → DocuFlow → Hermes`). It bridges
+sessions and prompts to DocuFlow executions and maps runtime events to `session/update`, while
+scheduling, policy and audit stay in DocuFlow's own layer. Each prompt starts a new execution because
+the HTTP adapter cannot continue a finished run. The endpoint is explicitly a skeleton: snapshots,
+policy enforcement and `session/request_permission` bridging are not wired yet, and the docs list them.

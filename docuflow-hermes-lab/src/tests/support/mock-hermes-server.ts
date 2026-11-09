@@ -34,7 +34,15 @@ const DEFAULT_EVENTS: MockEvent[] = [
   { event: "run.started", data: { run_id: "placeholder" }, id: "1" },
   { event: "message.delta", data: { text: "hello " }, id: "2" },
   { event: "message.delta", data: { text: "world" }, id: "3" },
-  { event: "run.completed", data: { output: "hello world" }, id: "4" }
+  {
+    event: "run.completed",
+    data: {
+      output: "hello world",
+      model: "mock-model",
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }
+    },
+    id: "4"
+  }
 ];
 
 export async function startMockHermes(options: MockHermesOptions = {}): Promise<MockHermes> {
@@ -76,7 +84,7 @@ export async function startMockHermes(options: MockHermesOptions = {}): Promise<
     if (method === "POST" && url.pathname === "/v1/runs") {
       counter += 1;
       const runId = `run_mock_${counter}`;
-      runs.set(runId, { status: "queued" });
+      runs.set(runId, { status: options.runStatus ?? "running" });
       json(response, 201, { run_id: runId, status: "queued" });
       return;
     }
@@ -84,8 +92,9 @@ export async function startMockHermes(options: MockHermesOptions = {}): Promise<
     const runMatch = /^\/v1\/runs\/([^/]+)$/.exec(url.pathname);
     if (method === "GET" && runMatch) {
       const runId = runMatch[1]!;
-      if (!runs.has(runId)) return json(response, 404, { error: "run_not_found" });
-      json(response, 200, { run_id: runId, status: options.runStatus ?? "running" });
+      const run = runs.get(runId);
+      if (!run) return json(response, 404, { error: "run_not_found" });
+      json(response, 200, { run_id: runId, status: run.status });
       return;
     }
 

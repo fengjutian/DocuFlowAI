@@ -28,6 +28,8 @@ This repository provides:
 - A Skill registry with immutable versions, declared permissions, runtime restrictions and policy-based
   authorization, plus per-execution usage/cost accounting.
 - Multi-runtime selection that filters by health and capabilities before considering load.
+- An ACP agent endpoint for Zed (`Zed → ACP → DocuFlow → Hermes`), with session/prompt bridging to
+  DocuFlow executions and ACP `session/update` notifications.
 - Unit tests that run without a Hermes server.
 - Contract tests against a local mock Hermes server (`src/tests/support/mock-hermes-server.ts`) covering
   capabilities, run creation, SSE ordering, aborts, stop/approval payloads and auth.
@@ -417,6 +419,23 @@ Contract tests prove the client and runner behave correctly against a conforming
 prove anything about the real runtime: event names, approval semantics and resume behavior still need
 the pinned version.
 
+## Zed (ACP)
+
+Zed is the client base; DocuFlow is the ACP agent behind it:
+
+```bash
+HERMES_HTTP_BASE_URL=http://127.0.0.1:8642 npm run acp:serve
+```
+
+JSON-RPC 2.0 over stdio, newline-delimited. `session/prompt` starts a DocuFlow execution in the
+session's `cwd`, streams `agent_message_chunk` / `tool_call` updates, and returns an ACP `stopReason`;
+`session/cancel` cancels the execution. Add the command to Zed's `agent_servers` — see
+[`docs/ZED.md`](docs/ZED.md) for the settings snippet.
+
+Current gaps, stated up front: this path does not yet capture snapshots or enforce the policy
+snapshot, and Hermes `permission.requested` is not yet bridged to ACP `session/request_permission`.
+Confinement therefore still depends on the verified sandbox.
+
 ## Test status vocabulary
 
 - `passed`: assertion verified by executable evidence.
@@ -432,6 +451,7 @@ layer, not merely a Hermes permission prompt.
 ```text
 src/
   accounting/         Usage/cost ledger and aggregation
+  acp/                ACP agent endpoint and DocuFlow session bridge
   adapters/           AgentRuntimeAdapter implementation, event normalizer, runtime registry
   api/                HTTP routes and the design-13 event envelope / SSE stream
   clients/http/       Hermes HTTP API client + SSE
