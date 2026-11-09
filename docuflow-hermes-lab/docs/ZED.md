@@ -46,6 +46,15 @@ Restart Zed after editing settings; the agent appears as an available external a
 Each prompt starts a new execution because the Hermes HTTP adapter cannot continue a finished run
 (D-015). The session keeps the workspace; the execution ids stay journaled.
 
+## Tests
+
+| Coverage | Test |
+|---|---|
+| Transport, dispatch, parse errors, cancel | `acp-server.test.ts` |
+| Prompt → execution → updates → stopReason | `acp-server.test.ts` |
+| Permission round-trip and fail-closed answers | `acp-server.test.ts` |
+| Full editor path over real HTTP against a mock Hermes | `acp-e2e-mock.test.ts` |
+
 ## Scope and gaps (read before relying on it)
 
 - **No snapshot records yet.** This path goes through the coordinator directly, so context/policy
