@@ -8,6 +8,8 @@ This repository provides:
 - Typed HTTP client for Hermes' documented run-oriented API.
 - SSE event reader for `/v1/runs/{id}/events`.
 - Generic JSON-RPC request tracking and a newline-delimited stdio process client for TUI Gateway validation.
+- The DocuFlow `AgentRuntimeAdapter` contract, a Hermes adapter over the HTTP client, and a runtime
+  registry with aggregated health checks.
 - Unit tests that run without a Hermes server.
 - Opt-in integration tests against a locally configured Hermes server.
 - Security-test fixture layout and a structured JSON result format.
@@ -87,6 +89,35 @@ production workspace.
 7. Verify cancellation, process crash, reconnect, resume and duplicate-run behavior.
 8. Export a signed-off Phase 0 report before starting the production Adapter.
 
+## Phase 1 adapter skeleton
+
+`src/types/adapter.ts` is DocuFlow's stable contract (design V1.0 section 5). `HermesAdapter`
+implements it on top of the HTTP client and covers the Phase 1 items that do not require a live
+server to be designed: execution lifecycle, event normalization, registration and health checks.
+
+```text
+start()      POST /v1/runs, then emit execution.started with the external run id
+subscribe()  one shared SSE pump per execution; events are buffered and replayed to late
+             subscribers, deduplicated by the SSE id field, and numbered per execution
+getStatus()  maps Hermes run status onto AgentExecutionStatus
+cancel()     POST /v1/runs/{id}/stop, but only when cancellation is declared verified
+resume()     always unsupported_capability: the HTTP API has no documented resume
+terminate()  aborts the local pump and drops the execution state
+```
+
+Two rules keep this honest:
+
+1. **Capabilities are declarations, not guesses.** `getCapabilities()` returns `streaming` only when
+   the server advertises `run_events_sse`, and returns false for cancellation, resume, tool events,
+   permission events, sub-agents and skills until Phase 0 evidence exists. Pass
+   `verifiedCapabilities: { cancellation: true }` only after P0-018 passes.
+2. **Unknown events are forwarded, never dropped.** Unmapped Hermes event names become
+   `runtime.unknown` with `payload.hermesEvent` and `payload.raw` preserved.
+
+`AgentRuntimeRegistry` holds runtime registrations and produces an aggregated health report; a
+runtime that throws or exceeds the health timeout is reported unhealthy rather than blocking the
+caller. See [`docs/ADAPTER_CONTRACT.md`](docs/ADAPTER_CONTRACT.md) for the full mapping.
+
 ## Test status vocabulary
 
 - `passed`: assertion verified by executable evidence.
@@ -101,12 +132,13 @@ layer, not merely a Hermes permission prompt.
 
 ```text
 src/
+  adapters/           AgentRuntimeAdapter implementation, event normalizer, runtime registry
   clients/http/       Hermes HTTP API client + SSE
   clients/gateway/    JSON-RPC primitives + stdio process transport
   tests/unit/         Offline tests
   tests/integration/  Opt-in live-server tests
   reporting/          Machine-readable test result writer
-  types/              Shared protocol types
+  types/              Shared protocol types + the DocuFlow adapter contract
 fixtures/security-lab/
   workspace/          Allowed test workspace
   restricted/         Must remain inaccessible to the agent
