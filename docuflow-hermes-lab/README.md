@@ -220,6 +220,11 @@ A gap means compensate first (re-fetch and `mergeCompensated()`, which refuses c
 recovery rebuilds with the checkpoint instead of pretending. See
 [`docs/RECOVERY.md`](docs/RECOVERY.md).
 
+`ExecutionCoordinator` wires it together: `start()` journals every event through one serialized chain,
+`recordAuditFact()` puts change records and policy decisions on the same timeline, and `recover()`
+executes the plan — including a rebuild that injects `[DOCUFLOW CHECKPOINT]` and records
+`recovery.rebuild` against the new execution.
+
 ## Test status vocabulary
 
 - `passed`: assertion verified by executable evidence.
@@ -239,6 +244,7 @@ src/
   clients/gateway/    JSON-RPC primitives + stdio process transport
   code-engine/        Worktrees, diff analysis, change pipeline, change records
   journal/            Append-only execution journal, checkpoints, recovery planner
+  orchestrator/       ExecutionCoordinator: adapter + journal + recovery wiring
   policy/             Permission evaluation from a policy snapshot
   security/           Sandbox boundary specification and probes
   tests/unit/         Offline tests

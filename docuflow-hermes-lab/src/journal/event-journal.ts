@@ -4,14 +4,19 @@ import type { JournalEntry, JournalStore } from "./journal.js";
 /**
  * Records a normalized runtime event in the execution journal.
  *
- * The journal reuses the event's own sequence so the journal order and the runtime order are the
- * same thing; the event id and external id travel in the payload so a duplicate delivery can be
- * recognized after a restart.
+ * `journalSequence` is the journal position allocated by the writer; the runtime's own sequence is
+ * kept separately as `eventSequence`, because audit entries advance the journal without consuming a
+ * runtime event number. Mixing the two would make an audit write look like a lost event.
  */
-export async function recordRuntimeEvent(store: JournalStore, event: AgentRuntimeEvent): Promise<void> {
+export async function recordRuntimeEvent(
+  store: JournalStore,
+  event: AgentRuntimeEvent,
+  journalSequence: number
+): Promise<void> {
   await store.append({
     executionId: event.executionId,
-    sequence: event.sequence,
+    sequence: journalSequence,
+    eventSequence: event.sequence,
     kind: "runtime.event",
     category: event.eventType,
     recordedAt: event.timestamp,
@@ -25,7 +30,7 @@ export async function recordRuntimeEvent(store: JournalStore, event: AgentRuntim
 
 export interface AuditEntryInput {
   executionId: string;
-  /** Next position in the execution timeline; the caller owns allocation. */
+  /** Next journal position; the caller owns allocation. */
   sequence: number;
   category: string;
   payload: Record<string, unknown>;
@@ -43,4 +48,13 @@ export async function recordAudit(store: JournalStore, input: AuditEntryInput): 
     payload: input.payload
   };
   await store.append(entry);
+}
+
+/** Runtime event numbers already journaled, used to make compensation idempotent. */
+export function journaledEventSequences(entries: readonly JournalEntry[]): Set<number> {
+  return new Set(
+    entries
+      .map(entry => entry.eventSequence)
+      .filter((sequence): sequence is number => sequence !== undefined)
+  );
 }

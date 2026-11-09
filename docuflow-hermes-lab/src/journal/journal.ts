@@ -12,8 +12,10 @@ export type JournalEntryKind = "runtime.event" | "audit";
 
 export interface JournalEntry {
   executionId: string;
-  /** Monotonic per execution. Gaps are allowed: they are what compensation detects. */
+  /** Journal position, allocated by the writer. Unique per execution; gaps are allowed. */
   sequence: number;
+  /** Runtime event sequence, when the entry came from the runtime event stream. */
+  eventSequence?: number;
   kind: JournalEntryKind;
   /** Dotted category, for example `execution.completed` or `change.applied`. */
   category: string;
@@ -41,6 +43,11 @@ export function assertValidEntry(entry: JournalEntry): void {
   if (!Number.isInteger(entry.sequence) || entry.sequence < 1) {
     throw new JournalConflictError(`Journal sequence must be a positive integer, received '${entry.sequence}'`);
   }
+  if (entry.eventSequence !== undefined && (!Number.isInteger(entry.eventSequence) || entry.eventSequence < 1)) {
+    throw new JournalConflictError(
+      `Journal eventSequence must be a positive integer, received '${String(entry.eventSequence)}'`
+    );
+  }
   if (entry.kind !== "runtime.event" && entry.kind !== "audit") {
     throw new JournalConflictError(`Unknown journal entry kind '${String(entry.kind)}'`);
   }
@@ -62,6 +69,28 @@ export function sortEntries(entries: readonly JournalEntry[]): JournalEntry[] {
 /** Sequence numbers missing between the lowest recorded sequence and the highest. */
 export function detectGaps(entries: readonly JournalEntry[], fromSequence = 1): number[] {
   const present = new Set(entries.map(entry => entry.sequence));
+  if (present.size === 0) return [];
+  const highest = Math.max(...present);
+  const gaps: number[] = [];
+  for (let sequence = fromSequence; sequence <= highest; sequence += 1) {
+    if (!present.has(sequence)) gaps.push(sequence);
+  }
+  return gaps;
+}
+
+/**
+ * Runtime event sequences that never reached the journal.
+ *
+ * Journal position and runtime order are different things: audit entries advance the journal but
+ * carry no runtime event. Compensation must look at the runtime sequence, otherwise an audit write
+ * would look like a missing event.
+ */
+export function detectEventGaps(entries: readonly JournalEntry[], fromSequence = 1): number[] {
+  const present = new Set(
+    entries
+      .map(entry => entry.eventSequence)
+      .filter((sequence): sequence is number => sequence !== undefined)
+  );
   if (present.size === 0) return [];
   const highest = Math.max(...present);
   const gaps: number[] = [];

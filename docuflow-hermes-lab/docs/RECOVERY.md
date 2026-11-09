@@ -47,9 +47,36 @@ Hermes over HTTP has no resume, so it always lands on `rebuild` — the same con
 `mergeCompensated()` deduplicates by sequence and throws on conflicting content, so a re-fetch can
 fill gaps but cannot rewrite what was already recorded.
 
+## Coordinate, don't scatter
+
+`ExecutionCoordinator` (`src/orchestrator/`) is the assembly line: it starts the adapter, journals
+every event through one serialized chain per execution, records DocuFlow audit facts, and turns a
+recovery plan into an action.
+
+```ts
+coordinator.start(input)                 // adapter.start + subscribe + journal
+coordinator.recordAuditFact(id, ...)     // change.applied, policy.denied, ...
+coordinator.getCheckpoint(id, context)   // flush, then build
+coordinator.recover(id)                  // stop | compensate | resume | rebuild
+coordinator.cancel(id) / terminate(id)   // audited delegation
+```
+
+Journal writes are queued per execution, so journal order is a real order rather than a race between
+async handlers. Failures are collected in `journalErrors()` instead of vanishing into a
+fire-and-forget callback.
+
+`rebuild` creates a new run (new `runId`, same `taskId`), appends a `[DOCUFLOW CHECKPOINT]` block that
+lists applied change records and explicitly says not to re-apply them, and records a
+`recovery.rebuild` audit entry linking the previous execution id.
+
+## Journal position vs runtime sequence
+
+`JournalEntry.sequence` is journal order; `eventSequence` is the runtime's event number. Audit entries
+advance the journal without consuming a runtime number, so gap detection uses `eventSequence`
+(`detectEventGaps`). Without that split, writing one audit row would look like a lost runtime event.
+
 ## Not implemented yet
 
 - Durable storage for change records, policy snapshots and prompt snapshots (they are still objects).
-- Automatic scheduling of recovery actions; the planner returns a decision, the orchestrator acts.
-- Checkpoint injection into a rebuilt execution is a prompt/context concern and belongs to the
-  Context Engine.
+- Scheduling recovery automatically (a timer/worker); `recover()` is called explicitly.
+- Checkpoint injection is textual: the Context Engine will replace it with a structured context build.

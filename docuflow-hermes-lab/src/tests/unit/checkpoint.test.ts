@@ -114,7 +114,7 @@ test("records runtime events and audit facts into one execution timeline", async
     externalEventId: "sse-1"
   };
 
-  await recordRuntimeEvent(store, event);
+  await recordRuntimeEvent(store, event, 1);
   await recordAudit(store, {
     executionId: "exec-1",
     sequence: 2,

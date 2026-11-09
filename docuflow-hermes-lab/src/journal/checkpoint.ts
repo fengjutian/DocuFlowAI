@@ -1,5 +1,5 @@
 import type { AgentCapability } from "../types/adapter.js";
-import { detectGaps, sortEntries, type JournalEntry } from "./journal.js";
+import { detectEventGaps, detectGaps, sortEntries, type JournalEntry } from "./journal.js";
 
 /** Fields a checkpoint must carry per design 14.3. */
 export interface CheckpointContext {
@@ -52,6 +52,7 @@ export function buildCheckpoint(
     }
   }
   const context = options.context ?? {};
+  const hasRuntimeEvents = sorted.some(entry => entry.eventSequence !== undefined);
   return {
     executionId,
     lastSequence: sorted.at(-1)?.sequence ?? 0,
@@ -61,7 +62,7 @@ export function buildCheckpoint(
     ...(sorted.at(-1) ? { lastEventType: sorted.at(-1)!.category } : {}),
     appliedChangeRecordIds: [...changeRecords].sort(),
     pendingPermissionRequestIds: [...requested].filter(id => !resolved.has(id)).sort(),
-    gaps: detectGaps(sorted),
+    gaps: hasRuntimeEvents ? detectEventGaps(sorted) : detectGaps(sorted),
     createdAt: (options.now ?? (() => new Date()))().toISOString(),
     ...cleanContext(context)
   };

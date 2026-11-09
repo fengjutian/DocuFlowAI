@@ -93,3 +93,21 @@ Decision: `planRecovery` returns stop / compensate / resume / rebuild from the c
 runtime's declared capabilities. `resume` requires both `sessionResume` and a live session; Hermes
 HTTP has neither, so it rebuilds with the checkpoint. Applied change records are carried in the
 checkpoint so a rebuild never re-applies a diff that already landed.
+
+## D-014: Journal position and runtime sequence are separate fields
+Status: accepted
+Context: audit entries and runtime events share one timeline, but only runtime events consume the
+runtime's event numbers. Using one counter for both makes an audit write look like a missing event
+and creates a write race between the adapter handler and the orchestrator.
+Decision: `JournalEntry.sequence` is journal order, assigned by the single writer per execution;
+`eventSequence` keeps the runtime number. Gap detection uses `eventSequence` via `detectEventGaps`,
+and journal writes are serialized through one promise chain per execution.
+
+## D-015: Rebuild is explicit and must not replay applied changes
+Status: accepted
+Context: design 14.3 requires injecting the checkpoint into a new execution and not re-applying a
+successful diff.
+Decision: `ExecutionCoordinator.rebuild()` creates a new run with a new run id, appends a
+`[DOCUFLOW CHECKPOINT]` block listing applied change records with an explicit instruction not to
+re-apply them, and writes a `recovery.rebuild` audit entry on the new execution that points at the
+previous execution id.
