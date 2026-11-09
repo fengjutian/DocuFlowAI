@@ -12,6 +12,12 @@ export interface JsonRpcResponse<T = unknown> {
   error?: { code: number; message: string; data?: unknown };
 }
 
+export interface JsonRpcNotification {
+  jsonrpc: "2.0";
+  method: string;
+  params?: unknown;
+}
+
 /**
  * Protocol-neutral JSON-RPC request tracker.
  * A real stdio/WebSocket transport must be added and validated against the pinned Hermes build.
@@ -38,6 +44,14 @@ export class JsonRpcPendingRequests {
     } else {
       entry.resolve(message.result);
     }
+    return true;
+  }
+
+  reject(id: string | number, reason: Error): boolean {
+    const entry = this.pending.get(id);
+    if (!entry) return false;
+    this.pending.delete(id);
+    entry.reject(reason);
     return true;
   }
 
