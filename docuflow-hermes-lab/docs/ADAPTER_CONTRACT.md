@@ -86,6 +86,12 @@ snapshot, never guessed by the adapter.
 | second active execution for one run id | `invalid_state` |
 | timeout | `input.timeoutSeconds`, combined with the local abort signal |
 
+## Validation
+
+`npm run validate:adapter` executes AT-001..AT-004 through this adapter and writes
+`reports/phase1-adapter.json`. It records `blocked` when `HERMES_HTTP_BASE_URL` is unset; a run that
+cannot see a runtime event or a terminal state is `failed`, never `blocked`.
+
 ## Not implemented yet
 
 - Durable event persistence and audit timeline (Phase 3).

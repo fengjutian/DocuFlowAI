@@ -90,6 +90,7 @@ production workspace.
 6. Run security tests only inside a disposable OS/container boundary.
 7. Verify cancellation, process crash, reconnect, resume and duplicate-run behavior.
 8. Export a signed-off Phase 0 report before starting the production Adapter.
+9. Run `npm run validate:adapter` to prove the Phase 1 adapter path end to end.
 
 ## Phase 1 adapter skeleton
 
@@ -141,6 +142,18 @@ The adapter consumes this through `permissionHandler` (or an explicit `respondTo
 a `permission.requested` event is forwarded, the execution moves to `waiting_approval`, and nothing
 is sent back until a decision exists. With no handler the request stays pending, which is the
 fail-closed behavior the upstream contract requires.
+
+### Adapter smoke test
+
+```bash
+npm run validate:adapter
+```
+
+Runs the Phase 1 acceptance items that do not need a human: AT-001 registration + health, AT-002 task
+submission, AT-003 runtime event reception, AT-004 terminal status recognition. It writes
+`reports/phase1-adapter.json`; without `HERMES_HTTP_BASE_URL` every check is recorded as `blocked`,
+not passed. AT-005 (cancellation) is deliberately not run here because cancellation is gated on
+P0-018 evidence.
 
 ## Test status vocabulary
 

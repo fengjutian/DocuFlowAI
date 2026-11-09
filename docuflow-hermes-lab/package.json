@@ -10,6 +10,7 @@
     "test:integration": "npm run build && node --test dist/tests/integration/**/*.test.js",
     "validate:http": "npm run build && node dist/runners/http-phase0.js",
     "validate:gateway": "npm run build && node dist/runners/gateway-phase0.js",
+    "validate:adapter": "npm run build && node dist/runners/adapter-phase1.js",
     "report:phase0": "npm run build && node dist/runners/aggregate-phase0.js",
     "check:hermes": "npm run build && node dist/runners/check-hermes-version.js",
     "typecheck": "tsc --noEmit"
