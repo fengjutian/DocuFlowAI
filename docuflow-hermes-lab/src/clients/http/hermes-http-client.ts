@@ -58,9 +58,13 @@ export class HermesHttpClient {
   }
 
   async *streamRunEvents(runId: string, signal?: AbortSignal): AsyncGenerator<{event: string; data: unknown; id?: string}> {
+    const init: RequestInit = {
+      headers: this.headers({ Accept: "text/event-stream" }),
+      ...(signal ? { signal } : {})
+    };
     const response = await this.fetchImpl(
       `${this.baseUrl}/v1/runs/${encodeURIComponent(runId)}/events`,
-      { headers: this.headers({ Accept: "text/event-stream" }), signal }
+      init
     );
     if (!response.ok) await this.throwHttpError(response);
     if (!response.body) throw new Error("Hermes SSE response has no body");
