@@ -24,7 +24,23 @@ import {
 } from "../persistence/records.js";
 import type { TraceStores, TraceabilityQuery } from "../persistence/traceability.js";
 import type { PolicySnapshot } from "../policy/permission-policy.js";
+import type { SkillBinding, SkillBindingStore } from "../skills/skill-bindings.js";
+import type { SkillRegistry, SkillAuthorization } from "../skills/skill-registry.js";
+import type { SkillManifest } from "../skills/skill.js";
 import type { AgentExecution, AgentTaskInput } from "../types/adapter.js";
+
+/** A skill the caller wants bound to this execution. */
+export interface RequestedSkill {
+  skillId: string;
+  version?: string;
+}
+
+export class SkillDeniedError extends Error {
+  constructor(message: string, public readonly reasons: string[] = []) {
+    super(message);
+    this.name = "SkillDeniedError";
+  }
+}
 
 /**
  * End-to-end task entry point: snapshots, execution, change, trace.
@@ -48,6 +64,10 @@ export interface StartTaskRequest {
   correlationId: string;
   timeoutSeconds: number;
   allowedTools: string[];
+  /** Skills to bind to this execution; each is authorized against `policy` first. */
+  skills?: RequestedSkill[];
+  /** `skillId@version` entries the caller has already had approved by a human. */
+  approvedSkills?: string[];
 }
 
 export interface StartTaskResult {
@@ -56,6 +76,7 @@ export interface StartTaskResult {
   contextSnapshot: ContextSnapshotRecord;
   policySnapshot: PolicySnapshotRecord;
   promptSnapshot: PromptSnapshotRecord;
+  skills: SkillBinding[];
 }
 
 export interface TaskExecutionServiceOptions {
@@ -64,6 +85,8 @@ export interface TaskExecutionServiceOptions {
   changes: CodeChangePipeline;
   stores: TraceStores;
   traceability: TraceabilityQuery;
+  /** Optional skill support: without it, `skills` in a request is rejected rather than ignored. */
+  skills?: { registry: SkillRegistry; bindings: SkillBindingStore; runtimeId: string };
   now?: () => Date;
   runIdFactory?: () => string;
   snapshotIdFactory?: (prefix: string) => string;
@@ -98,6 +121,10 @@ export class TaskExecutionService {
     });
     assertContextSnapshot(contextSnapshot);
     await this.options.stores.contextSnapshots.put(contextSnapshot);
+
+    // Skills are authorized against the same policy snapshot the execution will run under, before
+    // anything starts. A denied skill stops the task; nothing is "bound but disabled" silently.
+    const resolvedSkills = this.authorizeSkills(request);
 
     // Policy and prompt records name the execution, which only exists after `start`. Their ids are
     // decided first so the task input can reference them, and they are written once the run exists.
@@ -164,12 +191,29 @@ export class TaskExecutionService {
       templateVersion: promptSnapshot.templateVersion
     });
 
+    const skills: SkillBinding[] = [];
+    for (const resolved of resolvedSkills) {
+      const binding = await this.options.skills!.bindings.bind({
+        executionId: execution.executionId,
+        manifest: resolved.manifest,
+        policyId: policySnapshot.id,
+        authorization: resolved.authorization
+      });
+      skills.push(binding);
+      await this.options.coordinator.recordAuditFact(execution.executionId, "skill.bound", {
+        skillId: binding.skillId,
+        skillVersion: binding.skillVersion,
+        checksum: resolved.manifest.checksum
+      });
+    }
+
     return {
       execution,
       taskInput,
       contextSnapshot,
       policySnapshot,
-      promptSnapshot
+      promptSnapshot,
+      skills
     };
   }
 
@@ -257,6 +301,36 @@ export class TaskExecutionService {
       .filter(result => result.executionId === executionId)
       .sort((a, b) => a.finishedAt.localeCompare(b.finishedAt));
     return evaluateCompletionGate(results.at(-1));
+  }
+
+  /** Validates the requested skill set before anything starts. */
+  private authorizeSkills(
+    request: StartTaskRequest
+  ): Array<{ manifest: SkillManifest; authorization: SkillAuthorization }> {
+    const requested = request.skills ?? [];
+    if (requested.length === 0) return [];
+    if (!this.options.skills) {
+      throw new SkillDeniedError("Skills are not configured on this server");
+    }
+    const approved = new Set(request.approvedSkills ?? []);
+    const resolved: Array<{ manifest: SkillManifest; authorization: SkillAuthorization }> = [];
+
+    for (const skill of requested) {
+      const manifest = this.options.skills.registry.resolve(skill.skillId, skill.version);
+      const authorization = this.options.skills.registry.authorize(manifest, {
+        runtimeId: this.options.skills.runtimeId,
+        policy: request.policy
+      });
+      const key = `${manifest.skillId}@${manifest.version}`;
+      if (authorization.decision === "deny") {
+        throw new SkillDeniedError(`Skill ${key} is denied`, authorization.reasons);
+      }
+      if (authorization.decision === "require_approval" && !approved.has(key)) {
+        throw new SkillDeniedError(`Skill ${key} requires approval`, authorization.reasons);
+      }
+      resolved.push({ manifest, authorization });
+    }
+    return resolved;
   }
 
   async trace(executionId: string) {

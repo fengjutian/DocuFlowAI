@@ -21,6 +21,8 @@ import {
 } from "../persistence/records.js";
 import { TraceabilityQuery } from "../persistence/traceability.js";
 import { TaskExecutionService } from "../tasks/task-execution-service.js";
+import { SkillRegistry } from "../skills/skill-registry.js";
+import { SkillBindingStore, type SkillBindingEvent } from "../skills/skill-bindings.js";
 import type { ChangeRecord } from "../code-engine/change-record.js";
 import type { EvaluationResult } from "../evaluation/evaluation.js";
 import type { AgentRuntimeEvent } from "../types/adapter.js";
@@ -139,7 +141,18 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   const worktrees = new WorktreeManager(git, config.worktreeRoot, { repository: config.repository });
   const changes = new CodeChangePipeline(git, worktrees);
   const traceability = new TraceabilityQuery(stores);
-  const taskService = new TaskExecutionService({ git, coordinator, changes, stores, traceability });
+  const skillRegistry = new SkillRegistry();
+  const skillBindings = new SkillBindingStore(
+    new ImmutableRecordStore<SkillBindingEvent>(config.dataDir, "bindings")
+  );
+  const taskService = new TaskExecutionService({
+    git,
+    coordinator,
+    changes,
+    stores,
+    traceability,
+    skills: { registry: skillRegistry, bindings: skillBindings, runtimeId: "hermes-local" }
+  });
 
   return {
     deps: {
@@ -149,10 +162,12 @@ export function createRuntime(config: RuntimeConfig): Runtime {
       journal,
       bus,
       usage,
+      skills: { registry: skillRegistry, bindings: skillBindings },
       ...(config.token ? { token: config.token } : {})
     },
     ready: async () => {
       await usage.load();
+      await skillBindings.load();
     },
     close: () => coordinator.stopAll()
   };

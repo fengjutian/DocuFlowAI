@@ -18,7 +18,10 @@ import {
   type PromptSnapshotRecord
 } from "../../persistence/records.js";
 import { TraceabilityQuery } from "../../persistence/traceability.js";
-import { TaskExecutionService, type StartTaskRequest } from "../../tasks/task-execution-service.js";
+import { TaskExecutionService, SkillDeniedError, type StartTaskRequest } from "../../tasks/task-execution-service.js";
+import { SkillRegistry } from "../../skills/skill-registry.js";
+import { SkillBindingStore } from "../../skills/skill-bindings.js";
+import type { SkillManifest } from "../../skills/skill.js";
 import type { PolicySnapshot } from "../../policy/permission-policy.js";
 import {
   NO_CAPABILITIES,
@@ -80,6 +83,28 @@ async function setup() {
   const worktrees = new WorktreeManager(git, join(repo, ".worktrees"), { repository: repo });
   const changes = new CodeChangePipeline(git, worktrees);
   const traceability = new TraceabilityQuery(stores);
+  const skillRegistry = new SkillRegistry();
+  const skillBindings = new SkillBindingStore();
+  const skill = (overrides: Partial<SkillManifest> = {}): SkillManifest => ({
+    skillId: "react-dev",
+    version: "1.0.0",
+    name: "React development",
+    kind: "engineering",
+    permissions: ["read_file", "search_code", "modify_worktree"],
+    allowedRuntimes: ["hermes-local"],
+    riskLevel: "medium",
+    approvalPolicy: "auto",
+    checksum: "a".repeat(64),
+    createdAt: "2026-11-09T00:00:00.000Z",
+    ...overrides
+  });
+  skillRegistry.register(skill());
+  skillRegistry.register(skill({ skillId: "deploy", permissions: [], riskLevel: "high" }));
+  skillRegistry.register(skill({
+    skillId: "net-probe",
+    permissions: ["network_access"],
+    allowedRuntimes: ["*"]
+  }));
 
   const policy: PolicySnapshot = {
     snapshotId: "snap-1",
@@ -99,6 +124,7 @@ async function setup() {
     changes,
     stores,
     traceability,
+    skills: { registry: skillRegistry, bindings: skillBindings, runtimeId: "hermes-local" },
     runIdFactory: () => "run-1",
     snapshotIdFactory: prefix => `${prefix}-1`
   });
@@ -265,6 +291,66 @@ test("allows completion once every evaluation check passes", async () => {
 
     const gate = await service.completionGate("exec-1");
     assert.equal(gate.allowed, true);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("binds a requested skill and journals the binding", async () => {
+  const { repo, journal, coordinator, service, request } = await setup();
+  try {
+    const result = await service.startTask({ ...request, skills: [{ skillId: "react-dev" }] });
+
+    assert.equal(result.skills.length, 1);
+    assert.equal(result.skills[0]!.skillVersion, "1.0.0");
+
+    await coordinator.flush("exec-1");
+    const bound = (await journal.read("exec-1")).find(entry => entry.category === "skill.bound");
+    assert.equal(bound?.payload["skillId"], "react-dev");
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("refuses a skill whose permissions the policy does not grant", async () => {
+  const { repo, service, request } = await setup();
+  try {
+    await assert.rejects(
+      service.startTask({
+        ...request,
+        policy: { ...request.policy, grantedCapabilities: ["read_file"] },
+        skills: [{ skillId: "react-dev" }]
+      }),
+      (error: unknown) => error instanceof SkillDeniedError
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("refuses a high-risk skill without an explicit approval", async () => {
+  const { repo, service, request } = await setup();
+  try {
+    await assert.rejects(
+      service.startTask({ ...request, skills: [{ skillId: "deploy" }] }),
+      /requires approval/
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("binds a high-risk skill once it is approved", async () => {
+  const { repo, service, request } = await setup();
+  try {
+    const result = await service.startTask({
+      ...request,
+      skills: [{ skillId: "deploy" }],
+      approvedSkills: ["deploy@1.0.0"]
+    });
+
+    assert.equal(result.skills.length, 1);
+    assert.equal(result.skills[0]!.skillId, "deploy");
   } finally {
     await rm(repo, { recursive: true, force: true });
   }

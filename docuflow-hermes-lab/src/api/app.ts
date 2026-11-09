@@ -5,6 +5,11 @@ import type { JournalStore } from "../journal/journal.js";
 import type { UsageLedger } from "../accounting/usage.js";
 import type { ExecutionCoordinator } from "../orchestrator/execution-coordinator.js";
 import type { TaskExecutionService, StartTaskRequest } from "../tasks/task-execution-service.js";
+import { SkillDeniedError } from "../tasks/task-execution-service.js";
+import type { SkillBindingStore } from "../skills/skill-bindings.js";
+import type { SkillRegistry } from "../skills/skill-registry.js";
+import { SkillConflictError, SkillNotFoundError } from "../skills/skill-registry.js";
+import { SkillValidationError } from "../skills/skill.js";
 import { EventBus, formatSseFrame, journalEntryToEvent } from "./event-bus.js";
 
 /**
@@ -23,6 +28,8 @@ export interface ApiDependencies {
   bus: EventBus;
   /** Optional: without it the usage endpoint reports that accounting is not configured. */
   usage?: UsageLedger;
+  /** Optional skill surface; absent means the server cannot register or bind skills. */
+  skills?: { registry: SkillRegistry; bindings: SkillBindingStore };
   /** When set, every request must present `Authorization: Bearer <token>`. */
   token?: string;
   now?: () => Date;
@@ -218,6 +225,34 @@ async function route(
     return { status: 200, body: { summary: deps.usage.summary(), records: deps.usage.list() } };
   }
 
+  if (method === "GET" && matches(segments, ["api", "v1", "skills"])) {
+    if (!deps.skills) throw new ApiError(501, "skills_not_configured", "Skills are not wired into this server");
+    return {
+      status: 200,
+      body: {
+        skills: deps.skills.registry.list().map(manifest => ({
+          ...manifest,
+          deprecated: deps.skills!.registry.isDeprecated(manifest.skillId, manifest.version)
+        }))
+      }
+    };
+  }
+
+  if (method === "POST" && matches(segments, ["api", "v1", "skills"])) {
+    if (!deps.skills) throw new ApiError(501, "skills_not_configured", "Skills are not wired into this server");
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      throw new ApiError(400, "invalid_body", "A JSON object body is required");
+    }
+    deps.skills.registry.register(body as never);
+    return { status: 201, body: { registered: true } };
+  }
+
+  if (method === "GET" && matches(segments, ["api", "v1", "executions", ":id", "skills"])) {
+    const id = segments[3]!;
+    if (!deps.skills) throw new ApiError(501, "skills_not_configured", "Skills are not wired into this server");
+    return { status: 200, body: { bindings: deps.skills.bindings.forExecution(id) } };
+  }
+
   if (method === "GET" && matches(segments, ["api", "v1", "trace", "commits", ":sha"])) {
     const sha = segments[4]!;
     const trace = await deps.taskService.traceCommit(sha);
@@ -387,7 +422,38 @@ function toStartTaskRequest(taskId: string, body: unknown): StartTaskRequest {
       ? (record["allowedTools"] as unknown[]).every(item => typeof item === "string")
         ? (record["allowedTools"] as string[])
         : []
-      : []
+      : [],
+    ...(parseRequestedSkills(record) ?? {})
+  };
+}
+
+function parseRequestedSkills(record: Record<string, unknown>): Pick<StartTaskRequest, "skills" | "approvedSkills"> | undefined {
+  const raw = record["skills"];
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) throw new ApiError(400, "invalid_body", "Field 'skills' must be an array");
+
+  const skills = raw.map(item => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new ApiError(400, "invalid_body", "Each skill must be an object with a skillId");
+    }
+    const skill = item as Record<string, unknown>;
+    if (typeof skill["skillId"] !== "string" || skill["skillId"].trim() === "") {
+      throw new ApiError(400, "invalid_body", "Each skill needs a non-empty skillId");
+    }
+    return {
+      skillId: skill["skillId"],
+      ...(typeof skill["version"] === "string" ? { version: skill["version"] } : {})
+    };
+  });
+
+  const approvedRaw = record["approvedSkills"];
+  if (approvedRaw !== undefined && (!Array.isArray(approvedRaw) || !approvedRaw.every(item => typeof item === "string"))) {
+    throw new ApiError(400, "invalid_body", "Field 'approvedSkills' must be an array of strings");
+  }
+
+  return {
+    skills,
+    ...(Array.isArray(approvedRaw) ? { approvedSkills: approvedRaw as string[] } : {})
   };
 }
 
@@ -404,6 +470,18 @@ function readDecision(body: unknown): { decision: "approve" | "deny"; reason?: s
 function mapError(error: unknown): { status: number; code: string; message: string } {
   if (error instanceof ApiError) {
     return { status: error.status, code: error.code, message: error.message };
+  }
+  if (error instanceof SkillDeniedError) {
+    return { status: 403, code: "skill_denied", message: `${error.message}: ${error.reasons.join("; ")}` };
+  }
+  if (error instanceof SkillValidationError) {
+    return { status: 400, code: "invalid_skill", message: error.message };
+  }
+  if (error instanceof SkillConflictError) {
+    return { status: 409, code: "skill_conflict", message: error.message };
+  }
+  if (error instanceof SkillNotFoundError) {
+    return { status: 404, code: "skill_not_found", message: error.message };
   }
   if (error instanceof AgentAdapterError) {
     const status = {

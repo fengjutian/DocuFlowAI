@@ -4,6 +4,8 @@ import { AgentRuntimeRegistry } from "../../adapters/runtime-registry.js";
 import { createApiServer, type ApiDependencies } from "../../api/app.js";
 import { EventBus } from "../../api/event-bus.js";
 import { UsageLedger } from "../../accounting/usage.js";
+import { SkillRegistry } from "../../skills/skill-registry.js";
+import { SkillBindingStore } from "../../skills/skill-bindings.js";
 import { InMemoryJournalStore } from "../../journal/journal.js";
 import { ExecutionCoordinator } from "../../orchestrator/execution-coordinator.js";
 import type { TaskExecutionService, StartTaskRequest } from "../../tasks/task-execution-service.js";
@@ -23,7 +25,11 @@ interface Harness {
   coordinator: ExecutionCoordinator;
 }
 
-async function harness(options: { token?: string; usage?: UsageLedger } = {}): Promise<Harness> {
+async function harness(options: {
+  token?: string;
+  usage?: UsageLedger;
+  skills?: { registry: SkillRegistry; bindings: SkillBindingStore };
+} = {}): Promise<Harness> {
   const starts: StartTaskRequest[] = [];
   const cancelled: string[] = [];
   const approvals: Array<{ executionId: string; requestId: string; decision: string }> = [];
@@ -120,7 +126,8 @@ async function harness(options: { token?: string; usage?: UsageLedger } = {}): P
     journal,
     bus,
     ...(options.token ? { token: options.token } : {}),
-    ...(options.usage ? { usage: options.usage } : {})
+    ...(options.usage ? { usage: options.usage } : {}),
+    ...(options.skills ? { skills: options.skills } : {})
   };
   const server = await createApiServer(deps).listen(0);
   return {
@@ -390,6 +397,60 @@ test("streams live events as SSE with the design-13 envelope", async () => {
     assert.match(received, /event: agent\.message\.delta/);
   } finally {
     controller.abort();
+    await app.close();
+  }
+});
+
+test("registers and lists skills, and reports bindings per execution", async () => {
+  const skills = { registry: new SkillRegistry(), bindings: new SkillBindingStore() };
+  const app = await harness({ skills });
+  const manifest = {
+    skillId: "react-dev",
+    version: "1.0.0",
+    name: "React development",
+    kind: "engineering",
+    permissions: ["read_file"],
+    allowedRuntimes: ["hermes-local"],
+    riskLevel: "low",
+    approvalPolicy: "auto",
+    checksum: "a".repeat(64),
+    createdAt: "2026-11-09T00:00:00.000Z"
+  };
+  try {
+    const empty = await fetch(`${app.url}/api/v1/skills`);
+    assert.deepEqual((await empty.json() as { skills: unknown[] }).skills, []);
+
+    const created = await fetch(`${app.url}/api/v1/skills`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(manifest)
+    });
+    assert.equal(created.status, 201);
+
+    const listed = await fetch(`${app.url}/api/v1/skills`);
+    const body = await listed.json() as { skills: Array<{ skillId: string; deprecated: boolean }> };
+    assert.equal(body.skills.length, 1);
+    assert.equal(body.skills[0]!.deprecated, false);
+
+    const duplicate = await fetch(`${app.url}/api/v1/skills`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(manifest)
+    });
+    assert.equal(duplicate.status, 409);
+
+    const bindings = await fetch(`${app.url}/api/v1/executions/exec-1/skills`);
+    assert.deepEqual((await bindings.json() as { bindings: unknown[] }).bindings, []);
+  } finally {
+    await app.close();
+  }
+});
+
+test("reports 501 for skills when the server has no skill surface", async () => {
+  const app = await harness();
+  try {
+    assert.equal((await fetch(`${app.url}/api/v1/skills`)).status, 501);
+  } finally {
     await app.close();
   }
 });

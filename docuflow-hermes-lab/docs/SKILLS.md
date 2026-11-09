@@ -54,6 +54,22 @@ Bindings persist as an **append-only event log** (`bind` / `enable` / `disable`)
 `<data>/bindings/`, and `load()` folds the log back into current state. That keeps the file store
 immutable while still supporting the mutable `enabled` flag.
 
+## Binding during `startTask`
+
+Skills are authorized before the run starts, against the same policy snapshot the execution will use:
+
+```ts
+await service.startTask({ ...request, skills: [{ skillId: "react-dev" }], approvedSkills: ["deploy@1.0.0"] })
+```
+
+- `deny` aborts the task with `SkillDeniedError`; no execution is started.
+- `require_approval` also aborts unless the exact `skillId@version` is in `approvedSkills`.
+- Accepted skills are bound to the execution and journaled as `skill.bound` with the checksum.
+
+The API mirrors this: `POST /api/v1/tasks/{id}/executions` accepts `skills` / `approvedSkills`,
+`GET /api/v1/skills` lists versions with a `deprecated` flag, `POST /api/v1/skills` registers a
+manifest (400 invalid, 409 duplicate), and `GET /api/v1/executions/{id}/skills` returns bindings.
+
 ## Not implemented
 
 - Skill content review (design 10.2 "Skill 审核"): only the checksum is enforced, not a human approval.

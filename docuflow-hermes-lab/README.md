@@ -336,6 +336,12 @@ A skill must declare every permission it needs and the runtimes it may run on; a
 against the execution's policy snapshot, and high-risk or deprecated skills require approval. See
 [`docs/SKILLS.md`](docs/SKILLS.md).
 
+`startTask` accepts `skills: [{ skillId, version? }]` and authorizes each one against the same policy
+snapshot the run will use: a denied skill aborts the task, and a skill that needs approval must be
+listed in `approvedSkills`. Bindings are journaled as `skill.bound` and exposed at
+`GET /api/v1/executions/{id}/skills`. Register skills with `POST /api/v1/skills` and list them with
+`GET /api/v1/skills`.
+
 `UsageLedger` records model, tokens and duration per execution; `GET /api/v1/executions/{id}/usage` and
 `GET /api/v1/usage` expose it. An event with no usage data records nothing rather than a fake zero.
 Records persist under `<data>/usage/` and are reloaded at startup. See [`docs/COST.md`](docs/COST.md).
@@ -384,7 +390,8 @@ HERMES_PYTHON=/path/to/hermes/venv/bin/python npm run check:hermes
 
 On this machine that check reports `Installed Hermes is 0.15.1, but hermes.lock.json pins 0.23.0`, so
 every live validation stays `blocked` — running Phase 0 against the wrong version would be worse than
-not running it.
+not running it. A 0.23.0 upgrade was attempted with the official installer and abandoned after repeated
+TLS transfer failures on the 1.38 GB repository; the previous install was restored unchanged.
 
 ## Test status vocabulary
 

@@ -212,3 +212,12 @@ command".
 Decision: `HERMES_PYTHON` reads `importlib.metadata` (and `HERMES_VERSION_COMMAND` overrides entirely);
 the error message names the trap. On this machine the check reports 0.15.1 installed against the pinned
 0.23.0, which correctly keeps live validation blocked.
+
+## D-028: Skills are authorized before the run starts, not after
+Status: accepted
+Context: binding a skill after `start()` would let an execution run with tools nobody approved, and a
+"disabled binding" is still a record that looks like permission.
+Decision: `startTask` resolves and authorizes every requested skill against the same policy snapshot
+first. `deny` aborts; `require_approval` aborts unless the exact `skillId@version` appears in
+`approvedSkills`. Accepted skills are bound and journaled as `skill.bound`; nothing is silently
+downgraded.
