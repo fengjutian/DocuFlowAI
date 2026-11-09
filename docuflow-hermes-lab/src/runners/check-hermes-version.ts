@@ -46,4 +46,9 @@ function escapeRegex(value: string): string {
 }
 
 const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : undefined;
-if (invokedPath === import.meta.url) await main();
+if (invokedPath === import.meta.url) {
+  await main().catch(error => {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  });
+}
