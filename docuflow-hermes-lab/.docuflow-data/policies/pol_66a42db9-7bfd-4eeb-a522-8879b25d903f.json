@@ -1,0 +1,15 @@
+{
+  "id": "pol_66a42db9-7bfd-4eeb-a522-8879b25d903f",
+  "projectId": "docuflow",
+  "taskId": "TASK-UI-001",
+  "executionId": "exec_93216983-1a7a-46ef-8c7b-7c0a90e6693b",
+  "policyVersion": "v1",
+  "grantedCapabilities": [
+    "read_file",
+    "search_code"
+  ],
+  "deniedCapabilities": [],
+  "allowedPaths": [],
+  "expiresAt": "2026-11-10T03:33:02.132Z",
+  "createdAt": "2026-11-10T02:33:48.854Z"
+}

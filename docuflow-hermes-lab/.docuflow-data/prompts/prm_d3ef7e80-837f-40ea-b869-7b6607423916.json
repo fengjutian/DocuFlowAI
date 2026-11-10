@@ -1,0 +1,13 @@
+{
+  "id": "prm_d3ef7e80-837f-40ea-b869-7b6607423916",
+  "projectId": "docuflow",
+  "taskId": "TASK-UI-001",
+  "executionId": "exec_93216983-1a7a-46ef-8c7b-7c0a90e6693b",
+  "templateName": "default",
+  "templateVersion": "1.0.0",
+  "templateContentHash": "4d8653127c669f4d73b15b00f7c409039fa39b239dffbde45fda2dde4a43bc96",
+  "renderedPromptHash": "6291512c516c97281b6c61d97d145bb4a87c70d91416f0a24b840be2b6ad32b4",
+  "contextSnapshotId": "ctx_acc7e993-16a1-42a5-9ca9-3ecf3b29d722",
+  "modelConfig": {},
+  "createdAt": "2026-11-10T02:33:48.861Z"
+}

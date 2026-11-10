@@ -17,6 +17,7 @@
     "check:hermes": "npm run build && node dist/runners/check-hermes-version.js",
     "probe:pi-tools": "npm run build && node scripts/probe-pi-tools.mjs",
     "serve": "npm run build && node dist/server/main.js",
+    "dev:stack": "npm run build && node dist/runners/dev-stack.js",
     "acp:serve": "npm run build && node dist/runners/acp-server.js",
     "install:zed": "npm run build && node dist/runners/install-zed.js",
     "typecheck": "tsc --noEmit"

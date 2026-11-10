@@ -109,6 +109,12 @@ export function proposeChange(patch: string, options: ProposeOptions = {}): Chan
   if (/^deleted file mode /m.test(patch)) {
     risks.push({ code: "deletion", message: "Patch deletes at least one file", blocked: false });
   }
+  // A removal does not always carry the `deleted file mode` marker, and `git apply` deletes the
+  // file either way. Design 8 puts "delete file" at P2 - human approval - so an unmarked removal
+  // must not slip through as an ordinary modification.
+  for (const file of extractRemovedFiles(patch)) {
+    risks.push({ code: "deletion", message: `'${file}' removes a file`, blocked: false });
+  }
   if (/^Binary files .* differ$/m.test(patch) || /^GIT binary patch$/m.test(patch)) {
     risks.push({ code: "binary_patch", message: "Patch contains binary content", blocked: false });
   }
@@ -134,8 +140,7 @@ export function hashPatch(patch: string): string {
 }
 
 /** Paths mentioned by a patch, normalized and de-duplicated. */
-export function extractPatchFiles(patch: string): string[] {
-  const files = new Set<string>();
+export function extractPatchFiles(patch: string): string[] {  const files = new Set<string>();
   for (const rawLine of patch.split(/\r?\n/)) {
     const line = rawLine;
     if (line.startsWith("diff --git ")) {
@@ -162,6 +167,35 @@ export function extractPatchFiles(patch: string): string[] {
 
 function addPath(files: Set<string>, path: string): void {
   if (path) files.add(path.replace(/^\.\//, ""));
+}
+
+/**
+ * The files a patch removes.
+ *
+ * A removal is the `---` side of a hunk whose `+++` side is `/dev/null`. The marker
+ * `deleted file mode` is optional, so the marker cannot be the detector: the hunk itself is.
+ */
+export function extractRemovedFiles(patch: string): string[] {
+  const removed = new Set<string>();
+  let source: string | undefined;
+  for (const rawLine of patch.split(/\r?\n/)) {
+    const line = rawLine;
+    if (line.startsWith("diff --git ")) {
+      source = undefined;
+      continue;
+    }
+    if (line.startsWith("--- ")) {
+      const candidate = line.slice(4).trim();
+      source = candidate === "/dev/null" ? undefined : stripPrefix(unquote(candidate.split("\t")[0]!));
+      continue;
+    }
+    if (line.startsWith("+++ ")) {
+      const candidate = line.slice(4).trim();
+      if (candidate === "/dev/null" && source) removed.add(source);
+      continue;
+    }
+  }
+  return [...removed].sort();
 }
 
 function stripPrefix(path: string): string {

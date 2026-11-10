@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { extractPatchFiles, hashPatch, proposeChange } from "../../code-engine/diff-analysis.js";
+import { extractPatchFiles, extractRemovedFiles, hashPatch, proposeChange } from "../../code-engine/diff-analysis.js";
 
 const simplePatch = [
   "diff --git a/src/index.ts b/src/index.ts",
@@ -85,6 +85,34 @@ test("flags deletions, binary patches and oversized diffs", () => {
 
   const large = proposeChange(simplePatch, { maxPatchChars: 10 });
   assert.ok(large.risks.some(risk => risk.code === "large_patch"));
+});
+
+test("flags a removal that carries no deletion marker", () => {
+  // `git apply` deletes the file here, so the risk analysis has to see it too: design 8 puts
+  // "delete file" at P2, which means human approval, not a silent apply.
+  const removal = proposeChange(
+    "diff --git a/src/keep.ts b/src/keep.ts\n--- a/src/keep.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n"
+  );
+  assert.ok(
+    removal.risks.some(risk => risk.code === "deletion" && risk.blocked === false),
+    "the removal needs approval"
+  );
+  assert.equal(removal.requiresApproval, true);
+  assert.equal(removal.blocked, false);
+  assert.deepEqual(extractRemovedFiles(
+    "diff --git a/src/keep.ts b/src/keep.ts\n--- a/src/keep.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-gone\n"
+  ), ["src/keep.ts"]);
+});
+
+test("a new file is not a removal", () => {
+  const creation = proposeChange(
+    "diff --git a/doc/new.md b/doc/new.md\nnew file mode 100644\n--- /dev/null\n+++ b/doc/new.md\n@@ -0,0 +1 @@\n+hello\n"
+  );
+  assert.deepEqual(extractRemovedFiles(
+    "diff --git a/doc/new.md b/doc/new.md\nnew file mode 100644\n--- /dev/null\n+++ b/doc/new.md\n@@ -0,0 +1 @@\n+hello\n"
+  ), []);
+  assert.ok(!creation.risks.some(risk => risk.code === "deletion"));
+  assert.equal(creation.requiresApproval, false);
 });
 
 test("blocks an empty patch because it authorizes nothing", () => {
