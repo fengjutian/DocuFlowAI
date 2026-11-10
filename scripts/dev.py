@@ -272,10 +272,18 @@ def spawn(tag: str, command: list[str], cwd: Path) -> Managed:
     return managed
 
 
-def npm_command(script: str) -> list[str]:
-    """npm is a batch file on Windows; CreateProcess handles it directly."""
+def npm_command(script: str, *args: str) -> list[str]:
+    """npm is a batch file on Windows; CreateProcess handles it directly.
+
+    Extra arguments go after a ``--`` separator: ``npm run tauri dev`` is
+    read by npm as a script literally named "tauri dev" ("Missing script"),
+    while ``npm run tauri -- dev`` forwards "dev" to the tauri binary.
+    """
     npm = shutil.which("npm.cmd" if os.name == "nt" else "npm") or "npm"
-    return [npm, "run", script]
+    command = [npm, "run", script]
+    if args:
+        command += ["--", *args]
+    return command
 
 
 # ------------------------------------------------------------------ lifecycle
@@ -426,6 +434,26 @@ def kill_orphan_listeners() -> None:
             time.sleep(0.3)
 
 
+def _diagnose_ui_exit(args: argparse.Namespace, ui: Managed) -> None:
+    """Explain the desktop-mode failure that is easy to misread as a bug.
+
+    The Tauri window opens fine on most machines, but a broken WebView2
+    runtime on this host makes the app panic with
+    "Failed to setup app: 拒绝访问。 (os error 5)" — a runtime problem,
+    not a defect in this project.
+    """
+    if args.mode != "desktop":
+        return
+    try:
+        tail = ui.log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    if "os error 5" in tail or "Failed to setup app" in tail:
+        error("桌面窗口创建失败：本机 WebView2 运行时不可用（os error 5）。")
+        note("这是本机环境问题，不是本工程的代码缺陷。改用浏览器形态：")
+        note("    python scripts/dev.py --mode browser")
+
+
 def main() -> int:
     _configure_streams()
     _install_signal_handlers()
@@ -469,8 +497,12 @@ def main() -> int:
         wait_for_api(api)
 
         step(f"启动前端（{args.mode}）")
-        script = "tauri dev" if args.mode == "desktop" else "dev"
-        ui = spawn("ui", npm_command(script), UI_DIR)
+        if args.mode == "desktop":
+            # `tauri` is the npm script; `dev` is the tauri sub-command.
+            ui_command = npm_command("tauri", "dev")
+        else:
+            ui_command = npm_command("dev")
+        ui = spawn("ui", ui_command, UI_DIR)
         handles.append(ui)
         write_pid_file(handles)
 
@@ -492,6 +524,7 @@ def main() -> int:
             for handle in handles:
                 if handle.exited:
                     error(f"[{handle.tag}] 进程已退出，退出码 {handle.exit_code}")
+                    _diagnose_ui_exit(args, handle)
                     raise SystemExit(f"进程 {handle.tag} 提前退出，日志：{handle.log_path}")
             time.sleep(0.15)
     except KeyboardInterrupt:

@@ -52,8 +52,8 @@ npm run dev:stack
 
 # 前端
 cd docuflow-workspace
-npm run dev          # 浏览器形态
-npm run tauri dev    # 桌面形态
+npm run dev            # 浏览器形态
+npm run tauri -- dev   # 桌面形态（`--` 之后才是传给 tauri 的子命令）
 ```
 
 ## 依赖

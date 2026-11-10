@@ -41,7 +41,7 @@ npm run dev:stack      # API 服务 + lab 自带的 mock Hermes，监听 127.0.0
 ```powershell
 cd ..\docuflow-workspace
 npm install
-npm run tauri dev      # 开发；npm run tauri build 产出安装包
+npm run tauri -- dev      # 开发；npm run tauri -- build 产出安装包
 ```
 
 只想看界面：`npm run dev`，浏览器打开 <http://localhost:1420> 即可（后端地址在左下角「连接设置」里改）。
