@@ -28,7 +28,7 @@ import type { SkillBinding, SkillBindingStore } from "../skills/skill-bindings.j
 import { summarizeSkillEffectiveness, type SkillEffectiveness } from "../skills/skill-effectiveness.js";
 import type { SkillRegistry, SkillAuthorization } from "../skills/skill-registry.js";
 import type { SkillManifest } from "../skills/skill.js";
-import type { AgentExecution, AgentTaskInput } from "../types/adapter.js";
+import type { AgentExecution, AgentRuntimeAdapter, AgentTaskInput } from "../types/adapter.js";
 
 /** A skill the caller wants bound to this execution. */
 export interface RequestedSkill {
@@ -69,6 +69,20 @@ export interface StartTaskRequest {
   skills?: RequestedSkill[];
   /** `skillId@version` entries the caller has already had approved by a human. */
   approvedSkills?: string[];
+  /**
+   * The acceptance checks this task must pass.
+   *
+   * They are declared by the caller, not by the agent: the runtime may run them, but it may not
+   * write them. A task without checks has no evidence, and the completion gate stays closed.
+   */
+  evaluationChecks?: EvaluationCheckSpec[];
+  /**
+   * Which registered runtime runs this task. Omitted means the server's default runtime.
+   *
+   * The runtime id is a DocuFlow concept, not a runtime-specific one: the caller names the
+   * registered runtime, and DocuFlow resolves it to the adapter behind that id.
+   */
+  runtimeId?: string;
 }
 
 export interface StartTaskResult {
@@ -88,6 +102,12 @@ export interface TaskExecutionServiceOptions {
   traceability: TraceabilityQuery;
   /** Optional skill support: without it, `skills` in a request is rejected rather than ignored. */
   skills?: { registry: SkillRegistry; bindings: SkillBindingStore; runtimeId: string };
+  /**
+   * Resolves a runtime id to the adapter behind it. Without it every task runs on the server's
+   * default runtime, and a request that names a different runtime is rejected rather than
+   * silently redirected. The special id `auto` lets the server pick.
+   */
+  resolveRuntime?: (runtimeId: string) => AgentRuntimeAdapter | undefined | Promise<AgentRuntimeAdapter | undefined>;
   now?: () => Date;
   runIdFactory?: () => string;
   snapshotIdFactory?: (prefix: string) => string;
@@ -97,6 +117,8 @@ interface Session {
   taskInput: AgentTaskInput;
   contextSnapshotId: string;
   policySnapshotId: string;
+  /** The acceptance checks declared for this task; empty means "no evidence declared". */
+  evaluationChecks: readonly EvaluationCheckSpec[];
 }
 
 export class TaskExecutionService {
@@ -147,7 +169,7 @@ export class TaskExecutionService {
       correlationId: request.correlationId
     };
 
-    const execution = await this.options.coordinator.start(taskInput);
+    const execution = await this.options.coordinator.start(taskInput, await this.selectRuntime(request.runtimeId));
 
     const policySnapshot: PolicySnapshotRecord = {
       ...toPolicySnapshotRecord(request.policy, { createdAt: this.now().toISOString() }),
@@ -176,7 +198,8 @@ export class TaskExecutionService {
     this.sessions.set(execution.executionId, {
       taskInput,
       contextSnapshotId: contextSnapshot.id,
-      policySnapshotId: policySnapshot.id
+      policySnapshotId: policySnapshot.id,
+      evaluationChecks: [...(request.evaluationChecks ?? [])]
     });
     await this.options.coordinator.recordAuditFact(execution.executionId, "context.snapshot", {
       contextSnapshotId: contextSnapshot.id,
@@ -302,6 +325,40 @@ export class TaskExecutionService {
       .filter(result => result.executionId === executionId)
       .sort((a, b) => a.finishedAt.localeCompare(b.finishedAt));
     return evaluateCompletionGate(results.at(-1));
+  }
+
+  /**
+   * The policy snapshot an execution runs under, in the shape the policy engine reads.
+   *
+   * The tool surface asks for it at call time, because the snapshot is written after the run starts
+   * and the tool must be judged by the snapshot the execution actually runs under.
+   */
+  async policyFor(executionId: string): Promise<PolicySnapshot> {
+    const session = this.sessions.get(executionId);
+    const record = await this.resolvePolicy(executionId, session?.policySnapshotId);
+    return toEvaluatorSnapshot(record);
+  }
+
+  /** The acceptance checks the task declared; empty means the task has no evidence of its own. */
+  evaluationChecksFor(executionId: string): readonly EvaluationCheckSpec[] {
+    return this.sessions.get(executionId)?.evaluationChecks ?? [];
+  }
+
+  /**
+   * Resolves the runtime a task should run on.
+   *
+   * A request that names a runtime is honoured or refused, never quietly redirected: running a task
+   * on a different runtime than the caller asked for would change which policy and tools apply.
+   */
+  private async selectRuntime(runtimeId: string | undefined): Promise<AgentRuntimeAdapter | undefined> {
+    if (!runtimeId) return undefined;
+    const resolve = this.options.resolveRuntime;
+    if (!resolve) {
+      throw new Error(`Runtime ${runtimeId} was requested but this server has no runtime registry`);
+    }
+    const adapter = await resolve(runtimeId);
+    if (!adapter) throw new Error(`Unknown runtime ${runtimeId}`);
+    return adapter;
   }
 
   /** Validates the requested skill set before anything starts. */

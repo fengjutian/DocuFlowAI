@@ -284,6 +284,83 @@ test("lists and answers pending approvals", async () => {
   }
 });
 
+test("answers an approval through the design's approval path", async () => {
+  const app = await harness();
+  try {
+    await fetch(`${app.url}/api/v1/tasks/task-1/executions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(startBody())
+    });
+
+    const approve = await fetch(`${app.url}/api/v1/approvals/req-1/approve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ reason: "reviewed by a human" })
+    });
+    assert.equal(approve.status, 200);
+    assert.deepEqual(await approve.json(), {
+      executionId: "exec-1",
+      requestId: "req-1",
+      decision: "approve"
+    });
+    assert.deepEqual(app.approvals, [{ executionId: "exec-1", requestId: "req-1", decision: "approve" }]);
+  } finally {
+    await app.close();
+  }
+});
+
+test("rejects an approval for a request nobody is waiting on", async () => {
+  const app = await harness();
+  try {
+    const reject = await fetch(`${app.url}/api/v1/approvals/req-unknown/reject`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({})
+    });
+    assert.equal(reject.status, 404);
+    assert.deepEqual(app.approvals, []);
+  } finally {
+    await app.close();
+  }
+});
+
+test("carries the named runtime and the declared checks into the start request", async () => {
+  const app = await harness();
+  try {
+    await fetch(`${app.url}/api/v1/tasks/task-1/executions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        ...startBody(),
+        runtimeId: "pi-local",
+        evaluationChecks: [{ id: "build", name: "Build", command: "npm", args: ["run", "build"] }]
+      })
+    });
+    assert.equal(app.starts[0]!.runtimeId, "pi-local");
+    assert.deepEqual(app.starts[0]!.evaluationChecks, [
+      { id: "build", name: "Build", command: "npm", args: ["run", "build"] }
+    ]);
+  } finally {
+    await app.close();
+  }
+});
+
+test("refuses a malformed acceptance check before the task starts", async () => {
+  const app = await harness();
+  try {
+    const response = await fetch(`${app.url}/api/v1/tasks/task-1/executions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...startBody(), evaluationChecks: [{ id: "build" }] })
+    });
+    assert.equal(response.status, 400);
+    assert.equal(app.starts.length, 0, "nothing started");
+  } finally {
+    await app.close();
+  }
+});
+
 test("reports an unsupported resume instead of pretending", async () => {
   const app = await harness();
   try {

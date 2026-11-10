@@ -150,6 +150,50 @@ test("without a policy handler every tool call is blocked", async () => {
   assert.deepEqual(executed, [], "no handler means no execution");
 });
 
+test("the tool set is built per execution when tools is a function", async () => {
+  executed = [];
+  const bound: Array<{ taskId: string; executionId: string }> = [];
+  const adapter = new PiAdapter(
+    makeFactory([fauxAssistantMessage([fauxToolCall("read_file", { path: "README.md" })])]),
+    {
+      tools: (input, executionId) => {
+        bound.push({ taskId: input.taskId, executionId });
+        return [readFileTool];
+      },
+      permissionHandler: async () => ({ decision: "approve" })
+    }
+  );
+  const execution = await adapter.start(makeInput());
+  await new Promise(resolve => setTimeout(resolve, 250));
+
+  assert.equal(bound.length, 1, "the binder ran once for this execution");
+  assert.equal(bound[0]!.taskId, "task-1");
+  assert.equal(bound[0]!.executionId, execution.executionId, "the binder knows the execution id");
+  assert.deepEqual(executed, ["README.md"], "the bound tool really ran");
+});
+
+test("a self-enforced tool runs without a second permission decision", async () => {
+  executed = [];
+  let handlerCalls = 0;
+  const adapter = new PiAdapter(
+    makeFactory([fauxAssistantMessage([fauxToolCall("read_file", { path: "README.md" })])]),
+    {
+      tools: [readFileTool],
+      // The tool checks the policy itself, so the adapter must not gate it a second time.
+      selfEnforcedTools: ["read_file"],
+      permissionHandler: async () => {
+        handlerCalls += 1;
+        return { decision: "deny", reason: "the handler should not have been asked" };
+      }
+    }
+  );
+  const execution = await adapter.start(makeInput());
+  await new Promise(resolve => setTimeout(resolve, 250));
+
+  assert.equal(handlerCalls, 0, "the permission handler was not consulted");
+  assert.deepEqual(executed, ["README.md"], "the self-enforced tool ran");
+});
+
 test("cancel stops the run and records a single terminal event", async () => {
   const slowTool = {
     name: "slow_tool",

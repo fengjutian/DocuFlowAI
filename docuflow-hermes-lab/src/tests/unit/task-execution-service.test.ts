@@ -31,7 +31,9 @@ import {
 import type { ChangeRecord } from "../../code-engine/change-record.js";
 import type { EvaluationResult } from "../../evaluation/evaluation.js";
 
-async function setup() {
+async function setup(options: {
+  resolveRuntime?: (runtimeId: string) => AgentRuntimeAdapter | undefined | Promise<AgentRuntimeAdapter | undefined>;
+} = {}) {
   const repo = await mkdtemp(join(tmpdir(), "docuflow-task-"));
   const git = new SpawnGitRunner();
   await gitOrThrow(git, ["init", "-b", "main"], { cwd: repo });
@@ -126,7 +128,8 @@ async function setup() {
     traceability,
     skills: { registry: skillRegistry, bindings: skillBindings, runtimeId: "hermes-local" },
     runIdFactory: () => "run-1",
-    snapshotIdFactory: prefix => `${prefix}-1`
+    snapshotIdFactory: prefix => `${prefix}-1`,
+    ...(options.resolveRuntime ? { resolveRuntime: options.resolveRuntime } : {})
   });
 
   const request: StartTaskRequest = {
@@ -157,6 +160,82 @@ const patch = [
   "+export const value = 2;",
   ""
 ].join("\n");
+
+test("runs a task on the runtime the caller named", async () => {
+  const chosen: AgentRuntimeAdapter = {
+    async getCapabilities() { return NO_CAPABILITIES; },
+    async healthCheck() { return true; },
+    async start() { return { executionId: "exec-pi", runtimeType: "native", status: "running" }; },
+    async getStatus() { return "running"; },
+    async cancel() { return undefined; },
+    async resume() { throw new Error("not used"); },
+    async subscribe() { return async () => undefined; },
+    async terminate() { return undefined; }
+  };
+  const asked: string[] = [];
+  const { repo, coordinator, service, request } = await setup({
+    resolveRuntime: runtimeId => {
+      asked.push(runtimeId);
+      return chosen;
+    }
+  });
+  try {
+    await service.startTask({ ...request, runtimeId: "pi-local" });
+    assert.deepEqual(asked, ["pi-local"]);
+    assert.equal(coordinator.adapterFor("exec-pi"), chosen, "the named runtime owns the execution");
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("refuses an unknown runtime instead of running on another one", async () => {
+  const { repo, service, request } = await setup({ resolveRuntime: () => undefined });
+  try {
+    await assert.rejects(
+      () => service.startTask({ ...request, runtimeId: "does-not-exist" }),
+      /Unknown runtime does-not-exist/
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("refuses a named runtime when this server has no runtime registry", async () => {
+  const { repo, service, request } = await setup();
+  try {
+    await assert.rejects(
+      () => service.startTask({ ...request, runtimeId: "pi-local" }),
+      /no runtime registry/
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("the policy of an execution is the snapshot it runs under", async () => {
+  const { repo, service, request } = await setup();
+  try {
+    await service.startTask(request);
+    const policy = await service.policyFor("exec-1");
+    assert.equal(policy.grantedCapabilities.includes("*"), true);
+    assert.equal(policy.allowedPaths.includes(request.worktreePath), true);
+    assert.equal(policy.snapshotId, "pol-1");
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("the acceptance checks of an execution are the ones the task declared", async () => {
+  const { repo, service, request } = await setup();
+  try {
+    const checks = [{ id: "build", name: "Build", command: "npm", args: ["run", "build"] }];
+    await service.startTask({ ...request, evaluationChecks: checks });
+    assert.deepEqual(service.evaluationChecksFor("exec-1"), checks);
+    assert.deepEqual(service.evaluationChecksFor("exec-unknown"), [], "an unknown execution has no checks");
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
 
 test("starts a task with context, policy and prompt snapshots", async () => {
   const { repo, baseSha, stores, journal, coordinator, service, request } = await setup();

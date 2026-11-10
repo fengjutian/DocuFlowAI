@@ -33,6 +33,8 @@ export interface ExecutionCoordinatorOptions {
 interface Session {
   execution: AgentExecution;
   input: AgentTaskInput;
+  /** The adapter that owns this execution. Different executions may run on different runtimes. */
+  adapter: AgentRuntimeAdapter;
   chain: Promise<void>;
   nextJournalSequence: number;
   errors: Error[];
@@ -53,18 +55,27 @@ export class ExecutionCoordinator {
     this.now = options.now ?? (() => new Date());
   }
 
-  async start(input: AgentTaskInput): Promise<AgentExecution> {
-    const execution = await this.options.adapter.start(input);
+  /**
+   * Starts an execution.
+   *
+   * `adapter` overrides the default runtime for this one execution, which is how a multi-runtime
+   * setup routes work: the caller picks the runtime, the coordinator remembers which adapter owns
+   * the execution so later status, approval and cancellation calls reach the right one.
+   */
+  async start(input: AgentTaskInput, adapter?: AgentRuntimeAdapter): Promise<AgentExecution> {
+    const selected = adapter ?? this.options.adapter;
+    const execution = await selected.start(input);
     const session: Session = {
       execution,
       input,
+      adapter: selected,
       chain: Promise.resolve(),
       nextJournalSequence: 1,
       errors: []
     };
     this.sessions.set(execution.executionId, session);
 
-    session.unsubscribe = await this.options.adapter.subscribe(execution.executionId, event => {
+    session.unsubscribe = await selected.subscribe(execution.executionId, event => {
       this.enqueue(session, async () => {
         await recordRuntimeEvent(this.options.journal, event, session.nextJournalSequence);
         session.nextJournalSequence += 1;
@@ -87,7 +98,10 @@ export class ExecutionCoordinator {
 
   async recover(executionId: string, context?: CheckpointContext): Promise<RecoverResult> {
     const checkpoint = await this.getCheckpoint(executionId, context);
-    const capabilities = await this.options.adapter.getCapabilities();
+    // Recovery must ask the runtime that owns the execution: a resume only works on the runtime
+    // that still holds the session, and capabilities differ between runtimes.
+    const adapter = this.adapterFor(executionId);
+    const capabilities = await adapter.getCapabilities();
     const sessionResumable = this.options.isSessionResumable
       ? await this.options.isSessionResumable(executionId)
       : false;
@@ -103,7 +117,7 @@ export class ExecutionCoordinator {
     }
 
     if (plan.action === "resume") {
-      const execution = await this.options.adapter.resume(executionId);
+      const execution = await adapter.resume(executionId);
       return { plan, execution };
     }
 
@@ -113,13 +127,13 @@ export class ExecutionCoordinator {
 
   async cancel(executionId: string): Promise<void> {
     await this.recordAuditFact(executionId, "execution.cancel_requested", {});
-    await this.options.adapter.cancel(executionId);
+    await this.adapterFor(executionId).cancel(executionId);
   }
 
   async terminate(executionId: string): Promise<void> {
     await this.recordAuditFact(executionId, "execution.terminate_requested", {});
     const session = this.sessions.get(executionId);
-    await this.options.adapter.terminate(executionId);
+    await this.adapterFor(executionId).terminate(executionId);
     if (session?.unsubscribe) await session.unsubscribe().catch(() => undefined);
     this.sessions.delete(executionId);
   }
@@ -150,9 +164,36 @@ export class ExecutionCoordinator {
     });
   }
 
-  /** The adapter this coordinator drives; the API layer uses it for approval round-trips. */
+  /**
+   * The adapter that owns an execution.
+   *
+   * With more than one runtime registered, "the adapter" is ambiguous: a permission response or a
+   * cancel must reach the runtime that is actually running the task. The session records which
+   * adapter started the execution; for an unknown execution the default adapter answers, because
+   * guessing wrong would send the call to a runtime that never saw the task.
+   */
+  adapterFor(executionId: string): AgentRuntimeAdapter {
+    return this.sessions.get(executionId)?.adapter ?? this.options.adapter;
+  }
+
+  /** The default adapter; used when no execution context identifies a runtime. */
   getAdapter(): AgentRuntimeAdapter {
     return this.options.adapter;
+  }
+
+  /**
+   * The execution that owns a pending approval request.
+   *
+   * Design 12.3 addresses an approval by its own request id, not by execution id, so the server
+   * has to find the execution first. The owner is the adapter that raised the request — the same
+   * adapter that must receive the answer.
+   */
+  async findByPermissionRequest(requestId: string): Promise<string | undefined> {
+    for (const [executionId, session] of this.sessions) {
+      const pending = session.adapter.getPendingPermissions?.(executionId) ?? [];
+      if (pending.some(request => request.requestId === requestId)) return executionId;
+    }
+    return undefined;
   }
 
   /** The task input this coordinator started, for lineage and subagent spawning. */
@@ -213,7 +254,8 @@ export class ExecutionCoordinator {
       runId: `run_${randomUUID()}`,
       prompt: `${original.prompt}\n\n${renderCheckpoint(checkpoint)}`
     };
-    const execution = await this.start(input);
+    // A rebuild continues on the same runtime: the checkpoint describes that runtime's work.
+    const execution = await this.start(input, this.adapterFor(checkpoint.executionId));
     await this.recordAuditFact(execution.executionId, "recovery.rebuild", {
       previousExecutionId: checkpoint.executionId,
       previousLastSequence: checkpoint.lastSequence,

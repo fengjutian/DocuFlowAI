@@ -1,11 +1,15 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { AgentAdapterError } from "../types/adapter.js";
 import type { AgentRuntimeRegistry } from "../adapters/runtime-registry.js";
+import type { RuntimeScheduler } from "../adapters/runtime-scheduler.js";
+import type { SubagentManager } from "../orchestrator/subagent-manager.js";
 import type { JournalStore } from "../journal/journal.js";
 import type { UsageLedger } from "../accounting/usage.js";
 import type { ExecutionCoordinator } from "../orchestrator/execution-coordinator.js";
 import type { TaskExecutionService, StartTaskRequest } from "../tasks/task-execution-service.js";
 import { SkillDeniedError } from "../tasks/task-execution-service.js";
+import type { EvaluationCheckSpec } from "../evaluation/evaluation.js";
+import type { AgentTaskInput } from "../types/adapter.js";
 import type { SkillBindingStore } from "../skills/skill-bindings.js";
 import type { SkillRegistry } from "../skills/skill-registry.js";
 import { SkillConflictError, SkillNotFoundError } from "../skills/skill-registry.js";
@@ -30,6 +34,10 @@ export interface ApiDependencies {
   usage?: UsageLedger;
   /** Optional skill surface; absent means the server cannot register or bind skills. */
   skills?: { registry: SkillRegistry; bindings: SkillBindingStore };
+  /** Optional multi-runtime selection; absent means only the `auto` runtime id is unavailable. */
+  scheduler?: RuntimeScheduler;
+  /** Optional subagent spawning; absent means the server cannot delegate to a child execution. */
+  subagents?: SubagentManager;
   /** When set, every request must present `Authorization: Bearer <token>`. */
   token?: string;
   now?: () => Date;
@@ -52,6 +60,42 @@ export class ApiError extends Error {
 }
 
 const MAX_BODY_BYTES = 1_000_000;
+
+/**
+ * Origins allowed to call this server from a browser context.
+ *
+ * The desktop client (Tauri webview) and the Vite dev server run on a different origin than the API,
+ * and a browser refuses such requests unless the server says so. The list is an allowlist, never a
+ * wildcard: CORS is not authentication — the bearer token still is — but a loopback lab server should
+ * not answer arbitrary pages that ask.
+ */
+const DEFAULT_ALLOWED_ORIGINS = [
+  "http://localhost:1420",
+  "http://127.0.0.1:1420",
+  "http://localhost:1421",
+  "http://tauri.localhost",
+  "https://tauri.localhost"
+];
+
+function allowedOrigins(env: NodeJS.ProcessEnv = process.env): Set<string> {
+  const configured = (env["DOCUFLOW_ALLOWED_ORIGINS"] ?? "")
+    .split(",")
+    .map(origin => origin.trim())
+    .filter(origin => origin !== "");
+  return new Set([...DEFAULT_ALLOWED_ORIGINS, ...configured]);
+}
+
+/** Applies CORS headers for allowlisted origins; returns true when the origin is allowed. */
+function applyCors(request: IncomingMessage, response: ServerResponse): boolean {
+  const origin = request.headers.origin;
+  if (typeof origin !== "string" || !allowedOrigins().has(origin)) return false;
+  response.setHeader("Access-Control-Allow-Origin", origin);
+  response.setHeader("Vary", "Origin");
+  response.setHeader("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS");
+  response.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Last-Event-ID");
+  response.setHeader("Access-Control-Expose-Headers", "Content-Type");
+  return true;
+}
 
 export function createApiServer(deps: ApiDependencies) {
   return {
@@ -84,6 +128,18 @@ async function handleRequest(
   try {
     const url = new URL(request.url ?? "/", "http://localhost");
     const method = request.method ?? "GET";
+
+    // CORS first: a preflight carries no Authorization header, so it cannot pass the auth check.
+    const originAllowed = applyCors(request, response);
+    if (method === "OPTIONS") {
+      if (!originAllowed) {
+        sendJson(response, 403, { error: "origin_not_allowed", message: "This origin may not call the API" });
+        return;
+      }
+      response.writeHead(204);
+      response.end();
+      return;
+    }
 
     if (url.pathname === "/api/v1/events") {
       if (!authorize(request, deps, response)) return;
@@ -130,6 +186,23 @@ async function route(
     };
   }
 
+  if (method === "GET" && matches(segments, ["api", "v1", "runtimes", ":id"])) {
+    const id = segments[3]!;
+    const entry = deps.registry.list().find(item => item.id === id);
+    if (!entry) throw new ApiError(404, "runtime_not_found", `Runtime ${id} is not registered`);
+    const health = await deps.registry.healthCheckAll();
+    return {
+      status: 200,
+      body: {
+        id: entry.id,
+        runtimeType: entry.runtimeType,
+        version: entry.version ?? null,
+        metadata: entry.metadata ?? {},
+        health: health.runtimes.find(item => item.id === id) ?? null
+      }
+    };
+  }
+
   if (method === "POST" && matches(segments, ["api", "v1", "runtimes", ":id", "health-check"])) {
     const id = segments[3]!;
     const report = await deps.registry.healthCheckAll();
@@ -166,17 +239,128 @@ async function route(
     return { status: 200, body: { events: entries.map(journalEntryToEvent) } };
   }
 
+  if (method === "GET" && matches(segments, ["api", "v1", "executions", ":id", "logs"])) {
+    // The raw journal, not the event projection: an auditor needs the exact recorded lines.
+    const id = segments[3]!;
+    const entries = await deps.journal.read(id);
+    return {
+      status: 200,
+      body: {
+        executionId: id,
+        count: entries.length,
+        entries: entries.map(entry => ({
+          sequence: entry.sequence,
+          kind: entry.kind,
+          recordedAt: entry.recordedAt,
+          ...(entry.category ? { category: entry.category } : {}),
+          ...(entry.payload !== undefined ? { payload: entry.payload } : {})
+        }))
+      }
+    };
+  }
+
+  if (method === "POST" && matches(segments, ["api", "v1", "executions", ":id", "changes"])) {
+    const id = segments[3]!;
+    const outcome = await deps.taskService.applyProposedChange(id, readPatch(body), readApplyOptions(body));
+    return { status: outcome.status === "applied" ? 201 : 200, body: outcome };
+  }
+
+  if (method === "POST" && matches(segments, ["api", "v1", "executions", ":id", "evaluation"])) {
+    const id = segments[3]!;
+    const result = await deps.taskService.evaluateChange(id, readEvaluationChecks(body));
+    return { status: 200, body: result };
+  }
+
+  if (method === "GET" && matches(segments, ["api", "v1", "executions", ":id", "trace"])) {
+    const id = segments[3]!;
+    const trace = await deps.taskService.trace(id);
+    if (!trace) throw new ApiError(404, "trace_not_found", `No trace is recorded for execution ${id}`);
+    return { status: 200, body: trace };
+  }
+
+  if (method === "POST" && matches(segments, ["api", "v1", "executions", ":id", "subagents"])) {
+    if (!deps.subagents) {
+      throw new ApiError(501, "subagents_not_configured", "Subagent delegation is not wired into this server");
+    }
+    const parentExecutionId = segments[3]!;
+    const child = await deps.subagents.spawn(readSpawnRequest(parentExecutionId, body));
+    return {
+      status: 201,
+      body: {
+        execution: child.execution,
+        worktreeMode: child.worktreeMode,
+        workingDirectory: child.workingDirectory,
+        rootExecutionId: deps.subagents.rootOf(child.execution.executionId),
+        lineage: deps.subagents.lineageOf(child.execution.executionId)
+      }
+    };
+  }
+
+  if (method === "GET" && matches(segments, ["api", "v1", "executions", ":id", "subagents"])) {
+    if (!deps.subagents) {
+      throw new ApiError(501, "subagents_not_configured", "Subagent delegation is not wired into this server");
+    }
+    const parentExecutionId = segments[3]!;
+    return {
+      status: 200,
+      body: {
+        children: deps.subagents.childrenOf(parentExecutionId),
+        lineage: deps.subagents.lineageOf(parentExecutionId),
+        rootExecutionId: deps.subagents.rootOf(parentExecutionId)
+      }
+    };
+  }
+
+  if (method === "GET" && matches(segments, ["api", "v1", "runtimes", "selection"])) {
+    if (!deps.scheduler) {
+      throw new ApiError(501, "scheduler_not_configured", "Runtime scheduling is not wired into this server");
+    }
+    const selection = await deps.scheduler.select({
+      ...(url.searchParams.get("runtimeType")
+        ? { runtimeType: url.searchParams.get("runtimeType") as never }
+        : {}),
+      skipHealthCheck: url.searchParams.get("skipHealthCheck") === "true"
+    });
+    return {
+      status: 200,
+      body: {
+        runtimeId: selection.runtimeId,
+        runtimeType: selection.registration.runtimeType,
+        version: selection.registration.version ?? null
+      }
+    };
+  }
+
   if (method === "GET" && matches(segments, ["api", "v1", "executions", ":id", "approvals"])) {
     const id = segments[3]!;
-    const pending = deps.coordinator.getAdapter().getPendingPermissions?.(id) ?? [];
+    // The adapter that owns this execution, not "the" adapter: with several runtimes registered,
+    // only the owning one can have pending permission requests.
+    const pending = deps.coordinator.adapterFor(id).getPendingPermissions?.(id) ?? [];
     return { status: 200, body: { approvals: pending } };
+  }
+
+  // Design 12.3: an approval is addressed by its own request id, and the decision is the path.
+  if (
+    method === "POST" &&
+    (matches(segments, ["api", "v1", "approvals", ":requestId", "approve"]) ||
+      matches(segments, ["api", "v1", "approvals", ":requestId", "reject"]))
+  ) {
+    const requestId = segments[3]!;
+    const decision = segments[4] === "approve" ? "approve" : "deny";
+    const reason = readReason(body);
+    const executionId = await deps.coordinator.findByPermissionRequest(requestId);
+    if (!executionId) {
+      throw new ApiError(404, "approval_not_found", `No pending approval request ${requestId}`);
+    }
+    await answerApproval(deps, executionId, requestId, decision, reason);
+    return { status: 200, body: { executionId, requestId, decision } };
   }
 
   if (method === "POST" && matches(segments, ["api", "v1", "executions", ":id", "approvals", ":requestId"])) {
     const executionId = segments[3]!;
     const requestId = segments[5]!;
     const decision = readDecision(body);
-    await deps.coordinator.getAdapter().respondToPermission?.(executionId, requestId, decision);
+    await answerApproval(deps, executionId, requestId, decision.decision, decision.reason);
     return { status: 200, body: { executionId, requestId, decision: decision.decision } };
   }
 
@@ -271,7 +455,7 @@ async function describeExecution(executionId: string, deps: ApiDependencies): Pr
   }
   let status: string | undefined;
   try {
-    status = await deps.coordinator.getAdapter().getStatus(executionId);
+    status = await deps.coordinator.adapterFor(executionId).getStatus(executionId);
   } catch {
     status = undefined;
   }
@@ -279,7 +463,7 @@ async function describeExecution(executionId: string, deps: ApiDependencies): Pr
     executionId,
     status: status ?? (checkpoint.terminal ? checkpoint.terminalEventType : "unknown"),
     checkpoint,
-    pendingApprovals: deps.coordinator.getAdapter().getPendingPermissions?.(executionId) ?? [],
+    pendingApprovals: deps.coordinator.adapterFor(executionId).getPendingPermissions?.(executionId) ?? [],
     // AT-204 surfaced to the caller: "completed" is a claim that needs a passing evaluation.
     completion: await deps.taskService.completionGate(executionId)
   };
@@ -423,7 +607,13 @@ function toStartTaskRequest(taskId: string, body: unknown): StartTaskRequest {
         ? (record["allowedTools"] as string[])
         : []
       : [],
-    ...(parseRequestedSkills(record) ?? {})
+    ...(parseRequestedSkills(record) ?? {}),
+    ...(record["evaluationChecks"] === undefined
+      ? {}
+      : { evaluationChecks: parseEvaluationChecks(record["evaluationChecks"], "evaluationChecks") }),
+    ...(typeof record["runtimeId"] === "string" && record["runtimeId"].trim() !== ""
+      ? { runtimeId: record["runtimeId"] }
+      : {})
   };
 }
 
@@ -457,6 +647,144 @@ function parseRequestedSkills(record: Record<string, unknown>): Pick<StartTaskRe
   };
 }
 
+/** A child execution request. The parent decides the lineage; the caller supplies the work. */
+function readSpawnRequest(parentExecutionId: string, body: unknown): {
+  parentExecutionId: string;
+  taskInput: AgentTaskInput;
+  worktree?: "isolated" | "shared";
+  baseSha?: string;
+  label?: string;
+} {
+  const record = (body ?? {}) as Record<string, unknown>;
+  const requireString = (key: string): string => {
+    const value = record[key];
+    if (typeof value !== "string" || value.trim() === "") {
+      throw new ApiError(400, "invalid_body", `Field '${key}' must be a non-empty string`);
+    }
+    return value;
+  };
+  const worktree = record["worktree"];
+  if (worktree !== undefined && worktree !== "isolated" && worktree !== "shared") {
+    throw new ApiError(400, "invalid_body", "Field 'worktree' must be 'isolated' or 'shared'");
+  }
+  const baseSha = record["baseSha"];
+  const label = record["label"];
+  const prompt = requireString("prompt");
+
+  return {
+    parentExecutionId,
+    taskInput: {
+      projectId: requireString("projectId"),
+      taskId: requireString("taskId"),
+      runId: requireString("runId"),
+      prompt,
+      contextSnapshotId: requireString("contextSnapshotId"),
+      policySnapshotId: requireString("policySnapshotId"),
+      worktreeId: requireString("worktreeId"),
+      workingDirectory: typeof record["workingDirectory"] === "string" ? record["workingDirectory"] : "",
+      allowedTools: Array.isArray(record["allowedTools"])
+        ? (record["allowedTools"] as unknown[]).filter((item): item is string => typeof item === "string")
+        : [],
+      timeoutSeconds: typeof record["timeoutSeconds"] === "number" ? record["timeoutSeconds"] : 60,
+      correlationId: requireString("correlationId")
+    },
+    ...(worktree ? { worktree } : {}),
+    ...(typeof baseSha === "string" && baseSha ? { baseSha } : {}),
+    ...(typeof label === "string" && label ? { label } : {})
+  };
+}
+
+/** The patch an agent proposes. It is the only thing the Code Engine accepts as input. */
+function readPatch(body: unknown): string {
+  const record = (body ?? {}) as Record<string, unknown>;
+  const patch = record["patch"];
+  if (typeof patch !== "string" || patch.trim() === "") {
+    throw new ApiError(400, "invalid_body", "Field 'patch' must be a non-empty diff");
+  }
+  return patch;
+}
+
+function readApplyOptions(body: unknown): {
+  commitMessage?: string;
+  approval?: { approvedBy: string; reason: string; approvedAt: string };
+  allowedPaths?: string[];
+} {
+  const record = (body ?? {}) as Record<string, unknown>;
+  const options: {
+    commitMessage?: string;
+    approval?: { approvedBy: string; reason: string; approvedAt: string };
+    allowedPaths?: string[];
+  } = {};
+  if (typeof record["commitMessage"] === "string" && record["commitMessage"].trim() !== "") {
+    options.commitMessage = record["commitMessage"];
+  }
+  if (record["approval"] !== undefined) {
+    const approval = record["approval"];
+    if (!approval || typeof approval !== "object" || Array.isArray(approval)) {
+      throw new ApiError(400, "invalid_body", "Field 'approval' must be an object");
+    }
+    const value = approval as Record<string, unknown>;
+    // An approval is evidence of a human decision, so all three fields are required. A missing
+    // approver would leave the change record naming nobody.
+    const approvedBy = value["approvedBy"];
+    if (typeof approvedBy !== "string" || approvedBy.trim() === "") {
+      throw new ApiError(400, "invalid_body", "approval.approvedBy must be a non-empty string");
+    }
+    const reason = value["reason"];
+    if (typeof reason !== "string" || reason.trim() === "") {
+      throw new ApiError(400, "invalid_body", "approval.reason must be a non-empty string");
+    }
+    const approvedAt = value["approvedAt"];
+    if (typeof approvedAt !== "string" || approvedAt.trim() === "") {
+      throw new ApiError(400, "invalid_body", "approval.approvedAt must be an ISO timestamp");
+    }
+    options.approval = { approvedBy, reason, approvedAt };
+  }
+  const paths = record["allowedPaths"];
+  if (paths !== undefined) {
+    if (!Array.isArray(paths) || !paths.every(item => typeof item === "string")) {
+      throw new ApiError(400, "invalid_body", "Field 'allowedPaths' must be an array of strings");
+    }
+    options.allowedPaths = paths as string[];
+  }
+  return options;
+}
+
+/** Evaluation checks are independent commands, not the agent's own claim (AT-204). */
+function readEvaluationChecks(body: unknown): EvaluationCheckSpec[] {
+  const record = (body ?? {}) as Record<string, unknown>;
+  return parseEvaluationChecks(record["checks"], "checks");
+}
+
+function parseEvaluationChecks(raw: unknown, field: string): EvaluationCheckSpec[] {
+  if (!Array.isArray(raw)) {
+    throw new ApiError(400, "invalid_body", `Field '${field}' must be an array of evaluation checks`);
+  }
+  return raw.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw new ApiError(400, "invalid_body", `${field}[${index}] must be an object`);
+    }
+    const check = item as Record<string, unknown>;
+    const command = check["command"];
+    if (typeof command !== "string" || command.trim() === "") {
+      throw new ApiError(400, "invalid_body", `${field}[${index}].command must be a non-empty string`);
+    }
+    const args = check["args"];
+    if (args !== undefined && (!Array.isArray(args) || !args.every(arg => typeof arg === "string"))) {
+      throw new ApiError(400, "invalid_body", `${field}[${index}].args must be an array of strings`);
+    }
+    return {
+      id: typeof check["id"] === "string" ? check["id"] : `check-${index + 1}`,
+      name: typeof check["name"] === "string" ? check["name"] : `check-${index + 1}`,
+      command,
+      args: Array.isArray(args) ? (args as string[]) : [],
+      ...(typeof check["cwd"] === "string" ? { cwd: check["cwd"] } : {}),
+      ...(typeof check["timeoutMs"] === "number" ? { timeoutMs: check["timeoutMs"] } : {}),
+      ...(typeof check["expectExitCode"] === "number" ? { expectExitCode: check["expectExitCode"] } : {})
+    };
+  });
+}
+
 function readDecision(body: unknown): { decision: "approve" | "deny"; reason?: string } {
   const record = (body ?? {}) as Record<string, unknown>;
   const decision = record["decision"];
@@ -465,6 +793,40 @@ function readDecision(body: unknown): { decision: "approve" | "deny"; reason?: s
   }
   const reason = record["reason"];
   return { decision, ...(typeof reason === "string" && reason ? { reason } : {}) };
+}
+
+/** The optional reason a human gives with an approval decision. */
+function readReason(body: unknown): string | undefined {
+  const record = (body ?? {}) as Record<string, unknown>;
+  const reason = record["reason"];
+  return typeof reason === "string" && reason.trim() !== "" ? reason : undefined;
+}
+
+/**
+ * Sends an approval decision to the runtime that raised it.
+ *
+ * The answer always goes to the owning adapter, and a runtime without an approval surface is
+ * reported as such rather than silently swallowing the decision.
+ */
+async function answerApproval(
+  deps: ApiDependencies,
+  executionId: string,
+  requestId: string,
+  decision: "approve" | "deny",
+  reason?: string
+): Promise<void> {
+  const adapter = deps.coordinator.adapterFor(executionId);
+  if (!adapter.respondToPermission) {
+    throw new ApiError(
+      501,
+      "approvals_not_supported",
+      `Runtime '${adapter.constructor.name}' cannot answer approval requests`
+    );
+  }
+  await adapter.respondToPermission(executionId, requestId, {
+    decision,
+    ...(reason ? { reason } : {})
+  });
 }
 
 function mapError(error: unknown): { status: number; code: string; message: string } {

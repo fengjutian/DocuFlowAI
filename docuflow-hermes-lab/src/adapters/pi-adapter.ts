@@ -76,8 +76,23 @@ export interface PiAdapterOptions {
    * where an unanswered request stays pending instead of being approved).
    */
   permissionHandler?: (request: RuntimePermissionRequest) => Promise<RuntimePermissionResponse>;
-  /** Tools exposed to the runtime. Calls to tools outside this list are blocked by policy. */
-  tools?: unknown[];
+  /**
+   * Tools exposed to the runtime. Calls to tools outside this list are blocked by policy.
+   *
+   * A function receives the task input and the execution id, because the tool set is bound to one
+   * execution: the worktree and the policy snapshot belong to that execution, not to the adapter.
+   */
+  tools?: unknown[] | ((input: AgentTaskInput, executionId: string) => unknown[]);
+  /**
+   * Tools whose own implementation is the policy enforcement point.
+   *
+   * DocuFlow's own tools decide for themselves: `read_file` checks the path against the policy
+   * snapshot, `request_apply_diff` goes through the Code Engine, which checks scope, base SHA and
+   * policy before it writes. Gating them a second time would either duplicate the decision or block
+   * the tool outright, because the adapter-level hook sees only a tool name and no resolved paths.
+   * Every other tool still needs the permission handler.
+   */
+  selfEnforcedTools?: string[];
   /** The Pi model to run. */
   model?: unknown;
   systemPrompt?: string;
@@ -179,7 +194,7 @@ export class PiAdapter implements AgentRuntimeAdapter {
 
     const agent = this.createAgent({
       ...(this.options.systemPrompt ? { systemPrompt: this.options.systemPrompt } : {}),
-      tools: this.options.tools ?? [],
+      tools: this.resolveTools(input, executionId),
       model: this.options.model,
       beforeToolCall: context => this.beforeToolCall(state, context)
     });
@@ -195,6 +210,18 @@ export class PiAdapter implements AgentRuntimeAdapter {
     });
 
     return { ...execution };
+  }
+
+  /**
+   * The tool set for one execution.
+   *
+   * A function form is built per execution, because the tools are bound to that execution's
+   * worktree and policy snapshot; a static list is shared by every run.
+   */
+  private resolveTools(input: AgentTaskInput, executionId: string): unknown[] {
+    const tools = this.options.tools;
+    if (typeof tools === "function") return tools(input, executionId);
+    return tools ?? [];
   }
 
   async getStatus(executionId: string): Promise<AgentExecutionStatus> {
@@ -286,6 +313,12 @@ export class PiAdapter implements AgentRuntimeAdapter {
     const toolName = context.toolCall.name ?? "unknown";
     if (!state.input.allowedTools.includes(toolName)) {
       return { block: true, reason: `tool ${toolName} is not in the allowed tool list` };
+    }
+
+    // A tool that enforces the policy itself is not gated a second time here: the decision it makes
+    // is the accurate one, because it knows the paths the tool would really touch.
+    if (this.options.selfEnforcedTools?.includes(toolName)) {
+      return undefined;
     }
 
     if (!this.options.permissionHandler) {

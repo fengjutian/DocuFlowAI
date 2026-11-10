@@ -311,10 +311,10 @@ const server = await createApiServer({ registry, coordinator, taskService, journ
 ```
 
 `POST /api/v1/tasks/{taskId}/executions`, `GET /api/v1/executions/{id}`, `POST .../cancel`,
-`.../retry`, `.../resume`, `.../approvals/{requestId}`, `GET /api/v1/trace/commits/{sha}`, and
-`GET /api/v1/events` for a live SSE stream. Reconnecting clients replay from the journal with
-`since` / `Last-Event-ID`, because the stream is a notification channel, not the source of truth.
-See [`docs/API.md`](docs/API.md).
+`.../retry`, `.../resume`, `GET .../approvals`, `POST /api/v1/approvals/{requestId}/approve` and
+`.../reject`, `GET /api/v1/trace/commits/{sha}`, and `GET /api/v1/events` for a live SSE stream.
+Reconnecting clients replay from the journal with `since` / `Last-Event-ID`, because the stream is a
+notification channel, not the source of truth. See [`docs/API.md`](docs/API.md).
 
 ## Evaluation
 
@@ -454,7 +454,7 @@ Two runtimes are evaluated against the same `AgentRuntimeAdapter` contract:
 |---|---|---|
 | Shape | remote HTTP + SSE | in-process TypeScript library |
 | Install | tag tarball, Python 3.14, install stamp | `npm install` of two pinned packages |
-| Evidence so far | P0-001/002/003 + AT-001..004 against the pinned 0.23.0, real MiniMax M3 | 5/5 runtime probes, 7/7 adapter tests, real MiniMax M3 |
+| Evidence so far | P0-001/002/003 + AT-001..004 against the pinned 0.23.0, real MiniMax M3 | 5/5 runtime probes, 9/9 adapter tests, real MiniMax M3, full tool-surface run |
 | Cancellation | not available over HTTP (D-005) | `AbortSignal` on the running turn |
 | Resume | not available over HTTP | transcript continues on the same agent |
 | Policy enforcement | sandbox plus tool gating | `beforeToolCall` denial, before the tool runs |
@@ -469,6 +469,35 @@ repository).
 Neither runtime is retired yet: the 24-item checklist has to be signed off against whichever is
 chosen. DocuFlow's own layers — policy, Code Engine, journal, evaluation, skills, API, ACP — do not
 depend on the choice.
+
+## Tool surface and multiple runtimes
+
+The runtime is no longer the only thing a task can talk to. A task may name the runtime it wants
+(`runtimeId`), and the runtime gets DocuFlow's tool surface instead of raw access to the workspace:
+
+| Tool | What it does | Who decides |
+|---|---|---|
+| `read_file` | reads a file inside the execution's worktree | the policy snapshot; a path outside the worktree is denied before the read |
+| `request_diff` | inspects a unified diff without writing | the diff analysis; nothing is written |
+| `request_apply_diff` | applies a diff to the worktree | the Code Engine: path scope, base SHA, policy, then an atomic apply |
+| `evaluate_changes` | runs the task's acceptance checks | the checks the task declared; the model may narrow them, never extend them |
+
+The tool set is built per execution, from that execution's worktree, policy snapshot and declared
+checks, and only the tools the execution is allowed to use are exposed at all (D-049). DocuFlow's
+own tools are their own enforcement point, so the runtime's own tool gate does not decide them a
+second time (D-048).
+
+```powershell
+# A real run: HTTP API -> Pi -> tool surface -> Code Engine -> Evaluation Engine
+$env:MINIMAX_CN_API_KEY = "<your key>"
+node scripts/probe-pi-tools.mjs
+```
+
+The probe builds a throwaway git repository, starts a task on the `pi-local` runtime through the
+HTTP API and lets the real MiniMax China model drive the tools. It passes when the model read the
+file, the change landed in the worktree through the Code Engine, a change record was written, the
+acceptance check ran, and the completion gate opened.
+
 
 
 ## Zed (ACP)

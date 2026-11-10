@@ -41,15 +41,19 @@ function event(sequence: number, eventType: AgentRuntimeEvent["eventType"]): Age
 function makeAdapter(options: {
   events?: AgentRuntimeEvent[];
   capabilities?: Partial<AgentCapability>;
-} = {}): AgentRuntimeAdapter & { starts: AgentTaskInput[]; resumed: string[]; terminated: string[] } {
+  idPrefix?: string;
+} = {}): AgentRuntimeAdapter & { starts: AgentTaskInput[]; resumed: string[]; terminated: string[]; cancelled: string[] } {
   const starts: AgentTaskInput[] = [];
   const resumed: string[] = [];
   const terminated: string[] = [];
+  const cancelled: string[] = [];
+  const prefix = options.idPrefix ?? "exec";
   let counter = 0;
   return {
     starts,
     resumed,
     terminated,
+    cancelled,
     async getCapabilities() {
       return { ...NO_CAPABILITIES, ...options.capabilities };
     },
@@ -60,7 +64,7 @@ function makeAdapter(options: {
       starts.push(taskInput);
       counter += 1;
       return {
-        executionId: `exec-${counter}`,
+        executionId: `${prefix}-${counter}`,
         runtimeType: "hermes",
         status: "running",
         externalRunId: `run-${counter}`
@@ -69,8 +73,8 @@ function makeAdapter(options: {
     async getStatus() {
       return "running";
     },
-    async cancel() {
-      return undefined;
+    async cancel(executionId: string) {
+      cancelled.push(executionId);
     },
     async resume(executionId: string) {
       resumed.push(executionId);
@@ -221,4 +225,52 @@ test("renders a checkpoint that forbids re-applying recorded changes", () => {
   assert.match(rendered, /\[DOCUFLOW CHECKPOINT\]/);
   assert.match(rendered, /chg_1/);
   assert.match(rendered, /Do not re-apply/);
+});
+
+test("an execution runs on the adapter that started it", async () => {
+  const journal = new InMemoryJournalStore();
+  const defaultAdapter = makeAdapter({ events: [event(1, "execution.started")], idPrefix: "default" });
+  const otherAdapter = makeAdapter({ events: [event(1, "execution.started")], idPrefix: "other" });
+  const coordinator = new ExecutionCoordinator({ adapter: defaultAdapter, journal });
+
+  const first = await coordinator.start(input);
+  const second = await coordinator.start(input, otherAdapter);
+
+  assert.equal(coordinator.adapterFor(first.executionId), defaultAdapter);
+  assert.equal(coordinator.adapterFor(second.executionId), otherAdapter);
+  assert.equal(coordinator.getAdapter(), defaultAdapter, "the default adapter is unchanged");
+  assert.equal(
+    coordinator.adapterFor("exec-unknown"),
+    defaultAdapter,
+    "an unknown execution falls back to the default adapter"
+  );
+});
+
+test("a cancel reaches the runtime that owns the execution", async () => {
+  const journal = new InMemoryJournalStore();
+  const defaultAdapter = makeAdapter({ idPrefix: "default" });
+  const otherAdapter = makeAdapter({ idPrefix: "other" });
+  const coordinator = new ExecutionCoordinator({ adapter: defaultAdapter, journal });
+
+  const execution = await coordinator.start(input, otherAdapter);
+  await coordinator.cancel(execution.executionId);
+
+  assert.deepEqual(otherAdapter.cancelled, [execution.executionId], "the owner got the cancel");
+  assert.deepEqual(defaultAdapter.cancelled, [], "the other runtime was not touched");
+});
+
+test("finds the execution that owns a pending approval request", async () => {
+  const journal = new InMemoryJournalStore();
+  const owner = makeAdapter({ idPrefix: "owner" });
+  const bystander = makeAdapter({ idPrefix: "bystander" });
+  (owner as AgentRuntimeAdapter & { getPendingPermissions?: unknown }).getPendingPermissions = () => [
+    { requestId: "req-1", executionId: "owner-1", payload: {} }
+  ];
+  const coordinator = new ExecutionCoordinator({ adapter: bystander, journal });
+
+  const execution = await coordinator.start(input, owner);
+  const found = await coordinator.findByPermissionRequest("req-1");
+
+  assert.equal(found, execution.executionId);
+  assert.equal(await coordinator.findByPermissionRequest("req-unknown"), undefined);
 });

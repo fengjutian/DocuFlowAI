@@ -127,7 +127,7 @@ export function createDocuFlowAcpBackend(options: DocuFlowAcpBackendOptions): Ac
     event: AgentRuntimeEvent
   ): Promise<void> {
     const ask = options.requestPermission;
-    const adapter = options.coordinator.getAdapter();
+    const adapter = options.coordinator.adapterFor(executionId);
     if (!ask || !adapter.respondToPermission) return; // fail closed: leave the request pending
 
     const requestId = permissionRequestId(event);
@@ -188,7 +188,7 @@ export function createDocuFlowAcpBackend(options: DocuFlowAcpBackendOptions): Ac
       const terminal = new Promise<AcpStopReason>(resolve => { settle = resolve; });
       session.settle = settle;
 
-      const unsubscribe = await options.coordinator.getAdapter().subscribe(execution.executionId, event => {
+      const unsubscribe = await options.coordinator.adapterFor(execution.executionId).subscribe(execution.executionId, event => {
         const update = toSessionUpdate(event);
         if (update) emit(update);
         if (event.eventType === "permission.requested") {
@@ -200,7 +200,7 @@ export function createDocuFlowAcpBackend(options: DocuFlowAcpBackendOptions): Ac
 
       const timer = setTimeout(() => {
         settle("cancelled");
-        void options.coordinator.getAdapter().cancel(execution.executionId).catch(() => undefined);
+        void options.coordinator.adapterFor(execution.executionId).cancel(execution.executionId).catch(() => undefined);
       }, timeoutSeconds * 1000);
 
       try {
@@ -228,7 +228,7 @@ export function createDocuFlowAcpBackend(options: DocuFlowAcpBackendOptions): Ac
             reason: error instanceof Error ? error.message : String(error)
           })
           .catch(() => undefined);
-        await options.coordinator.getAdapter().terminate(executionId).catch(() => undefined);
+        await options.coordinator.adapterFor(executionId).terminate(executionId).catch(() => undefined);
       } finally {
         session.settle?.("cancelled");
       }

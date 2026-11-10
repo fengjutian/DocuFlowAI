@@ -399,3 +399,50 @@ Decision: one resolver, `resolveEventName()`, decides where the event name lives
 adapter and the Phase 0 runner use it. The mock server can emit either shape so the contract test
 covers the real one. The rule generalises: when one layer already knows how to read a runtime frame,
 a second implementation of the same rule is a defect waiting to happen.
+
+## D-046: With several runtimes, "the adapter" belongs to the execution
+Status: accepted
+Context: the coordinator, the API layer and the ACP backend all held a single adapter reference.
+That was correct while only one runtime was registered, and it becomes wrong the moment a second
+one exists: a permission response, a cancellation or a status query must reach the runtime that is
+actually running the task. Sending it to the default runtime would answer on behalf of a runtime
+that never saw the execution, and the audit trail would name the wrong runtime.
+Decision: the coordinator records the adapter that started each execution and exposes it as
+`adapterFor(executionId)`; the API layer and the ACP backend route every per-execution call
+through it. The default adapter remains the fallback for an unknown execution, because answering
+from the default runtime is better than guessing. `getAdapter()` survives only for the calls that
+genuinely have no execution context.
+
+## D-047: A named runtime is honoured or refused, never silently redirected
+Status: accepted
+Context: a task request may name the runtime it wants. Running it on a different runtime than the
+caller asked for would change which policy snapshot, which tools and which audit trail apply, so
+the request would no longer be the thing that was asked for.
+Decision: an explicit `runtimeId` is resolved to exactly that registered runtime or the request is
+refused; an unknown id is an error, not a fallback. `auto` is the one exception: it is the explicit
+request for the scheduler to choose. A task that does not name a runtime uses the server default.
+
+## D-048: DocuFlow's own tools are their own enforcement point
+Status: accepted
+Context: the Pi adapter gates every tool call with the DocuFlow permission handler, because the
+handler is where the policy decision belongs (D-003). That is correct for a tool the runtime
+brought with it, and wrong for DocuFlow's own tools: `read_file` knows the resolved path and
+`request_apply_diff` goes through the Code Engine, which checks the path scope, the base SHA and
+the policy before it writes. A second gate in front of them would either duplicate the decision
+with less information or refuse a tool that was never unsafe.
+Decision: the adapter lists the tools whose own implementation is the enforcement point
+(`selfEnforcedTools`) and does not gate them a second time. Every other tool still needs the
+permission handler, and a policy that cannot answer on its own stays pending for a human rather
+than being approved on the runtime's behalf (D-020).
+
+## D-049: The tool surface belongs to one execution, and the checks belong to the task
+Status: accepted
+Context: the tool surface was written as a set of functions over a worktree and a policy snapshot,
+but it had no caller, so `applyProposedChange` and `evaluateChange` were reachable only from the
+HTTP API and never from a runtime. Binding them needed two decisions that the design left open.
+Decision: a tool set is built per execution, from that execution's worktree, its policy snapshot and
+the acceptance checks its task declared; the runtime only sees the tools the execution is allowed
+to use. The acceptance checks are declared by the caller when the task starts, never by the model:
+a runtime that could name its own command would be grading itself. The model may narrow the
+declared set, not extend it, and a task without declared checks has no evidence — the completion
+gate stays closed (AT-204).

@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { HermesAdapter } from "../adapters/hermes-adapter.js";
 import { AgentRuntimeRegistry } from "../adapters/runtime-registry.js";
+import { RuntimeScheduler } from "../adapters/runtime-scheduler.js";
 import { createApiServer, type ApiDependencies } from "../api/app.js";
 import { EventBus } from "../api/event-bus.js";
 import { UsageLedger, type UsageRecord } from "../accounting/usage.js";
@@ -10,6 +11,7 @@ import { SpawnGitRunner } from "../code-engine/git-runner.js";
 import { WorktreeManager } from "../code-engine/worktree-manager.js";
 import { JsonlJournalStore } from "../journal/journal.js";
 import { ExecutionCoordinator } from "../orchestrator/execution-coordinator.js";
+import { SubagentManager } from "../orchestrator/subagent-manager.js";
 import { ImmutableRecordStore } from "../persistence/record-store.js";
 import {
   assertContextSnapshot,
@@ -21,6 +23,10 @@ import {
 } from "../persistence/records.js";
 import { TraceabilityQuery } from "../persistence/traceability.js";
 import { TaskExecutionService } from "../tasks/task-execution-service.js";
+import { createPiRuntime } from "./pi-runtime.js";
+import { DOCUFLOW_TOOL_NAMES } from "../tools/docuflow-tools.js";
+import { DocuFlowToolBinder } from "../tools/execution-tool-binding.js";
+import { createPolicyPermissionHandler } from "../tools/runtime-permission-handler.js";
 import { SkillRegistry } from "../skills/skill-registry.js";
 import { SkillBindingStore, type SkillBindingEvent } from "../skills/skill-bindings.js";
 import type { ChangeRecord } from "../code-engine/change-record.js";
@@ -44,6 +50,11 @@ export interface RuntimeConfig {
   hermesBaseUrl: string;
   hermesApiKey?: string;
   hermesTimeoutMs: number;
+  /**
+   * Pi runtime configuration. When present, a second runtime is registered next to Hermes and a
+   * task may name it with `runtimeId`. Absent means this server runs Hermes only.
+   */
+  pi?: { provider: string; model: string };
 }
 
 export function loadConfigFromEnv(env: NodeJS.ProcessEnv = process.env): RuntimeConfig {
@@ -61,6 +72,7 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Runtime
     throw new Error("HERMES_TIMEOUT_MS must be a positive number");
   }
   const token = env["DOCUFLOW_API_TOKEN"]?.trim();
+  const piModel = env["PI_MODEL"]?.trim();
 
   return {
     host: env["DOCUFLOW_API_HOST"] ?? "127.0.0.1",
@@ -71,7 +83,9 @@ export function loadConfigFromEnv(env: NodeJS.ProcessEnv = process.env): Runtime
     repository: resolve(env["DOCUFLOW_REPOSITORY"] ?? process.cwd()),
     hermesBaseUrl,
     ...(env["HERMES_API_KEY"] ? { hermesApiKey: env["HERMES_API_KEY"] } : {}),
-    hermesTimeoutMs: timeout
+    hermesTimeoutMs: timeout,
+    // A Pi runtime needs a model. The provider defaults to the one this lab has evidence for.
+    ...(piModel ? { pi: { provider: env["PI_PROVIDER"]?.trim() ?? "minimax-cn", model: piModel } } : {})
   };
 }
 
@@ -145,13 +159,37 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   const skillBindings = new SkillBindingStore(
     new ImmutableRecordStore<SkillBindingEvent>(config.dataDir, "bindings")
   );
-  const taskService = new TaskExecutionService({
-    git,
-    coordinator,
-    changes,
-    stores,
-    traceability,
-    skills: { registry: skillRegistry, bindings: skillBindings, runtimeId: "hermes-local" }
+    // The scheduler reads the registry at call time, so a runtime registered later (Pi is created
+    // during `ready()`) is still visible to it.
+    const scheduler = new RuntimeScheduler(registry);
+    const taskService = new TaskExecutionService({
+      git,
+      coordinator,
+      changes,
+      stores,
+      traceability,
+      skills: { registry: skillRegistry, bindings: skillBindings, runtimeId: "hermes-local" },
+      // `auto` asks the scheduler to choose a healthy, capable runtime. Every other id names one
+      // registered runtime exactly, so a task never lands on a runtime the caller did not pick.
+      resolveRuntime: async runtimeId => {
+        if (runtimeId === "auto") {
+          const selection = await scheduler.select({ requiredCapabilities: { streaming: true } });
+          return selection.adapter;
+        }
+        return registry.get(runtimeId);
+      }
+    });
+  const subagents = new SubagentManager({ coordinator, worktrees });
+
+  // The tool surface a runtime sees is bound to one execution: its worktree, its policy snapshot
+  // and the acceptance checks its task declared. The binder is the only bridge from a runtime's
+  // tool call to the Code Engine and the Evaluation Engine.
+  const toolBinder = new DocuFlowToolBinder({
+    service: taskService,
+    propose: patch => changes.propose(patch)
+  });
+  const permissionHandler = createPolicyPermissionHandler({
+    policyFor: executionId => taskService.policyFor(executionId)
   });
 
   return {
@@ -162,12 +200,35 @@ export function createRuntime(config: RuntimeConfig): Runtime {
       journal,
       bus,
       usage,
+      scheduler,
+      subagents,
       skills: { registry: skillRegistry, bindings: skillBindings },
       ...(config.token ? { token: config.token } : {})
     },
     ready: async () => {
       await usage.load();
       await skillBindings.load();
+      // Pi is created here rather than in `createRuntime` because the Pi packages are ESM-only
+      // and are loaded dynamically. A server without `PI_MODEL` never loads them at all.
+      if (config.pi) {
+        const { adapter, modelId } = await createPiRuntime({
+          ...config.pi,
+          // The tools are built per execution, so the worktree and the policy snapshot the tool
+          // enforces are the ones this run actually has.
+          tools: (input, executionId) => toolBinder.bind(input, executionId),
+          // DocuFlow's own tools are their own enforcement point; everything else the runtime
+          // brings is decided by the policy engine.
+          selfEnforcedTools: [...DOCUFLOW_TOOL_NAMES],
+          permissionHandler
+        });
+        registry.register({
+          id: "pi-local",
+          runtimeType: "native",
+          adapter,
+          version: modelId,
+          metadata: { provider: config.pi.provider }
+        });
+      }
     },
     close: () => coordinator.stopAll()
   };
