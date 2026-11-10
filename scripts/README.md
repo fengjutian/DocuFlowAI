@@ -5,24 +5,28 @@
 
 ## 用法
 
-```powershell
+```bash
 # 桌面形态（Tauri 窗口）—— 默认
-powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1
+python scripts/dev.py
 
 # 浏览器形态（本机 WebView2 不可用时用这个）
-powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1 -Mode browser
+python scripts/dev.py --mode browser
 
 # 端口被占用时强制覆盖
-powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1 -Force
+python scripts/dev.py --force
+
+# 停止上一次运行留下的进程
+python scripts/dev.py --stop
 ```
 
 | 参数 | 作用 |
 |---|---|
-| `-Mode desktop` | Tauri 桌面窗口（默认） |
-| `-Mode browser` | 只起 Vite，并自动打开浏览器 |
-| `-Force` | 端口被占用时先结束占用进程 |
-| `-NoBuild` | 跳过后端 TypeScript 编译，直接用现有 `dist` |
-| `-NoBrowser` | browser 模式下不自动开浏览器 |
+| `--mode desktop` | Tauri 桌面窗口（默认） |
+| `--mode browser` | 只起 Vite，并自动打开浏览器 |
+| `--force` | 端口被占用时先结束占用进程 |
+| `--no-build` | 跳过后端 TypeScript 编译，直接用现有 `dist` |
+| `--no-browser` | browser 模式下不自动开浏览器 |
+| `--stop` | 结束上一次运行留下的进程与端口占用者 |
 
 ## 脚本做什么
 
@@ -36,11 +40,12 @@ powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1 -Force
 
 ## 停止
 
-按 **Ctrl+C**。脚本会一并结束后端和前端进程。
+按 **Ctrl+C**。脚本会一并结束后端和前端进程（包括 `npm.cmd` → `cmd.exe` → `node`
+链条上被孤立的那些）。也可以在另一个终端跑 `python scripts/dev.py --stop`。
 
 ## 手动分开启动
 
-```powershell
+```bash
 # 后端
 cd docuflow-hermes-lab
 npm run dev:stack
@@ -51,11 +56,18 @@ npm run dev          # 浏览器形态
 npm run tauri dev    # 桌面形态
 ```
 
+## 依赖
+
+Python 3.9+。`psutil` 可选但推荐——没有它时脚本退回用 `taskkill /T`，
+清理孤儿进程的效果不如按进程树逐个 kill。
+
+```bash
+pip install psutil
+```
+
 ## 已知问题
 
 - **本机 `npm run tauri dev` 打不开窗口**：建窗时 WebView2 返回 `E_ACCESSDENIED` (os error 5)，
-  已排除代码与权限因素，是本机 WebView2 运行时环境问题。用 `-Mode browser` 绕过。
-- **Ctrl+C 会被 PowerShell 当成调试中断**（"正在进入调试模式"），脚本本身仍会正常退出并清理子进程，
-  只是提示信息可能出现偏差。
-- **Vite 绑在 IPv6 `::1`** 而不是 IPv4 `127.0.0.1`。这意味着用 IPv4 探测端口会误报"空闲"，
-  脚本改用 `Get-NetTCPConnection` 判断占用。
+  已排除代码与权限因素，是本机 WebView2 运行时环境问题。用 `--mode browser` 绕过。
+- **Vite 绑在 IPv6 `::1`** 而不是 IPv4 `127.0.0.1`。用 IPv4 探测端口会误报"空闲"，
+  所以脚本对两种协议族分别尝试 bind 来判断占用。

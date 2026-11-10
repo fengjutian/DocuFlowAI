@@ -5,6 +5,10 @@ client/*.tar.gz
 # Security-boundary probe artifact: the container writes it into the bind-mounted workspace.
 docuflow-hermes-lab/fixtures/security-lab/workspace/.docuflow-write-probe
 
-# Local dev stack output (scripts/dev.ps1) and scratch logs.
+# Local dev stack output (scripts/dev.py) and scratch logs.
 .dev-logs/
 .dev-logs-test*.log
+
+# Python bytecode from the dev script.
+__pycache__/
+*.pyc

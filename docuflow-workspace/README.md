@@ -16,11 +16,12 @@ Tauri v2 + React + TypeScript 的 DocuFlow 控制台。它是 `docuflow-hermes-l
 
 仓库根目录有一个一键脚本，同时拉起后端和前端：
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\dev.ps1
+```bash
+python scripts/dev.py
 ```
 
-参数：`-Mode browser`（本机 WebView2 不可用时）、`-Force`（端口被占用时强制覆盖）、`-NoBuild`、`-NoBrowser`。
+参数：`--mode browser`（本机 WebView2 不可用时）、`--force`（端口被占用时强制覆盖）、
+`--no-build`、`--no-browser`、`--stop`。
 详见 [`scripts/README.md`](../scripts/README.md)。
 
 手动分开启动：
