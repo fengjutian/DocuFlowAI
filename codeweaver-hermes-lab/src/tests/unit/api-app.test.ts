@@ -6,6 +6,7 @@ import { EventBus } from "../../api/event-bus.js";
 import { UsageLedger } from "../../accounting/usage.js";
 import { SkillRegistry } from "../../skills/skill-registry.js";
 import { SkillBindingStore } from "../../skills/skill-bindings.js";
+import { skillContentChecksum } from "../../skills/skill.js";
 import { InMemoryJournalStore, type JournalStore } from "../../journal/journal.js";
 import { ExecutionCoordinator } from "../../orchestrator/execution-coordinator.js";
 import type { TaskExecutionService, StartTaskRequest } from "../../tasks/task-execution-service.js";
@@ -486,6 +487,7 @@ test("streams live events as SSE with the design-13 envelope", async () => {
 test("registers and lists skills, and reports bindings per execution", async () => {
   const skills = { registry: new SkillRegistry(), bindings: new SkillBindingStore() };
   const app = await harness({ skills });
+  const content = "# React development\n\nPrefer function components and hooks.\n";
   const manifest = {
     skillId: "react-dev",
     version: "1.0.0",
@@ -495,7 +497,8 @@ test("registers and lists skills, and reports bindings per execution", async () 
     allowedRuntimes: ["hermes-local"],
     riskLevel: "low",
     approvalPolicy: "auto",
-    checksum: "a".repeat(64),
+    content,
+    checksum: skillContentChecksum(content),
     createdAt: "2026-11-09T00:00:00.000Z"
   };
   try {
@@ -510,9 +513,11 @@ test("registers and lists skills, and reports bindings per execution", async () 
     assert.equal(created.status, 201);
 
     const listed = await fetch(`${app.url}/api/v1/skills`);
-    const body = await listed.json() as { skills: Array<{ skillId: string; deprecated: boolean }> };
+    const body = await listed.json() as { skills: Array<{ skillId: string; deprecated: boolean; content: string }> };
     assert.equal(body.skills.length, 1);
     assert.equal(body.skills[0]!.deprecated, false);
+    // The body comes back with the manifest: a skill the console cannot read is a skill it cannot show.
+    assert.equal(body.skills[0]!.content, content);
 
     const duplicate = await fetch(`${app.url}/api/v1/skills`, {
       method: "POST",
@@ -520,6 +525,20 @@ test("registers and lists skills, and reports bindings per execution", async () 
       body: JSON.stringify(manifest)
     });
     assert.equal(duplicate.status, 409);
+
+    // A body that does not match its checksum is refused: the checksum is only evidence if it is
+    // checked against something.
+    const tampered = await fetch(`${app.url}/api/v1/skills`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        ...manifest,
+        skillId: "other",
+        version: "1.0.0",
+        content: `${content}\nsneaky\n`
+      })
+    });
+    assert.equal(tampered.status, 400);
 
     const bindings = await fetch(`${app.url}/api/v1/executions/exec-1/skills`);
     assert.deepEqual((await bindings.json() as { bindings: unknown[] }).bindings, []);

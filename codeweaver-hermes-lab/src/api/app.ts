@@ -432,7 +432,9 @@ async function route(
     if (!body || typeof body !== "object" || Array.isArray(body)) {
       throw new ApiError(400, "invalid_body", "A JSON object body is required");
     }
-    deps.skills.registry.register(body as never);
+    // The manifest is validated and written to disk before the API answers: a skill the server
+    // accepted but cannot read back is a skill it would silently drop on the next restart.
+    await deps.skills.registry.register(body as never);
     return { status: 201, body: { registered: true } };
   }
 

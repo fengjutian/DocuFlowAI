@@ -25,6 +25,7 @@ import {
 import type { TraceStores, TraceabilityQuery } from "../persistence/traceability.js";
 import type { PolicySnapshot } from "../policy/permission-policy.js";
 import type { SkillBinding, SkillBindingStore } from "../skills/skill-bindings.js";
+import { composePromptWithSkills, describeDeliveries } from "../skills/skill-delivery.js";
 import { summarizeSkillEffectiveness, type SkillEffectiveness } from "../skills/skill-effectiveness.js";
 import type { SkillRegistry, SkillAuthorization } from "../skills/skill-registry.js";
 import type { SkillManifest } from "../skills/skill.js";
@@ -101,7 +102,7 @@ export interface TaskExecutionServiceOptions {
   stores: TraceStores;
   traceability: TraceabilityQuery;
   /** Optional skill support: without it, `skills` in a request is rejected rather than ignored. */
-  skills?: { registry: SkillRegistry; bindings: SkillBindingStore; runtimeId: string };
+  skills?: { registry: SkillRegistry; bindings: SkillBindingStore };
   /**
    * Resolves a runtime id to the adapter behind it. Without it every task runs on the server's
    * default runtime, and a request that names a different runtime is rejected rather than
@@ -145,9 +146,20 @@ export class TaskExecutionService {
     assertContextSnapshot(contextSnapshot);
     await this.options.stores.contextSnapshots.put(contextSnapshot);
 
+    // The runtime is resolved before the skills are authorized: a skill is authorized against the
+    // runtime the task will actually run on. Authorizing against the server's default would refuse
+    // a `pi-local` skill on a Pi run and allow a `hermes-local` skill there, which is the opposite
+    // of what the author declared.
+    const runtime = await this.selectRuntime(request.runtimeId);
+    const runtimeId = this.runtimeIdFor(request.runtimeId, runtime);
+
     // Skills are authorized against the same policy snapshot the execution will run under, before
     // anything starts. A denied skill stops the task; nothing is "bound but disabled" silently.
-    const resolvedSkills = this.authorizeSkills(request);
+    const resolvedSkills = this.authorizeSkills(request, runtimeId);
+
+    // The prompt the runtime receives carries the authorized skill bodies. The user's own words stay
+    // first; the skills are appended, and the journal hashes what was actually delivered.
+    const effectivePrompt = composePromptWithSkills(request.prompt, resolvedSkills);
 
     // Policy and prompt records name the execution, which only exists after `start`. Their ids are
     // decided first so the task input can reference them, and they are written once the run exists.
@@ -159,7 +171,7 @@ export class TaskExecutionService {
       ...(request.featureId ? { featureId: request.featureId } : {}),
       taskId: request.taskId,
       runId: (this.options.runIdFactory ?? (() => `run_${randomUUID()}`))(),
-      prompt: request.prompt,
+      prompt: effectivePrompt,
       contextSnapshotId: contextSnapshot.id,
       policySnapshotId,
       worktreeId: request.taskId,
@@ -169,7 +181,7 @@ export class TaskExecutionService {
       correlationId: request.correlationId
     };
 
-    const execution = await this.options.coordinator.start(taskInput, await this.selectRuntime(request.runtimeId));
+    const execution = await this.options.coordinator.start(taskInput, runtime);
 
     // Which runtime ran this task, and what it was asked, are journaled by the coordinator: it is
     // the one that starts executions, and a rebuild goes through it too.
@@ -190,7 +202,7 @@ export class TaskExecutionService {
       templateName: request.template.name,
       templateVersion: request.template.version,
       templateContentHash: request.template.contentHash,
-      renderedPromptHash: hashRenderedPrompt(request.prompt, contextSnapshot.contextHash),
+      renderedPromptHash: hashRenderedPrompt(effectivePrompt, contextSnapshot.contextHash),
       contextSnapshotId: contextSnapshot.id,
       modelConfig: { ...request.modelConfig },
       createdAt: this.now().toISOString()
@@ -215,7 +227,13 @@ export class TaskExecutionService {
     });
     await this.options.coordinator.recordAuditFact(execution.executionId, "prompt.snapshot", {
       promptSnapshotId: promptSnapshot.id,
-      templateVersion: promptSnapshot.templateVersion
+      templateVersion: promptSnapshot.templateVersion,
+      // How much of the prompt was skill instructions, so a reader can tell an instructed run from
+      // a bare one without opening the model.
+      skillInstructionsBytes: Buffer.byteLength(
+        effectivePrompt.slice(request.prompt.length),
+        "utf8"
+      )
     });
 
     const skills: SkillBinding[] = [];
@@ -231,6 +249,16 @@ export class TaskExecutionService {
         skillId: binding.skillId,
         skillVersion: binding.skillVersion,
         checksum: resolved.manifest.checksum
+      });
+    }
+
+    // The delivery record is what says the body reached the runtime, not just that a version was
+    // bound to the execution. A binding without a delivery is a skill that was authorized and then
+    // quietly dropped.
+    for (const delivery of describeDeliveries(resolvedSkills)) {
+      await this.options.coordinator.recordAuditFact(execution.executionId, "skill.delivered", {
+        ...delivery,
+        runtimeId: runtimeId ?? null
       });
     }
 
@@ -364,9 +392,26 @@ export class TaskExecutionService {
     return adapter;
   }
 
+  /**
+   * The registered id of the runtime a task will run under.
+   *
+   * A named runtime is its own id. "auto" means the scheduler picked, so the adapter's registered
+   * id is the answer. No name means the server's default runtime. When none of that yields an id,
+   * the caller gets `undefined` and the skill authorization fails closed.
+   */
+  private runtimeIdFor(
+    requested: string | undefined,
+    resolved: AgentRuntimeAdapter | undefined
+  ): string | undefined {
+    if (requested && requested !== "auto") return requested;
+    if (resolved) return this.options.coordinator.runtimeIdOf(resolved);
+    return this.options.coordinator.defaultRuntimeId();
+  }
+
   /** Validates the requested skill set before anything starts. */
   private authorizeSkills(
-    request: StartTaskRequest
+    request: StartTaskRequest,
+    runtimeId: string | undefined
   ): Array<{ manifest: SkillManifest; authorization: SkillAuthorization }> {
     const requested = request.skills ?? [];
     if (requested.length === 0) return [];
@@ -379,7 +424,7 @@ export class TaskExecutionService {
     for (const skill of requested) {
       const manifest = this.options.skills.registry.resolve(skill.skillId, skill.version);
       const authorization = this.options.skills.registry.authorize(manifest, {
-        runtimeId: this.options.skills.runtimeId,
+        runtimeId,
         policy: request.policy
       });
       const key = `${manifest.skillId}@${manifest.version}`;

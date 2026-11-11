@@ -210,6 +210,13 @@ export interface SkillManifest {
   allowedRuntimes: string[];
   riskLevel: RiskLevel;
   approvalPolicy: SkillApprovalPolicy;
+  /**
+   * The skill body: the Markdown that is injected into the prompt of a run that binds it.
+   *
+   * It is part of the manifest because it is what the checksum covers, and the checksum is only
+   * evidence when there is something to check it against.
+   */
+  content: string;
   checksum: string;
   createdAt: string;
   deprecated?: boolean;

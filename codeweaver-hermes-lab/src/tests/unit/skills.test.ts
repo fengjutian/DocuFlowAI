@@ -12,16 +12,19 @@ import { ImmutableRecordStore } from "../../persistence/record-store.js";
 import {
   SkillConflictError,
   SkillNotFoundError,
-  SkillRegistry
+  SkillRegistry,
+  type SkillManifestRecord
 } from "../../skills/skill-registry.js";
 import {
+  MAX_SKILL_CONTENT_BYTES,
   SkillValidationError,
   compareVersions,
+  skillContentChecksum,
   type SkillManifest
 } from "../../skills/skill.js";
 import type { PolicySnapshot } from "../../policy/permission-policy.js";
 
-const checksum = "a".repeat(64);
+const CONTENT = "# React development\n\nPrefer function components and hooks.\n";
 
 function manifest(overrides: Partial<SkillManifest> = {}): SkillManifest {
   return {
@@ -33,7 +36,8 @@ function manifest(overrides: Partial<SkillManifest> = {}): SkillManifest {
     allowedRuntimes: ["hermes-local"],
     riskLevel: "medium",
     approvalPolicy: "auto",
-    checksum,
+    content: CONTENT,
+    checksum: skillContentChecksum(CONTENT),
     createdAt: "2026-11-09T00:00:00.000Z",
     ...overrides
   };
@@ -54,11 +58,11 @@ function policy(overrides: Partial<PolicySnapshot> = {}): PolicySnapshot {
   };
 }
 
-test("orders versions and resolves the newest non-deprecated one", () => {
+test("orders versions and resolves the newest non-deprecated one", async () => {
   const registry = new SkillRegistry();
-  registry.register(manifest({ version: "1.0.0" }));
-  registry.register(manifest({ version: "1.10.0" }));
-  registry.register(manifest({ version: "1.2.0" }));
+  await registry.register(manifest({ version: "1.0.0" }));
+  await registry.register(manifest({ version: "1.10.0" }));
+  await registry.register(manifest({ version: "1.2.0" }));
 
   assert.deepEqual(registry.listVersions("react-dev"), ["1.10.0", "1.2.0", "1.0.0"]);
   assert.equal(registry.resolve("react-dev").version, "1.10.0");
@@ -74,33 +78,69 @@ test("treats a pre-release as older than the release", () => {
   assert.equal(compareVersions("1.2.3", "1.2.3"), 0);
 });
 
-test("refuses to overwrite a published version", () => {
+test("refuses to overwrite a published version", async () => {
   const registry = new SkillRegistry();
-  registry.register(manifest());
+  await registry.register(manifest());
 
-  assert.throws(
+  await assert.rejects(
     () => registry.register(manifest({ description: "edited" })),
     (error: unknown) => error instanceof SkillConflictError
   );
   assert.throws(() => registry.resolve("missing"), (error: unknown) => error instanceof SkillNotFoundError);
 });
 
-test("rejects manifests with undeclared permissions or malformed evidence", () => {
+test("rejects manifests with undeclared permissions or malformed evidence", async () => {
   const registry = new SkillRegistry();
 
-  assert.throws(
+  await assert.rejects(
     () => registry.register(manifest({ permissions: ["root_everything" as never] })),
     (error: unknown) => error instanceof SkillValidationError
   );
-  assert.throws(() => registry.register(manifest({ checksum: "not-a-hash" })), /checksum/);
-  assert.throws(() => registry.register(manifest({ version: "v1" })), /semantic version/);
-  assert.throws(() => registry.register(manifest({ allowedRuntimes: [] })), /allowedRuntimes/);
+  await assert.rejects(() => registry.register(manifest({ checksum: "not-a-hash" })), /checksum/);
+  await assert.rejects(() => registry.register(manifest({ version: "v1" })), /semantic version/);
+  await assert.rejects(() => registry.register(manifest({ allowedRuntimes: [] })), /allowedRuntimes/);
 });
 
-test("authorizes against the execution policy and runtime", () => {
+test("the checksum has to match the skill body", async () => {
+  const registry = new SkillRegistry();
+
+  // A body that was edited after the checksum was computed is exactly the silent edit that
+  // immutable versions exist to prevent, so it is refused.
+  await assert.rejects(
+    () => registry.register(manifest({ content: `${CONTENT}\nsneaky line\n` })),
+    /does not match the skill content/
+  );
+  await assert.rejects(() => registry.register(manifest({ content: "   " })), /content/);
+  await assert.rejects(
+    () => registry.register(manifest({ content: "x".repeat(MAX_SKILL_CONTENT_BYTES + 1) })),
+    /byte limit/
+  );
+});
+
+test("keeps the registered skills on disk and reads them back after a restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "codeweaver-skills-"));
+  try {
+    const store = new ImmutableRecordStore<SkillManifestRecord>(root, "skills");
+    const first = new SkillRegistry(store);
+    await first.register(manifest());
+    await first.register(manifest({ skillId: "deploy", version: "2.0.0", permissions: [] }));
+
+    const second = new SkillRegistry(store);
+    await second.load();
+    assert.equal(second.list().length, 2);
+    // The body comes back with the manifest: a skill the server cannot read is a skill it cannot
+    // deliver.
+    assert.equal(second.resolve("react-dev").content, CONTENT);
+    assert.equal(second.resolve("deploy").version, "2.0.0");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("authorizes against the execution policy and runtime", async () => {
   const registry = new SkillRegistry();
   const skill = manifest();
-  registry.register(skill);
+  await registry.register(skill);
 
   assert.equal(registry.authorize(skill, { runtimeId: "hermes-local", policy: policy() }).decision, "allow");
 
@@ -116,24 +156,42 @@ test("authorizes against the execution policy and runtime", () => {
   assert.match(wrongRuntime.reasons[0]!, /may not run/);
 });
 
-test("requires approval for high-risk, deprecated or explicitly gated skills", () => {
+test("denies a runtime-specific skill when the runtime of the task is unknown", async () => {
+  const registry = new SkillRegistry();
+  const skill = manifest();
+  await registry.register(skill);
+
+  const result = registry.authorize(skill, { runtimeId: undefined, policy: policy() });
+  assert.equal(result.decision, "deny");
+  assert.match(result.reasons[0]!, /runtime of this task is unknown/);
+
+  // A skill that names every runtime is still allowed when the runtime is unknown.
+  const wildcard = manifest({ skillId: "anywhere", allowedRuntimes: ["*"] });
+  await registry.register(wildcard);
+  assert.equal(
+    registry.authorize(wildcard, { runtimeId: undefined, policy: policy() }).decision,
+    "allow"
+  );
+});
+
+test("requires approval for high-risk, deprecated or explicitly gated skills", async () => {
   const registry = new SkillRegistry();
   const risky = manifest({ skillId: "deploy", riskLevel: "high", permissions: [] });
-  registry.register(risky);
+  await registry.register(risky);
   assert.equal(
     registry.authorize(risky, { runtimeId: "hermes-local", policy: policy({ grantedCapabilities: ["*"] }) }).decision,
     "require_approval"
   );
 
   const gated = manifest({ skillId: "db-migrate", approvalPolicy: "require_approval", permissions: [] });
-  registry.register(gated);
+  await registry.register(gated);
   assert.equal(
     registry.authorize(gated, { runtimeId: "hermes-local", policy: policy({ grantedCapabilities: ["*"] }) }).decision,
     "require_approval"
   );
 
   const old = manifest({ version: "0.9.0" });
-  registry.register(old);
+  await registry.register(old);
   registry.deprecate("react-dev", "0.9.0");
   assert.equal(
     registry.authorize(old, { runtimeId: "hermes-local", policy: policy() }).decision,
@@ -141,10 +199,10 @@ test("requires approval for high-risk, deprecated or explicitly gated skills", (
   );
 });
 
-test("denies authorization when the policy snapshot expired", () => {
+test("denies authorization when the policy snapshot expired", async () => {
   const registry = new SkillRegistry();
   const skill = manifest();
-  registry.register(skill);
+  await registry.register(skill);
 
   const result = registry.authorize(skill, {
     runtimeId: "hermes-local",
@@ -159,7 +217,7 @@ test("binds allowed skills immutably and refuses denied ones", async () => {
   const registry = new SkillRegistry();
   const store = new SkillBindingStore();
   const skill = manifest();
-  registry.register(skill);
+  await registry.register(skill);
   const allowed = registry.authorize(skill, { runtimeId: "hermes-local", policy: policy() });
 
   const binding = await store.bind({

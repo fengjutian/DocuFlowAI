@@ -89,6 +89,7 @@ export function SkillsPage() {
           .filter(item => item !== ""),
         riskLevel,
         approvalPolicy,
+        content,
         checksum,
         createdAt: new Date().toISOString()
       });
@@ -134,6 +135,7 @@ export function SkillsPage() {
               <TableHeader>
                 <TableRow>
                   <TableHead>技能</TableHead>
+                  <TableHead>正文</TableHead>
                   <TableHead>类型</TableHead>
                   <TableHead>风险</TableHead>
                   <TableHead>审批</TableHead>
@@ -159,6 +161,16 @@ export function SkillsPage() {
                           </Badge>
                         ) : null}
                       </div>
+                    </TableCell>
+                    <TableCell className="max-w-[16rem]">
+                      {/* The body is what the model is told; showing its first lines is the
+                          difference between a registry and a skill the user can check. */}
+                      <p className="truncate text-xs text-muted-foreground">
+                        {firstMeaningfulLine(skill.content)}
+                      </p>
+                      <p className="text-[10px] text-muted-foreground/70">
+                        {new TextEncoder().encode(skill.content).length} 字节
+                      </p>
                     </TableCell>
                     <TableCell className="text-xs">{skill.kind}</TableCell>
                     <TableCell>

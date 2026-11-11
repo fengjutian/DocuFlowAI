@@ -223,6 +223,22 @@ export class ExecutionCoordinator {
   }
 
   /**
+   * The registered id of the runtime behind an adapter.
+   *
+   * A task has to know which runtime it will run on *before* it starts: skills are authorized
+   * against that runtime, and a skill allowed on `pi-local` must not be refused because the
+   * server's default happens to be another one.
+   */
+  runtimeIdOf(adapter: AgentRuntimeAdapter): string | undefined {
+    return this.options.runtimeIdOf?.(adapter);
+  }
+
+  /** The registered id of the runtime that runs a task when the caller names none. */
+  defaultRuntimeId(): string | undefined {
+    return this.options.runtimeIdOf?.(this.options.adapter);
+  }
+
+  /**
    * Whether this server process still holds the live session for an execution.
    *
    * A restart empties the sessions but not the journal, so an execution can be recorded and

@@ -2,6 +2,7 @@ import { NavLink, useLocation } from "react-router-dom";
 import {
   Activity,
   Gauge,
+  GitBranch,
   GitCommitHorizontal,
   LayoutDashboard,
   Puzzle,
@@ -21,6 +22,7 @@ const NAV_ITEMS = [
   { to: "/", label: "工作台总览", icon: LayoutDashboard, end: true },
   { to: "/runtimes", label: "Runtime 管理", icon: Server, end: false },
   { to: "/executions", label: "执行与事件", icon: Activity, end: false },
+  { to: "/subagents", label: "子代理委派", icon: GitBranch, end: false },
   { to: "/skills", label: "技能管理", icon: Puzzle, end: false },
   { to: "/usage", label: "用量统计", icon: Gauge, end: false },
   { to: "/trace", label: "提交追溯", icon: GitCommitHorizontal, end: false }

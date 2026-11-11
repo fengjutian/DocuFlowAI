@@ -21,12 +21,13 @@ import { TraceabilityQuery } from "../../persistence/traceability.js";
 import { TaskExecutionService, SkillDeniedError, type StartTaskRequest } from "../../tasks/task-execution-service.js";
 import { SkillRegistry } from "../../skills/skill-registry.js";
 import { SkillBindingStore } from "../../skills/skill-bindings.js";
-import type { SkillManifest } from "../../skills/skill.js";
+import { skillContentChecksum, type SkillManifest } from "../../skills/skill.js";
 import type { PolicySnapshot } from "../../policy/permission-policy.js";
 import {
   NO_CAPABILITIES,
   type AgentRuntimeAdapter,
-  type AgentRuntimeEvent
+  type AgentRuntimeEvent,
+  type AgentTaskInput
 } from "../../types/adapter.js";
 import type { ChangeRecord } from "../../code-engine/change-record.js";
 import type { EvaluationResult } from "../../evaluation/evaluation.js";
@@ -55,6 +56,8 @@ async function setup(options: {
   };
 
   const journal = new InMemoryJournalStore();
+  /** The request the runtime was actually started with; the prompt under test. */
+  let startedInput: AgentTaskInput | undefined;
   const started: AgentRuntimeEvent = {
     eventId: "exec-1:1",
     executionId: "exec-1",
@@ -68,7 +71,8 @@ async function setup(options: {
   const adapter: AgentRuntimeAdapter = {
     async getCapabilities() { return NO_CAPABILITIES; },
     async healthCheck() { return true; },
-    async start() {
+    async start(input) {
+      startedInput = input;
       return { executionId: "exec-1", runtimeType: "hermes", status: "running", externalRunId: "run-ext-1" };
     },
     async getStatus() { return "running"; },
@@ -81,12 +85,13 @@ async function setup(options: {
     async terminate() { return undefined; }
   };
 
-  const coordinator = new ExecutionCoordinator({ adapter, journal });
+  const coordinator = new ExecutionCoordinator({ adapter, journal, runtimeIdOf: () => "hermes-local" });
   const worktrees = new WorktreeManager(git, join(repo, ".worktrees"), { repository: repo });
   const changes = new CodeChangePipeline(git, worktrees);
   const traceability = new TraceabilityQuery(stores);
   const skillRegistry = new SkillRegistry();
   const skillBindings = new SkillBindingStore();
+  const SKILL_CONTENT = "# React development\n\nPrefer function components and hooks.\n";
   const skill = (overrides: Partial<SkillManifest> = {}): SkillManifest => ({
     skillId: "react-dev",
     version: "1.0.0",
@@ -96,13 +101,14 @@ async function setup(options: {
     allowedRuntimes: ["hermes-local"],
     riskLevel: "medium",
     approvalPolicy: "auto",
-    checksum: "a".repeat(64),
+    content: SKILL_CONTENT,
+    checksum: skillContentChecksum(SKILL_CONTENT),
     createdAt: "2026-11-09T00:00:00.000Z",
     ...overrides
   });
-  skillRegistry.register(skill());
-  skillRegistry.register(skill({ skillId: "deploy", permissions: [], riskLevel: "high" }));
-  skillRegistry.register(skill({
+  await skillRegistry.register(skill());
+  await skillRegistry.register(skill({ skillId: "deploy", permissions: [], riskLevel: "high" }));
+  await skillRegistry.register(skill({
     skillId: "net-probe",
     permissions: ["network_access"],
     allowedRuntimes: ["*"]
@@ -126,7 +132,7 @@ async function setup(options: {
     changes,
     stores,
     traceability,
-    skills: { registry: skillRegistry, bindings: skillBindings, runtimeId: "hermes-local" },
+    skills: { registry: skillRegistry, bindings: skillBindings },
     runIdFactory: () => "run-1",
     snapshotIdFactory: prefix => `${prefix}-1`,
     ...(options.resolveRuntime ? { resolveRuntime: options.resolveRuntime } : {})
@@ -148,7 +154,17 @@ async function setup(options: {
     allowedTools: ["read_file"]
   };
 
-  return { repo, baseSha, stores, journal, coordinator, service, request };
+  return {
+    repo,
+    baseSha,
+    stores,
+    journal,
+    coordinator,
+    service,
+    request,
+    /** The request the runtime was started with. */
+    startedInput: () => startedInput
+  };
 }
 
 const patch = [
@@ -386,6 +402,42 @@ test("binds a requested skill and journals the binding", async () => {
     await coordinator.flush("exec-1");
     const bound = (await journal.read("exec-1")).find(entry => entry.category === "skill.bound");
     assert.equal(bound?.payload["skillId"], "react-dev");
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("delivers the skill body to the runtime and journals the delivery", async () => {
+  const { repo, journal, coordinator, service, request, startedInput } = await setup();
+  try {
+    await service.startTask({ ...request, skills: [{ skillId: "react-dev" }] });
+
+    // The runtime is started with the composed prompt: the user's words first, then the skill body.
+    const prompt = startedInput()?.prompt ?? "";
+    assert.match(prompt, /^change value to 2/);
+    assert.match(prompt, /Prefer function components and hooks\./);
+    assert.match(prompt, /react-dev@1\.0\.0/);
+
+    // The prompt snapshot hashes what was delivered, not the prompt before the skills were added.
+    const snapshot = await service.trace("exec-1");
+    assert.equal(snapshot.promptSnapshots.length, 1);
+
+    await coordinator.flush("exec-1");
+    const delivered = (await journal.read("exec-1")).find(entry => entry.category === "skill.delivered");
+    assert.equal(delivered?.payload["skillId"], "react-dev");
+    assert.equal(delivered?.payload["deliveryMode"], "prompt_inline");
+    assert.equal(delivered?.payload["runtimeId"], "hermes-local");
+    assert.ok(Number(delivered?.payload["bytes"]) > 0);
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("a task without skills is not given a skill block", async () => {
+  const { repo, service, request, startedInput } = await setup();
+  try {
+    await service.startTask(request);
+    assert.equal(startedInput()?.prompt, "change value to 2");
   } finally {
     await rm(repo, { recursive: true, force: true });
   }

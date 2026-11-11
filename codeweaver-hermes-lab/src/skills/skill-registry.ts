@@ -52,27 +52,37 @@ export class SkillRegistry {
   async load(): Promise<void> {
     if (!this.store) return;
     for (const record of await this.store.list()) {
-      this.registerInMemory(record.manifest);
+      // A manifest that no longer validates is not delivered. The failure is loud: a skill that
+      // silently disappears would make a task run without instructions the user believes are bound.
+      assertValidSkill(record.manifest);
+      this.assertNotRegistered(record.manifest);
+      this.setInMemory(record.manifest);
     }
   }
 
   async register(manifest: SkillManifest): Promise<void> {
     assertValidSkill(manifest);
-    this.registerInMemory(manifest);
+    this.assertNotRegistered(manifest);
+    // The manifest is on disk before the server believes it exists: a skill the server cannot read
+    // back after a restart is a skill it cannot promise to deliver.
     await this.store?.put({
       id: skillRecordId(manifest.skillId, manifest.version),
       manifest,
       registeredAt: manifest.createdAt
     });
+    this.setInMemory(manifest);
   }
 
-  private registerInMemory(manifest: SkillManifest): void {
-    const versions = this.skills.get(manifest.skillId) ?? new Map<string, SkillManifest>();
-    if (versions.has(manifest.version)) {
+  private assertNotRegistered(manifest: SkillManifest): void {
+    if (this.skills.get(manifest.skillId)?.has(manifest.version)) {
       throw new SkillConflictError(
         `Skill ${manifest.skillId}@${manifest.version} is already registered; publish a new version`
       );
     }
+  }
+
+  private setInMemory(manifest: SkillManifest): void {
+    const versions = this.skills.get(manifest.skillId) ?? new Map<string, SkillManifest>();
     versions.set(manifest.version, Object.freeze({ ...manifest }));
     this.skills.set(manifest.skillId, versions);
   }
@@ -119,18 +129,25 @@ export class SkillRegistry {
   /**
    * Design 10.3: declared permissions must already be granted by the execution's policy snapshot,
    * and the skill must be allowed on this runtime. Anything undeclared-but-required is a deny.
+   *
+   * An unknown runtime denies a runtime-specific skill: "we could not check" is not "it is fine".
    */
   authorize(
     manifest: SkillManifest,
-    context: { runtimeId: string; policy: PolicySnapshot; now?: Date }
+    context: { runtimeId: string | undefined; policy: PolicySnapshot; now?: Date }
   ): SkillAuthorization {
     const reasons: string[] = [];
-    const allowedRuntime = manifest.allowedRuntimes.includes("*")
-      || manifest.allowedRuntimes.includes(context.runtimeId);
+    const allowedRuntime =
+      manifest.allowedRuntimes.includes("*") ||
+      (context.runtimeId !== undefined && manifest.allowedRuntimes.includes(context.runtimeId));
     if (!allowedRuntime) {
       return {
         decision: "deny",
-        reasons: [`Skill ${manifest.skillId} may not run on runtime '${context.runtimeId}'`]
+        reasons: [
+          context.runtimeId
+            ? `Skill ${manifest.skillId} may not run on runtime '${context.runtimeId}'`
+            : `Skill ${manifest.skillId} names the runtimes it may run on, and the runtime of this task is unknown`
+        ]
       };
     }
 
@@ -169,4 +186,22 @@ export class SkillRegistry {
 
 function key(skillId: string, version: string): string {
   return `${skillId}@${version}`;
+}
+
+/** The stored form of a manifest: the manifest itself, under a file-safe id. */
+export interface SkillManifestRecord {
+  id: string;
+  manifest: SkillManifest;
+  registeredAt: string;
+}
+
+/**
+ * A file-safe id for a skill version.
+ *
+ * The record id is a digest rather than the name because `@` is not a safe file name character and
+ * skill ids are caller-supplied.
+ */
+export function skillRecordId(skillId: string, version: string): string {
+  const digest = createHash("sha256").update(`${skillId}@${version}`, "utf8").digest("hex");
+  return `skill_${digest.slice(0, 24)}`;
 }

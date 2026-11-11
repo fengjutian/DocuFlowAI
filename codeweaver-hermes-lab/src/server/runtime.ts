@@ -28,7 +28,7 @@ import { createPiRuntime } from "./pi-runtime.js";
 import { CODEWEAVER_TOOL_NAMES } from "../tools/codeweaver-tools.js";
 import { CodeWeaverToolBinder } from "../tools/execution-tool-binding.js";
 import { createPolicyPermissionHandler } from "../tools/runtime-permission-handler.js";
-import { SkillRegistry } from "../skills/skill-registry.js";
+import { SkillRegistry, type SkillManifestRecord } from "../skills/skill-registry.js";
 import { SkillBindingStore, type SkillBindingEvent } from "../skills/skill-bindings.js";
 import type { ChangeRecord } from "../code-engine/change-record.js";
 import type { EvaluationResult } from "../evaluation/evaluation.js";
@@ -169,7 +169,11 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   const worktrees = new WorktreeManager(git, config.worktreeRoot, { repository: config.repository });
   const changes = new CodeChangePipeline(git, worktrees);
   const traceability = new TraceabilityQuery(stores);
-  const skillRegistry = new SkillRegistry();
+  // The registry keeps the manifest *and* its body, and it keeps them on disk: a skill library that
+  // empties on every restart is a library the user cannot rely on.
+  const skillRegistry = new SkillRegistry(
+    new ImmutableRecordStore<SkillManifestRecord>(config.dataDir, "skills")
+  );
   const skillBindings = new SkillBindingStore(
     new ImmutableRecordStore<SkillBindingEvent>(config.dataDir, "bindings")
   );
@@ -182,7 +186,7 @@ export function createRuntime(config: RuntimeConfig): Runtime {
       changes,
       stores,
       traceability,
-      skills: { registry: skillRegistry, bindings: skillBindings, runtimeId: "hermes-local" },
+      skills: { registry: skillRegistry, bindings: skillBindings },
       // `auto` asks the scheduler to choose a healthy, capable runtime. Every other id names one
       // registered runtime exactly, so a task never lands on a runtime the caller did not pick.
       resolveRuntime: async runtimeId => {
@@ -222,6 +226,7 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     ready: async () => {
       await usage.load();
       await skillBindings.load();
+      await skillRegistry.load();
       // Pi is created here rather than in `createRuntime` because the Pi packages are ESM-only
       // and are loaded dynamically. A server without `PI_MODEL` never loads them at all.
       if (config.pi) {
