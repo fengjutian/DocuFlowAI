@@ -42,6 +42,20 @@ const KNOWN_PERMISSIONS = [
 ];
 
 /**
+ * The first line of a skill body that says something.
+ *
+ * A Markdown body usually starts with a heading, which is the most useful single line to show in
+ * the list, but a body that starts with a blank line or a comment should still show its content.
+ */
+function firstMeaningfulLine(content: string): string {
+  const line = content
+    .split("\n")
+    .map(item => item.trim())
+    .find(item => item !== "" && !item.startsWith("<!--"));
+  return line ?? "（空正文）";
+}
+
+/**
  * Skill registry.
  *
  * A skill is not trusted because it is Markdown: the registry only accepts a manifest that declares
@@ -110,7 +124,7 @@ export function SkillsPage() {
           <div>
             <CardTitle className="text-base">技能清单</CardTitle>
             <CardDescription>
-              技能必须声明所需权限、可运行环境、风险等级与审批策略；未声明的一律拒绝。
+              技能必须声明所需权限、可运行环境、风险等级与审批策略；未声明的一律拒绝。正文会随清单保存，并注入到绑定该技能的执行的 prompt 中。
             </CardDescription>
           </div>
           <Button size="sm" onClick={() => setDialogOpen(true)}>
@@ -203,7 +217,7 @@ export function SkillsPage() {
           <DialogHeader>
             <DialogTitle>注册技能</DialogTitle>
             <DialogDescription>
-              校验和由客户端按技能正文计算（SHA-256）。技能正文本身由 Runtime 侧加载，此处只登记清单。
+              校验和由客户端按技能正文计算（SHA-256），服务端会核对正文与校验和是否一致。正文随清单一起保存，并注入到绑定该技能的执行的 prompt 中。
             </DialogDescription>
           </DialogHeader>
 
@@ -322,7 +336,7 @@ export function SkillsPage() {
             </div>
 
             <div className="space-y-2">
-              <Label htmlFor="skill-content">技能正文（用于计算校验和）</Label>
+              <Label htmlFor="skill-content">技能正文（注入执行 prompt，并参与校验和计算）</Label>
               <Textarea
                 id="skill-content"
                 rows={5}

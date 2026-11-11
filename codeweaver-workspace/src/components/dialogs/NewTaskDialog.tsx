@@ -16,6 +16,7 @@ import {
   SheetTitle
 } from "@/components/ui/sheet";
 import { Textarea } from "@/components/ui/textarea";
+import { Switch } from "@/components/ui/switch";
 import { api } from "@/lib/api";
 import { sha256Hex } from "@/lib/hash";
 import { useApiData } from "@/hooks/useApiData";
@@ -60,6 +61,28 @@ export function NewTaskDialog({
   // is honoured or refused, never quietly redirected (D-047).
   const [runtimeId, setRuntimeId] = useState("auto");
   const runtimes = useApiData(() => api.listRuntimes(), []);
+  // The skills this task binds. Their bodies are injected into the prompt the runtime receives, so
+  // a task without skills is not the same task as one with them.
+  const [selectedSkills, setSelectedSkills] = useState<Array<{ skillId: string; version: string }>>([]);
+  const [approvedSkills, setApprovedSkills] = useState<string[]>([]);
+  const skills = useApiData(() => api.listSkills(), []);
+
+  const skillKey = (skillId: string, version: string) => `${skillId}@${version}`;
+  const isSkillSelected = (skillId: string, version: string) =>
+    selectedSkills.some(item => item.skillId === skillId && item.version === version);
+  const toggleSkill = (skillId: string, version: string) => {
+    setSelectedSkills(current =>
+      isSkillSelected(skillId, version)
+        ? current.filter(item => !(item.skillId === skillId && item.version === version))
+        : [...current, { skillId, version }]
+    );
+  };
+  const toggleApproval = (skillId: string, version: string) => {
+    const key = skillKey(skillId, version);
+    setApprovedSkills(current =>
+      current.includes(key) ? current.filter(item => item !== key) : [...current, key]
+    );
+  };
 
   const splitList = (raw: string) =>
     raw
@@ -95,7 +118,13 @@ export function NewTaskDialog({
       modelConfig: {},
       timeoutSeconds: Number(timeoutSeconds) || 60,
       allowedTools: splitList(allowedTools),
-      runtimeId
+      runtimeId,
+      ...(selectedSkills.length > 0
+        ? {
+            skills: selectedSkills.map(item => ({ skillId: item.skillId, version: item.version })),
+            ...(approvedSkills.length > 0 ? { approvedSkills } : {})
+          }
+        : {})
     };
   }, [    taskId,
     projectId,
@@ -112,7 +141,9 @@ export function NewTaskDialog({
     templateVersion,
     timeoutSeconds,
     allowedTools,
-    runtimeId
+    runtimeId,
+    selectedSkills,
+    approvedSkills
   ]);
 
   const submit = async () => {
@@ -202,6 +233,58 @@ export function NewTaskDialog({
             </Select>
             <p className="text-xs text-muted-foreground">
               运行时由服务端注册；点名的运行时要么就用它，要么被拒绝，不会被悄悄换成别的。
+            </p>
+          </div>
+
+          <div className="space-y-2">
+            <Label>绑定技能</Label>
+            {skills.data && skills.data.skills.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                技能库为空。先在「技能管理」注册一个技能，它正文才会被注入到执行的 prompt 里。
+              </p>
+            ) : null}
+            <div className="space-y-2">
+              {skills.data?.skills.map(skill => {
+                const key = skillKey(skill.skillId, skill.version);
+                const selected = isSkillSelected(skill.skillId, skill.version);
+                const needsApproval = skill.approvalPolicy === "require_approval";
+                return (
+                  <div
+                    key={key}
+                    className="flex items-start justify-between gap-3 rounded-md border border-border/70 px-3 py-2"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => toggleSkill(skill.skillId, skill.version)}
+                      className="min-w-0 flex-1 text-left"
+                    >
+                      <p className="truncate text-sm">
+                        {skill.name}
+                        {selected ? " · 已绑定" : ""}
+                      </p>
+                      <p className="truncate font-mono text-xs text-muted-foreground">{key}</p>
+                      <p className="truncate text-xs text-muted-foreground">
+                        {skill.permissions.join(", ") || "无额外权限"} · {skill.riskLevel}
+                      </p>
+                    </button>
+                    {needsApproval ? (
+                      <div className="flex items-center gap-2 pt-1">
+                        <Label htmlFor={`approve-${key}`} className="text-xs text-muted-foreground">
+                          我已审批
+                        </Label>
+                        <Switch
+                          id={`approve-${key}`}
+                          checked={approvedSkills.includes(key)}
+                          onCheckedChange={() => toggleApproval(skill.skillId, skill.version)}
+                        />
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+            <p className="text-xs text-muted-foreground">
+              技能正文会在执行开始时随 prompt 一起交给运行时；服务端会按策略核对权限与运行环境，未通过的技能会直接拒绝这次执行。
             </p>
           </div>
 

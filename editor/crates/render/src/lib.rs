@@ -113,12 +113,8 @@ impl Renderer {
         let cache = Cache::new(&device);
         let mut atlas = TextAtlas::new(&device, &queue, &cache, format);
         let viewport = Viewport::new(&device, &cache);
-        let renderer = TextRenderer::new(
-            &mut atlas,
-            &device,
-            wgpu::MultisampleState::default(),
-            None,
-        );
+        let renderer =
+            TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         let text = TextState {
             font_system: FontSystem::new(),
             swash_cache: SwashCache::new(),
@@ -159,11 +155,7 @@ impl Renderer {
         )
     }
 
-    pub fn render(
-        &mut self,
-        scene: &FrameScene,
-        scale_factor: f64,
-    ) -> Result<(), RendererError> {
+    pub fn render(&mut self, scene: &FrameScene, scale_factor: f64) -> Result<(), RendererError> {
         if self.size.width == 0 || self.size.height == 0 {
             return Ok(());
         }
