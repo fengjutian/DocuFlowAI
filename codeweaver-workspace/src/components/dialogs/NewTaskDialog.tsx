@@ -60,12 +60,14 @@ export function NewTaskDialog({
   // The runtime that runs the task. `auto` lets the server pick a healthy one; naming a runtime
   // is honoured or refused, never quietly redirected (D-047).
   const [runtimeId, setRuntimeId] = useState("auto");
-  const runtimes = useApiData(() => api.listRuntimes(), []);
+  // Both lists are read when the sheet opens, not when the app mounts: a runtime or a skill
+  // registered after the page loaded would otherwise be missing from the picker.
+  const runtimes = useApiData(() => api.listRuntimes(), [open]);
   // The skills this task binds. Their bodies are injected into the prompt the runtime receives, so
   // a task without skills is not the same task as one with them.
   const [selectedSkills, setSelectedSkills] = useState<Array<{ skillId: string; version: string }>>([]);
   const [approvedSkills, setApprovedSkills] = useState<string[]>([]);
-  const skills = useApiData(() => api.listSkills(), []);
+  const skills = useApiData(() => api.listSkills(), [open]);
 
   const skillKey = (skillId: string, version: string) => `${skillId}@${version}`;
   const isSkillSelected = (skillId: string, version: string) =>

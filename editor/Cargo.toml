@@ -2,8 +2,10 @@
 resolver = "2"
 members = [
     "crates/app",
+    "crates/editor-core",
     "crates/platform",
     "crates/render",
+    "crates/text",
 ]
 default-members = ["crates/app"]
 

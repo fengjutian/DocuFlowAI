@@ -18,7 +18,7 @@
 app -> workbench/ui/editor-core（待建）
 app -> platform -> render
 ui  -> render-api（待从 render 中抽出）
-editor-core -> text（待建）
+editor-core -> text
 agent-acp -> editor-core transaction（待建）
 ```
 
@@ -53,7 +53,10 @@ GPU，也使渲染 benchmark 可以使用合成场景。
 `platform::TextInputState` 将 winit 的 IME 事件归一化为两类状态：
 
 - `preedit`：正在组合的文本，仅用于视图展示，不进入正式 Buffer；
-- `commit`：输入法确认的文本，未来必须通过一个编辑事务写入 Buffer。
+- `commit`：输入法确认的文本，通过一个编辑事务写入 Buffer。
+
+当前 commit 已通过 `editor-core::Editor::insert` 生成版本化事务；preedit 不进入 Buffer，
+只在生成 `FrameScene` 时插入光标位置。撤销不会留下输入法组合过程，只撤销最终提交。
 
 IME 候选窗位置应由获得文本焦点的 UI 组件按光标位置更新。当前原型已经开启原生
 IME 并处理 enabled、disabled、preedit 和 commit，候选窗定位会在编辑器视图实现时接入。

@@ -3,6 +3,7 @@ mod input;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use codeweaver_editor_core::Editor;
 use codeweaver_render::{Color, FrameScene, Rect, Renderer, RendererError, TextStyle};
 use input::TextInputState;
 use winit::{
@@ -10,7 +11,7 @@ use winit::{
     dpi::LogicalSize,
     event::{ElementState, Ime, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
-    keyboard::{Key, NamedKey},
+    keyboard::{Key, ModifiersState, NamedKey},
     window::{ImePurpose, Window, WindowAttributes, WindowId},
 };
 
@@ -20,7 +21,9 @@ const WINDOW_TITLE: &str = "CodeWeaver";
 pub struct NativeApplication {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
+    editor: Editor,
     input: TextInputState,
+    modifiers: ModifiersState,
 }
 
 impl NativeApplication {
@@ -89,18 +92,49 @@ impl ApplicationHandler for NativeApplication {
                     Ime::Enabled => self.input.enable_ime(true),
                     Ime::Disabled => self.input.enable_ime(false),
                     Ime::Preedit(text, selection) => self.input.set_preedit(text, selection),
-                    Ime::Commit(text) => self.input.commit(&text),
+                    Ime::Commit(text) => {
+                        if let Err(error) = self.editor.insert(&text) {
+                            eprintln!("failed to commit IME text: {error}");
+                        }
+                        self.input.finish_commit();
+                    }
                 }
                 window.request_redraw();
             }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                if event.logical_key == Key::Named(NamedKey::Backspace) {
-                    self.input.delete_previous_scalar();
-                } else if self.input.preedit().is_empty()
-                    && let Some(text) = event.text
-                    && !text.chars().any(char::is_control)
-                {
-                    self.input.commit(&text);
+                let result = match event.logical_key.as_ref() {
+                    Key::Named(NamedKey::Backspace) => self.editor.backspace(),
+                    Key::Named(NamedKey::ArrowLeft) => {
+                        self.editor.move_left();
+                        Ok(())
+                    }
+                    Key::Named(NamedKey::ArrowRight) => {
+                        self.editor.move_right();
+                        Ok(())
+                    }
+                    Key::Named(NamedKey::Enter) => self.editor.insert("\n"),
+                    Key::Character(character)
+                        if self.modifiers.control_key() && character.eq_ignore_ascii_case("z") =>
+                    {
+                        self.editor.undo()
+                    }
+                    Key::Character(character)
+                        if self.modifiers.control_key() && character.eq_ignore_ascii_case("y") =>
+                    {
+                        self.editor.redo()
+                    }
+                    _ if self.input.preedit().is_empty()
+                        && !self.modifiers.control_key()
+                        && let Some(text) = event.text
+                        && !text.chars().any(char::is_control) =>
+                    {
+                        self.editor.insert(&text)
+                    }
+                    _ => Ok(()),
+                };
+                if let Err(error) = result {
+                    eprintln!("editor input transaction failed: {error}");
                 }
                 window.request_redraw();
             }
@@ -108,8 +142,11 @@ impl ApplicationHandler for NativeApplication {
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
                 };
-                let scene =
-                    build_demo_scene(renderer.logical_size(window.scale_factor()), &self.input);
+                let scene = build_demo_scene(
+                    renderer.logical_size(window.scale_factor()),
+                    &self.editor,
+                    &self.input,
+                );
                 match renderer.render(&scene, window.scale_factor()) {
                     Ok(()) => {}
                     Err(RendererError::Surface(wgpu::SurfaceError::Lost)) => {
@@ -131,7 +168,11 @@ impl ApplicationHandler for NativeApplication {
     }
 }
 
-fn build_demo_scene(size: codeweaver_render::Size, input: &TextInputState) -> FrameScene {
+fn build_demo_scene(
+    size: codeweaver_render::Size,
+    editor_state: &Editor,
+    input: &TextInputState,
+) -> FrameScene {
     let viewport = Rect::new(0.0, 0.0, size.width, size.height);
     let editor = Rect::new(56.0, 52.0, (size.width - 80.0).max(1.0), 180.0);
     let content_clip = Rect::new(
@@ -153,8 +194,11 @@ fn build_demo_scene(size: codeweaver_render::Size, input: &TextInputState) -> Fr
         viewport,
     );
     let heading = format!(
-        "CodeWeaver · wgpu FrameScene · IME {}",
-        if input.ime_enabled() { "ON" } else { "READY" }
+        "CodeWeaver · Buffer v{} · IME {} · Undo {} · Redo {}",
+        editor_state.snapshot().version(),
+        if input.ime_enabled() { "ON" } else { "READY" },
+        editor_state.can_undo(),
+        editor_state.can_redo(),
     );
     scene.push_text(
         heading,
@@ -166,11 +210,14 @@ fn build_demo_scene(size: codeweaver_render::Size, input: &TextInputState) -> Fr
             line_height: 22.0,
         },
     );
-    let text = if input.display_text().is_empty() {
-        "点击窗口并输入；支持中文输入法 preedit / commit".to_owned()
-    } else {
-        input.display_text()
-    };
+    let caret = editor_state.selection().head.0;
+    let mut text = String::with_capacity(editor_state.text().len() + input.preedit().len());
+    text.push_str(&editor_state.text()[..caret]);
+    text.push_str(input.preedit());
+    text.push_str(&editor_state.text()[caret..]);
+    if text.is_empty() {
+        text = "点击窗口输入；支持中文 IME，Ctrl+Z 撤销，Ctrl+Y 重做".to_owned();
+    }
     scene.push_text(
         text,
         content_clip,

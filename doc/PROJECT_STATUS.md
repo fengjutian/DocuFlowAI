@@ -77,13 +77,13 @@ CodeWeaver 已经具备一条可运行的最小闭环：固定的 Hermes 0.23.0 
 
 ## 7. 下一步建议
 
-1. **在 Pi 路径上推进 15 项 `not_run` 中的高价值项**。主运行时是 Pi（D-042、D-060），所以下一步都落在 Pi 侧：P0-005/P0-006/P0-007（单步、多工具、多轮）、P0-008（子代理委派）、P0-024（端到端可追溯）、P0-019/P0-020（客户端断开与运行时崩溃——设计要求这四种故障不能用同一种恢复策略，P0-021 已经把「worker 崩溃」这一种钉死为「会话随进程没了 → 安全重建」，剩下三种要各自有自己的策略与证据）。取消（P0-018）与会话恢复/重建（P0-021）已在 Pi 上签收。
+1. **在 Pi 路径上推进 14 项 `not_run` 中的高价值项**。主运行时是 Pi（D-042、D-060），所以下一步都落在 Pi 侧：P0-005/P0-006/P0-007（单步、多工具、多轮）、P0-024（端到端可追溯）、P0-019/P0-020（客户端断开与运行时崩溃——设计要求这四种故障不能用同一种恢复策略，P0-021 已经把「worker 崩溃」这一种钉死为「会话随进程没了 → 安全重建」，剩下三种要各自有自己的策略与证据）。取消（P0-018）、会话恢复/重建（P0-021）与子代理委派（P0-008）已在 Pi 上签收。
 2. **实现 Windows 原生边界并产出 `SEC-B*` 证据**。不再恢复或依赖 Docker daemon；先验证 AppContainer 对 Hermes/Python 的兼容性，不满足时切换到 Windows Sandbox/Hyper-V。只有拿到真实 OS 边界证据，P0-017（宿主机路径保护）等项才具备签收前提（D-008、D-009）。详细规划见 `doc/HERMES_NATIVE_PLAN.md`。
-3. **按 Pi 签收 24 项清单，并把清单口径从「两个运行时」收敛为「Pi 签收 + Hermes 参考」**。D-042 的退役条件是「24 项清单针对选定运行时签收」——清单既已在 Pi 上签收 9 项，Hermes 的 7 项（P0-001/002/003 + AT-001..004）作为远程形态的契约证据保留，但不再作为必须补齐的缺口。
+3. **按 Pi 签收 24 项清单，并把清单口径从「两个运行时」收敛为「Pi 签收 + Hermes 参考」**。D-042 的退役条件是「24 项清单针对选定运行时签收」——清单既已在 Pi 上签收 10 项，Hermes 的 7 项（P0-001/002/003 + AT-001..004）作为远程形态的契约证据保留，但不再作为必须补齐的缺口。
 4. **补齐两项未实现能力并留下可执行证据**：多模型执行策略需要至少两个运行时并存的策略运行证据（依赖建议 3 的口径收敛结果）；Agent 能力评分需要把运行时的实测表现聚合成可比较的指标。
 
-> 已取消的方向：不为 Hermes 暴露 CodeWeaver 工具面（D-060）。工具面、agent 级安全探针、取消与会话恢复都已在 Pi 侧签收，为远程参考运行时再做一套 MCP 接入是重复劳动。
+> 已取消的方向：不为 Hermes 暴露 CodeWeaver 工具面（D-060）。工具面、agent 级安全探针、取消与会话恢复、子代理委派都已在 Pi 侧签收，为远程参考运行时再做一套 MCP 接入是重复劳动。
 
 ---
 
-> 证据来源：`codeweaver-hermes-lab/reports/phase0.json`、`codeweaver-hermes-lab/reports/phase0-agent-security.json`、`codeweaver-hermes-lab/reports/phase0-agent-security-transcripts/`、`codeweaver-hermes-lab/docs/DECISION_LOG.md`、`codeweaver-hermes-lab/README.md`。文中所有状态数字与结论均取自这些文件，未做推测。
+> 证据来源：`codeweaver-hermes-lab/reports/phase0.json`、`codeweaver-hermes-lab/reports/phase0-agent-security.json`、`codeweaver-hermes-lab/reports/phase0-agent-security-transcripts/`、`codeweaver-hermes-lab/reports/phase0-pi-subagent.json`、`codeweaver-hermes-lab/reports/phase0-pi-skill-delivery.json`、`codeweaver-hermes-lab/docs/DECISION_LOG.md`、`codeweaver-hermes-lab/README.md`。文中所有状态数字与结论均取自这些文件，未做推测。

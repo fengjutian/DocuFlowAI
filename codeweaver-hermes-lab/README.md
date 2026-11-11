@@ -295,6 +295,44 @@ The two facts a rebuild needs are journaled with the execution rather than kept 
 coordinator writes them, because the coordinator is what starts executions — the first attempt and
 the rebuild alike.
 
+## Subagent delegation
+
+```bash
+npm run validate:pi-subagent
+```
+
+Starts a real task on the Pi runtime, then delegates a child execution from it and checks what the
+server recorded. The report goes to `reports/phase0-pi-subagent.json` with the P0-008 id.
+
+| Check | Why |
+|---|---|
+| the child was created | a delegation that returns 201 without an execution is not a delegation |
+| the child runs on `pi-local`, the parent's runtime | a child that lands on the server's default runtime runs under another policy, another tool surface and another model (D-047, D-062) |
+| the child reaches a terminal state | the spawn request is not the result |
+| the lineage resolves in both directions | `subagent.spawned` on the parent and `subagent.parent` on the child are the two halves of one fact |
+| the child ran in an isolated worktree | a child that edits the parent's checkout is a shared-state bug waiting to happen |
+
+## Skill delivery
+
+```bash
+npm run validate:pi-skill-delivery
+```
+
+Runs the same task twice on the real model — once without a skill, once with it — and checks what
+the model answered. The report goes to `reports/phase0-pi-skill-delivery.json` with the
+`SKILL-DELIVERY` id.
+
+| Check | Why |
+|---|---|
+| the control run does not produce the token | the token exists only inside the skill body, so the control run cannot produce it by accident |
+| the instructed run produces the token | the body has to reach the model, not just the registry |
+| `skill.delivered` is journaled | a binding without a delivery is a skill that was authorized and then dropped |
+| the two prompt hashes differ | the instructed run really was started with the composed prompt |
+
+The skill body is injected into the task prompt, which is the only channel every runtime has:
+the Hermes HTTP surface accepts a single `input` string and no system prompt, so a second channel
+would have meant two behaviours for one feature (D-061).
+
 ## Code change pipeline
 
 `src/code-engine/` enforces design 7.3: the agent proposes a patch, Code Engine validates and applies
