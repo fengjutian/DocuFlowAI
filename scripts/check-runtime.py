@@ -207,6 +207,60 @@ def check_mock_mode() -> bool:
         stop_stack(process)
 
 
+def check_pi_mode() -> bool:
+    """The primary runtime must be registered and reachable in the dev stack.
+
+    Pi is the runtime the product runs on (D-042, D-060), so a stack that comes up without it is
+    not a stack that can carry product work — the console would only offer the mock and the remote
+    reference.
+    """
+    print("== Pi 模式（主运行时）==")
+    if not port_is_free(API_PORT):
+        print(f"   端口 {API_PORT} 已被占用，先用 dev.py --stop 释放。")
+        return False
+
+    env = dict(os.environ)
+    env["CODEWEAVER_RUNTIME"] = "pi"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(ROOT / "scripts" / "dev.py"),
+            "--runtime",
+            "pi",
+            "--mode",
+            "browser",
+            "--no-browser",
+            "--no-build",
+        ],
+        cwd=str(ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+    )
+    try:
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            status, body = api_get("/api/v1/runtimes")
+            if status == 200:
+                runtimes = json.loads(body).get("runtimes", [])
+                ids = [entry.get("id") for entry in runtimes]
+                print(f"   已注册运行时：{ids}")
+                pi = next((entry for entry in runtimes if entry.get("id") == "pi-local"), None)
+                if not pi:
+                    print("   没有注册 pi-local。")
+                    return False
+                print(f"   pi-local：model={pi.get('version')} provider={pi.get('metadata', {}).get('provider')}")
+                return True
+            if process.poll() is not None:
+                print("   dev.py 提前退出。")
+                return False
+            time.sleep(1)
+        print(f"   {API_PORT} 在超时内没有就绪。")
+        return False
+    finally:
+        stop_stack(process)
+
+
 def main() -> int:
     # The console on this machine decodes as ANSI unless the stream says otherwise, and the
     # Chinese labels below then arrive as mojibake. UTF-8 is what the rest of the dev stack
@@ -219,10 +273,17 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="验证 CodeWeaver 开发栈的运行时链路")
     parser.add_argument("--with-mock", action="store_true", help="同时检查 mock 模式")
+    parser.add_argument(
+        "--skip-pi",
+        action="store_true",
+        help="跳过 Pi 模式检查（Pi 需要模型密钥）",
+    )
     args = parser.parse_args()
 
     results: list[tuple[str, bool]] = [("真实运行时启停", check_real_runtime())]
     results.append(("真实模式下的栈", check_stack_reaches_real_runtime()))
+    if not args.skip_pi:
+        results.append(("Pi 模式（主运行时）", check_pi_mode()))
     if args.with_mock:
         results.append(("mock 模式", check_mock_mode()))
 

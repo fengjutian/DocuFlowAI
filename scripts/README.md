@@ -77,13 +77,19 @@ Hermes 属于启动它的人，不会被这个脚本带走。
 # 只验证真实 Hermes 的启停闭环（不可达 → 可达 → 不可达）
 python scripts/dev.py --check-runtime
 
-# 验证整条链路：真实运行时启停 + 真实模式下的栈 + mock 模式
+# 验证整条链路：Hermes 启停 + Hermes 模式的栈 + Pi 模式（主运行时）+ mock 模式
 python scripts/check-runtime.py --with-mock
+
+# 没有模型密钥时跳过 Pi 那一项
+python scripts/check-runtime.py --with-mock --skip-pi
 ```
 
 `--check-runtime` 存在的原因是 teardown 最难被观察到：用 `taskkill /F` 杀栈时 Python 是被
 直接终止的，永远走不到 `finally` 里的清理，于是"退出时会停掉自己启的 Hermes"这条路径根本没
 被执行过。`check-runtime.py` 把三个状态都走一遍并报告到达了哪一个。
+
+Pi 模式之所以要单独查：Pi 是主运行时，一个起不来 Pi 的栈并不是能承载产品工作的栈——控制台
+里只剩 mock 和远程参考运行时。
 
 注意 Vite 绑在 IPv6 `::1`、API 绑在 IPv4 `127.0.0.1`：判断端口是否释放必须两个协议族都试，
 只探 IPv4 会把"还占着"报成"空着"。
