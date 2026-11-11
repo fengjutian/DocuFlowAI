@@ -806,3 +806,39 @@ of 24 to 12 of 24.
 Consequence: the checklist can carry items that mean "the agent did the thing". The rule worth
 keeping: an answer that could have been produced without the work is not evidence, and neither is
 a tool call that proves nothing landed.
+## D-065: A second turn is the same session; a new execution with the same text is not
+Status: accepted
+Context: P0-007 asks for "session continuity evidence", which is the part that is easy to fake. A
+second execution launched with the same text produces a second turn that shares nothing with the
+first — it starts from an empty transcript — so it would look like continuity while carrying
+none. And the mechanism did not exist to begin with: the adapter contract had no way to send a
+follow-up to a finished execution, the coordinator had no session to continue, and the console had
+no way to ask.
+Decision: continuation is an optional adapter capability — `followUp?(executionId, prompt)` — and
+it is answered by the runtime that owns the execution, never by the server's default runtime. Pi
+implements it on the same agent instance, so the transcript survives the turn boundary. Hermes
+does not implement it, and the API answers 501 rather than quietly starting a fresh run that only
+looks like a continuation; that is D-047 one level down. The coordinator also requires a live
+session: an execution recorded by an earlier server process answers 409, because the transcript
+lived in the process that is gone. Every accepted follow-up writes a `turn.started` audit fact,
+so the journal shows where one turn ends and the next begins — without a boundary, "the second
+turn" is not even a thing that can be located.
+The judgement is two-sided on purpose. The first turn is asked to remember two strings and to
+answer with nothing but "READY"; the follow-up asks for one of them. The second turn must carry
+the string that appeared only in the first prompt, and must not carry the one it was never asked
+for — an answer that dumps the whole context is a failure, not a stronger pass, because dumping
+the context is not answering the question. The second turn's text is cut at the turn boundary, so
+a model that repeats its previous answer cannot pass by accident.
+Evidence: the probe passes on the real model through the HTTP API. The first turn ended
+`agent.execution.completed`; the follow-up was accepted with 202; the second turn ended
+`agent.execution.completed`; the journal carries the turn marker; the second answer was 32
+characters long and carried the string it was asked for and not the one it was not. Report:
+`reports/phase0-pi-multi-turn.json`. The verdict logic is unit tested, and most of those tests
+are the ones that have to fail: a refused follow-up, a second turn without the string, a second
+turn that dumps the context, a journal without a turn boundary, and a second turn that never
+completed. The HTTP surface has four more: 202 when the runtime can continue, 501 when it cannot,
+400 on an empty prompt, 409 when the execution is not live in this process.
+Consequence: P0-007 is signed off against Pi and the Phase 0 count moves from 12 of 24 to 13 of
+24. The console gained a "继续这一轮" card on the execution detail page, so a follow-up is
+something a user does rather than something the journal proves happened. The rule worth keeping:
+a follow-up continues a session, and never starts a new one that only looks like it does.

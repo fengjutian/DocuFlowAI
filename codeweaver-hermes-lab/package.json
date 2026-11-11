@@ -19,6 +19,7 @@
     "validate:pi-skill-delivery": "npm run build && node dist/runners/pi-skill-delivery-phase0.js",
     "validate:pi-subagent": "npm run build && node dist/runners/pi-subagent-phase0.js",
     "validate:pi-agent-execution": "npm run build && node dist/runners/pi-agent-execution-phase0.js",
+    "validate:pi-multi-turn": "npm run build && node dist/runners/pi-multi-turn-phase0.js",
     "validate:multi-runtime-policy": "npm run build && node dist/runners/multi-runtime-policy-phase0.js",
     "report:phase0": "npm run build && node dist/runners/aggregate-phase0.js",
     "check:hermes": "npm run build && node dist/runners/check-hermes-version.js",

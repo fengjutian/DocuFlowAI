@@ -10,6 +10,7 @@ import {
   KeyRound,
   Loader2,
   MessageSquare,
+  MessageSquarePlus,
   Plug,
   RefreshCw,
   RotateCcw,
@@ -23,6 +24,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
 import { EmptyState, ErrorNotice } from "@/components/common/EmptyState";
 import { StatusBadge } from "@/components/common/StatusBadge";
 import { api } from "@/lib/api";
@@ -67,6 +69,9 @@ export function ExecutionDetailPage() {
   const { executionId = "" } = useParams();
   const navigate = useNavigate();
   const [busy, setBusy] = useState<string | undefined>(undefined);
+  // The prompt of a follow-up turn. It goes to the session the execution already used, so the
+  // answer can depend on what was said before.
+  const [followUpPrompt, setFollowUpPrompt] = useState("");
 
   const detail = useApiData(() => api.getExecution(executionId), [executionId], { pollMs: 3000 });
   const history = useApiData(() => api.getExecutionEvents(executionId), [executionId]);
@@ -147,6 +152,17 @@ export function ExecutionDetailPage() {
     } finally {
       setBusy(undefined);
     }
+  };
+
+  /** Continues the turn on the session the execution already used. */
+  const sendFollowUp = async () => {
+    const prompt = followUpPrompt.trim();
+    if (prompt === "") return;
+    await run("follow-up", async () => {
+      await api.followUp(executionId, prompt);
+      setFollowUpPrompt("");
+      return "已发出追问：运行时会在同一会话里继续";
+    });
   };
 
   const approvals = detail.data?.pendingApprovals ?? [];
@@ -359,6 +375,46 @@ export function ExecutionDetailPage() {
               ) : (
                 <p className="text-xs text-muted-foreground">该执行还没有产生助手输出。</p>
               )}
+            </CardContent>
+          </Card>
+
+          <Card className="border-border/70 bg-card/60">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <MessageSquarePlus className="size-4 text-muted-foreground" />
+                继续这一轮
+              </CardTitle>
+              <CardDescription>
+                追问发回该执行已经用过的会话，回答因此可以依赖上一轮；运行时不支持续问时会明确拒绝，不会另起一次看起来像续问的执行。
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              <Textarea
+                value={followUpPrompt}
+                onChange={event => setFollowUpPrompt(event.target.value)}
+                placeholder="例：把刚才那份方案改成只保留前两步"
+                rows={3}
+                disabled={busy !== undefined || !live}
+              />
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-[11px] text-muted-foreground">
+                  {live
+                    ? "追问记在同一条执行时间线上，判据仍按该执行的终态与评估证据。"
+                    : "该执行不在当前服务进程内运行，没有活的会话可以续问。"}
+                </p>
+                <Button
+                  size="sm"
+                  disabled={busy !== undefined || !live || followUpPrompt.trim() === ""}
+                  onClick={() => void sendFollowUp()}
+                >
+                  {busy === "follow-up" ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <MessageSquarePlus className="size-4" />
+                  )}
+                  发出追问
+                </Button>
+              </div>
             </CardContent>
           </Card>
 

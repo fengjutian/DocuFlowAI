@@ -356,6 +356,35 @@ that was never read, an answer without the nonce, tools in the wrong order, a mi
 change that never landed, a missing change record, a failed acceptance check and a closed
 completion gate.
 
+## Multi-turn sessions
+
+```bash
+npm run validate:pi-multi-turn
+```
+
+Signs off P0-007 (multi-turn session) on the real model through the HTTP API. The report goes to
+`reports/phase0-pi-multi-turn.json`, and because it is a checklist item the report joins the
+Phase 0 aggregate.
+
+A follow-up continues the session the execution already used: `POST /api/v1/executions/{id}/follow-up`
+sends the prompt to the runtime that owns the execution, and that runtime keeps the transcript.
+A runtime that cannot continue refuses with 501 rather than starting a run that only looks like a
+continuation.
+
+| Check | Why |
+|---|---|
+| The follow-up is accepted with 202 | a refused continuation is not a second turn |
+| The second turn ends `agent.execution.completed` | the turn has to finish |
+| The journal carries a `turn.started` boundary | without it, "the second turn" cannot be located |
+| The second answer carries the string that appeared only in the first prompt | it came out of the retained transcript |
+| The second answer does not carry the string it was never asked for | dumping the context is not answering the question |
+
+The first turn is asked to remember two strings and to answer "READY"; the follow-up asks for one
+of them. The verdict logic has unit tests, most of them the cases that have to fail: a refused
+follow-up, a second turn without the string, a second turn that dumps the context, a journal
+without a turn boundary and a second turn that never completed. The HTTP surface has four more:
+202, 501, 400 and 409.
+
 ## Multi-runtime policy and runtime scoring
 
 ```bash

@@ -136,6 +136,19 @@ export const api = {
       { method: "POST" }
     ),
 
+  /**
+   * Continues a finished turn on the session the execution already used.
+   *
+   * The runtime keeps the transcript, so the answer can depend on the earlier turn. A runtime that
+   * cannot continue refuses this (501) rather than starting a fresh run that only looks like a
+   * continuation.
+   */
+  followUp: (executionId: string, prompt: string) =>
+    request<{ executionId: string; status: string }>(
+      `/api/v1/executions/${encodeURIComponent(executionId)}/follow-up`,
+      { method: "POST", body: { prompt } }
+    ),
+
   retryExecution: (executionId: string) =>
     request<RetryResponse>(`/api/v1/executions/${encodeURIComponent(executionId)}/retry`, {
       method: "POST"

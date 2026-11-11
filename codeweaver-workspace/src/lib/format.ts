@@ -188,13 +188,15 @@ function textFromContent(content: unknown): string | undefined {
  * The assistant's own words, when the payload carries them.
  *
  * Pi sends a completed message as `{ message: { content: [{ type: "text", text }] } }` and a stream
- * chunk as `{ delta }`; Hermes passes its payload through unchanged. Without this the console only
- * ever showed event names, and the answer the user actually asked for was one "原始数据" click away.
+ * chunk as `{ delta }`; Hermes passes its payload through unchanged, and its terminal event carries
+ * the whole answer as `output`. Without this the console only ever showed event names, and the
+ * answer the user actually asked for was one "原始数据" click away — a Hermes run whose answer
+ * lived in `output` looked like a run that had produced nothing at all.
  */
 export function agentMessageText(data: unknown): string | undefined {
   if (!data || typeof data !== "object") return undefined;
   const record = data as Record<string, unknown>;
-  for (const key of ["text", "delta"]) {
+  for (const key of ["text", "delta", "output"]) {
     const value = record[key];
     if (typeof value === "string" && value.trim() !== "") return value;
   }

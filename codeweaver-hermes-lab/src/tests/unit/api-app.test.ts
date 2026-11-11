@@ -22,6 +22,7 @@ interface Harness {
   starts: StartTaskRequest[];
   cancelled: string[];
   approvals: Array<{ executionId: string; requestId: string; decision: string }>;
+  followUps: Array<{ executionId: string; prompt: string }>;
   bus: EventBus;
   coordinator: ExecutionCoordinator;
 }
@@ -35,10 +36,13 @@ async function harness(options: {
    * That is what a server restart looks like from the outside: same records, empty memory.
    */
   journal?: JournalStore;
+  /** Whether the runtime can continue a finished turn on the same session. */
+  canFollowUp?: boolean;
 } = {}): Promise<Harness> {
   const starts: StartTaskRequest[] = [];
   const cancelled: string[] = [];
   const approvals: Array<{ executionId: string; requestId: string; decision: string }> = [];
+  const followUps: Array<{ executionId: string; prompt: string }> = [];
   let pending: RuntimePermissionRequest[] = [
     { requestId: "req-1", executionId: "exec-1", payload: { tool: "shell" } }
   ];
@@ -52,6 +56,16 @@ async function harness(options: {
     async getStatus() { return "running"; },
     async cancel(executionId) { cancelled.push(executionId); },
     async resume() { throw new Error("not used"); },
+    // A runtime that cannot continue a finished turn omits the method, exactly like the Hermes
+    // adapter does. The API has to refuse the follow-up rather than start a fresh run.
+    ...(options.canFollowUp
+      ? {
+          async followUp(executionId: string, prompt: string) {
+            followUps.push({ executionId, prompt });
+            return { executionId, runtimeType: "hermes" as const, status: "running" as const };
+          }
+        }
+      : {}),
     async subscribe(_id, handler) {
       handler({
         eventId: "exec-1:1",
@@ -142,6 +156,7 @@ async function harness(options: {
     starts,
     cancelled,
     approvals,
+    followUps,
     bus,
     coordinator
   };
@@ -246,6 +261,87 @@ test("a runtime id of 'scores' is not mistaken for a runtime name", async () => 
     // The literal route wins over the `:id` wildcard, and a real name still resolves as a runtime.
     const named = await fetch(`${app.url}/api/v1/runtimes/hermes-local`);
     assert.equal(named.status, 200);
+  } finally {
+    await app.close();
+  }
+});
+
+test("continues a finished turn on the session the execution already used", async () => {
+  const app = await harness({ canFollowUp: true });
+  try {
+    // The follow-up needs the live session: the transcript the runtime keeps lives in this process.
+    const started = await fetch(`${app.url}/api/v1/tasks/task-1/executions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(startBody())
+    });
+    assert.equal(started.status, 201);
+
+    const response = await fetch(`${app.url}/api/v1/executions/exec-1/follow-up`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "now tell me B" })
+    });
+
+    assert.equal(response.status, 202);
+    assert.deepEqual(app.followUps, [{ executionId: "exec-1", prompt: "now tell me B" }]);
+  } finally {
+    await app.close();
+  }
+});
+
+test("refuses a follow-up on a runtime that cannot continue a turn", async () => {
+  const app = await harness();
+  try {
+    const started = await fetch(`${app.url}/api/v1/tasks/task-1/executions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(startBody())
+    });
+    assert.equal(started.status, 201);
+
+    const response = await fetch(`${app.url}/api/v1/executions/exec-1/follow-up`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "now tell me B" })
+    });
+    const body = await response.json() as { error?: string; message?: string };
+
+    assert.equal(response.status, 501);
+    assert.equal(body.error, "unsupported_capability");
+    assert.equal(app.followUps.length, 0);
+  } finally {
+    await app.close();
+  }
+});
+
+test("refuses a follow-up on an execution this process does not hold", async () => {
+  const app = await harness({ canFollowUp: true });
+  try {
+    const response = await fetch(`${app.url}/api/v1/executions/exec-unknown/follow-up`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "now tell me B" })
+    });
+
+    assert.equal(response.status, 409);
+    assert.equal(app.followUps.length, 0);
+  } finally {
+    await app.close();
+  }
+});
+
+test("rejects a follow-up without a prompt", async () => {
+  const app = await harness({ canFollowUp: true });
+  try {
+    const response = await fetch(`${app.url}/api/v1/executions/exec-1/follow-up`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prompt: "   " })
+    });
+
+    assert.equal(response.status, 400);
+    assert.equal(app.followUps.length, 0);
   } finally {
     await app.close();
   }
