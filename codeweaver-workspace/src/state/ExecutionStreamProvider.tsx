@@ -1,15 +1,24 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import { subscribeEvents, type StreamStatus } from "@/lib/events";
-import type { CodeWeaverEvent } from "@/lib/types";
-import { StreamContext, type ExecutionSummary, type StreamContextValue } from "@/state/execution-stream";
+import { api } from "@/lib/api";
+import type { CodeWeaverEvent, ExecutionSummaryRecord } from "@/lib/types";
+import {
+  StreamContext,
+  mergeExecutionSummaries,
+  type ExecutionSummary,
+  type StreamContextValue
+} from "@/state/execution-stream";
 
 /**
  * Global event stream.
  *
- * The lab server has no "list executions" endpoint: the journal is per execution and the live stream
- * is the only place where every execution shows up. The provider therefore keeps one subscription to
- * `GET /api/v1/events` and derives the execution list from what arrives, which is exactly the source
- * the API itself uses for live state.
+ * The provider keeps one subscription to `GET /api/v1/events` and derives the live state from what
+ * arrives. The live stream only knows the executions it has watched, so the execution list is also
+ * read from the server's own journal summary (`GET /api/v1/executions`): that snapshot is what puts
+ * back the executions that started and finished while the console was disconnected.
+ *
+ * The snapshot is therefore pulled once at start and again after every reconnect, and the two
+ * sources are merged by execution id.
  *
  * The stream is a notification channel, never a verdict: an execution is only "successful" when its
  * terminal state and the evaluation gate say so.
@@ -26,10 +35,27 @@ const STATUS_BY_EVENT: Record<string, string> = {
 
 export function ExecutionStreamProvider({ children }: { children: ReactNode }) {
   const [events, setEvents] = useState<CodeWeaverEvent[]>([]);
+  const [snapshot, setSnapshot] = useState<ExecutionSummaryRecord[]>([]);
   const [streamStatus, setStreamStatus] = useState<StreamStatus>("connecting");
   const [streamMessage, setStreamMessage] = useState<string | undefined>(undefined);
 
+  /**
+   * Reads the server's execution list.
+   *
+   * A failure here is not fatal: the live stream still carries the executions it watches, so the
+   * console keeps working and the next reconnect tries again.
+   */
+  const refreshSnapshot = useCallback(() => {
+    void api
+      .listExecutions()
+      .then(result => setSnapshot(result.executions ?? []))
+      .catch(() => {
+        // The list endpoint is the recovery path, not the only path; the live stream still runs.
+      });
+  }, []);
+
   useEffect(() => {
+    refreshSnapshot();
     const unsubscribe = subscribeEvents({
       onEvent: event => {
         setEvents(current => {
@@ -40,12 +66,15 @@ export function ExecutionStreamProvider({ children }: { children: ReactNode }) {
       onStatus: (status, detail) => {
         setStreamStatus(status);
         setStreamMessage(detail);
-      }
+      },
+      // The socket only carries what happens while it listens, so a reconnect is the moment to read
+      // back what was missed.
+      onReconnect: refreshSnapshot
     });
     return unsubscribe;
-  }, []);
+  }, [refreshSnapshot]);
 
-  const executions = useMemo(() => {
+  const liveExecutions = useMemo(() => {
     const byExecution = new Map<string, ExecutionSummary>();
     for (const event of events) {
       if (!event.executionId) continue;
@@ -62,10 +91,13 @@ export function ExecutionStreamProvider({ children }: { children: ReactNode }) {
         eventCount: (existing?.eventCount ?? 0) + 1
       });
     }
-    return [...byExecution.values()].sort((a, b) =>
-      (b.lastTimestamp ?? "").localeCompare(a.lastTimestamp ?? "")
-    );
+    return [...byExecution.values()];
   }, [events]);
+
+  const executions = useMemo(
+    () => mergeExecutionSummaries(snapshot, liveExecutions),
+    [snapshot, liveExecutions]
+  );
 
   const value = useMemo<StreamContextValue>(
     () => ({

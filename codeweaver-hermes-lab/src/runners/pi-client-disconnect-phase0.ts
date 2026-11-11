@@ -118,25 +118,33 @@ export function judgeDisconnect(input: {
 
   const journalPositions = [...input.journal].sort((left, right) => left - right);
   const missing = journalPositions.filter(position => !held.some(event => event.sequence === position));
+  // An empty journal would make this link pass without a single event being checked, so the link
+  // also demands that the server recorded something at all. A run that recorded nothing did not
+  // deliver a complete timeline — it delivered no timeline (D-020).
+  const complete = journalPositions.length > 0 && missing.length === 0;
   links.push({
     name: "complete",
-    ok: missing.length === 0,
-    detail:
-      missing.length === 0
-        ? `the client holds all ${journalPositions.length} recorded event(s)`
+    ok: complete,
+    detail: complete
+      ? `the client holds all ${journalPositions.length} recorded event(s)`
+      : journalPositions.length === 0
+        ? "the server recorded no event at all, so no timeline was delivered"
         : `the client never received ${missing.length} event(s): ${missing.join(",")}`
   });
 
-  const repeated = held.filter(
-    (event, index) => held.findIndex(other => other.id === event.id) !== index
-  );
+  // The duplicate check runs on what actually arrived, not on the deduplicated timeline: the client
+  // hides a repeated event by its id, but the server must not send one twice. Counting on the
+  // deduplicated list would make this link true by construction.
+  const seen = new Map<string, number>();
+  for (const event of input.received) seen.set(event.id, (seen.get(event.id) ?? 0) + 1);
+  const repeated = [...seen.entries()].filter(([, count]) => count > 1).map(([id]) => id);
   links.push({
     name: "no-duplicate",
     ok: repeated.length === 0,
     detail:
       repeated.length === 0
-        ? `the timeline holds ${held.length} event(s), each once`
-        : `the timeline holds ${repeated.length} event(s) twice`
+        ? `the client received ${input.received.length} event(s), each exactly once`
+        : `the client received ${repeated.length} event(s) twice: ${repeated.join(",")}`
   });
 
   const single = input.executionIds.length === 1 && input.executionIds[0] === input.expectedExecutionId;

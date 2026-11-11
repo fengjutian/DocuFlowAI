@@ -22,6 +22,17 @@ editor-core -> text
 agent-acp -> editor-core transaction（待建）
 ```
 
+实际落地为：
+
+```text
+platform -> agent-ui -> agent-acp
+platform -> editor-core -> text
+platform -> render
+```
+
+`agent-acp` 是纯传输层，只依赖 serde；`agent-ui` 是编辑器的会话模型。阶段 2
+的 Diff 审批会让 `agent-ui` 依赖 `editor-core` 的事务接口，届时该边才建立。
+
 禁止事项：
 
 - `editor-core` 依赖 `winit` 或 `wgpu`；
@@ -48,6 +59,18 @@ agent-acp -> editor-core transaction（待建）
 
 `Buffer::text()` 会物化整份文本，大文件下不能每帧调用；只读局部用
 `Buffer::slice`，只读版本号用 `Buffer::version()`。
+
+## Agent 接入
+
+编辑器是 ACP 客户端，通过 stdio 与 CodeWeaver 的 agent endpoint 说 JSON-RPC 2.0，
+详见 [ADR-0003](adr/0003-acp-integration.md)。
+
+- `agent-acp`：帧格式（写 ndjson、读 ndjson 与 Content-Length）、stdio 传输、
+  请求分发；对外是 `SessionEvent`。
+- `agent-ui`：编辑器自己的面板模型，把 `SessionEvent` 变成可绘制的内容。
+- 事件循环不阻塞：每帧 `pump()` 一次收集 Agent 输出。
+- 权限必须由人回答；端点关闭、超时、解析失败一律按拒绝处理。
+- 端点路径由环境变量给出，不在代码里猜。
 
 ## 下一层接口
 

@@ -495,13 +495,13 @@ fn dispatch(
             let Some(id) = message.get("id").and_then(|id| id.as_i64()) else {
                 return;
             };
-            if method == "session/request_permission" {
-                if let Some(request) = parse_permission_request(&message) {
-                    let _ = events.send(SessionEvent::PermissionRequested {
-                        request_id: id,
-                        request,
-                    });
-                }
+            if method == "session/request_permission"
+                && let Some(request) = parse_permission_request(&message)
+            {
+                let _ = events.send(SessionEvent::PermissionRequested {
+                    request_id: id,
+                    request,
+                });
             }
         }
         // A notification.

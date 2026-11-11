@@ -15,10 +15,12 @@
 |---|---|---|
 | [ADR-0001](0001-rope-and-anchor.md) | 文本模型使用 Rope，并引入 Anchor | 已接受 |
 | [ADR-0002](0002-wgpu-rendering.md) | 渲染层自建 wgpu，不依赖 GPUI；扩展宿主选型 | 已接受 |
+| [ADR-0003](0003-acp-integration.md) | 编辑器通过 ACP 接入 CodeWeaver 运行时 | 已接受 |
 
 ## 待补
 
 计划 `doc/EDITOR_DEVELOPMENT_PLAN.md` §13 列出的以下项目尚无 ADR：
 
 - 第三方依赖清单与许可证 CI（`third_party/manifest.toml`）——阶段 0 未开始；
-- Agent 补丁与编辑器事务的冲突检测（`agent-acp` crate 未建立）。
+- Agent 补丁与编辑器事务的冲突检测（`agent-ui` 尚未依赖 `editor-core`，
+  Diff 审批与冲突重算属于阶段 2）。
