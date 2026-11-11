@@ -764,3 +764,45 @@ Consequence: the runtime registry page carries a score that is computed from rec
 what it was computed from. The score does not join the 24-item Phase 0 list: it is a new kind of
 evidence with its own id and its own report, the same way skill delivery was kept out of the
 denominator.
+## D-064: A checklist item is signed off by what the agent did, not by what the server logged
+Status: accepted
+Context: the Phase 0 list has 24 items and 12 were still unrun. Two of them are about the agent's
+own behaviour rather than about the server's plumbing: P0-005 "single-step task" and P0-006
+"multi-tool task". The lab already had a tool-chain script, but a script is not a checklist item:
+it printed its own booleans, it was not in the report set the aggregate reads, and nothing in it
+was written to be wrong on purpose.
+The interesting part is what "correct" and "in order" have to mean before they can be checked.
+"Correct" is the hard one: an answer can be wrong, and a check written as "the answer is
+reasonable" checks nothing. The only answers worth asserting on are ones that could not have been
+produced without the work being done.
+Decision: P0-005 asks the model to read a file and reply with its content, and the file holds a
+nonce that exists nowhere else — not in the prompt, not in the task text. The check is therefore
+two-sided: the runtime must have emitted exactly one kind of tool call (`read_file`), and the
+answer must contain the nonce. A model that guessed, a server that echoed the instruction and a
+run that never touched the file all fail the same check. The first version of this probe put the
+nonce into the prompt as well, which would have made the check pass for a model that never read
+anything; that was wrong and was removed before the probe was run.
+P0-006 claims the *order* of the tool calls, so the evidence is the ordered list of tool events,
+and the order is only half of it: the change has to be in the file, a change record has to exist,
+an independent command has to have passed, and the completion gate has to be open. A chain that
+runs the tools and produces nothing is not a finished task.
+The verdict logic is unit tested, and most of those tests are the ones that have to fail: a file
+that was never read, an answer without the nonce, tools in the wrong order, a missing tool, a
+change that never landed, a missing change record, an acceptance check that did not pass, and a
+completion gate that stayed shut.
+One correction belongs on the record: the first real run of P0-005 failed, and the model was
+right. The verdict counted a `tool.started` and its `tool.completed` as two tool calls, so a
+correct single read looked like two reads. The probe's verdict was wrong, not the agent. The check
+now asks what the checklist item asks — one step, one kind of tool — rather than pinning a number
+the model has no reason to respect.
+Evidence: both items pass on the real model through the HTTP API. P0-005: the execution reached
+`succeeded`, the journal holds one `read_file` call (`started` at sequence 19, `completed` at 20),
+and the answer carried the file's nonce. P0-006: the tool events ran `read_file` then
+`request_apply_diff` then `evaluate_changes`, the file holds the new value, one change record was
+written, the acceptance check returned `passed` and the completion gate opened. Report:
+`reports/phase0-pi-agent-execution.json`. Unlike skill delivery and the multi-runtime policy,
+these are checklist items, so the report joins the Phase 0 aggregate and the count moves from 10
+of 24 to 12 of 24.
+Consequence: the checklist can carry items that mean "the agent did the thing". The rule worth
+keeping: an answer that could have been produced without the work is not evidence, and neither is
+a tool call that proves nothing landed.

@@ -333,6 +333,29 @@ The skill body is injected into the task prompt, which is the only channel every
 the Hermes HTTP surface accepts a single `input` string and no system prompt, so a second channel
 would have meant two behaviours for one feature (D-061).
 
+## Agent execution: single-step and multi-tool tasks
+
+```bash
+npm run validate:pi-agent-execution
+```
+
+Signs off P0-005 (single-step task) and P0-006 (multi-tool task) on the real model through the
+HTTP API. The report goes to `reports/phase0-pi-agent-execution.json`, and because both are
+checklist items the report joins the Phase 0 aggregate.
+
+| Check | Why |
+|---|---|
+| P0-005: one kind of tool call, `read_file` | the item is a single step; a model that reads the file twice has still taken one step |
+| P0-005: the answer contains a nonce that exists only in the file | the nonce is nowhere else, so an answer that carries it cannot be a guess or an echo of the instruction |
+| P0-006: the tool events ran `read_file` → `request_apply_diff` → `evaluate_changes`, in that order | the item is about the order, not about the count |
+| P0-006: the change is in the file and a change record exists | tools that ran and produced nothing are not a finished task |
+| P0-006: the acceptance check passed and the completion gate opened | an independent command decides, not the agent's own word |
+
+The probe's verdict logic has unit tests, and most of them are the cases that have to fail: a file
+that was never read, an answer without the nonce, tools in the wrong order, a missing tool, a
+change that never landed, a missing change record, a failed acceptance check and a closed
+completion gate.
+
 ## Multi-runtime policy and runtime scoring
 
 ```bash
