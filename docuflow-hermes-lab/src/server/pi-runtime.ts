@@ -20,6 +20,8 @@ export interface PiRuntimeConfig {
   selfEnforcedTools?: string[];
   /** Decides the tool calls DocuFlow does not own. */
   permissionHandler?: PiAdapterOptions["permissionHandler"];
+  /** The system prompt the agent runs with. */
+  systemPrompt?: string;
 }
 
 export interface PiRuntimeResult {
@@ -54,7 +56,8 @@ export async function createPiRuntime(config: PiRuntimeConfig): Promise<PiRuntim
     model,
     ...(config.tools ? { tools: config.tools } : {}),
     ...(config.selfEnforcedTools ? { selfEnforcedTools: config.selfEnforcedTools } : {}),
-    ...(config.permissionHandler ? { permissionHandler: config.permissionHandler } : {})
+    ...(config.permissionHandler ? { permissionHandler: config.permissionHandler } : {}),
+    ...(config.systemPrompt ? { systemPrompt: config.systemPrompt } : {})
   });
   return { adapter, modelId: config.model };
 }

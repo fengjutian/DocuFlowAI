@@ -3,6 +3,7 @@ dist/
 .env
 *.log
 reports/*.json
+reports/**/*.json
 
 # Runtime data produced by the API server (contexts / journal / policies / prompts).
 # These are per-run snapshots, not source: they are regenerated on every execution.

@@ -2,6 +2,10 @@ import { spawn } from "node:child_process";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { writeTestReport } from "../reporting/report-writer.js";
+import {
+  SECURITY_LAB_CONFIRMATION,
+  readSecurityLabConfirmation
+} from "../security/agent-probes.js";
 import { BOUNDARY_PROBES, evaluateBoundaryProbe, type ProbeOutcome } from "../security/boundary-probes.js";
 import {
   DEFAULT_SECURITY_IMAGE,
@@ -76,13 +80,13 @@ function blockedAll(note: string): TestResult[] {
 
 async function main(): Promise<void> {
   const reportPath = resolve(process.env.HERMES_SECURITY_REPORT_PATH ?? "reports/phase0-security-boundary.json");
-  const confirmation = process.env.HERMES_SECURITY_LAB_CONFIRM;
+  const confirmation = readSecurityLabConfirmation();
   let results: TestResult[];
 
-  if (confirmation !== "I_UNDERSTAND_THE_RISK") {
+  if (confirmation !== SECURITY_LAB_CONFIRMATION) {
     results = blockedAll(
-      "Refusing to run security probes. Set HERMES_SECURITY_LAB_CONFIRM=I_UNDERSTAND_THE_RISK only in a " +
-        "disposable VM/container with no production credentials."
+      "Refusing to run security probes. Set SECURITY_LAB_CONFIRM=" +
+        `${SECURITY_LAB_CONFIRMATION} only in a disposable VM/container with no production credentials.`
     );
   } else {
     const spec: BoundarySpec = {
