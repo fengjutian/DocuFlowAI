@@ -549,3 +549,103 @@ that ran the original task, looked up by that journaled id; if the runtime canno
 rebuild is refused rather than redirected. The probe stages the failure the design calls out — a
 worker that dies mid-turn — and checks the decision, the runtime, the checkpoint and the fact that
 the rebuilt execution actually ran.
+
+## D-056: The runtime is chosen explicitly, and the stack starts it before the API server
+Status: accepted
+Context: the lab stack always started the mock Hermes, so the pinned runtime was reachable only
+through the Phase 0 runners, and the console could not be pointed at it. Two things made "just
+connect to whatever is on 8642" wrong. First, the mode has to be explicit: a stack that silently
+attached to a real runtime would report the real runtime's answers under the mock's name, and the
+difference between "the UI works" and "the pinned runtime works" is exactly what this lab exists
+to prove. Second, the order matters: the API server reads the runtime's capabilities at boot, so
+starting the API first reports an unreachable runtime for a runtime that was merely still
+starting.
+Decision: the runtime is a mode, not a guess — `CODEWEAVER_RUNTIME=mock|hermes` in the server and
+`--runtime mock|hermes` in `scripts/dev.py`. In `hermes` mode the stack starts the runtime, waits
+for it to answer `/v1/capabilities`, and only then starts the API server. The bearer token comes
+from the Hermes profile's own `.env`, never from a command line: a credential on a command line
+ends up in shell history and in the process list. The stack stops the runtime on exit only if it
+was the one that brought it up; a runtime that was already running belongs to whoever started it.
+The runtime's own lifecycle lives in `scripts/hermes.ps1`, which records the supervisor PID,
+resolves the listener separately (the gateway forks, so the process that answers on the port is
+not the process that was started), and refuses to stop a gateway it did not start unless `-Force`
+is given.
+
+## D-057: A path that was never exercised is not a path that works
+Status: accepted
+Context: `scripts/install-hermes.ps1` looked for `hermes.lock.json` two directories above itself,
+which was correct while the lab was named `docuflow-hermes-lab` and wrong after the rename. The
+script had therefore been failing at its first line — "lock file not found" — and nobody noticed,
+because the runtime it installs was already installed from an earlier session. A script that
+cannot run is not a script that is merely unused.
+Decision: the lock file is resolved relative to the lab root, the same place the version check
+reads it from, and the failure is stated rather than tolerated. The general rule this records: a
+script in this repository is evidence only when it has been run. The lifecycle script added in
+D-056 was exercised end to end — start, status, stop, the refusal to stop a foreign gateway, and
+a full task through the real runtime — before any of it was described as working.
+
+## D-058: A background runtime's output is captured through a file, not a pipe
+Status: accepted
+Context: `scripts/dev.py` started the real Hermes runtime by running `hermes.ps1 start` with
+`subprocess.run(..., stdout=PIPE)`. The stack hung there: Hermes was up and healthy, the API
+server never started, and the log stopped at the runtime step. The cause is the pipe's lifetime,
+not the script's: the gateway that `hermes.ps1` starts inherits the script's stdout, and a pipe
+stays open for as long as any process holds it. `subprocess.run` waits for EOF, and the gateway
+outlives the script by design, so the pipe never closed. The same trap is why a "the child
+exited but the parent is still waiting" symptom reads as a hang in the wrong place.
+Decision: the lifecycle script's output is captured through a file, which the caller reads
+afterwards. A file has no reader-blocking semantics, so the call returns when the script returns
+regardless of what the runtime inherited. The general rule: a process that is meant to outlive its
+launcher must never hold the launcher's stdout pipe. The teardown path is verified separately,
+because a stack killed with `taskkill /F` never reaches its `finally` block at all — so
+`dev.py --check-runtime` walks the three states the stack depends on (down, up, down) and reports
+which one it reached.
+
+## D-059: On Windows the stack is stopped by a file, not by a signal
+Status: accepted
+Context: the dev stack's teardown never ran when the stack was stopped from another process. The
+symptom was precise: the API server and the frontend kept their ports, the runtime kept running,
+and the console output stopped at "running" without ever printing the teardown line. The cause is
+that `Popen.terminate()` on Windows calls `TerminateProcess` — it does not raise a signal, so
+`SIGTERM` is never delivered and the handler never runs. A `SIGTERM` handler therefore looks
+correct and is never called; only `Ctrl+C` in the console itself reaches the process as SIGINT.
+Two smaller faults compounded it: `psutil.wait_procs` raises `TimeoutExpired` for a process that
+refuses to die, and that exception sat inside the `finally` block, so one stuck process skipped
+every cleanup step after it.
+Decision: the running stack watches a stop file (`.dev-logs/stop.request`). Writing the file asks
+the stack to stop, and the stack cleans up after itself — releasing both ports, and stopping the
+Hermes runtime if it was the one that brought it up. `dev.py --stop` writes that file first and
+falls back to killing recorded PIDs only when no live instance answers. Every step of the
+teardown is independently guarded, because one failure must not skip the rest. The general rule: a
+cleanup path that is only reachable from the console is a cleanup path nobody exercises; it needs
+a mechanism that another process can trigger, and it needs a test that triggers it.
+
+## D-060: The tool surface belongs to Pi; Hermes does not get an equivalent
+Status: accepted
+Context: D-042 chose Pi as the primary runtime candidate and kept Hermes as the remote-runtime
+reference. The tool surface (`read_file`, `request_diff`, `request_apply_diff`,
+`evaluate_changes`) is CodeWeaver's own, and it is already proven end to end on Pi against a real
+MiniMax M3 model — along with the four agent-level security probes, cancellation and session
+recovery. Hermes 0.23.0 does support `mcp_servers`, so exposing the same tools to it was
+technically reachable. It was nonetheless proposed as the largest remaining capability gap, and
+that proposal reopened a decision D-042 had already made. The reasoning behind it was that
+"multi-runtime" means every runtime can do the same work — but the runtime that carries the
+product is Pi, and the capabilities the tool surface buys (a denial before the tool runs,
+`AbortSignal` cancellation, a transcript that survives) are native to Pi and absent from the
+Hermes HTTP surface, which is exactly why D-005 declares them unavailable there.
+Decision: the tool surface is provided on Pi only; Hermes does not get an equivalent MCP
+exposure. Hermes is kept as the remote-runtime reference — it is the only instance of the
+"remote HTTP + SSE" shape, and its adapter is the evidence that the adapter contract holds in
+that shape (run creation, SSE event stream, terminal recognition, approval round-trip). That
+evidence is not weakened by not exposing tools to it. The consequence for the work queue: the
+remaining checklist items are signed off against Pi, and the list is stated as "Pi signed off,
+Hermes referenced" rather than "both runtimes must be completed". A reference runtime is not a
+half-built product path, and treating it as one is what put an unnecessary MCP integration on the
+critical path.
+
+The decision was checked against the running product rather than against the documents: with the
+dev stack in `--runtime pi` mode the console lists `pi-local` (`runtimeType=native`,
+`version=MiniMax-M3`, `provider=minimax-cn`) beside the reference runtime, and a real task on
+`pi-local` had the model call `read_file` itself — the tool returned the actual file and the model
+answered from it. The tool surface is live inside a real execution on the runtime the product
+runs on, which is what the choice was supposed to buy.

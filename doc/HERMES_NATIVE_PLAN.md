@@ -49,12 +49,22 @@ CodeWeaver API 127.0.0.1:8787
 - 启动时检查必要配置并快速失败，不允许在第一次 agent turn 时临时下载依赖。
 - 验收：仓库扫描无凭据；缺少配置时给出可操作错误；真实模型任务可以完成。
 
-### P4：Hermes 工具面接入
+### P4：Hermes 工具面接入 —— 已决定不做（D-060）
 
-- 将 CodeWeaver 的执行级工具注册给 Hermes：`read_file`、`request_diff`、`request_apply_diff`、`evaluate_changes`。
-- 每次执行只暴露策略快照允许的路径和操作；工具调用必须先经过 Policy Engine，再进入 Code Engine。
-- 所有工具请求、批准、拒绝、diff、验收结果写入同一个 execution journal。
-- 验收：Hermes 完成 `read_file -> request_apply_diff -> evaluate_changes` 的真实端到端任务，并留下可回放证据。
+工具面（`read_file`、`request_diff`、`request_apply_diff`、`evaluate_changes`）**只在 Pi 侧提供**。
+
+按 D-042，Pi 是主运行时候选，Hermes 保留为远程运行时参考。工具面在 Pi 侧已经跑通完整链路
+（`read_file` -> `request_apply_diff` -> `evaluate_changes`，真实 MiniMax M3），也已经在 Pi 侧签收
+了 agent 级安全探针、取消与会话恢复。为一个参考运行时再实现一套等价的 MCP 接入，投入的是重复
+劳动，换不到 Pi 上已经拿到的能力（工具执行前拦截、`AbortSignal` 取消、transcript 续跑）。
+
+Hermes 保留的价值是另一件事：它是**远程 HTTP + SSE** 这一类运行时形态的唯一实例，其适配器证明
+了契约在远程形态下成立（run 创建、SSE 事件流、终态识别、审批往返）。这份契约证据不因为不做
+工具面而失效。
+
+因此本规划的范围收敛为：让 Hermes 能在本机可靠启停（P1/P2/P3）、把边界落到 Windows 原生隔离
+（P5），并保持远程运行时形态可用。**不在本规划中的内容**追加一条：不为 Hermes 暴露 CodeWeaver
+工具面。
 
 ### P5：无 Docker 安全边界
 
@@ -74,9 +84,9 @@ CodeWeaver API 127.0.0.1:8787
 
 ## 近期执行顺序
 
-1. 完成真实 Hermes 的 start/stop/status PowerShell 脚本。
-2. 给 `scripts/dev.py` 增加 `mock` / `hermes` 运行时选择和健康检查。
-3. 跑通 Hermes 工具面的真实端到端证据。
+1. ~~完成真实 Hermes 的 start/stop/status PowerShell 脚本。~~ **已完成**：`codeweaver-hermes-lab/scripts/hermes.ps1`（D-056）。
+2. ~~给 `scripts/dev.py` 增加 `mock` / `hermes` 运行时选择和健康检查。~~ **已完成**：`scripts/dev.py --runtime mock|hermes`（D-056）。
+3. ~~跑通 Hermes 工具面的真实端到端证据。~~ **已取消**：工具面只在 Pi 侧做（D-060），Hermes 保持为远程参考运行时。
 4. 抽象安全边界 provider，移除验证代码对 Docker 的硬编码。
 5. 先完成 AppContainer 兼容性原型，再决定使用 AppContainer 或 Windows Sandbox/Hyper-V。
 6. 更新 Phase 0 清单和 CI，使 Docker 不再是安装项或验收前置条件。
@@ -86,4 +96,6 @@ CodeWeaver API 127.0.0.1:8787
 - 不使用 Docker Desktop、Docker Engine、WSL Docker 或 Compose。
 - 不把普通进程、提示词约束或 Hermes 的批准弹窗当成宿主机隔离证据。
 - 不自动上传代码、日志、凭据或执行记录到外部服务。
+- **不为 Hermes 暴露 CodeWeaver 工具面**（D-060）：主运行时是 Pi，工具面与它的安全探针、取消、
+  恢复能力都已在 Pi 侧签收。
 

@@ -490,6 +490,34 @@ in `hermes.lock.json` (v0.23.0, commit `2bd378ed`) into an isolated profile unde
 powershell -ExecutionPolicy Bypass -File scripts/install-hermes.ps1 -StartGateway
 ```
 
+### Runtime lifecycle
+
+`scripts/hermes.ps1` owns the runtime's lifecycle, so the pinned installation can be run without
+Docker and without a manual terminal dance:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/hermes.ps1 status    # is it up, and does it answer?
+powershell -ExecutionPolicy Bypass -File scripts/hermes.ps1 start     # start it in the background
+powershell -ExecutionPolicy Bypass -File scripts/hermes.ps1 stop      # stop what this script started
+powershell -ExecutionPolicy Bypass -File scripts/hermes.ps1 restart
+```
+
+Three facts about the lifecycle are worth knowing before touching it:
+
+- **The gateway forks.** `gateway run` spawns a child that owns the listening socket, so the PID
+  written at start is not the PID that answers on the port. The script records the supervisor and
+  resolves the listener separately.
+- **The profile owns the credentials.** `API_SERVER_KEY` in the profile's `.env` is the bearer token
+  the API server demands, and `MINIMAX_CN_API_KEY` is the model key. Neither is passed on a command
+  line, because a command line ends up in shell history and in the process list.
+- **A manually started gateway survives.** `stop` refuses to kill an instance this script did not
+  start unless `-Force` is given, so shutting the lab down never takes down a developer's own
+  long-lived instance.
+
+The API server reads the runtime's capabilities at boot, so the runtime has to be up before it
+starts. `scripts/dev.py --runtime hermes` does that ordering (runtime -> health check -> API ->
+workspace) and stops the runtime again only if it was the one that brought it up.
+
 Three facts about the install are worth knowing before touching it:
 
 - PyPI publishes `hermes-agent` only up to 0.19.0, so the pinned release comes from the GitHub tag
@@ -523,6 +551,37 @@ only `: keepalive` comments while a turn is in flight, so the SSE timeout has to
 thinking-model turn; and the event name travels inside the JSON payload (`data.event`) rather than
 in the SSE `event:` field (D-045).
 
+### Running the stack against the real runtime
+
+The dev stack defaults to the mock runtime. The other two modes are explicit:
+
+```bash
+python scripts/dev.py --runtime pi        # primary runtime: Pi, real MiniMax, full tool surface
+python scripts/dev.py --runtime hermes    # remote reference runtime: pinned Hermes 0.23.0
+python scripts/dev.py --runtime mock      # the mock (default)
+```
+
+With `--runtime hermes` the stack starts the runtime, waits for it to answer, and only then starts
+the API server — the API reads the runtime's capabilities at boot, so the reverse order reports an
+unreachable runtime for a runtime that was merely still starting. The API key comes from the
+Hermes profile, not from the command line.
+
+With `--runtime pi` the model and key are read from the same place (Pi's `minimax-cn` provider
+reads `MINIMAX_CN_API_KEY`, which the profile carries), so the primary runtime needs no second
+credential and no second install.
+
+This keeps the remote-runtime reference usable on the same machine as the product runtime (D-060).
+Hermes is not the runtime the product runs on — Pi is — so that mode exists to keep the remote
+HTTP + SSE shape exercised against a real runtime, not to carry product traffic.
+
+Measured end to end against the pinned 0.23.0 with a real MiniMax China key (2026-11-11): a task
+submitted through `POST /api/v1/tasks/{taskId}/executions` ran on `hermes-local`, produced
+`externalRunId=run_5d9cc1e905674b8596ef30dc57f0262a`, streamed the reply as `agent.message.delta`,
+and ended in `agent.execution.completed` with `output=CODEWEAVER_HERMES_E2E_OK` and
+`usage.total_tokens=12501`. The execution was still readable after the API process was restarted —
+`runtimeId=hermes-local`, `status=succeeded`, `live=false` — so the journal-backed status rule
+(D-054) holds for the real runtime and not only for the mock.
+
 Contract tests still prove only that the client behaves correctly against a conforming server. They
 say nothing about the pinned runtime's approval semantics or resume behaviour.
 
@@ -532,12 +591,14 @@ Two runtimes are evaluated against the same `AgentRuntimeAdapter` contract:
 
 | | Hermes | Pi |
 |---|---|---|
+| Role | remote-runtime reference | **primary runtime** (D-042, D-060) |
 | Shape | remote HTTP + SSE | in-process TypeScript library |
 | Install | tag tarball, Python 3.14, install stamp | `npm install` of two pinned packages |
-| Evidence so far | P0-001/002/003 + AT-001..004 against the pinned 0.23.0, real MiniMax M3 | 5/5 runtime probes, 9/9 adapter tests, real MiniMax M3, full tool-surface run, P0-009/010/011/013 agent-level security probes |
+| Evidence so far | P0-001/002/003 + AT-001..004 against the pinned 0.23.0, real MiniMax M3 | 5/5 runtime probes, 9/9 adapter tests, real MiniMax M3, full tool-surface run, P0-009/010/011/013 agent-level security probes, P0-018 cancellation, P0-021 session recovery |
 | Cancellation | not available over HTTP (D-005) | `AbortSignal` on the running turn |
 | Resume | not available over HTTP | transcript continues on the same agent |
 | Policy enforcement | sandbox plus tool gating | `beforeToolCall` denial, before the tool runs |
+| Tool surface | not provided (D-060) | provided and proven end to end |
 
 The agent-level security probes are signed off against Pi, because that is where the policy gate runs
 before the tool executes: the probes ask a real agent to attack a real filesystem and a real network,
@@ -550,9 +611,14 @@ real `pi-agent-core` agent without a model.
 real MiniMax China model (`MINIMAX_CN_API_KEY` from the environment, never from a file in the
 repository).
 
-Neither runtime is retired yet: the 24-item checklist has to be signed off against whichever is
-chosen. CodeWeaver's own layers — policy, Code Engine, journal, evaluation, skills, API, ACP — do not
-depend on the choice.
+**Pi is the runtime the product runs on** (D-042, D-060). The remaining checklist items are signed
+off against it. Hermes is kept as the remote-runtime reference — the only instance of the "remote
+HTTP + SSE" shape, and the evidence that the adapter contract holds in that shape (run creation,
+SSE event stream, terminal recognition, approval round-trip). It does not get an equivalent tool
+surface: the capabilities the tool surface buys (a denial before the tool runs, `AbortSignal`
+cancellation, a transcript that survives) are native to Pi and absent from the Hermes HTTP surface,
+which is why D-005 declares them unavailable there. CodeWeaver's own layers — policy, Code Engine,
+journal, evaluation, skills, API, ACP — do not depend on the choice.
 
 ## Tool surface and multiple runtimes
 
@@ -581,6 +647,12 @@ The probe builds a throwaway git repository, starts a task on the `pi-local` run
 HTTP API and lets the real MiniMax China model drive the tools. It passes when the model read the
 file, the change landed in the worktree through the Code Engine, a change record was written, the
 acceptance check ran, and the completion gate opened.
+
+Measured through the dev stack on 2026-11-11 (not through the probe): a task submitted to
+`pi-local` had the model call `read_file` itself — `agent.tool.started` recorded
+`args={path: scripts/README.md}` — the tool returned the real file content, and the model
+answered from it. The tool surface was live inside a real execution, which is the property the
+runtime choice rests on.
 
 
 

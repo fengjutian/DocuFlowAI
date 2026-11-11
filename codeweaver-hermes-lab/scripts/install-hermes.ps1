@@ -54,8 +54,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$lockPath = Join-Path $repoRoot 'hermes.lock.json'
+# The lock file lives next to this script's parent directory (the lab root), not at the repository
+# root: the lab was renamed from docuflow-hermes-lab, and this path was left pointing one level
+# too high, so the script could not find the lock it refuses to install without.
+$labRoot = Split-Path -Parent $PSScriptRoot
+$lockPath = Join-Path $labRoot 'hermes.lock.json'
 if (-not (Test-Path $lockPath)) { throw "hermes.lock.json not found at $lockPath" }
 $lock = Get-Content $lockPath -Raw | ConvertFrom-Json
 
