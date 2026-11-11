@@ -18,11 +18,21 @@ GPUI 的单向状态更新、帧调度和组件化思想，但不依赖 GPUI，�
 - Selection、Unicode 光标移动、撤销和重做；
 - ACP 客户端：JSON-RPC 2.0 over stdio，接入 CodeWeaver 的 agent endpoint；
 - Agent 面板：流式回复、工具调用、权限审批、取消；
+- 文件打开与保存：`workspace` 服务层，保存时拒绝覆盖外部改动；
 - `app -> platform -> render` 的单向依赖边界。
 
 当前窗口展示一个可输入中英文的编辑器内核验证场景，支持左右移动、Backspace、Enter、
 `Ctrl+Z` 和 `Ctrl+Y`；右侧是 Agent 面板。下一步需要实现 UI 布局、命中测试、鼠标选区和
 可见光标。
+
+## 打开文件
+
+```powershell
+cargo run -- path/to/file.rs
+```
+
+无参数时启动在空文档上。`Ctrl+S` 保存；保存前会检查文件是否在磁盘上被改过，
+被改过就**拒绝写入**并提示，而不是覆盖别人的改动。
 
 ## 与 Agent 运行时联调
 
@@ -41,14 +51,18 @@ cargo run
 | 按键 | 作用 |
 |---|---|
 | `Ctrl+M` | 把当前缓冲区内容作为提示发给 Agent |
+| `Ctrl+S` | 保存当前文件 |
 | `Ctrl+.` | 取消当前轮次 |
 | `Ctrl+Alt+A` | 允许待审批的工具调用 |
 | `Ctrl+Alt+N` | 拒绝待审批的工具调用 |
+
+会话的工作目录是**当前文件所在目录**，所以 Agent 拿到的是用户正在看的那个文件。
 
 端到端自检（真实端点 + mock 运行时）：
 
 ```powershell
 cargo run -p codeweaver-platform --example agent_end_to_end
+cargo run -p codeweaver-platform --example file_agent_check
 ```
 
 ## 运行

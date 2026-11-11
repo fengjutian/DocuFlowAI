@@ -27,11 +27,16 @@ agent-acp -> editor-core transaction（待建）
 ```text
 platform -> agent-ui -> agent-acp
 platform -> editor-core -> text
+platform -> workspace
 platform -> render
 ```
 
 `agent-acp` 是纯传输层，只依赖 serde；`agent-ui` 是编辑器的会话模型。阶段 2
 的 Diff 审批会让 `agent-ui` 依赖 `editor-core` 的事务接口，届时该边才建立。
+
+`workspace` 是文件系统的唯一入口：UI 不直接读写文件，只调用
+`Workspace::open` / `Workspace::save`。保存前会检查文件在磁盘上是否被改过，
+被改过就拒绝写入。
 
 禁止事项：
 

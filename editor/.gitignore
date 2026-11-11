@@ -1,2 +1,3 @@
-/target/
-
+# Build output of every crate in the workspace. The path is not anchored, so
+# each crate's own target directory is ignored too.
+target/

@@ -193,7 +193,7 @@ impl NativeApplication {
                 } else {
                     ""
                 };
-                format!("{}{dirty}", document.path().display())
+                format!("{}{dirty}", document.display_path())
             }
             None => "untitled".to_owned(),
         };
@@ -213,7 +213,7 @@ impl NativeApplication {
         let text = self.editor.text();
         match self.workspace.save(&mut document, &text) {
             Ok(()) => {
-                self.status = Some(format!("已保存 {}", document.path().display()));
+                self.status = Some(format!("已保存 {}", document.display_path()));
             }
             Err(error) => {
                 self.status = Some(format!("保存失败：{error}"));
@@ -629,7 +629,10 @@ mod tests {
 
         let mut app = NativeApplication::new(Some(path.clone())).expect("the application starts");
         app.editor.insert("edited ").unwrap();
-        assert!(app.status_line().contains('●'), "the file must show as changed");
+        assert!(
+            app.status_line().contains('●'),
+            "the file must show as changed"
+        );
 
         app.save_document();
 

@@ -374,7 +374,10 @@ mod tests {
         editor.load_text("new content");
         assert_eq!(editor.text(), "new content");
         assert_eq!(editor.caret(), TextOffset(0));
-        assert!(!editor.can_undo(), "the old history must not survive a load");
+        assert!(
+            !editor.can_undo(),
+            "the old history must not survive a load"
+        );
         assert!(!editor.can_redo());
     }
 
@@ -383,7 +386,7 @@ mod tests {
         let mut editor = Editor::new("");
         editor.load_text("hello");
         editor.move_right();
-        editor.insert("!");
+        editor.insert("!").unwrap();
         assert_eq!(editor.text(), "h!ello");
         editor.undo().unwrap();
         assert_eq!(editor.text(), "hello");

@@ -78,6 +78,14 @@ impl Document {
         &self.path
     }
 
+    /// The file's path, ready to show to a person.
+    ///
+    /// Windows' verbatim prefix (`\\?\`) is an implementation detail of the
+    /// path API; showing it in a status line helps nobody.
+    pub fn display_path(&self) -> String {
+        display_path(&self.path)
+    }
+
     /// The text the file had when it was opened.
     pub fn saved_text(&self) -> &str {
         &self.saved_text
@@ -163,6 +171,18 @@ impl Workspace {
         document.saved_text = text.to_owned();
         document.fingerprint = Fingerprint::of(path)?;
         Ok(())
+    }
+}
+
+/// Renders a path for a person to read.
+///
+/// Windows' verbatim prefix (`\\?\`) is an implementation detail of the path
+/// API; showing it in a status line helps nobody.
+pub fn display_path(path: &Path) -> String {
+    let text = path.display().to_string();
+    match text.strip_prefix(r"\\?\") {
+        Some(restored) => restored.to_owned(),
+        None => text,
     }
 }
 
@@ -266,5 +286,17 @@ mod tests {
             .open(&scratch("does-not-exist.txt"))
             .unwrap_err();
         assert!(matches!(error, WorkspaceError::Read { .. }));
+    }
+
+    #[test]
+    fn the_display_path_drops_the_windows_verbatim_prefix() {
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\repo\main.rs")),
+            r"C:\repo\main.rs"
+        );
+        assert_eq!(
+            display_path(Path::new(r"C:\repo\main.rs")),
+            r"C:\repo\main.rs"
+        );
     }
 }

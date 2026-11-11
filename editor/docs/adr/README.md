@@ -16,6 +16,7 @@
 | [ADR-0001](0001-rope-and-anchor.md) | 文本模型使用 Rope，并引入 Anchor | 已接受 |
 | [ADR-0002](0002-wgpu-rendering.md) | 渲染层自建 wgpu，不依赖 GPUI；扩展宿主选型 | 已接受 |
 | [ADR-0003](0003-acp-integration.md) | 编辑器通过 ACP 接入 CodeWeaver 运行时 | 已接受 |
+| [ADR-0004](0004-file-open-and-save.md) | 文件读写放在 workspace 服务层，打开文件即一次新的编辑会话 | 已接受 |
 
 ## 待补
 

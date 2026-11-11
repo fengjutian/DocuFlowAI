@@ -46,7 +46,8 @@ fn main() {
 
     // The agent session runs against the real ACP endpoint; the bridge starts
     // it with the mock runtime behind it.
-    let bridge = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/fixtures/acp-e2e-bridge.mjs");
+    let bridge =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/fixtures/acp-e2e-bridge.mjs");
     app.set_endpoint(codeweaver_platform::EndpointSettings {
         program: "node".to_owned(),
         args: vec![bridge.to_string_lossy().to_string()],
