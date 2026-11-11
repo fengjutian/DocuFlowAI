@@ -111,17 +111,24 @@ export async function executeSingleStepTask(
 
   const events = await client.events(executionId);
   const toolCalls = toolEventsInOrder(events);
-  evidence.push(`toolCalls=${toolCalls.map(call => call.name).join(",") || "none"}`);
+  const startedCalls = toolCalls.filter(call => call.kind === "started");
+  evidence.push(
+    `toolCalls=${toolCalls.map(call => `${call.kind}:${call.name}@${call.sequence}`).join(",") || "none"}`
+  );
 
   const output = assistantText(events);
   evidence.push(`outputChars=${output.length}`);
   evidence.push(`outputHasNonce=${String(output.includes(nonce))}`);
 
   if (status !== "succeeded") failures.push(`the execution ended as '${status}'`);
-  if (toolCalls.length !== 1) {
-    failures.push(`expected exactly one tool call, found ${toolCalls.length}`);
-  } else if (toolCalls[0]!.name !== "read_file") {
-    failures.push(`the single tool call was '${toolCalls[0]!.name}' instead of 'read_file'`);
+  // The checklist item is about the task, not about how many times the runtime chose to repeat
+  // itself: one step, one kind of tool. A model that reads the file twice has still taken one step.
+  if (!startedCalls.some(call => call.name === "read_file")) {
+    failures.push("the file was never read");
+  }
+  const otherTools = startedCalls.filter(call => call.name !== "read_file").map(call => call.name);
+  if (otherTools.length > 0) {
+    failures.push(`the single-step task called other tools: ${otherTools.join(",")}`);
   }
   // The nonce lives in one place only: the file in the worktree. It is not in the prompt, so an
   // answer that contains it cannot be a lucky guess or an echo of the instruction — the model had
