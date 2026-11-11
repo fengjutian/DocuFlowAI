@@ -1,4 +1,6 @@
+import { createHash } from "node:crypto";
 import type { PolicySnapshot } from "../policy/permission-policy.js";
+import type { RecordStore } from "../persistence/record-store.js";
 import {
   assertValidSkill,
   compareVersions,
@@ -31,13 +33,40 @@ export interface SkillAuthorization {
  *
  * A version is registered once. Publishing a change means publishing a new version, and a binding
  * always names the exact version it used, so "which skill did this run execute" stays answerable.
+ *
+ * The registry holds the manifest *and* its body: a skill the server cannot read back is a skill
+ * it cannot deliver, and the body is what makes the checksum mean anything.
  */
 export class SkillRegistry {
   private readonly skills = new Map<string, Map<string, SkillManifest>>();
   private readonly deprecated = new Set<string>();
 
-  register(manifest: SkillManifest): void {
+  constructor(private readonly store?: RecordStore<SkillManifestRecord>) {}
+
+  /**
+   * Reads the registered manifests back from disk.
+   *
+   * Without this a restart empties the skill library: the console would show no skills and every
+   * task would run without the instructions the user wrote.
+   */
+  async load(): Promise<void> {
+    if (!this.store) return;
+    for (const record of await this.store.list()) {
+      this.registerInMemory(record.manifest);
+    }
+  }
+
+  async register(manifest: SkillManifest): Promise<void> {
     assertValidSkill(manifest);
+    this.registerInMemory(manifest);
+    await this.store?.put({
+      id: skillRecordId(manifest.skillId, manifest.version),
+      manifest,
+      registeredAt: manifest.createdAt
+    });
+  }
+
+  private registerInMemory(manifest: SkillManifest): void {
     const versions = this.skills.get(manifest.skillId) ?? new Map<string, SkillManifest>();
     if (versions.has(manifest.version)) {
       throw new SkillConflictError(
