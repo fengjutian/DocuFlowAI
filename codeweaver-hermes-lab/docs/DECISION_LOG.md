@@ -842,3 +842,138 @@ Consequence: P0-007 is signed off against Pi and the Phase 0 count moves from 12
 24. The console gained a "继续这一轮" card on the execution detail page, so a follow-up is
 something a user does rather than something the journal proves happened. The rule worth keeping:
 a follow-up continues a session, and never starts a new one that only looks like it does.
+## D-066: The trace is the chain, and it can be walked from both ends
+Status: accepted
+Context: P0-024 asks for end-to-end traceability, and design 15 draws the chain as Task → Run →
+Tool → Change → Commit → Test. The traceability query answered part of it: a commit resolved back
+to the execution it came from, and an execution resolved to its context, prompt and policy
+snapshots and its evaluations. Three links were missing, and the way they were missing was
+instructive.
+The task and the run were not absent from the records — they were absent from the *query*. The
+journal had `execution.input` (the task) and `execution.runtime` (the runtime) written as audit
+facts from the first attempt onwards, but nothing read them back into the trace. The tool calls
+were worse: they were in the journal as runtime events, and the trace did not look at the journal
+at all. It read four record stores, and the timeline was not one of them.
+The tool link brought a second gap with it. Design 15 asks what a tool call was answered with —
+the permission decision. That decision was computed and enforced, but never recorded: the journal
+had `permission.requested` and nothing else, and the checkpoint had a branch for
+`permission.resolved` that no code ever wrote. So the records could show that the runtime asked
+and could not show what CodeWeaver answered, which is the difference between an enforced denial
+and a request nobody settled.
+Decision: the decision becomes a runtime event. `permission.resolved` joins the event union, and
+the adapter emits it when the answer arrives — inline from the policy handler or later through the
+API, whichever path answered. The request and its answer then sit on the same timeline, and the
+checkpoint's unresolved-permission bookkeeping starts working for the first time. The Pi adapter
+also carries the tool call id on both the request and the decision, so the pairing is exact
+rather than a guess from the tool name.
+The chain itself is read from the journal, not from a second bookkeeping structure. A record that
+is maintained next to the timeline can disagree with it, and a trace that disagrees with the
+timeline is worse than no trace: it looks like evidence. The journal is the only place the
+timeline exists, so it is the only place the task, the run and the tool calls come from.
+The chain is judged link by link, and the two round trips are links in their own right: the task
+must list the execution it produced, and the commit must resolve back to the same execution the
+chain started from. A chain that can only be read in one direction is a log, not traceability.
+The task query also became reachable: `GET /api/v1/tasks/{taskId}/trace` answers design 15's
+"从任务查询所有 Hermes 执行记录", and it finds executions that no record store links yet, because
+the journal knows which task a run belonged to even when the run died before its first snapshot.
+Evidence: the probe passes on the real model through the HTTP API. One run read `app.ts`, applied
+a diff and had the acceptance checks executed; every link was then read back out of the server's
+records. The task `task-p0-024` names the execution; the execution names the runtime `pi-local`;
+the tool calls are `read_file > request_apply_diff > evaluate_changes`, in that order; one change
+record exists; the change landed in commit `109fa849d47c988645c5766870c2d9e66bb730ad`; the
+evaluation verdict is `passed`; the task lists the execution; and the commit resolves back to that
+same execution. Report: `reports/phase0-pi-traceability.json`. The verdict logic is unit tested,
+and most of those tests are the ones that have to fail: a trace that names the wrong task, a trace
+that names no runtime, a missing tool call, tools in the wrong order, no change record, a change
+that never became a commit, an evaluation that did not pass, a task that does not list the
+execution, and a commit that resolves somewhere else.
+Consequence: P0-024 is signed off against Pi and the Phase 0 count moves from 13 of 24 to 14 of
+24. The console's traceability page now shows the chain as a chain — one row per link, with a
+missing link shown as missing rather than dropped — and it can be entered from a commit, an
+execution or a task. The rule worth keeping: a chain is only evidence if it can be walked from
+both ends.
+
+## D-067: An execution that was never recorded is refused, not answered with an empty chain
+Status: accepted
+Context: D-066 made the console's traceability page show a chain link by link, and made a missing
+link visible as missing rather than dropped. That rule is right inside a chain. It was applied one
+level too far, and the browser check showed it.
+`GET /api/v1/executions/{id}/trace` answered every id with 200 and a chain of six empty links. A
+mistyped execution id therefore looked exactly like a real run that happened to produce no tool
+calls, no change, no commit and no evaluation — every link "无记录 / not_run", every status green
+in the sense that nothing failed. An auditor reading that page cannot tell a typo from an empty
+run, and an empty run is not a neutral fact: it is the difference between "this ran" and "this
+never happened".
+The rule that was already in the codebase said the opposite. `GET /api/v1/executions/{id}` holds
+that "a real execution always journals at least `execution.started`; an empty journal means
+unknown", and refuses the id with 404. The trace endpoint answered a different question without
+saying so.
+Decision: the trace endpoint applies the same rule as the execution endpoint. An execution whose
+timeline is empty never existed as far as the API is concerned, so the trace is a 404 with the
+server's own words, not a chain of holes. The check goes through the coordinator rather than
+straight to the journal, because the coordinator flushes the pending writes of a live execution
+first — a running execution has not written its journal yet, and it must not be refused as one
+that never existed.
+The task endpoint stays a 200 with an empty list, and that is a deliberate difference: a task
+that produced no execution is a real state (the run died before it wrote anything), while a
+mistyped execution id is not a state at all. The console therefore says "没有执行记录" for the
+task and shows the refusal for the execution.
+Two smaller things came out of the same check. The console collected the change record for a
+commit lookup and then never passed it to the card that renders it, so the commit entry showed
+the chain but not the change it was about; it is passed now. And a task lookup that found nothing
+rendered nothing at all — no card, no heading, as if the query had never happened — so it gets an
+explicit empty state.
+Evidence: the probe now has a ninth link, `not-found`, and it is judged on the real server: an id
+that was never recorded must be answered with 404. The run passed on the real model through the
+HTTP API; `missingTraceStatus=404` and all nine links hold. Report:
+`reports/phase0-pi-traceability.json`. The verdict logic is unit tested, and the new case is one
+of the ones that has to fail: a server that answers 200 with an empty chain for an id that was
+never recorded breaks the probe. The HTTP surface has one more: the trace of an unknown execution
+is a 404 with `execution_not_found`, while the trace of a recorded one is a 200. The console was
+checked in the browser on all three entrances — commit, execution and task — plus both wrong
+answers: a mistyped execution id shows the refusal, and a task with no executions shows the empty
+state.
+Consequence: P0-024 stays signed off, and the rule it rests on gets its second half: a chain is
+evidence only if a missing link means "this link was empty", never "this was never here".
+
+## D-068: The console's default task has to be a real task
+Status: accepted
+Context: the traceability page was verified in the browser, and the verification went through the
+console's own "新建执行" dialog — which is where the product's default path lives. The first run
+of it produced a successful execution on `hermes-local` with ten events and the answer "hello
+world". Nothing was wrong with the model, the runtime or the task. The dialog's defaults simply
+described a different product than the one the project is building, in four separate ways.
+The allowed tools were `read_file,search_code`. The Pi adapter refuses a tool that is not on that
+list before it runs ("tool request_apply_diff is not in the allowed tool list"), so the three
+change tools — `request_diff`, `request_apply_diff`, `evaluate_changes` — were all blocked, and
+`search_code` was on the list although CodeWeaver does not provide it. A task created through the
+console could read and could not change anything, which is the opposite of what the product is.
+The granted capabilities were `read_file,search_code` as well. The policy table grants
+`modify_worktree` at P1, and the Code Engine checks it before it writes, so even a tool that got
+through the list would have been refused ("Operation 'modify_worktree' is not granted by
+snapshot"). The allowed paths were empty. A P1 write has to land inside a path prefix the
+snapshot authorizes, and an empty list authorizes nothing ("Path ... is outside every authorized
+path in the snapshot"). The runtime was "自动选择". The scheduler picks by load and, at a tie, by
+registration order, and `hermes-local` is registered first — and in the Pi development stack
+`hermes-local` is the mock, which answers "hello world" to anything and looks successful without
+having done anything.
+So the default path of the product was a path that does nothing, and it looked like success. That
+is the same failure as a mock counted as evidence: a wrong answer that no one can tell from a
+right one.
+Decision: the defaults describe the product's own path. The allowed tools are the four
+CodeWeaver tools. The granted capabilities are the ones the path needs — reading, diffing and
+writing inside the worktree — and not the wildcard, because the wildcard also grants the P2 and
+P3 operations that are supposed to ask a human. The allowed paths fall back to the worktree the
+task was pointed at: the user already named that scope, and the advanced field can narrow it. The
+runtime defaults to `pi-local` when it is registered, because that is the primary runtime
+(D-042, D-060); "自动选择" stays as the fallback for a stack without it, and the picker still
+offers every runtime, so nothing is hidden and nothing is silently redirected (D-047).
+Evidence: the same dialog, with the advanced section untouched, now runs a real task. The task
+`TASK-DEFAULT-02` ran on `pi-local`; the tool calls were `read_file > request_diff >
+request_apply_diff > evaluate_changes`, all completed; the change landed in commit
+`c332a9a26e14d634e3f562b61966095aaeeecfdc`; the acceptance check reported `passed: 1/1 checks
+passed`; and the repository's `app.ts` went from `export const value = 1;` to
+`export const value = 2;`. The run before it, with the old defaults, was `hermes-local` with the
+answer "hello world" and a terminal state of succeeded. The rule worth keeping: a default is
+not a placeholder — it is the path most people will take, so it has to be the real one, and it
+has to fail loudly when it cannot be.

@@ -7,13 +7,17 @@ import type { JournalEntry, JournalStore } from "./journal.js";
  * `journalSequence` is the journal position allocated by the writer; the runtime's own sequence is
  * kept separately as `eventSequence`, because audit entries advance the journal without consuming a
  * runtime event number. Mixing the two would make an audit write look like a lost event.
+ *
+ * The written entry is returned so the caller can publish *what was recorded*. The live stream and
+ * the replay then speak the same sequence space — a client that reconnects with `since` can trust
+ * the number it was given (design 13: "断线后根据 executionId 和 sequence 补齐事件").
  */
 export async function recordRuntimeEvent(
   store: JournalStore,
   event: AgentRuntimeEvent,
   journalSequence: number
-): Promise<void> {
-  await store.append({
+): Promise<JournalEntry> {
+  const entry: JournalEntry = {
     executionId: event.executionId,
     sequence: journalSequence,
     eventSequence: event.sequence,
@@ -23,9 +27,15 @@ export async function recordRuntimeEvent(
     payload: {
       ...event.payload,
       eventId: event.eventId,
+      // The envelope needs to know which execution and task the event belongs to, and the replayed
+      // frames are built from the payload alone. The runtime event carries both outside its payload.
+      projectId: event.projectId,
+      ...(event.taskId ? { taskId: event.taskId } : {}),
       ...(event.externalEventId ? { externalEventId: event.externalEventId } : {})
     }
-  });
+  };
+  await store.append(entry);
+  return entry;
 }
 
 export interface AuditEntryInput {

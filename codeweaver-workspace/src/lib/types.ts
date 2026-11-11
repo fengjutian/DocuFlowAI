@@ -245,6 +245,19 @@ export interface StartTaskInput {
    * Naming a runtime is honoured or refused, never quietly redirected (D-047).
    */
   runtimeId?: string;
+  /**
+   * The independent checks that decide whether the task passed.
+   *
+   * Without them the completion gate has nothing to decide on: a run that ends with a model
+   * saying "done" is not a finished task, and the gate says so.
+   */
+  evaluationChecks?: Array<{
+    id: string;
+    name: string;
+    command: string;
+    args: string[];
+    cwd?: string;
+  }>;
 }
 
 export interface RecoveryPlan {
@@ -392,8 +405,40 @@ export interface EvaluationResult {
   [key: string]: unknown;
 }
 
+/** A permission request and the decision it was answered with. */
+export interface TracedPermission {
+  requestId: string;
+  decision: "approve" | "deny";
+  tool?: string;
+  toolCallId?: string;
+  reason?: string;
+}
+
+/** One tool call, with the decision that gated it. */
+export interface TracedToolCall {
+  toolCallId: string;
+  toolName: string;
+  sequence: number;
+  status: "started" | "completed" | "failed";
+  args?: Record<string, unknown>;
+  permission?: TracedPermission;
+}
+
+/**
+ * The whole chain of one execution: Task → Run → Tool → Change → Commit → Test.
+ *
+ * The task, the run and the tool calls are read off the timeline; the change records and the
+ * evaluations are read off the record stores. A missing link is shown as missing rather than
+ * hidden — a chain with a hole in it is information.
+ */
 export interface ExecutionTrace {
   executionId: string;
+  taskIds: string[];
+  runtimeId?: string;
+  externalRunId?: string;
+  toolCalls: TracedToolCall[];
+  permissions: TracedPermission[];
+  gitCommits: string[];
   changeRecords: ChangeRecord[];
   contextSnapshots: ContextSnapshotRecord[];
   promptSnapshots: PromptSnapshotRecord[];
@@ -404,4 +449,10 @@ export interface ExecutionTrace {
 export interface CommitTrace {
   changeRecord: ChangeRecord;
   trace: ExecutionTrace;
+}
+
+/** Every execution a task produced. */
+export interface TaskTrace {
+  taskId: string;
+  executions: ExecutionTrace[];
 }

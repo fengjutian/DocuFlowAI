@@ -71,6 +71,15 @@ export type AgentRuntimeEventType =
   | "tool.completed"
   | "tool.failed"
   | "permission.requested"
+  /**
+   * The answer to a permission request.
+   *
+   * The request alone is half a fact: a reader who sees "the runtime asked" but not "CodeWeaver
+   * answered" cannot tell an enforced denial from a request that was never settled. Design 15 asks
+   * exactly this question — what was a tool call answered with — so the decision travels on the
+   * same timeline as the request.
+   */
+  | "permission.resolved"
   | "execution.waiting"
   | "execution.completed"
   | "execution.failed"

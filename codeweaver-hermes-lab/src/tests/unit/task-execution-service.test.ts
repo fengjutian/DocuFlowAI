@@ -88,7 +88,7 @@ async function setup(options: {
   const coordinator = new ExecutionCoordinator({ adapter, journal, runtimeIdOf: () => "hermes-local" });
   const worktrees = new WorktreeManager(git, join(repo, ".worktrees"), { repository: repo });
   const changes = new CodeChangePipeline(git, worktrees);
-  const traceability = new TraceabilityQuery(stores);
+  const traceability = new TraceabilityQuery(stores, journal);
   const skillRegistry = new SkillRegistry();
   const skillBindings = new SkillBindingStore();
   const SKILL_CONTENT = "# React development\n\nPrefer function components and hooks.\n";

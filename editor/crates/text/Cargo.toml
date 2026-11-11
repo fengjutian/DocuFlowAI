@@ -6,5 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+ropey = "1.6.1"
 thiserror.workspace = true
+
+[[bench]]
+name = "text_model"
+harness = false
 

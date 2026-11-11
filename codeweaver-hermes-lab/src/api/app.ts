@@ -7,6 +7,7 @@ import type { SubagentManager } from "../orchestrator/subagent-manager.js";
 import type { JournalStore } from "../journal/journal.js";
 import type { UsageLedger } from "../accounting/usage.js";
 import type { ExecutionCoordinator } from "../orchestrator/execution-coordinator.js";
+import type { ExecutionCheckpoint } from "../journal/checkpoint.js";
 import type { TaskExecutionService, StartTaskRequest } from "../tasks/task-execution-service.js";
 import { SkillDeniedError } from "../tasks/task-execution-service.js";
 import type { EvaluationCheckSpec } from "../evaluation/evaluation.js";
@@ -15,7 +16,7 @@ import type { SkillBindingStore } from "../skills/skill-bindings.js";
 import type { SkillRegistry } from "../skills/skill-registry.js";
 import { SkillConflictError, SkillNotFoundError } from "../skills/skill-registry.js";
 import { SkillValidationError } from "../skills/skill.js";
-import { EventBus, formatSseFrame, journalEntryToEvent } from "./event-bus.js";
+import { EventBus, formatSseFrame, journalEntryToEvent, type CodeWeaverEvent } from "./event-bus.js";
 
 /**
  * HTTP surface (design 12) kept intentionally thin: it authenticates, validates, delegates and maps
@@ -234,11 +235,23 @@ async function route(
     };
   }
 
+  if (method === "GET" && matches(segments, ["api", "v1", "tasks", ":taskId", "trace"])) {
+    const taskId = segments[3]!;
+    // Design 15: "从任务查询所有 Hermes 执行记录" — the task is the head of the chain.
+    const traces = await deps.taskService.traceTask(taskId);
+    return { status: 200, body: { taskId, executions: traces } };
+  }
+
+  // Before the `:id` route on purpose: the list is a literal segment, and a literal segment that
+  // arrives after a wildcard never gets reached.
+  if (method === "GET" && matches(segments, ["api", "v1", "executions"])) {
+    return { status: 200, body: await listExecutions(deps) };
+  }
+
   if (method === "GET" && matches(segments, ["api", "v1", "executions", ":id"])) {
     const id = segments[3]!;
     return { status: 200, body: await describeExecution(id, deps) };
   }
-
   if (method === "GET" && matches(segments, ["api", "v1", "executions", ":id", "events"])) {
     const id = segments[3]!;
     const since = Number(url.searchParams.get("since") ?? 0);
@@ -281,6 +294,9 @@ async function route(
 
   if (method === "GET" && matches(segments, ["api", "v1", "executions", ":id", "trace"])) {
     const id = segments[3]!;
+    // The trace answers for an execution that exists. A chain of six empty links would read like a
+    // real but empty run, so a mistyped id has to be told apart from one.
+    await assertExecutionRecorded(id, deps);
     const trace = await deps.taskService.trace(id);
     if (!trace) throw new ApiError(404, "trace_not_found", `No trace is recorded for execution ${id}`);
     return { status: 200, body: trace };
@@ -473,12 +489,80 @@ async function route(
   throw new ApiError(404, "not_found", `No route for ${method} ${url.pathname}`);
 }
 
-async function describeExecution(executionId: string, deps: ApiDependencies): Promise<unknown> {
+/**
+ * A real execution always journals at least `execution.started`; an empty timeline means the id was
+ * never an execution.
+ *
+ * The checkpoint goes through the coordinator so the pending writes of a live execution are flushed
+ * first — a running execution has not written its journal yet, and it must not be mistaken for one
+ * that never existed.
+ */
+async function assertExecutionRecorded(
+  executionId: string,
+  deps: ApiDependencies
+): Promise<ExecutionCheckpoint> {
   const checkpoint = await deps.coordinator.getCheckpoint(executionId);
-  // A real execution always journals at least `execution.started`; an empty journal means unknown.
   if (checkpoint.eventCount === 0) {
     throw new ApiError(404, "execution_not_found", `No execution ${executionId} is recorded`);
   }
+  return checkpoint;
+}
+
+/** The journal categories that end an execution. */
+const TERMINAL_CATEGORIES = new Set(["execution.completed", "execution.failed", "execution.cancelled"]);
+
+/**
+ * The executions the journal knows about.
+ *
+ * The lab had no "list executions" endpoint until now, which made the console's execution list a
+ * function of the live event stream: a client that disconnected lost every execution that ran
+ * while it was away, with no way to get them back. The journal is per execution and durable, so it
+ * is where the list comes from — and it is what lets a reconnecting client rebuild instead of
+ * starting over.
+ */
+async function listExecutions(deps: ApiDependencies): Promise<unknown> {
+  const executions: Array<{
+    executionId: string;
+    taskId?: string;
+    projectId?: string;
+    runtimeId?: string;
+    status: string;
+    eventCount: number;
+    firstRecordedAt?: string;
+    lastRecordedAt?: string;
+  }> = [];
+
+  for (const executionId of await deps.journal.listExecutions()) {
+    const entries = await deps.journal.read(executionId);
+    if (entries.length === 0) continue;
+    const input = entries.find(entry => entry.category === "execution.input");
+    const runtime = entries.find(entry => entry.category === "execution.runtime");
+    const terminal = [...entries].reverse().find(entry => TERMINAL_CATEGORIES.has(entry.category));
+    // A live execution has no terminal event yet, and its status comes from the coordinator rather
+    // than from the journal — the journal has not been told anything about it since the last event.
+    const status = deps.coordinator.isLive(executionId)
+      ? "running"
+      : (terminal ? statusFromTerminalEvent(terminal.category) ?? "unknown" : "unknown");
+    executions.push({
+      executionId,
+      ...(typeof input?.payload["taskId"] === "string" ? { taskId: input.payload["taskId"] } : {}),
+      ...(typeof input?.payload["projectId"] === "string" ? { projectId: input.payload["projectId"] } : {}),
+      ...(typeof runtime?.payload["runtimeId"] === "string" ? { runtimeId: runtime.payload["runtimeId"] } : {}),
+      status,
+      eventCount: entries.length,
+      firstRecordedAt: entries[0]!.recordedAt,
+      lastRecordedAt: entries[entries.length - 1]!.recordedAt
+    });
+  }
+
+  executions.sort((left, right) =>
+    (left.lastRecordedAt ?? "") < (right.lastRecordedAt ?? "") ? 1 : -1
+  );
+  return { executions };
+}
+
+async function describeExecution(executionId: string, deps: ApiDependencies): Promise<unknown> {
+  const checkpoint = await assertExecutionRecorded(executionId, deps);
   // A restart empties the coordinator's live sessions but not the journal, so an execution can be
   // recorded and fully readable while nothing about it runs in this process any more. The adapter
   // then knows nothing about it, and asking it anyway would fail the whole request — or, worse,
@@ -563,15 +647,43 @@ async function serveEvents(
 
   const since = resolveSince(url, request);
   const executionId = url.searchParams.get("executionId");
+
+  // Subscribe first, replay second.
+  //
+  // The other order loses events: an event that is published between the read of the journal and the
+  // subscription is in neither the replay nor the live stream, and the client never learns about it.
+  // So the subscription comes first and everything that arrives while the replay is written waits in
+  // the buffer.
+  const buffered: CodeWeaverEvent[] = [];
+  let replaying = true;
+
+  let lastSequence = since;
   if (executionId) {
     const entries = (await deps.journal.read(executionId)).filter(entry => entry.sequence > since);
-    for (const entry of entries) response.write(formatSseFrame(journalEntryToEvent(entry)));
+    for (const entry of entries) {
+      response.write(formatSseFrame(journalEntryToEvent(entry)));
+      lastSequence = Math.max(lastSequence, entry.sequence);
+    }
   }
 
   const unsubscribe = deps.bus.subscribe(event => {
     if (executionId && event.executionId !== executionId) return;
+    if (replaying) {
+      buffered.push(event);
+      return;
+    }
     response.write(formatSseFrame(event));
   });
+  // The buffer is flushed now, minus the frames the replay already carried. The live stream and the
+  // replay speak the same sequence space, so the same event cannot be delivered twice.
+  replaying = false;
+  for (const event of buffered) {
+    if (event.sequence <= lastSequence) continue;
+    response.write(formatSseFrame(event));
+    lastSequence = Math.max(lastSequence, event.sequence);
+  }
+  buffered.length = 0;
+
   const heartbeat = setInterval(() => response.write(": heartbeat\n\n"), 15_000);
 
   const cleanup = () => {

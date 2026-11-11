@@ -385,6 +385,49 @@ follow-up, a second turn without the string, a second turn that dumps the contex
 without a turn boundary and a second turn that never completed. The HTTP surface has four more:
 202, 501, 400 and 409.
 
+## End-to-end traceability
+
+```bash
+npm run validate:pi-traceability
+```
+
+Signs off P0-024 (end-to-end traceability) on the real model through the HTTP API. The report goes
+to `reports/phase0-pi-traceability.json`, and because it is a checklist item the report joins the
+Phase 0 aggregate.
+
+The chain is Task → Run → Tool → Change → Commit → Test (design 15), and it is walked from both
+ends: from the task forward, and from the commit backward.
+
+| Link | Why |
+|---|---|
+| Task | the trace names the task the execution belongs to |
+| Run | the trace names the runtime that ran it |
+| Tool | the tool calls are on the trace, in the order the runtime made them |
+| Change | a change record exists |
+| Commit | the change landed in a commit |
+| Test | the acceptance check produced a passing verdict |
+| Task round trip | the task lists the execution it produced |
+| Commit round trip | the commit resolves back to that same execution |
+| Not found | an execution that was never recorded is refused with 404, not answered with an empty chain |
+
+The task, the run and the tool calls are read from the journal — the timeline the audit engine
+writes — rather than from a second bookkeeping structure that could disagree with it. The
+permission decision travels with the tool call: `permission.resolved` is a runtime event now, so
+the records show what a tool call was answered with and not only that it was asked.
+
+The last link is the one that keeps the other eight honest. A real execution always journals at
+least `execution.started`, so an execution id whose timeline is empty never existed and its trace
+is a 404 — the same rule `GET /api/v1/executions/{id}` already applies. Otherwise a mistyped id
+would render as a chain of six empty links, which is exactly what a real run that produced
+nothing looks like, and the two must not be confused. The check goes through the coordinator so a
+running execution's pending writes are flushed before the timeline is judged.
+
+The verdict logic has unit tests, most of them the cases that have to fail: a trace that names the
+wrong task, a trace that names no runtime, a missing tool call, tools in the wrong order, no
+change record, a change that never became a commit, an evaluation that did not pass, a task that
+does not list the execution, a commit that resolves somewhere else, and a server that answers an
+unknown execution id with an empty chain instead of a 404.
+
 ## Multi-runtime policy and runtime scoring
 
 ```bash

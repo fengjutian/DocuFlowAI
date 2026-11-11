@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Loader2, Play } from "lucide-react";
 import { toast } from "sonner";
@@ -47,10 +47,21 @@ export function NewTaskDialog({
   const [architectureVersion, setArchitectureVersion] = useState("v1");
   const [documents, setDocuments] = useState("");
   const [selectedFiles, setSelectedFiles] = useState("");
-  const [allowedTools, setAllowedTools] = useState("read_file,search_code");
+  // The tools CodeWeaver provides. The default is the whole set, because a task that cannot change
+  // anything is not the product: the Pi adapter refuses a tool that is not in the allowed list
+  // before it runs, so a default of "read only" would silently turn every console task into a
+  // reading exercise.
+  const [allowedTools, setAllowedTools] = useState(
+    "read_file,request_diff,request_apply_diff,evaluate_changes"
+  );
+  const [evaluationChecks, setEvaluationChecks] = useState("");
   const [timeoutSeconds, setTimeoutSeconds] = useState("60");
   const [policyVersion, setPolicyVersion] = useState("v1");
-  const [grantedCapabilities, setGrantedCapabilities] = useState("read_file,search_code");
+  // The capabilities the policy grants. The Code Engine needs `modify_worktree` before it will
+  // write, so a task that only grants reading cannot land a change either.
+  const [grantedCapabilities, setGrantedCapabilities] = useState(
+    "read_file,search_code,generate_diff,modify_worktree"
+  );
   const [allowedPaths, setAllowedPaths] = useState("");
   const [expiresAt, setExpiresAt] = useState(() => new Date(Date.now() + 3600_000).toISOString());
   const [templateName, setTemplateName] = useState("default");
@@ -63,6 +74,19 @@ export function NewTaskDialog({
   // Both lists are read when the sheet opens, not when the app mounts: a runtime or a skill
   // registered after the page loaded would otherwise be missing from the picker.
   const runtimes = useApiData(() => api.listRuntimes(), [open]);
+  /**
+   * The default runtime is the one the project runs tasks on (D-042, D-060).
+   *
+   * "自动选择" stays the fallback for a stack without it, but as the *default* it hands the task
+   * to whichever runtime the scheduler happens to pick first — and in the Pi stack that is the
+   * mock Hermes, which answers "hello world" to everything and looks successful without having
+   * done anything. The picker still offers both; the default just stops pretending.
+   */
+  useEffect(() => {
+    const list = runtimes.data?.runtimes ?? [];
+    if (!list.some(item => item.id === "pi-local")) return;
+    setRuntimeId(current => (current === "auto" ? "pi-local" : current));
+  }, [runtimes.data]);
   // The skills this task binds. Their bodies are injected into the prompt the runtime receives, so
   // a task without skills is not the same task as one with them.
   const [selectedSkills, setSelectedSkills] = useState<Array<{ skillId: string; version: string }>>([]);
@@ -92,6 +116,24 @@ export function NewTaskDialog({
       .map(item => item.trim())
       .filter(item => item !== "");
 
+  /**
+   * The acceptance checks, one per line: a command and its arguments.
+   *
+   * The check runs in the worktree, so it sees the change the task made. Without a check the
+   * completion gate has nothing to decide on and every run ends as "no evaluation result".
+   */
+  const parseChecks = (raw: string, worktree: string) =>
+    splitList(raw)
+      .map(line => line.split(/\s+/).filter(part => part !== ""))
+      .filter(parts => parts.length > 0)
+      .map((parts, index) => ({
+        id: `check-${index + 1}`,
+        name: parts.join(" "),
+        command: parts[0]!,
+        args: parts.slice(1),
+        cwd: worktree
+      }));
+
   const payload = useMemo<StartTaskInput | undefined>(() => {
     if (taskId.trim() === "" || prompt.trim() === "" || worktreePath.trim() === "") return undefined;
     return {
@@ -109,7 +151,11 @@ export function NewTaskDialog({
         worktreeId: taskId.trim(),
         policyVersion: policyVersion.trim() || "v1",
         grantedCapabilities: splitList(grantedCapabilities),
-        allowedPaths: splitList(allowedPaths),
+        // A path prefix authorizes writes. The worktree the task was pointed at is the scope the
+        // user already named, so an empty field means "the worktree" rather than "nothing" — with
+        // an empty list the policy denies every write with "outside every authorized path".
+        allowedPaths:
+          splitList(allowedPaths).length > 0 ? splitList(allowedPaths) : [worktreePath.trim()],
         expiresAt
       },
       template: {
@@ -121,6 +167,9 @@ export function NewTaskDialog({
       timeoutSeconds: Number(timeoutSeconds) || 60,
       allowedTools: splitList(allowedTools),
       runtimeId,
+      ...(parseChecks(evaluationChecks, worktreePath.trim()).length > 0
+        ? { evaluationChecks: parseChecks(evaluationChecks, worktreePath.trim()) }
+        : {}),
       ...(selectedSkills.length > 0
         ? {
             skills: selectedSkills.map(item => ({ skillId: item.skillId, version: item.version })),
@@ -144,6 +193,7 @@ export function NewTaskDialog({
     timeoutSeconds,
     allowedTools,
     runtimeId,
+    evaluationChecks,
     selectedSkills,
     approvedSkills
   ]);
@@ -313,6 +363,20 @@ export function NewTaskDialog({
             </div>
           </div>
 
+          <div className="space-y-2">
+            <Label htmlFor="checks">验收检查（每行一条：命令 + 参数）</Label>
+            <Textarea
+              id="checks"
+              rows={3}
+              value={evaluationChecks}
+              placeholder={"node check.mjs"}
+              onChange={event => setEvaluationChecks(event.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              检查在工作区里独立运行，决定「完成门禁」是否放行；没有检查时运行会以「无评估结果」收尾。
+            </p>
+          </div>
+
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-2">
               <Label htmlFor="arch">架构版本</Label>
@@ -366,7 +430,7 @@ export function NewTaskDialog({
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="allowed-paths">允许写入的路径前缀</Label>
+                <Label htmlFor="allowed-paths">允许写入的路径前缀（留空则用工作区路径）</Label>
                 <Input
                   id="allowed-paths"
                   value={allowedPaths}

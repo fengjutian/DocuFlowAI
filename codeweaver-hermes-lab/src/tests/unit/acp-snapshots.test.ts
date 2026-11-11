@@ -74,7 +74,7 @@ async function harness(repo: string, storeRoot: string) {
     coordinator,
     changes: new CodeChangePipeline(git, worktrees),
     stores,
-    traceability: new TraceabilityQuery(stores)
+    traceability: new TraceabilityQuery(stores, journal)
   });
 
   const warnings: string[] = [];

@@ -423,6 +423,9 @@ export class PiAdapter implements AgentRuntimeAdapter {
     this.emit(state, "permission.requested", {
       requestId: request.requestId,
       tool: toolName,
+      // The tool call id is what ties the decision to the call it decided about: the decision is
+      // recorded before the call runs, so there is no other way to pair them afterwards.
+      ...(context.toolCall.id ? { toolCallId: context.toolCall.id } : {}),
       args: context.args
     });
 
@@ -437,6 +440,16 @@ export class PiAdapter implements AgentRuntimeAdapter {
     ]);
     state.permissionDecisions.delete(request.requestId);
     state.pendingPermissions.delete(request.requestId);
+    // The decision belongs on the timeline: "the runtime asked" is half a fact, and design 15 asks
+    // what a tool call was answered with. A denial recorded here is the enforced one — the tool
+    // never ran.
+    this.emit(state, "permission.resolved", {
+      requestId: request.requestId,
+      tool: toolName,
+      ...(context.toolCall.id ? { toolCallId: context.toolCall.id } : {}),
+      decision: decision?.decision ?? "deny",
+      ...(decision?.reason ? { reason: decision.reason } : {})
+    });
     if (!decision || decision.decision === "deny") {
       return {
         block: true,

@@ -30,6 +30,25 @@ agent-acp -> editor-core transaction（待建）
 - 扩展和 Agent 绕过事务接口修改工作区；
 - 为了短期方便将上游 GPUI 类型暴露为公共 API。
 
+## 文本模型
+
+`text` crate 是文本的真相源，详见 [ADR-0001](adr/0001-rope-and-anchor.md)。
+
+- `Buffer` 内部是 `ropey::Rope`，对外以字节偏移为坐标系；
+- `BufferSnapshot` 是一次不可变视图，持有文本拷贝，编辑器后续的修改不影响它；
+- `Transaction` 带 `base_version`，过期版本写入被拒绝；
+- `Anchor` 是跨编辑稳定的位置引用，配合 `Bias` 表达插入方向。
+
+写入分两条路径：
+
+| 路径 | 用途 | 版本检查 |
+|---|---|---|
+| `Buffer::apply` | 外部写入：LSP、Agent patch、格式化 | 强制，`base_version` 不匹配即拒绝 |
+| `Buffer::replay` | 撤销/重做历史回放 | 跳过，因为逆事务的坐标空间属于编辑之后的状态 |
+
+`Buffer::text()` 会物化整份文本，大文件下不能每帧调用；只读局部用
+`Buffer::slice`，只读版本号用 `Buffer::version()`。
+
 ## 下一层接口
 
 渲染层不接收业务组件，而接收一帧不可变 `FrameScene`：

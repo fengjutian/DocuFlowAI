@@ -134,6 +134,9 @@ async function harness(options: {
         ? { changeRecord: { id: "chg-1", executionId: "exec-1" }, trace: { executionId: "exec-1" } }
         : undefined;
     },
+    async trace(executionId: string) {
+      return { executionId, taskIds: [], toolCalls: [], permissions: [], gitCommits: [] } as never;
+    },
     async completionGate() {
       return { allowed: false, reason: "not evaluated yet" };
     }
@@ -552,6 +555,28 @@ test("returns 404 for an unknown route and for an unknown commit", async () => {
     assert.equal((await fetch(`${app.url}/api/v1/trace/commits/${"9".repeat(40)}`)).status, 404);
 
     const found = await fetch(`${app.url}/api/v1/trace/commits/${"c".repeat(40)}`);
+    assert.equal(found.status, 200);
+  } finally {
+    await app.close();
+  }
+});
+
+test("the trace of an execution that was never recorded is a 404, not a chain of empty links", async () => {
+  const app = await harness();
+  try {
+    // A mistyped id has to be told apart from an execution that ran and recorded nothing: the
+    // second one is a chain with holes in it, the first one has no chain at all.
+    const missing = await fetch(`${app.url}/api/v1/executions/exec-unknown/trace`);
+    const missingBody = await missing.json() as { error: string };
+    assert.equal(missing.status, 404);
+    assert.equal(missingBody.error, "execution_not_found");
+
+    await fetch(`${app.url}/api/v1/tasks/task-1/executions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(startBody())
+    });
+    const found = await fetch(`${app.url}/api/v1/executions/exec-1/trace`);
     assert.equal(found.status, 200);
   } finally {
     await app.close();

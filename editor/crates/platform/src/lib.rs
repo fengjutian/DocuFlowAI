@@ -1,3 +1,4 @@
+mod agent;
 mod input;
 
 use std::sync::Arc;
@@ -15,6 +16,8 @@ use winit::{
     window::{ImePurpose, Window, WindowAttributes, WindowId},
 };
 
+use agent::{AgentSession, EndpointSettings};
+
 const WINDOW_TITLE: &str = "CodeWeaver";
 
 #[derive(Default)]
@@ -24,6 +27,10 @@ pub struct NativeApplication {
     editor: Editor,
     input: TextInputState,
     modifiers: ModifiersState,
+    /// The agent session, started when the user asks for it.
+    agent: Option<AgentSession>,
+    /// Why the agent session could not be started, if that happened.
+    agent_error: Option<String>,
 }
 
 impl NativeApplication {
@@ -32,6 +39,95 @@ impl NativeApplication {
         event_loop
             .run_app(&mut self)
             .context("native event loop failed")
+    }
+
+    /// Handles the keys that drive the agent.
+    ///
+    /// Returns `true` when the key belonged to the agent, so the caller does
+    /// not also feed it to the editor.
+    fn handle_agent_key(&mut self, key: &Key) -> bool {
+        let control = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+        if !control && !alt {
+            return false;
+        }
+
+        let Key::Character(character) = key else {
+            return false;
+        };
+
+        // Ctrl+Alt+A allows the pending permission, Ctrl+Alt+N denies it.
+        if control && alt {
+            let option = match character.to_ascii_lowercase() {
+                'a' => Some("allow"),
+                'n' => Some("reject"),
+                _ => None,
+            };
+            if let (Some(option), Some(session)) = (option, self.agent.as_mut()) {
+                if let Err(error) = session.answer_permission(option) {
+                    eprintln!("could not answer the permission request: {error}");
+                }
+                return true;
+            }
+            return false;
+        }
+
+        if !control {
+            return false;
+        }
+
+        match character.to_ascii_lowercase() {
+            // Ctrl+Enter starts a turn with the buffer's text as the prompt.
+            'm' => {
+                self.start_agent_turn();
+                true
+            }
+            // Ctrl+. cancels the running turn.
+            '.' => {
+                if let Some(session) = self.agent.as_mut()
+                    && let Err(error) = session.cancel()
+                {
+                    eprintln!("could not cancel the turn: {error}");
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Starts an agent turn with the editor's current text as the prompt.
+    fn start_agent_turn(&mut self) {
+        let prompt = self.editor.text();
+        if prompt.trim().is_empty() {
+            self.agent_error = Some("the buffer is empty, so there is nothing to ask about".to_owned());
+            return;
+        }
+
+        if self.agent.is_none() {
+            let Some(settings) = EndpointSettings::from_env() else {
+                self.agent_error = Some(
+                    "the agent endpoint is not configured; set CODEWEAVER_ACP_COMMAND and CODEWEAVER_ACP_ARGS"
+                        .to_owned(),
+                );
+                return;
+            };
+            match AgentSession::start(&settings) {
+                Ok(session) => {
+                    self.agent = Some(session);
+                    self.agent_error = None;
+                }
+                Err(error) => {
+                    self.agent_error = Some(format!("the agent endpoint did not start: {error}"));
+                    return;
+                }
+            }
+        }
+
+        if let Some(session) = self.agent.as_mut()
+            && let Err(error) = session.start_prompt(&prompt)
+        {
+            eprintln!("could not start the turn: {error}");
+        }
     }
 
     fn create_window(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -103,6 +199,10 @@ impl ApplicationHandler for NativeApplication {
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if self.handle_agent_key(event.logical_key.as_ref()) {
+                    window.request_redraw();
+                    return;
+                }
                 let result = match event.logical_key.as_ref() {
                     Key::Named(NamedKey::Backspace) => self.editor.backspace(),
                     Key::Named(NamedKey::ArrowLeft) => {
@@ -139,6 +239,13 @@ impl ApplicationHandler for NativeApplication {
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
+                // The agent's output is collected once per frame, so a reply
+                // appears while the agent is still producing it.
+                if let Some(session) = self.agent.as_mut()
+                    && session.pump()
+                {
+                    window.request_redraw();
+                }
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
                 };
@@ -146,6 +253,8 @@ impl ApplicationHandler for NativeApplication {
                     renderer.logical_size(window.scale_factor()),
                     &self.editor,
                     &self.input,
+                    self.agent.as_ref(),
+                    self.agent_error.as_deref(),
                 );
                 match renderer.render(&scene, window.scale_factor()) {
                     Ok(()) => {}
@@ -195,7 +304,7 @@ fn build_demo_scene(
     );
     let heading = format!(
         "CodeWeaver · Buffer v{} · IME {} · Undo {} · Redo {}",
-        editor_state.snapshot().version(),
+        editor_state.version(),
         if input.ime_enabled() { "ON" } else { "READY" },
         editor_state.can_undo(),
         editor_state.can_redo(),
@@ -210,11 +319,10 @@ fn build_demo_scene(
             line_height: 22.0,
         },
     );
-    let caret = editor_state.selection().head.0;
     let mut text = String::with_capacity(editor_state.text().len() + input.preedit().len());
-    text.push_str(&editor_state.text()[..caret]);
+    text.push_str(&editor_state.text_before_caret());
     text.push_str(input.preedit());
-    text.push_str(&editor_state.text()[caret..]);
+    text.push_str(&editor_state.text_after_caret());
     if text.is_empty() {
         text = "点击窗口输入；支持中文 IME，Ctrl+Z 撤销，Ctrl+Y 重做".to_owned();
     }

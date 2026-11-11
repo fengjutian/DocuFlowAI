@@ -451,6 +451,11 @@ export class TaskExecutionService {
   async trace(executionId: string) {
     return this.options.traceability.byExecution(executionId);
   }
+
+  /** Every execution a task produced, each with its own chain. */
+  async traceTask(taskId: string) {
+    return this.options.traceability.byTask(taskId);
+  }
   async traceCommit(commitSha: string) {
     return this.options.traceability.byCommit(commitSha);
   }

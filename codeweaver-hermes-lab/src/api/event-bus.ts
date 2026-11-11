@@ -28,6 +28,7 @@ const TYPE_MAP: Record<AgentRuntimeEventType, string> = {
   "tool.completed": "agent.tool.completed",
   "tool.failed": "agent.tool.failed",
   "permission.requested": "agent.permission.requested",
+  "permission.resolved": "agent.permission.resolved",
   "execution.waiting": "agent.execution.waiting",
   "execution.completed": "agent.execution.completed",
   "execution.failed": "agent.execution.failed",
@@ -48,13 +49,20 @@ export function toCodeWeaverEvent(event: AgentRuntimeEvent): CodeWeaverEvent {
   };
 }
 
-/** Replays persisted journal entries into the same envelope, for reconnect catch-up. */
+/**
+ * Replays persisted journal entries into the same envelope, for reconnect catch-up.
+ *
+ * The sequence here is the journal position, and it is the same number the live stream carries
+ * (the live stream publishes what was recorded). A client therefore uses one `since` for both, and
+ * the merge of a replayed frame with a live frame cannot collide.
+ */
 export function journalEntryToEvent(entry: JournalEntry): CodeWeaverEvent {
   const type = entry.kind === "audit" ? `codeweaver.${entry.category}` : `agent.${entry.category}`;
   return {
     id: `${entry.executionId}:${entry.sequence}`,
     type,
     projectId: typeof entry.payload["projectId"] === "string" ? entry.payload["projectId"] : "",
+    ...(typeof entry.payload["taskId"] === "string" ? { taskId: entry.payload["taskId"] } : {}),
     executionId: entry.executionId,
     sequence: entry.sequence,
     timestamp: entry.recordedAt,

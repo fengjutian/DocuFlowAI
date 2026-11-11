@@ -6,6 +6,7 @@ import type {
   CodeWeaverEvent,
   ExecutionCheckpoint,
   ExecutionDetail,
+  ExecutionTrace,
   ResumeResponse,
   RetryResponse,
   RuntimeEntry,
@@ -16,6 +17,7 @@ import type {
   SkillManifest,
   StartTaskInput,
   StartTaskResponse,
+  TaskTrace,
   UsageRecord,
   UsageSummary
 } from "./types";
@@ -171,6 +173,19 @@ export const api = {
 
   listExecutionSkills: (executionId: string) =>
     request<{ bindings: SkillBinding[] }>(`/api/v1/executions/${encodeURIComponent(executionId)}/skills`),
+
+  /**
+   * The trace of one execution: task, run, tool calls, change, commit and test.
+   *
+   * Everything in it is read from the server's own records — the console never rebuilds the chain
+   * from the event stream, because a chain assembled by the client is not a chain.
+   */
+  traceExecution: (executionId: string) =>
+    request<ExecutionTrace>(`/api/v1/executions/${encodeURIComponent(executionId)}/trace`),
+
+  /** Every execution a task produced. */
+  traceTask: (taskId: string) =>
+    request<TaskTrace>(`/api/v1/tasks/${encodeURIComponent(taskId)}/trace`),
 
   traceCommit: (sha: string) =>
     request<CommitTrace>(`/api/v1/trace/commits/${encodeURIComponent(sha)}`)

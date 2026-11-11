@@ -451,7 +451,16 @@ export class HermesAdapter implements AgentRuntimeAdapter {
         cause: error
       });
     }
+    const tool = state.pendingPermissions.get(requestId)?.tool;
     state.pendingPermissions.delete(requestId);
+    // The decision is part of the fact: a reader who only sees the request cannot tell an
+    // enforced denial from a request nobody ever answered.
+    this.emit(state, "permission.resolved", {
+      requestId,
+      ...(tool ? { tool } : {}),
+      decision: response.decision,
+      ...(response.reason ? { reason: response.reason } : {})
+    });
     if (!state.terminal) {
       state.status = "running";
       state.execution.status = "running";

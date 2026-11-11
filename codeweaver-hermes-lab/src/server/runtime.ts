@@ -4,7 +4,7 @@ import { HermesAdapter } from "../adapters/hermes-adapter.js";
 import { AgentRuntimeRegistry } from "../adapters/runtime-registry.js";
 import { RuntimeScheduler } from "../adapters/runtime-scheduler.js";
 import { createApiServer, type ApiDependencies } from "../api/app.js";
-import { EventBus } from "../api/event-bus.js";
+import { EventBus, journalEntryToEvent } from "../api/event-bus.js";
 import { UsageLedger, type UsageRecord } from "../accounting/usage.js";
 import { HermesHttpClient } from "../clients/http/hermes-http-client.js";
 import { CodeChangePipeline } from "../code-engine/code-change-pipeline.js";
@@ -146,8 +146,10 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   const coordinator = new ExecutionCoordinator({
     adapter,
     journal,
-    onEvent: event => {
-      bus.publishRuntimeEvent(event);
+    onEvent: (event, entry) => {
+      // The live stream carries the recorded entry, so its sequence is the journal position — the
+      // same number a reconnect asks to resume from.
+      bus.publish(journalEntryToEvent(entry));
       void recordUsage(event).catch(() => undefined);
     },
     // After a restart the session is gone, but the journal still says which runtime ran it and
@@ -168,7 +170,7 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   const git = new SpawnGitRunner();
   const worktrees = new WorktreeManager(git, config.worktreeRoot, { repository: config.repository });
   const changes = new CodeChangePipeline(git, worktrees);
-  const traceability = new TraceabilityQuery(stores);
+  const traceability = new TraceabilityQuery(stores, journal);
   // The registry keeps the manifest *and* its body, and it keeps them on disk: a skill library that
   // empties on every restart is a library the user cannot rely on.
   const skillRegistry = new SkillRegistry(

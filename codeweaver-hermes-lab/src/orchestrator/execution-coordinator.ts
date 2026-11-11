@@ -8,7 +8,7 @@ import {
   type RecoveryPlan
 } from "../journal/checkpoint.js";
 import { journaledEventSequences, recordAudit, recordRuntimeEvent } from "../journal/event-journal.js";
-import type { JournalStore } from "../journal/journal.js";
+import type { JournalEntry, JournalStore } from "../journal/journal.js";
 
 /**
  * Wires the adapter to the journal and turns a recovery plan into an action.
@@ -21,7 +21,14 @@ export interface ExecutionCoordinatorOptions {
   adapter: AgentRuntimeAdapter;
   journal: JournalStore;
   now?: () => Date;
-  onEvent?: (event: AgentRuntimeEvent) => void;
+  /**
+   * Called for every runtime event, **after** it was recorded.
+   *
+   * The journal entry comes along because the live stream has to carry what was recorded: the
+   * journal position is the only sequence the replay and the live stream can both speak, and a
+   * client that reconnects with `since` needs both to agree on it.
+   */
+  onEvent?: (event: AgentRuntimeEvent, entry: JournalEntry) => void;
   /** Fetches runtime events the journal never received; required for `compensate`. */
   compensationSource?: (checkpoint: ExecutionCheckpoint) => Promise<AgentRuntimeEvent[]>;
   /** Whether the runtime-side session still exists. Defaults to false: assume it is gone. */
@@ -120,10 +127,13 @@ export class ExecutionCoordinator {
 
     session.unsubscribe = await selected.subscribe(execution.executionId, event => {
       this.enqueue(session, async () => {
-        await recordRuntimeEvent(this.options.journal, event, session.nextJournalSequence);
+        const entry = await recordRuntimeEvent(this.options.journal, event, session.nextJournalSequence);
         session.nextJournalSequence += 1;
+        // Published after the write, not before it. An event that is announced before it is recorded
+        // can be lost by a client that reconnects in between: it is in neither the replay nor the
+        // live stream. The journal is the source of truth, so the live stream carries the record.
+        this.options.onEvent?.(event, entry);
       });
-      this.options.onEvent?.(event);
     });
     return execution;
   }
