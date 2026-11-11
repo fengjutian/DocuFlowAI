@@ -33,11 +33,7 @@ fn fixture() -> PathBuf {
 
 /// Whether the contract tests can run on this machine.
 fn endpoint_available() -> bool {
-    if Command::new("node")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
+    if Command::new("node").arg("--version").output().is_err() {
         return false;
     }
     repo_root()
@@ -54,7 +50,10 @@ fn start(scenario: &str) -> Option<Client> {
         "node",
         vec![fixture().to_string_lossy().to_string(), scenario.to_owned()],
     )
-    .with_env("CODEWEAVER_REPO_ROOT", repo_root().to_string_lossy().to_string());
+    .with_env(
+        "CODEWEAVER_REPO_ROOT",
+        repo_root().to_string_lossy().to_string(),
+    );
     match Client::start(&config) {
         Ok(client) => Some(client),
         Err(error) => panic!("could not start the mock endpoint: {error}"),
@@ -205,9 +204,10 @@ fn answers_a_permission_request() {
     let request = events
         .iter()
         .find_map(|event| match event {
-            SessionEvent::PermissionRequested { request_id, request } => {
-                Some((*request_id, request.clone()))
-            }
+            SessionEvent::PermissionRequested {
+                request_id,
+                request,
+            } => Some((*request_id, request.clone())),
             _ => None,
         })
         .expect("the permission request was seen");

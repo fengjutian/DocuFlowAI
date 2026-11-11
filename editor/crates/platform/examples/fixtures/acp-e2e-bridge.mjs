@@ -8,10 +8,9 @@
 // Usage: node acp-e2e-bridge.mjs
 
 import { spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 
 const repoRoot = process.env.CODEWEAVER_REPO_ROOT
   ? resolve(process.env.CODEWEAVER_REPO_ROOT)
@@ -33,7 +32,13 @@ const hermes = await startMockHermes({
 });
 
 const endpoint = resolve(repoRoot, "codeweaver-hermes-lab/dist/runners/acp-server.js");
-const dataDir = mkdtempSync(join(tmpdir(), "codeweaver-acp-e2e-"));
+
+// The endpoint writes its data directory; it is created under the
+// repository's own scratch directory rather than the system temp directory,
+// which is not always writable.
+const scratchRoot = join(repoRoot, ".dev-logs");
+mkdirSync(scratchRoot, { recursive: true });
+const dataDir = mkdtempSync(join(scratchRoot, "acp-e2e-"));
 
 const child = spawn("node", [endpoint], {
   env: {

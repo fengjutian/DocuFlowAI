@@ -104,7 +104,9 @@ impl FrameReader {
     fn read_line_frame(&mut self) -> Option<Option<String>> {
         let newline = self.buffer.iter().position(|byte| *byte == b'\n')?;
         let line: Vec<u8> = self.buffer.drain(..=newline).collect();
-        let text = String::from_utf8_lossy(&line[..line.len() - 1]).trim().to_owned();
+        let text = String::from_utf8_lossy(&line[..line.len() - 1])
+            .trim()
+            .to_owned();
         if text.is_empty() {
             return Some(None);
         }
@@ -189,7 +191,10 @@ mod tests {
     fn reads_newline_delimited_frames() {
         let mut reader = FrameReader::new();
         let frames = reader.push(b"{\"a\":1}\n{\"b\":2}\n");
-        assert_eq!(frames, vec!["{\"a\":1}".to_string(), "{\"b\":2}".to_string()]);
+        assert_eq!(
+            frames,
+            vec!["{\"a\":1}".to_string(), "{\"b\":2}".to_string()]
+        );
         assert_eq!(reader.framing(), Some(Framing::Ndjson));
     }
 

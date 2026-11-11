@@ -16,21 +16,20 @@ use std::{
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc::{channel, Receiver, Sender},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, Sender, channel},
     },
     thread::JoinHandle,
 };
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{
-    framing::{serialize, FrameReader, Framing},
+    framing::{FrameReader, Framing, serialize},
     protocol::{
-        permission_result, InitializeResult, PermissionOption, PermissionOutcome,
-        PermissionRequest, PromptBlock, PromptCompleted, SessionCreated, SessionUpdate, StopReason,
-        PROTOCOL_VERSION,
+        InitializeResult, PROTOCOL_VERSION, PermissionOption, PermissionOutcome, PermissionRequest,
+        PromptBlock, PromptCompleted, SessionCreated, SessionUpdate, StopReason, permission_result,
     },
 };
 
@@ -196,7 +195,10 @@ impl Client {
     /// the event loop drains the stream once per frame.
     pub fn start_prompt(&self, session_id: &str, text: &str) -> Result<(), AcpError> {
         let id = {
-            let mut next = self.next_id.lock().expect("the request id lock is not poisoned");
+            let mut next = self
+                .next_id
+                .lock()
+                .expect("the request id lock is not poisoned");
             let id = *next;
             *next += 1;
             id
@@ -225,7 +227,10 @@ impl Client {
     /// tests and the CLI. The editor uses [`Client::start_prompt`] instead.
     pub fn prompt(&self, session_id: &str, text: &str) -> Result<PromptCompleted, AcpError> {
         let id = {
-            let mut next = self.next_id.lock().expect("the request id lock is not poisoned");
+            let mut next = self
+                .next_id
+                .lock()
+                .expect("the request id lock is not poisoned");
             let id = *next;
             *next += 1;
             id
@@ -293,7 +298,10 @@ impl Client {
     /// Sends a request and waits for its response.
     fn request(&self, method: &str, params: Value) -> Result<Value, AcpError> {
         let id = {
-            let mut next = self.next_id.lock().expect("the request id lock is not poisoned");
+            let mut next = self
+                .next_id
+                .lock()
+                .expect("the request id lock is not poisoned");
             let id = *next;
             *next += 1;
             id
@@ -348,7 +356,8 @@ impl Client {
     }
 
     fn write(&self, message: &Value) -> Result<(), AcpError> {
-        let text = serde_json::to_string(message).map_err(|error| AcpError::Protocol(error.to_string()))?;
+        let text = serde_json::to_string(message)
+            .map_err(|error| AcpError::Protocol(error.to_string()))?;
         let mut guard = self.stdin.lock().expect("the stdin lock is not poisoned");
         let stdin = guard.as_mut().ok_or(AcpError::Closed)?;
         // The client always writes ndjson; the endpoint answers in the
@@ -364,7 +373,7 @@ impl Drop for Client {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         // Closing stdin lets the endpoint shut down on its own.
-        if let Some(mut guard) = self.stdin.lock().ok() {
+        if let Ok(mut guard) = self.stdin.lock() {
             guard.take();
         }
         if let Some(child) = self.child.as_mut() {
@@ -450,7 +459,9 @@ fn dispatch(
                     .and_then(|reason| reason.as_str())
                     .map(StopReason::from_wire)
                     .unwrap_or(StopReason::Unknown);
-                let _ = events.send(SessionEvent::TurnCompleted { stop_reason: reason });
+                let _ = events.send(SessionEvent::TurnCompleted {
+                    stop_reason: reason,
+                });
                 return;
             }
 
@@ -463,7 +474,10 @@ fn dispatch(
             };
             let outcome = if let Some(error) = message.get("error") {
                 Err(AcpError::Remote {
-                    code: error.get("code").and_then(|code| code.as_i64()).unwrap_or(0),
+                    code: error
+                        .get("code")
+                        .and_then(|code| code.as_i64())
+                        .unwrap_or(0),
                     message: error
                         .get("message")
                         .and_then(|message| message.as_str())

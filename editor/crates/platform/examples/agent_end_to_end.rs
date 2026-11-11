@@ -42,9 +42,7 @@ fn main() {
     .with_env("CODEWEAVER_REPO_ROOT", root.to_string_lossy().to_string());
 
     let client = Client::start(&config).expect("the agent endpoint starts");
-    let session = client
-        .new_session(&root)
-        .expect("the session opens");
+    let session = client.new_session(&root).expect("the session opens");
     println!("session: {}", session.session_id);
 
     let mut panel = AgentPanel::new();

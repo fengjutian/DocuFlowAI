@@ -45,11 +45,7 @@ impl EndpointSettings {
         let cwd = env::var("CODEWEAVER_ACP_CWD")
             .map(PathBuf::from)
             .unwrap_or_else(|_| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        Some(EndpointSettings {
-            program,
-            args,
-            cwd,
-        })
+        Some(EndpointSettings { program, args, cwd })
     }
 }
 

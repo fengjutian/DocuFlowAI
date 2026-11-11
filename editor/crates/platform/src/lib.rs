@@ -104,7 +104,8 @@ impl NativeApplication {
     fn start_agent_turn(&mut self) {
         let prompt = self.editor.text();
         if prompt.trim().is_empty() {
-            self.agent_error = Some("the buffer is empty, so there is nothing to ask about".to_owned());
+            self.agent_error =
+                Some("the buffer is empty, so there is nothing to ask about".to_owned());
             return;
         }
 
@@ -371,12 +372,7 @@ fn push_agent_panel(
 ) {
     let viewport = Rect::new(0.0, 0.0, size.width, size.height);
     let panel_width = (size.width * 0.34).clamp(280.0, 520.0);
-    let panel = Rect::new(
-        size.width - panel_width,
-        0.0,
-        panel_width,
-        size.height,
-    );
+    let panel = Rect::new(size.width - panel_width, 0.0, panel_width, size.height);
     let content = Rect::new(
         panel.origin.x + 16.0,
         56.0,

@@ -77,7 +77,10 @@ impl AgentPanel {
                     }),
                 }
             }
-            SessionEvent::PermissionRequested { request_id, request } => {
+            SessionEvent::PermissionRequested {
+                request_id,
+                request,
+            } => {
                 self.pending_permission = Some(PendingPermission {
                     request_id,
                     tool_call_id: request.tool_call_id,

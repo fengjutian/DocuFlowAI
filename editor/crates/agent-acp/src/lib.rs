@@ -16,7 +16,7 @@ mod protocol;
 pub use client::{AcpError, Client, EndpointConfig, SessionEvent};
 pub use framing::{FrameReader, Framing};
 pub use protocol::{
-    permission_result, AgentInfo, InitializeResult, MessageChunk, PermissionOption,
+    AgentInfo, InitializeResult, MessageChunk, PROTOCOL_VERSION, PermissionOption,
     PermissionOutcome, PermissionRequest, PromptBlock, PromptCompleted, SessionCreated,
-    SessionUpdate, StopReason, ToolCall, ToolStatus, PROTOCOL_VERSION,
+    SessionUpdate, StopReason, ToolCall, ToolStatus, permission_result,
 };
