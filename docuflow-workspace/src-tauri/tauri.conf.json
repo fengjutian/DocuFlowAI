@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "DocuFlow Workspace",
+  "productName": "CodeWeaver",
   "version": "0.1.0",
   "identifier": "com.charlesfeng.docuflow-workspace",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "DocuFlow Workspace",
+        "title": "CodeWeaver · 代码织造",
         "width": 1440,
         "height": 900,
         "minWidth": 1080,

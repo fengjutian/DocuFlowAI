@@ -1,6 +1,8 @@
-# DocuFlow Workspace（桌面端 UI）
+# CodeWeaver · 代码织造（桌面端 UI）
 
-Tauri v2 + React + TypeScript 的 DocuFlow 控制台。它是 `docuflow-hermes-lab` 服务端的**客户端**：界面本身不做任何业务判定，所有状态都来自服务端。
+**Weaving Ideas Into Software.**
+
+Tauri v2 + React + TypeScript 的 CodeWeaver 控制台。它是 `docuflow-hermes-lab` 服务端的**客户端**：界面本身不做任何业务判定，所有状态都来自服务端。
 
 ## 技术栈
 

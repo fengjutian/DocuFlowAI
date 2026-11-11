@@ -366,7 +366,7 @@ export function ExecutionDetailPage() {
                 <KeyRound className="size-4 text-muted-foreground" />
                 权限审批
               </CardTitle>
-              <CardDescription>Runtime 提问，DocuFlow 决定；未决请求不会被自动放行。</CardDescription>
+              <CardDescription>Runtime 提问，CodeWeaver 决定；未决请求不会被自动放行。</CardDescription>
             </CardHeader>
             <CardContent className="space-y-3">
               {approvals.length === 0 ? (

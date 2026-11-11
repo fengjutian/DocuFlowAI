@@ -56,8 +56,8 @@ export function AppShell({
             <Waypoints className="size-4" />
           </span>
           <div className="min-w-0">
-            <p className="truncate text-sm font-semibold">DocuFlow</p>
-            <p className="truncate text-xs text-muted-foreground">Workspace 控制台</p>
+            <p className="truncate text-sm font-semibold">CodeWeaver</p>
+            <p className="truncate text-xs text-muted-foreground">代码织造</p>
           </div>
         </div>
 
@@ -126,9 +126,9 @@ export function AppShell({
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 shrink-0 items-center justify-between gap-4 border-b border-border/70 px-6">
           <div className="min-w-0">
-            <h1 className="truncate text-sm font-semibold">{current?.label ?? "DocuFlow"}</h1>
+            <h1 className="truncate text-sm font-semibold">{current?.label ?? "CodeWeaver"}</h1>
             <p className="truncate text-xs text-muted-foreground">
-              文档驱动的 Agent 执行控制平面 · 设计基线 V1.0
+              Weaving Ideas Into Software.
             </p>
           </div>
           <div className="flex items-center gap-2">

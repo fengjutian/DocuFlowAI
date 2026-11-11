@@ -116,7 +116,7 @@
     --color-brand-foreground: var(--brand-foreground);
 }
 
-/* DocuFlow brand accent. The preset is deliberately neutral so that state colours
+/* CodeWeaver brand accent. The preset is deliberately neutral so that state colours
    (success / warning / danger) stay readable; the brand hue only marks the product. */
 :root {
     --brand: oklch(0.62 0.17 255);
