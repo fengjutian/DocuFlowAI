@@ -656,6 +656,14 @@ async function serveEvents(
   // the buffer.
   const buffered: CodeWeaverEvent[] = [];
   let replaying = true;
+  const unsubscribe = deps.bus.subscribe(event => {
+    if (executionId && event.executionId !== executionId) return;
+    if (replaying) {
+      buffered.push(event);
+      return;
+    }
+    response.write(formatSseFrame(event));
+  });
 
   let lastSequence = since;
   if (executionId) {
@@ -666,14 +674,6 @@ async function serveEvents(
     }
   }
 
-  const unsubscribe = deps.bus.subscribe(event => {
-    if (executionId && event.executionId !== executionId) return;
-    if (replaying) {
-      buffered.push(event);
-      return;
-    }
-    response.write(formatSseFrame(event));
-  });
   // The buffer is flushed now, minus the frames the replay already carried. The live stream and the
   // replay speak the same sequence space, so the same event cannot be delivered twice.
   replaying = false;

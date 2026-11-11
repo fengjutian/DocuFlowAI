@@ -48,7 +48,7 @@ export interface AuditEntryInput {
 }
 
 /** Records a CodeWeaver-side fact (change applied, policy denied, approval granted) in the journal. */
-export async function recordAudit(store: JournalStore, input: AuditEntryInput): Promise<void> {
+export async function recordAudit(store: JournalStore, input: AuditEntryInput): Promise<JournalEntry> {
   const entry: JournalEntry = {
     executionId: input.executionId,
     sequence: input.sequence,
@@ -58,6 +58,7 @@ export async function recordAudit(store: JournalStore, input: AuditEntryInput): 
     payload: input.payload
   };
   await store.append(entry);
+  return entry;
 }
 
 /** Runtime event numbers already journaled, used to make compensation idempotent. */

@@ -22,13 +22,21 @@ export interface ExecutionCoordinatorOptions {
   journal: JournalStore;
   now?: () => Date;
   /**
-   * Called for every runtime event, **after** it was recorded.
+   * Called for every runtime event.
    *
-   * The journal entry comes along because the live stream has to carry what was recorded: the
-   * journal position is the only sequence the replay and the live stream can both speak, and a
-   * client that reconnects with `since` needs both to agree on it.
+   * The runtime event is what the usage accounting reads; the journal entry comes through
+   * `onRecorded` instead, because the live stream has to carry what was recorded.
    */
-  onEvent?: (event: AgentRuntimeEvent, entry: JournalEntry) => void;
+  onEvent?: (event: AgentRuntimeEvent) => void;
+  /**
+   * Called for every journal entry — runtime events and CodeWeaver's own facts alike — after it was
+   * written.
+   *
+   * The journal position is the only sequence the replay and the live stream can both speak, so the
+   * live stream carries the record rather than the raw runtime event. A client that reconnects with
+   * `since` then has one number to compare, and the two sides cannot disagree about what it means.
+   */
+  onRecorded?: (entry: JournalEntry) => void;
   /** Fetches runtime events the journal never received; required for `compensate`. */
   compensationSource?: (checkpoint: ExecutionCheckpoint) => Promise<AgentRuntimeEvent[]>;
   /** Whether the runtime-side session still exists. Defaults to false: assume it is gone. */
@@ -132,7 +140,8 @@ export class ExecutionCoordinator {
         // Published after the write, not before it. An event that is announced before it is recorded
         // can be lost by a client that reconnects in between: it is in neither the replay nor the
         // live stream. The journal is the source of truth, so the live stream carries the record.
-        this.options.onEvent?.(event, entry);
+        this.options.onEvent?.(event);
+        this.options.onRecorded?.(entry);
       });
     });
     return execution;
@@ -228,13 +237,16 @@ export class ExecutionCoordinator {
     const session = this.sessions.get(executionId);
     if (session) {
       this.enqueue(session, async () => {
-        await recordAudit(this.options.journal, {
+        const entry = await recordAudit(this.options.journal, {
           executionId,
           sequence: session.nextJournalSequence,
           category,
           payload
         });
         session.nextJournalSequence += 1;
+        // A CodeWeaver fact is on the timeline too, so the live stream carries it like any other
+        // event: design 13 lists `code.diff.applied` and `evaluation.completed` as events.
+        this.options.onRecorded?.(entry);
       });
       await session.chain;
       return;

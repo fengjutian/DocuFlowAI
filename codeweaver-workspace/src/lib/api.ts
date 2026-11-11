@@ -6,6 +6,7 @@ import type {
   CodeWeaverEvent,
   ExecutionCheckpoint,
   ExecutionDetail,
+  ExecutionSummaryRecord,
   ExecutionTrace,
   ResumeResponse,
   RetryResponse,
@@ -110,6 +111,15 @@ export const api = {
 
   getExecution: (executionId: string) =>
     request<ExecutionDetail>(`/api/v1/executions/${encodeURIComponent(executionId)}`),
+
+  /**
+   * Every execution the journal holds, newest first.
+   *
+   * This is the only source for the executions a disconnected client never saw: the live stream
+   * only carries what happens while it is listening.
+   */
+  listExecutions: () =>
+    request<{ executions: ExecutionSummaryRecord[] }>("/api/v1/executions"),
 
   getExecutionEvents: (executionId: string, since = 0) =>
     request<{ events: CodeWeaverEvent[] }>(

@@ -146,11 +146,14 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   const coordinator = new ExecutionCoordinator({
     adapter,
     journal,
-    onEvent: (event, entry) => {
-      // The live stream carries the recorded entry, so its sequence is the journal position — the
-      // same number a reconnect asks to resume from.
-      bus.publish(journalEntryToEvent(entry));
+    onEvent: event => {
       void recordUsage(event).catch(() => undefined);
+    },
+    // The live stream carries what was recorded, so its sequence is the journal position — the same
+    // number a reconnect asks to resume from. Runtime events and CodeWeaver's own facts both go
+    // through here, because both are on the timeline.
+    onRecorded: entry => {
+      bus.publish(journalEntryToEvent(entry));
     },
     // After a restart the session is gone, but the journal still says which runtime ran it and
     // what was asked. Both are needed to recover: the runtime to recover on, and the input to

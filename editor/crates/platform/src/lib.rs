@@ -4,6 +4,7 @@ mod input;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use codeweaver_agent_acp::ToolStatus;
 use codeweaver_editor_core::Editor;
 use codeweaver_render::{Color, FrameScene, Rect, Renderer, RendererError, TextStyle};
 use input::TextInputState;
@@ -45,7 +46,7 @@ impl NativeApplication {
     ///
     /// Returns `true` when the key belonged to the agent, so the caller does
     /// not also feed it to the editor.
-    fn handle_agent_key(&mut self, key: &Key) -> bool {
+    fn handle_agent_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
         let control = self.modifiers.control_key();
         let alt = self.modifiers.alt_key();
         if !control && !alt {
@@ -55,10 +56,14 @@ impl NativeApplication {
         let Key::Character(character) = key else {
             return false;
         };
+        let Some(letter) = character.as_ref().chars().next() else {
+            return false;
+        };
+        let letter = letter.to_ascii_lowercase();
 
         // Ctrl+Alt+A allows the pending permission, Ctrl+Alt+N denies it.
         if control && alt {
-            let option = match character.to_ascii_lowercase() {
+            let option = match letter {
                 'a' => Some("allow"),
                 'n' => Some("reject"),
                 _ => None,
@@ -76,8 +81,8 @@ impl NativeApplication {
             return false;
         }
 
-        match character.to_ascii_lowercase() {
-            // Ctrl+Enter starts a turn with the buffer's text as the prompt.
+        match letter {
+            // Ctrl+M starts a turn with the buffer's text as the prompt.
             'm' => {
                 self.start_agent_turn();
                 true
@@ -168,7 +173,9 @@ impl ApplicationHandler for NativeApplication {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(window) = self.window.as_ref() else {
+        // The window handle is cloned so that no borrow of `self` is alive
+        // while the agent keys are handled.
+        let Some(window) = self.window.clone() else {
             return;
         };
         if window.id() != window_id {
@@ -199,7 +206,7 @@ impl ApplicationHandler for NativeApplication {
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                if self.handle_agent_key(event.logical_key.as_ref()) {
+                if self.handle_agent_key(&event.logical_key.as_ref()) {
                     window.request_redraw();
                     return;
                 }
@@ -281,6 +288,8 @@ fn build_demo_scene(
     size: codeweaver_render::Size,
     editor_state: &Editor,
     input: &TextInputState,
+    agent: Option<&AgentSession>,
+    agent_error: Option<&str>,
 ) -> FrameScene {
     let viewport = Rect::new(0.0, 0.0, size.width, size.height);
     let editor = Rect::new(56.0, 52.0, (size.width - 80.0).max(1.0), 180.0);
@@ -348,5 +357,103 @@ fn build_demo_scene(
             content_clip,
         );
     }
+
+    push_agent_panel(&mut scene, size, agent, agent_error);
     scene
+}
+
+/// Draws the agent panel on the right of the window.
+fn push_agent_panel(
+    scene: &mut FrameScene,
+    size: codeweaver_render::Size,
+    agent: Option<&AgentSession>,
+    agent_error: Option<&str>,
+) {
+    let viewport = Rect::new(0.0, 0.0, size.width, size.height);
+    let panel_width = (size.width * 0.34).clamp(280.0, 520.0);
+    let panel = Rect::new(
+        size.width - panel_width,
+        0.0,
+        panel_width,
+        size.height,
+    );
+    let content = Rect::new(
+        panel.origin.x + 16.0,
+        56.0,
+        (panel.size.width - 32.0).max(1.0),
+        (panel.size.height - 72.0).max(1.0),
+    );
+
+    scene.push_quad(panel, Color::rgb(0.055, 0.063, 0.082), viewport);
+    scene.push_quad(
+        Rect::new(panel.origin.x, 0.0, 1.0, panel.size.height),
+        Color::rgb(0.16, 0.18, 0.22),
+        viewport,
+    );
+
+    let heading = agent::session_summary(agent);
+    let heading = if agent.is_some_and(|session| session.is_running()) {
+        format!("{heading} · working")
+    } else {
+        heading
+    };
+    scene.push_text(
+        heading,
+        Rect::new(
+            panel.origin.x + 16.0,
+            16.0,
+            (panel.size.width - 32.0).max(1.0),
+            28.0,
+        ),
+        TextStyle {
+            clip: viewport,
+            color: Color::rgb(0.72, 0.78, 0.88),
+            font_size: 14.0,
+            line_height: 20.0,
+        },
+    );
+
+    let body = match agent {
+        Some(session) => {
+            let panel = session.panel();
+            let mut body = panel.transcript.clone();
+            for tool in &panel.tools {
+                body.push_str(&format!(
+                    "\n[{}] {}",
+                    match tool.status {
+                        ToolStatus::InProgress => "running",
+                        ToolStatus::Completed => "done",
+                        ToolStatus::Failed => "failed",
+                    },
+                    tool.title
+                ));
+            }
+            if let Some(pending) = &panel.pending_permission {
+                body.push_str(&format!(
+                    "\n需要授权：{}（Ctrl+Alt+A 允许 / Ctrl+Alt+N 拒绝）",
+                    pending.title
+                ));
+            }
+            if body.is_empty() {
+                "Ctrl+M 把当前内容交给 Agent；Ctrl+. 取消本轮".to_owned()
+            } else {
+                body
+            }
+        }
+        None => match agent_error {
+            Some(error) => format!("Agent 不可用：{error}"),
+            None => "Agent 未启动。Ctrl+M 把当前内容交给 Agent".to_owned(),
+        },
+    };
+
+    scene.push_text(
+        body,
+        content,
+        TextStyle {
+            clip: content,
+            color: Color::rgb(0.84, 0.87, 0.92),
+            font_size: 14.0,
+            line_height: 20.0,
+        },
+    );
 }

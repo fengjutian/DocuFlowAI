@@ -119,14 +119,16 @@ async function collect(
 ): Promise<CodeWeaverEvent[]> {
   const controller = new AbortController();
   const frames: CodeWeaverEvent[] = [];
+  // The deadline aborts the read, so a stream that never delivers cannot hold the test open until
+  // the server's next heartbeat.
+  const deadline = setTimeout(() => controller.abort(), options.timeoutMs ?? 2_000);
   try {
     const query = options.since ? `?executionId=${EXECUTION_ID}&since=${options.since}` : `?executionId=${EXECUTION_ID}`;
     const response = await fetch(`${url}/api/v1/events${query}`, { signal: controller.signal });
     const reader = response.body!.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    const deadline = Date.now() + (options.timeoutMs ?? 2_000);
-    while (!options.until(frames) && Date.now() < deadline) {
+    while (!options.until(frames)) {
       const chunk = await reader.read();
       if (chunk.done) break;
       buffer += decoder.decode(chunk.value, { stream: true });
@@ -144,7 +146,11 @@ async function collect(
       }
     }
     return frames;
+  } catch (error) {
+    if (!controller.signal.aborted) throw error;
+    return frames;
   } finally {
+    clearTimeout(deadline);
     controller.abort();
   }
 }

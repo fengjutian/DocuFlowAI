@@ -285,6 +285,8 @@ name = "codeweaver-platform"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "codeweaver-agent-acp",
+ "codeweaver-agent-ui",
  "codeweaver-editor-core",
  "codeweaver-render",
  "pollster",

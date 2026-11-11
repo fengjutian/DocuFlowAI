@@ -168,6 +168,24 @@ export interface RuntimePermissionRequest {
   tool?: string;
 }
 
+/**
+ * One execution as the server's journal knows it.
+ *
+ * The live stream cannot tell the console about executions that ran while the console was not
+ * listening, so the journal publishes this list instead: after a reconnect the snapshot is what
+ * puts the missed executions back on screen.
+ */
+export interface ExecutionSummaryRecord {
+  executionId: string;
+  taskId?: string;
+  projectId?: string;
+  runtimeId?: string;
+  status: string;
+  eventCount: number;
+  firstRecordedAt?: string;
+  lastRecordedAt?: string;
+}
+
 export interface ExecutionDetail {
   executionId: string;
   /** The registered runtime that ran this execution, when the server can name it. */

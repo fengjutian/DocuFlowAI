@@ -7,6 +7,8 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+codeweaver-agent-acp = { path = "../agent-acp" }
+codeweaver-agent-ui = { path = "../agent-ui" }
 codeweaver-editor-core = { path = "../editor-core" }
 codeweaver-render = { path = "../render" }
 pollster.workspace = true

@@ -14,7 +14,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use codeweaver_agent_acp::{Client, EndpointConfig, PermissionOutcome, SessionEvent};
+use codeweaver_agent_acp::{Client, EndpointConfig, PermissionOutcome};
 use codeweaver_agent_ui::AgentPanel;
 
 /// How the editor finds the agent endpoint.
@@ -136,15 +136,6 @@ impl AgentSession {
     }
 }
 
-/// The agent state the editor keeps when no endpoint is configured.
-///
-/// It exists so the panel can say "the agent endpoint is not configured"
-/// instead of silently showing nothing.
-#[derive(Clone, Debug, Default)]
-pub struct AgentUnavailable {
-    pub reason: String,
-}
-
 /// A short description of the session state, for the panel header.
 pub fn session_summary(session: Option<&AgentSession>) -> String {
     match session {
@@ -161,11 +152,4 @@ pub fn session_summary(session: Option<&AgentSession>) -> String {
         }
         None => "CodeWeaver Agent · not configured".to_owned(),
     }
-}
-
-/// Collects the events of a session that is not connected.
-///
-/// The platform uses this to keep one code path for the panel.
-pub fn drain_without_session() -> Vec<SessionEvent> {
-    Vec::new()
 }
