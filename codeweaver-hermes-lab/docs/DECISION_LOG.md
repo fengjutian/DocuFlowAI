@@ -977,3 +977,53 @@ passed`; and the repository's `app.ts` went from `export const value = 1;` to
 answer "hello world" and a terminal state of succeeded. The rule worth keeping: a default is
 not a placeholder — it is the path most people will take, so it has to be the real one, and it
 has to fail loudly when it cannot be.
+
+## D-069: The live stream and the replay are two readings of one journal
+Status: accepted
+Context: design 13 makes the server the recorder and the socket a notification channel: the client
+reconnects with an `executionId` and a `since`, and the server replays what it missed. The promise
+was in the design and nowhere in the code — the three pieces that had to agree did not.
+The live stream and the replay spoke two different sequence spaces. A live frame carried the
+runtime's own event sequence; a replayed frame carried the journal position. `since` was a
+journal position, so the number a client was told to resume from was a number it could not compare
+against the frames it had already received. The console's execution page merged the history and
+the live stream by sequence, which under that rule could not tell a replayed frame from a live one.
+The live stream also announced events before they were recorded. An event that was published
+before its journal write, to a client that then dropped, was in neither the replay nor the live
+stream: the client could never learn that it had happened. And the server read the journal before
+it subscribed, so every event published between those two steps fell into the same hole.
+Decision: the journal is the only sequence space, and the live stream carries what was recorded.
+The runtime event and the CodeWeaver audit fact are written to the journal first and published
+afterwards, as the journal entry itself — so a live frame's `sequence` is the journal position and
+its `id` is `${executionId}:${journalPosition}`. Design 13's own event table lists
+`code.diff.applied` and `evaluation.completed` next to the agent events, so the audit facts go on
+the same stream; the replay and the live stream are then the same thing read two ways, and a
+client has exactly one number to compare. The server subscribes before it replays: the frames
+that arrive while the replay is written wait in a buffer and are flushed afterwards, minus the
+frames the replay already carried, so no event is lost and none is delivered twice.
+`GET /api/v1/executions` was added to the same rule — the journal is what the server knows, so
+the execution list is read from the journal rather than from a second bookkeeping structure.
+Evidence: the probe `pi-client-disconnect-phase0` runs a real task on the real model, opens the
+event stream, drops the connection in the middle of the run, waits for the execution to finish on
+its own, and comes back with `since`. The journal is the yardstick: the client's timeline is
+compared against the entries the server actually recorded, so a stream that quietly dropped half
+the run cannot pass. The last run received 9 frames before the disconnect, resumed from 9,
+received 98 more, and the journal held 107 entries — 9 + 98 = 107, every entry held exactly once,
+one execution, the change landed in commit `a5016c371a4e41e190e0c0584cf7029676dbed65` and the
+acceptance check passed. The five links are `continues`, `complete`, `no-duplicate`,
+`single-execution` and `evidence`, and a run that finished before the client could disconnect is
+`blocked`, not `passed`: the probe never got to test the thing (D-020).
+Two things had to be true of the verdict itself. The `complete` link used to pass on an empty
+journal — nothing to miss is nothing missing — so it now also demands that the server recorded
+something. The `no-duplicate` link counted the deduplicated timeline, which cannot hold a repeat
+by construction; it now counts the raw deliveries, because a client that keys on the frame id
+hides a repeated frame and only the probe can see it. The probe was then broken on purpose twice,
+because a probe that cannot fail is not evidence. Replaying one position too many
+(`sequence >= since`) made the client receive event 9 twice and the `no-duplicate` link fail.
+Switching the replay off made the client never receive 114 of the 118 recorded entries and the
+`complete` link fail. Both runs exited non-zero, and both were restored before the signed-off run.
+The server-side order has its own test, `src/tests/unit/event-reconnect.test.ts`, whose two race
+cases fail on the old order (the client receives `[1]` where it should receive `[1,2]`).
+Consequence: P0-019 is signed off. The rule it rests on: the live stream and the replay are two
+readings of one journal, so a client that comes back gets exactly what it missed — and exactly
+once.

@@ -9,14 +9,15 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { EmptyState } from "@/components/common/EmptyState";
 import { StatusBadge } from "@/components/common/StatusBadge";
 import { relativeTime } from "@/lib/format";
-import { useExecutionStream } from "@/state/execution-stream";
+import { streamStatusLabel, useExecutionStream } from "@/state/execution-stream";
 
 /**
  * Execution list.
  *
- * The lab server exposes no "list executions" endpoint, so the list is built from the live event
- * stream. A direct-by-id box covers the case where an execution started before this client was
- * opened and therefore produced no live events here.
+ * The list merges the server's execution summary with the live event stream: the summary knows every
+ * execution the journal holds — including the ones that ran while this console was disconnected —
+ * and the stream keeps the running ones current. A direct-by-id box covers the case where an
+ * execution is not in either of them.
  */
 export function ExecutionsPage({ onNewTask }: { onNewTask: () => void }) {
   const navigate = useNavigate();
@@ -42,8 +43,8 @@ export function ExecutionsPage({ onNewTask }: { onNewTask: () => void }) {
           <div>
             <CardTitle className="text-base">执行</CardTitle>
             <CardDescription>
-              数据来自实时事件流（{streamStatus === "open" ? "已连接" : streamStatus}）；事件不会因为刷新页面而丢失，
-              重新连接后按 sequence 补齐。
+              数据来自实时事件流与服务端执行清单（{streamStatusLabel(streamStatus)}）；事件不会因为刷新页面而丢失，
+              重新连接后按 sequence 补齐，断线期间新产生的执行也会从清单里补回。
             </CardDescription>
           </div>
           <Button size="sm" onClick={onNewTask}>

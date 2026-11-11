@@ -43,32 +43,32 @@ interface FakeOptions {
   executionIds?: string[];
   gitCommits?: string[];
   verdicts?: string[];
-  /** The terminal event lands in the first connection, so the run was over before the disconnect. */
-  terminalInFirstStream?: boolean;
 }
 
 /**
  * A server that behaves like the real one: the first connection hands over the first three
- * events, the reconnect hands over everything after the client's last seen position.
+ * events, the reconnect hands over what the client missed.
+ *
+ * The reconnect does not filter by `since` on purpose. A real server does, and a server that
+ * replays one event too many is exactly the failure the probe has to catch — a fake that always
+ * filtered would make the duplicate case impossible to express.
  */
 function fakeClient(options: FakeOptions = {}): DisconnectClient {
   const journal = options.journal ?? [1, 2, 3, 4, 5];
   const firstStream = options.firstStream ?? [1, 2, 3];
   const resumedStream = options.resumedStream ?? journal.filter(position => position > 3);
-  const terminal = options.terminalInFirstStream ? "agent.execution.completed" : "agent.tool.started";
+  const terminalSequence = resumedStream.at(-1) ?? firstStream.at(-1);
+  let calls = 0;
 
   return {
     start: async () => EXECUTION_ID,
     status: async () => options.status ?? "succeeded",
-    stream: async (_executionId: string, since: number) => {
-      const positions = options.terminalInFirstStream
-        ? journal
-        : (since === 0 ? firstStream : resumedStream);
-      const frames = positions
-        .filter(position => position > since)
-        .map(position =>
-          frame(position, position === journal.at(-1) ? terminal : "agent.tool.started")
-        );
+    stream: async () => {
+      calls += 1;
+      const positions = calls === 1 ? firstStream : resumedStream;
+      const frames = positions.map(position =>
+        frame(position, position === terminalSequence ? "agent.execution.completed" : "agent.tool.started")
+      );
       return { frames, close: () => undefined };
     },
     journal: async () => journal,
@@ -143,7 +143,9 @@ test("P0-019 fails when the acceptance check did not pass", async () => {
 test("P0-019 is blocked when the run finished before the client could disconnect", async () => {
   // Nothing was missed, so the reconnect was never exercised. That is neither a pass nor a
   // failure: the probe never got to test the thing it is here to test (D-020).
-  const result = await executeClientDisconnect(fakeClient({ terminalInFirstStream: true }));
+  const result = await executeClientDisconnect(
+    fakeClient({ journal: [1, 2, 3, 4, 5], firstStream: [1, 2, 3, 4, 5] })
+  );
 
   assert.equal(result.status, "blocked");
   assert.match(result.notes ?? "", /finished before the client could disconnect/);

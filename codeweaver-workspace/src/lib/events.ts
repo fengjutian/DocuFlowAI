@@ -77,9 +77,10 @@ export function subscribeEvents(options: EventStreamOptions): () => void {
 
   const startPolling = (detail: string) => {
     if (closed) return;
+    const executionId = options.executionId;
     // Polling replays a single execution's journal. There is no equivalent for the global stream:
     // the server only journals per execution, so say the stream is gone instead of pretending.
-    if (!options.executionId) {
+    if (!executionId) {
       options.onStatus?.("error", `${detail}；全局事件流不可轮询，执行清单改由服务端清单接口恢复`);
       return;
     }
@@ -87,7 +88,7 @@ export function subscribeEvents(options: EventStreamOptions): () => void {
     const tick = async () => {
       if (closed) return;
       try {
-        const { events } = await api.getExecutionEvents(options.executionId!, since);
+        const { events } = await api.getExecutionEvents(executionId, since);
         for (const event of events) {
           since = Math.max(since, event.sequence);
           emit(event);

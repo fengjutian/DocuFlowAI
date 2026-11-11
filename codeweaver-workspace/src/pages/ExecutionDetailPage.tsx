@@ -81,11 +81,21 @@ export function ExecutionDetailPage() {
   const liveEvents = useExecutionEvents(executionId);
 
   // The journal holds the authoritative history; the stream adds what happens after this page
-  // opened. Merging by sequence keeps one ordered timeline.
+  // opened. Both sides number their entries by the same journal sequence, so merging by sequence
+  // keeps one ordered timeline and cannot leave the same entry in it twice. The id check is a second
+  // guard: the same evidence must not appear twice in the timeline, whatever brought it in.
   const timeline = useMemo<CodeWeaverEvent[]>(() => {
     const merged = new Map<number, CodeWeaverEvent>();
-    for (const event of history.data?.events ?? []) merged.set(event.sequence, event);
-    for (const event of liveEvents) merged.set(event.sequence, event);
+    const seenIds = new Set<string>();
+    for (const event of history.data?.events ?? []) {
+      merged.set(event.sequence, event);
+      seenIds.add(event.id);
+    }
+    for (const event of liveEvents) {
+      if (event.id && seenIds.has(event.id)) continue;
+      merged.set(event.sequence, event);
+      if (event.id) seenIds.add(event.id);
+    }
     return [...merged.values()].sort((a, b) => a.sequence - b.sequence);
   }, [history.data, liveEvents]);
 

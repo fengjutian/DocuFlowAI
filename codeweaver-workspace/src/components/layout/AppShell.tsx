@@ -31,6 +31,7 @@ const NAV_ITEMS = [
 const STREAM_LABEL: Record<string, string> = {
   connecting: "连接中",
   open: "实时",
+  reconnecting: "重连中",
   polling: "轮询",
   closed: "已断开",
   error: "异常"

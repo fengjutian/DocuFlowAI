@@ -212,6 +212,22 @@ export async function executeClientDisconnect(
   const status = await waitForTerminal(client, executionId, options.runTimeoutMs ?? 300_000);
   evidence.push(`status=${status}`);
 
+  // A run that finished before the probe could drop the connection does not exercise a reconnect.
+  // That is not a pass and not a failure: the probe never got to test the thing (D-020). It is
+  // decided here, before the reconnect, because a reconnect after the end has nothing to catch up
+  // and would only produce a misleading verdict about duplication.
+  if (endedBeforeDisconnect) {
+    return {
+      id: "P0-019",
+      title: "客户端断开后重连：事件补齐且不重复执行",
+      status: "blocked",
+      startedAt,
+      finishedAt: now().toISOString(),
+      evidence,
+      notes: "the run finished before the client could disconnect, so the reconnect was not exercised"
+    };
+  }
+
   // The client comes back and asks for what it has not seen.
   const lastSeen = first.frames.reduce((highest, frame) => Math.max(highest, frame.sequence), 0);
   const resumed = await client.stream(executionId, lastSeen);
@@ -239,8 +255,8 @@ export async function executeClientDisconnect(
     journal,
     executionIds,
     expectedExecutionId: executionId,
-    gitCommits: trace.gitCommits,
-    verdicts: trace.verdicts
+    ...(trace.gitCommits ? { gitCommits: trace.gitCommits } : {}),
+    ...(trace.verdicts ? { verdicts: trace.verdicts } : {})
   });
   for (const link of judgement.links) {
     evidence.push(`${link.name}:${link.ok ? "ok" : "missing"} ${link.detail}`);
@@ -249,20 +265,6 @@ export async function executeClientDisconnect(
   if (status !== "succeeded") failures.push(`the execution ended as '${status}'`);
   for (const link of judgement.links) {
     if (!link.ok) failures.push(`the ${link.name} link does not hold: ${link.detail}`);
-  }
-
-  // A run that finished before the probe could drop the connection does not exercise a reconnect.
-  // That is not a pass and not a failure: the probe never got to test the thing (D-020).
-  if (endedBeforeDisconnect) {
-    return {
-      id: "P0-019",
-      title: "客户端断开后重连：事件补齐且不重复执行",
-      status: "blocked",
-      startedAt,
-      finishedAt: now().toISOString(),
-      evidence,
-      notes: "the run finished before the client could disconnect, so the reconnect was not exercised"
-    };
   }
 
   return {
@@ -327,6 +329,7 @@ async function main(): Promise<void> {
   const repo = await mkdtemp(join(tmpdir(), "codeweaver-pi-disconnect-repo-"));
   const dataDir = await mkdtemp(join(tmpdir(), "codeweaver-pi-disconnect-data-"));
   await writeFile(join(repo, "app.ts"), "export const value = 1;\n", "utf8");
+  await writeFile(join(repo, "spec.md"), "# Spec\nThe value must become 2.\n", "utf8");
   await writeFile(
     join(repo, "check.mjs"),
     [
