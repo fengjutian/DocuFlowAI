@@ -1,0 +1,37 @@
+{
+  "name": "codeweaver-hermes-lab",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/tests/**/*.test.js",
+    "test:unit": "npm run build && node --test dist/tests/unit/**/*.test.js",
+    "test:integration": "npm run build && node --test dist/tests/integration/**/*.test.js",
+    "validate:http": "npm run build && node dist/runners/http-phase0.js",
+    "validate:gateway": "npm run build && node dist/runners/gateway-phase0.js",
+    "validate:adapter": "npm run build && node dist/runners/adapter-phase1.js",
+    "validate:security": "npm run build && node dist/runners/security-phase0.js",
+    "validate:security-agent": "npm run build && node dist/runners/security-agent-phase0.js",
+    "validate:security-agent:pi": "npm run build && node dist/runners/security-agent-phase0-pi.js",
+    "validate:pi-cancellation": "npm run build && node dist/runners/pi-cancellation-phase0.js",
+    "validate:pi-session-recovery": "npm run build && node dist/runners/pi-session-recovery-phase0.js",
+    "report:phase0": "npm run build && node dist/runners/aggregate-phase0.js",
+    "check:hermes": "npm run build && node dist/runners/check-hermes-version.js",
+    "probe:pi-tools": "npm run build && node scripts/probe-pi-tools.mjs",
+    "serve": "npm run build && node dist/server/main.js",
+    "dev:stack": "npm run build && node dist/runners/dev-stack.js",
+    "acp:serve": "npm run build && node dist/runners/acp-server.js",
+    "install:zed": "npm run build && node dist/runners/install-zed.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "1.5.0",
+    "@earendil-works/pi-ai": "1.5.0",
+    "jsonc-parser": "^3.3.1"
+  }
+}

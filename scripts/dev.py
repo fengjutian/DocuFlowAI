@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start the DocuFlow API server and the Workspace UI together.
+"""Start the CodeWeaver API server and the Workspace UI together.
 
 The backend is the lab stack (mock Hermes + the real API server) on port 8787;
 the frontend is either the Tauri desktop window or the plain Vite dev server on
@@ -27,8 +27,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-LAB_DIR = ROOT / "docuflow-hermes-lab"
-UI_DIR = ROOT / "docuflow-workspace"
+LAB_DIR = ROOT / "codeweaver-hermes-lab"
+UI_DIR = ROOT / "codeweaver-workspace"
 LOG_DIR = ROOT / ".dev-logs"
 PID_FILE = LOG_DIR / "pids.json"
 
@@ -290,7 +290,7 @@ def npm_command(script: str, *args: str) -> list[str]:
 
 
 def run_build() -> None:
-    step("编译后端（docuflow-hermes-lab）")
+    step("编译后端（codeweaver-hermes-lab）")
     result = subprocess.run(
         npm_command("build"), cwd=str(LAB_DIR), stdout=subprocess.PIPE, stderr=subprocess.STDOUT
     )
@@ -299,7 +299,7 @@ def run_build() -> None:
     output = result.stdout.decode("utf-8", errors="replace")
     print(output, flush=True)
     if not (LAB_DIR / "dist" / "runners" / "dev-stack.js").exists():
-        raise SystemExit("后端编译失败且没有可用的 dist，请先修复 docuflow-hermes-lab 的类型错误。")
+        raise SystemExit("后端编译失败且没有可用的 dist，请先修复 codeweaver-hermes-lab 的类型错误。")
     # tsc emits even when it reports type errors, so a usable dist can exist.
     note("编译报错但 dist 已生成（tsc 仍会 emit），继续使用现有 dist。")
     note("如需强制干净构建，请先修复 lab 的类型错误后重试。")
@@ -311,7 +311,7 @@ def ensure_dependencies() -> None:
         raise SystemExit("找不到 node，请先安装 Node.js。")
     note(f"node {subprocess.run(['node', '--version'], capture_output=True, text=True).stdout.strip()}")
 
-    for directory, name in ((LAB_DIR, "docuflow-hermes-lab"), (UI_DIR, "docuflow-workspace")):
+    for directory, name in ((LAB_DIR, "codeweaver-hermes-lab"), (UI_DIR, "codeweaver-workspace")):
         if not (directory / "node_modules").exists():
             note(f"{name} 缺少 node_modules，正在安装依赖…")
             subprocess.run(
@@ -458,7 +458,7 @@ def main() -> int:
     _install_signal_handlers()
 
     parser = argparse.ArgumentParser(
-        description="同时启动 DocuFlow 后端与 Workspace 前端",
+        description="同时启动 CodeWeaver 后端与 Workspace 前端",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(

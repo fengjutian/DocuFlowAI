@@ -1,6 +1,6 @@
-# DocuFlow 本地开发栈
+# CodeWeaver 本地开发栈
 
-一个脚本同时拉起 **后端**（`docuflow-hermes-lab`）和 **前端**（`docuflow-workspace`），
+一个脚本同时拉起 **后端**（`codeweaver-hermes-lab`）和 **前端**（`codeweaver-workspace`），
 并把两个进程的输出合并到同一个控制台。
 
 ## 用法
@@ -47,11 +47,11 @@ python scripts/dev.py --stop
 
 ```bash
 # 后端
-cd docuflow-hermes-lab
+cd codeweaver-hermes-lab
 npm run dev:stack
 
 # 前端
-cd docuflow-workspace
+cd codeweaver-workspace
 npm run dev            # 浏览器形态
 npm run tauri -- dev   # 桌面形态（`--` 之后才是传给 tauri 的子命令）
 ```

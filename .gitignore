@@ -1,9 +1,9 @@
-﻿client/zed/
+client/zed/
 client/*.tar.gz
 *.tmp
 
 # Security-boundary probe artifact: the container writes it into the bind-mounted workspace.
-docuflow-hermes-lab/fixtures/security-lab/workspace/.docuflow-write-probe
+codeweaver-hermes-lab/fixtures/security-lab/workspace/.codeweaver-write-probe
 
 # Local dev stack output (scripts/dev.py) and scratch logs.
 .dev-logs/
@@ -12,3 +12,6 @@ docuflow-hermes-lab/fixtures/security-lab/workspace/.docuflow-write-probe
 # Python bytecode from the dev script.
 __pycache__/
 *.pyc
+
+# Preserved pre-rename runtime data, reports and dependency/build caches.
+/codeweaver-legacy-runtime-data/

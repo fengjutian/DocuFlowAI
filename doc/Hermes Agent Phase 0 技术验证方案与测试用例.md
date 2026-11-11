@@ -1,12 +1,12 @@
-继续推进 DocuFlow AI 的 Hermes 集成。
+继续推进 CodeWeaver 的 Hermes 集成。
 
 这一阶段进入 Phase 0：技术可行性验证。目标不是马上开发 Adapter，而是先用真实运行环境验证 Hermes 的协议能力、执行隔离、权限控制和故障恢复。
 
 我重新核对了 Hermes 官方开发文档，有一个重要的架构调整：
 
-对于 DocuFlow，建议把 TUI Gateway JSON-RPC 作为深度集成的首选协议，HTTP API 作为备选和快速验证接口，ACP 专门服务 Zed 等编辑器。
+对于 CodeWeaver，建议把 TUI Gateway JSON-RPC 作为深度集成的首选协议，HTTP API 作为备选和快速验证接口，ACP 专门服务 Zed 等编辑器。
 
-原因是 DocuFlow 需要的不只是模型对话，还需要审批、Session、Subagent、流式事件和执行中断。Hermes 官方也将 TUI Gateway 定位为需要完整会话和交互控制的自定义宿主协议。
+原因是 CodeWeaver 需要的不只是模型对话，还需要审批、Session、Subagent、流式事件和执行中断。Hermes 官方也将 TUI Gateway 定位为需要完整会话和交互控制的自定义宿主协议。
 
 [image](https://www.google.com/s2/favicons?domain=https://hermes-agent.nousresearch.com\&sz=32)
 
@@ -18,13 +18,13 @@ Hermes Agent
 
 Phase 0 技术验证方案
 
-DocuFlow AI V1.2
+CodeWeaver V1.2
 
 
 
 # 一、Phase 0 总体目标
 
-# 验证 Hermes 是否适合成为 DocuFlow 的 Agent Runtime
+# 验证 Hermes 是否适合成为 CodeWeaver 的 Agent Runtime
 
 # 6
 
@@ -42,7 +42,7 @@ DocuFlow AI V1.2
 
 最终技术验证报告
 
-通过标准： 能够安全启动、执行、控制、取消和追溯 Hermes Agent，并且不破坏 DocuFlow 的权限和代码变更边界。
+通过标准： 能够安全启动、执行、控制、取消和追溯 Hermes Agent，并且不破坏 CodeWeaver 的权限和代码变更边界。
 
 六个验证维度：
 
@@ -55,11 +55,11 @@ DocuFlow AI V1.2
 
 # 二、实验环境设计
 
-建议先搭建独立的验证环境，不要直接连接 DocuFlow 正式项目。
+建议先搭建独立的验证环境，不要直接连接 CodeWeaver 正式项目。
 
 Phase 0 实验架构
 
-DocuFlow Test Client
+CodeWeaver Test Client
 
 Node.js + TypeScript 测试客户端
 
@@ -99,7 +99,7 @@ Git Worktree
 | 通信     | HTTP/SSE、JSON-RPC、stdio        |
 | 日志     | 结构化 JSON 日志                    |
 
-不建议一开始部署完整 DocuFlow 数据库和所有引擎。Phase 0 只需要一个小型测试客户端。
+不建议一开始部署完整 CodeWeaver 数据库和所有引擎。Phase 0 只需要一个小型测试客户端。
 
 # 三、协议选型实验
 
@@ -133,7 +133,7 @@ TUI Gateway
 
 主集成候选
 
-作为 DocuFlow 深度集成的主要协议，重点测试审批、Session 恢复、事件和 Subagent。
+作为 CodeWeaver 深度集成的主要协议，重点测试审批、Session 恢复、事件和 Subagent。
 
 HTTP API
 
@@ -145,7 +145,7 @@ ACP
 
 编辑器协议
 
-用于 Zed 与 Hermes 之间的交互，不作为 DocuFlow 主任务控制协议。
+用于 Zed 与 Hermes 之间的交互，不作为 CodeWeaver 主任务控制协议。
 
 # 四、24 项技术验证测试用例
 
@@ -222,9 +222,9 @@ Hermes Agent
 
 这里特别强调：
 
-Hermes 自身的审批机制不等于 DocuFlow 的 Policy Engine。
+Hermes 自身的审批机制不等于 CodeWeaver 的 Policy Engine。
 
-即使 Hermes 请求获得批准，也必须由 DocuFlow 的权限规则再次确认。审批只能授权具体操作，不能自动授予整个容器的无限权限。
+即使 Hermes 请求获得批准，也必须由 CodeWeaver 的权限规则再次确认。审批只能授权具体操作，不能自动授予整个容器的无限权限。
 
 ## D. 运行隔离（4 项）
 
@@ -251,7 +251,7 @@ Hermes 自身的审批机制不等于 DocuFlow 的 Policy Engine。
 | ------ | ----------- | --------------- |
 | P0-018 | 正常取消任务      | 进入明确的取消终态       |
 | P0-019 | 客户端断开连接     | Agent 不发生意外重复执行 |
-| P0-020 | Hermes 进程崩溃 | DocuFlow 能识别中断  |
+| P0-020 | Hermes 进程崩溃 | CodeWeaver 能识别中断  |
 | P0-021 | Session 恢复  | 能恢复可恢复的会话或安全重建  |
 
 这里有一个重要细节：
@@ -263,7 +263,7 @@ Hermes 自身的审批机制不等于 DocuFlow 的 Policy Engine。
 1. WebSocket 或 SSE 客户端断开。
 2. Hermes Gateway 进程停止。
 3. Agent 执行进程崩溃。
-4. DocuFlow Worker 崩溃。
+4. CodeWeaver Worker 崩溃。
 
 这四种故障不能采用同一种恢复策略。
 
@@ -395,7 +395,7 @@ interface TechnicalTestResult {
 Phase 0 先建立独立测试工程：
 
 ```
-docuflow-hermes-lab/
+codeweaver-hermes-lab/
 ├── docs/
 │   ├── TEST_PLAN.md
 │   ├── TEST_RESULTS.md
@@ -446,7 +446,7 @@ docuflow-hermes-lab/
 | ACP 完整通过                       | Zed 集成使用 ACP                    |
 | 文件隔离失败                         | 不允许 Hermes 直接执行文件写入工具           |
 | 权限审批无法可靠控制                     | 禁止开放高风险工具                       |
-| Session 无法恢复                   | 使用 DocuFlow Checkpoint 重建执行     |
+| Session 无法恢复                   | 使用 CodeWeaver Checkpoint 重建执行     |
 | 多 Agent 隔离失败                   | 暂时限制单 Agent 并发                  |
 | 审计信息不完整                        | 在 Adapter 层增加事件采集和关联记录          |
 
@@ -467,7 +467,7 @@ docuflow-hermes-lab/
 
 先做 TUI Gateway 的核心能力验证，同时做 HTTP API 的基础对照测试。
 
-因为 DocuFlow 的核心场景是长时间运行的工程任务，而不是简单的聊天请求。
+因为 CodeWeaver 的核心场景是长时间运行的工程任务，而不是简单的聊天请求。
 
 TUI Gateway 已经提供会话管理、审批请求、工具事件、恢复相关接口以及 Subagent 控制能力。HTTP API 也已经提供 Run、Approval、Steer、Stop 和事件接口，因此两者都值得实际测试，而不是预先假定某一个一定更可靠。
 
@@ -517,4 +517,4 @@ Phase 0 进度跟踪
 - [Hermes Agent GitHub](https://github.com/NousResearch/hermes-agent?utm_source=chatgpt.com)
 - [Hermes Agent Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture?utm_source=chatgpt.com)
 
-下一步就是根据这份测试方案，生成 `docuflow-hermes-lab` 的实际工程骨架和第一批可运行测试代码。
+下一步就是根据这份测试方案，生成 `codeweaver-hermes-lab` 的实际工程骨架和第一批可运行测试代码。

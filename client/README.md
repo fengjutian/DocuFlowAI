@@ -51,7 +51,7 @@ in `client/zed/target` (GBs).
 If a real fork is needed later, the clean move is a repository fork plus this directory as a
 submodule, not a copy.
 
-## What DocuFlow uses it for
+## What CodeWeaver uses it for
 
-Nothing yet at runtime: the installed Zed already talks to DocuFlow over ACP (`npm run install:zed`).
+Nothing yet at runtime: the installed Zed already talks to CodeWeaver over ACP (`npm run install:zed`).
 The source is here for features that settings or an extension cannot express.
