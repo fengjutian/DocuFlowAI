@@ -19,6 +19,7 @@ const CHILD_ID = "exec-child";
 interface FakeOptions {
   /** The status of the delegation request; a non-201 means no child was created. */
   spawnStatus?: number;
+  spawnErrorCode?: string;
   spawnError?: string;
   /** The child's terminal status; a non-terminal status means the child never finished. */
   childStatus?: string;
@@ -50,6 +51,7 @@ function client(options: FakeOptions = {}): PiSubagentClient {
     options.spawnStatus !== undefined && options.spawnStatus !== 201
       ? {
           status: options.spawnStatus,
+          ...(options.spawnErrorCode ? { errorCode: options.spawnErrorCode } : {}),
           ...(options.spawnError ? { error: options.spawnError } : {})
         }
       : {
@@ -75,6 +77,10 @@ function client(options: FakeOptions = {}): PiSubagentClient {
       executionId === PARENT_ID
         ? options.parentRuntimeId ?? "pi-local"
         : options.childRuntimeId ?? "pi-local",
+    runtimes: async () => [
+      { id: "hermes-local", runtimeType: "hermes" },
+      { id: "pi-local", runtimeType: "native" }
+    ],
     spawnChild: async () => spawn,
     fact: async (executionId, category) => facts[executionId]?.[category],
     lineage: async (executionId): Promise<SubagentLineage> => {
@@ -157,12 +163,20 @@ test("fails when the parent does not list the child among its children", async (
 
 test("is blocked when the server never created a child", async () => {
   const results = await executePiSubagentPhase0(
-    client({ spawnStatus: 500, spawnError: "runtime unreachable" })
+    client({
+      spawnStatus: 502,
+      spawnErrorCode: "runtime_unreachable",
+      spawnError: "Hermes run creation failed"
+    })
   );
 
   assert.equal(results[0]!.status, "blocked");
-  assert.match(results[0]!.notes ?? "", /HTTP 500 — runtime unreachable/);
-  assert.ok(results[0]!.evidence.some(item => item.includes("spawnStatus=500")));
+  assert.match(results[0]!.notes ?? "", /HTTP 502 \(runtime_unreachable\) — Hermes run creation failed/);
+  assert.match(results[0]!.notes ?? "", /the parent ran on 'pi-local'/);
+  assert.ok(results[0]!.evidence.some(item => item.includes("spawnStatus=502")));
+  assert.ok(results[0]!.evidence.some(item => item.includes("spawnErrorCode=runtime_unreachable")));
+  // The delegation endpoint still answers for a parent without children, and the report says so.
+  assert.ok(results[0]!.evidence.some(item => item.includes("parentLineage")));
 });
 
 test("is blocked when the parent never produced any output", async () => {

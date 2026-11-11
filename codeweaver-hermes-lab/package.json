@@ -16,6 +16,7 @@
     "validate:security-agent:pi": "npm run build && node dist/runners/security-agent-phase0-pi.js",
     "validate:pi-cancellation": "npm run build && node dist/runners/pi-cancellation-phase0.js",
     "validate:pi-session-recovery": "npm run build && node dist/runners/pi-session-recovery-phase0.js",
+    "validate:pi-skill-delivery": "npm run build && node dist/runners/pi-skill-delivery-phase0.js",
     "report:phase0": "npm run build && node dist/runners/aggregate-phase0.js",
     "check:hermes": "npm run build && node dist/runners/check-hermes-version.js",
     "probe:pi-tools": "npm run build && node scripts/probe-pi-tools.mjs",

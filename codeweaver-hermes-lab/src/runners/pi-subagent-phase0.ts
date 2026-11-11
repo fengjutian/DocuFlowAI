@@ -71,6 +71,8 @@ export interface PiSubagentClient {
   waitForTerminal(executionId: string, timeoutMs: number): Promise<string>;
   /** The runtime the server names for an execution. */
   runtimeId(executionId: string): Promise<string | undefined>;
+  /** The runtimes the server has registered. */
+  runtimes(): Promise<Array<{ id: string; runtimeType: string }>>;
   /** Delegates a child execution from the parent execution. */
   spawnChild(parentExecutionId: string): Promise<SpawnOutcome>;
   /** A journaled fact of an execution, by category. */
@@ -123,6 +125,11 @@ export async function executePiSubagentPhase0(
 
   const parentRuntimeId = await client.runtimeId(parentId);
   evidence.push(`parentRuntimeId=${String(parentRuntimeId)}`);
+
+  // The registered runtimes are part of the evidence: a delegation that fails while the parent's
+  // runtime is registered is not a delegation that had nowhere to go.
+  const registered = await client.runtimes();
+  evidence.push(`registeredRuntimes=${registered.map(item => item.id).join(",")}`);
 
   const spawn = await client.spawnChild(parentId);
   evidence.push(`spawnStatus=${spawn.status}`);
@@ -355,6 +362,14 @@ async function main(): Promise<void> {
       const body = await response.json();
       return typeof body.runtimeId === "string" ? body.runtimeId : undefined;
     },
+    runtimes: async () => {
+      const response = await fetch(`${url}/api/v1/runtimes`);
+      if (response.status !== 200) return [];
+      const body = await response.json();
+      return ((body.runtimes ?? []) as Array<{ id?: string; runtimeType?: string }>)
+        .filter(item => typeof item.id === "string")
+        .map(item => ({ id: item.id as string, runtimeType: item.runtimeType ?? "unknown" }));
+    },
     spawnChild: async parentExecutionId => {
       const response = await fetch(`${url}/api/v1/executions/${parentExecutionId}/subagents`, {
         method: "POST",
@@ -445,6 +460,18 @@ async function main(): Promise<void> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolveSleep => setTimeout(resolveSleep, ms));
+}
+
+/** The lineage the server records for an execution, or nothing when it cannot answer. */
+async function readLineage(
+  client: PiSubagentClient,
+  executionId: string
+): Promise<SubagentLineage | undefined> {
+  try {
+    return await client.lineage(executionId);
+  } catch {
+    return undefined;
+  }
 }
 
 function git(args: string[], cwd: string): string {
