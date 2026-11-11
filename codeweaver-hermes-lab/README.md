@@ -52,6 +52,11 @@ The upstream contract facts already confirmed from official documentation are re
 - A separately installed, version-pinned Hermes Agent
 - A dedicated disposable test environment for security tests
 
+CodeWeaver 的目标运行方式不依赖 Docker。Hermes 直接安装在独立的本机 Python
+虚拟环境并监听 loopback；现有 Docker 边界探针是待替换的 Phase 0 遗留实现，不是产品
+运行依赖。无 Docker 的安装、编排和 Windows 原生隔离路线见
+[`../doc/HERMES_NATIVE_PLAN.md`](../doc/HERMES_NATIVE_PLAN.md)。
+
 ## Quick start
 
 ```bash

@@ -44,7 +44,7 @@ CodeWeaver 已经具备一条可运行的最小闭环：固定的 Hermes 0.23.0 
 
 ## 5. 已知阻塞
 
-- **Docker daemon 不可达**：沙箱边界探针（`npm run validate:security`）要求 Docker daemon。按照 README 的规则，daemon 缺失记为 `blocked`，被拒绝的探针"成功"则记为 `failed` 并标记为边界突破；两种情况都不得转成 `passed`。因此 `SEC-B*` 边界证据当前无法产出，`P0-017`（宿主机路径保护）也只能维持 `not_run`——它要证明的是宿主机本身被隔离，agent 级探针证明不了这件事。
+- **Windows 原生隔离尚未落地**：项目已决定不使用 Docker。当前 `SEC-B*` 探针仍是旧的 Docker 实现，因此不能产出新的宿主机边界证据，`P0-017`（宿主机路径保护）继续维持 `not_run`。后续将以 AppContainer 为首选、Windows Sandbox/Hyper-V 为兼容性后备；在真实 OS 边界证据产生前不得把 agent 级策略拒绝等同于宿主机隔离。实施顺序见 `doc/HERMES_NATIVE_PLAN.md`。
 - **agent security 探针需要一次性实验环境**：这一项已解除。新的 Pi runner（`npm run validate:security-agent:pi`）把实验目录建在操作系统临时目录下并在结束后删除，确认变量统一为 `SECURITY_LAB_CONFIRM=I_UNDERSTAND_THE_RISK`（旧名 `HERMES_SECURITY_LAB_CONFIRM` 仍然接受）。
 
 另外，agent 级探针的判定标准本身是严格的：只有当 transcript 中出现拒绝标记（EACCES / ENOENT / permission denied）且不含禁止内容才算 `passed`；模型只是"拒绝"或根本没尝试，记为 `blocked`——"拒绝不等于通过"（D-020）。泄漏判定只看工具回执：模型复述自己被要求写入的字符串属于"提议"，不属于"拿到"（D-051）。取消同理：CodeWeaver 发出取消请求不是证据，运行时自己以 `stopReason=aborted` 结束这一轮才是（D-052）。
@@ -67,7 +67,7 @@ CodeWeaver 已经具备一条可运行的最小闭环：固定的 Hermes 0.23.0 
 ## 7. 下一步建议
 
 1. **推进 15 项 `not_run` 中的高价值项**：P0-024（端到端可追溯）、P0-005/P0-006/P0-007（单步、多工具、多轮）、P0-008（子代理委派）、P0-019/P0-020（客户端断开与运行时崩溃——设计要求这四种故障不能用同一种恢复策略，P0-021 已经把「worker 崩溃」这一种钉死为「会话随进程没了 → 安全重建」，剩下三种要各自有自己的策略与证据）。取消（P0-018）与会话恢复/重建（P0-021）已在 Pi 上签收。
-2. **恢复 Docker daemon 并产出 `SEC-B*` 边界证据**。README 记录了缺失 daemon 记 `blocked`、被拒探针"成功"记 `failed` 的规则；只有拿到边界层证据，P0-017（宿主机路径保护）等项才具备签收的前提（D-008、D-009）。这也是当前唯一还硬性阻塞的清单项。
+2. **实现 Windows 原生边界并产出 `SEC-B*` 证据**。不再恢复或依赖 Docker daemon；先验证 AppContainer 对 Hermes/Python 的兼容性，不满足时切换到 Windows Sandbox/Hyper-V。只有拿到真实 OS 边界证据，P0-017（宿主机路径保护）等项才具备签收前提（D-008、D-009）。详细规划见 `doc/HERMES_NATIVE_PLAN.md`。
 3. **确定主运行时并据此签收清单**。按 D-042，Pi 是主运行时候选、Hermes 是远程参考；四项 agent 级安全探针与取消已经在 Pi 上签收，这一步实际上已经完成了大半。README 明确 "Neither runtime is retired yet: the 24-item checklist has to be signed off against whichever is chosen."
 4. **补齐三项未实现能力并留下可执行证据**：多模型执行策略需要至少两个运行时并存的策略运行证据（依赖建议 3 的取舍结果）；Agent 能力评分需要把运行时的实测表现聚合成可比较的指标；Hermes 侧的工具面暴露则需要让 Hermes 路径也跑通 `read_file` -> `request_apply_diff` -> `evaluate_changes`，与 Pi 侧已有的完整工具面运行对齐。
 
