@@ -152,8 +152,12 @@ fn build_demo_scene(size: codeweaver_render::Size, input: &TextInputState) -> Fr
         Color::rgb(0.30, 0.58, 0.96),
         viewport,
     );
+    let heading = format!(
+        "CodeWeaver · wgpu FrameScene · IME {}",
+        if input.ime_enabled() { "ON" } else { "READY" }
+    );
     scene.push_text(
-        "CodeWeaver · wgpu FrameScene",
+        heading,
         Rect::new(56.0, 16.0, size.width - 72.0, 28.0),
         TextStyle {
             clip: viewport,

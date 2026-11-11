@@ -187,7 +187,6 @@ impl Renderer {
                         load: wgpu::LoadOp::Clear(scene.clear.into()),
                         store: wgpu::StoreOp::Store,
                     },
-                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -241,7 +240,7 @@ impl Renderer {
             buffer.set_text(
                 &mut self.text.font_system,
                 &run.text,
-                Attrs::new().family(Family::SansSerif),
+                &Attrs::new().family(Family::SansSerif),
                 Shaping::Advanced,
             );
             buffer.shape_until_scroll(&mut self.text.font_system, false);

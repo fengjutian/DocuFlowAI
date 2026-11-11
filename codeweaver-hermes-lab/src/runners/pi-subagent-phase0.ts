@@ -39,6 +39,8 @@ const DEFAULT_CHILD_PROMPT = "Reply with exactly one word: CHILD_OK";
 export interface SpawnOutcome {
   /** The HTTP status of the delegation request. */
   status: number;
+  /** The error code the server refused with, when it refused. */
+  errorCode?: string;
   /** The child execution, when the server created one. */
   childExecutionId?: string;
   worktreeMode?: string;
@@ -129,12 +131,20 @@ export async function executePiSubagentPhase0(
   if (spawn.workingDirectory) evidence.push(`childWorkingDirectory=${spawn.workingDirectory}`);
   if (spawn.rootExecutionId) evidence.push(`spawnRootExecutionId=${spawn.rootExecutionId}`);
   if (spawn.lineage) evidence.push(`spawnLineage=${JSON.stringify(spawn.lineage)}`);
+  if (spawn.errorCode) evidence.push(`spawnErrorCode=${spawn.errorCode}`);
   if (spawn.error) evidence.push(`spawnError=${spawn.error}`);
 
   const childId = spawn.childExecutionId;
   if (spawn.status !== 201 || !childId) {
     // No child means no delegation: the probe reports what the server said instead of a verdict
-    // about a child that does not exist.
+    // about a child that does not exist. The parent's own lineage is still read, so the report
+    // shows that the delegation endpoint answers for a parent without children.
+    const parentTree = await readLineage(client, parentId);
+    if (parentTree) {
+      evidence.push(`parentChildren=${JSON.stringify(parentTree.children)}`);
+      evidence.push(`parentLineage=${JSON.stringify(parentTree.lineage)}`);
+      evidence.push(`parentRootExecutionId=${parentTree.rootExecutionId}`);
+    }
     return [
       {
         id: "P0-008",
@@ -144,8 +154,8 @@ export async function executePiSubagentPhase0(
         finishedAt: now().toISOString(),
         evidence,
         notes: `The server did not create a child execution: HTTP ${spawn.status}${
-          spawn.error ? ` — ${spawn.error}` : ""
-        }`
+          spawn.errorCode ? ` (${spawn.errorCode})` : ""
+        }${spawn.error ? ` — ${spawn.error}` : ""}; the parent ran on '${String(parentRuntimeId)}'`
       }
     ];
   }
@@ -368,13 +378,19 @@ async function main(): Promise<void> {
       const text = await response.text();
       if (response.status !== 201) {
         let message = text;
+        let code: string | undefined;
         try {
           const parsed = JSON.parse(text) as { error?: string; message?: string };
           message = parsed.message ?? parsed.error ?? text;
+          code = parsed.error;
         } catch {
           // A non-JSON body is the server's own text; keep it.
         }
-        return { status: response.status, error: message };
+        return {
+          status: response.status,
+          ...(code ? { errorCode: code } : {}),
+          error: message
+        };
       }
       const body = JSON.parse(text) as {
         execution?: { executionId?: string };

@@ -32,9 +32,6 @@ impl TextInputState {
         self.committed.pop();
     }
 
-    pub fn committed(&self) -> &str {
-        &self.committed
-    }
     pub fn preedit(&self) -> &str {
         &self.preedit
     }
@@ -63,7 +60,7 @@ mod tests {
         input.set_preedit("zhong wen".into(), Some((0, 9)));
         assert_eq!(input.display_text(), "zhong wen");
         input.commit("中文");
-        assert_eq!(input.committed(), "中文");
+        assert_eq!(input.display_text(), "中文");
         assert!(input.preedit().is_empty());
     }
 
@@ -72,6 +69,6 @@ mod tests {
         let mut input = TextInputState::default();
         input.commit("A中");
         input.delete_previous_scalar();
-        assert_eq!(input.committed(), "A");
+        assert_eq!(input.display_text(), "A");
     }
 }
