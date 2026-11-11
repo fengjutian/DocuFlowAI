@@ -475,3 +475,77 @@ Decision: a leak is forbidden content that came back in a tool result. The reque
 transcript — the arguments, the permission request that carried them, the model's own words — is a
 proposal, not a breach. The allow probe follows the same rule in reverse: the expected content has
 to come back from a tool, so a model cannot sign off P0-009 by stating the answer from memory.
+
+## D-052: A cancellation is reported when the runtime confirms it, not when it is requested
+Status: accepted
+Context: the adapter reported the cancelled state the moment the cancel request arrived. That made
+the product's own claim the only evidence: the event said "cancelled" because DocuFlow asked, not
+because the runtime stopped, and a runtime that ignored the request would have produced exactly the
+same record.
+Decision: the terminal event waits for the runtime. Pi ends an aborted turn with
+`stopReason: "aborted"`, so the cancelled event carries that reason together with
+`runtimeConfirmed`, and the audit timeline says who stopped the turn and why. The wait is bounded: a
+runtime that never answers produces a cancellation marked `runtimeConfirmed: false` rather than an
+execution that hangs. The execution passes through the `cancelling` state, which is what the API's
+202 already promised.
+
+## D-053: The console shows what the runtime said, and folds the stream noise instead of hiding it
+Status: accepted
+Context: once a task could actually run on Pi, the console turned out to be the weakest link in the
+chain. It rendered every event as a full card labelled by type alone, so a single run produced 216
+rows of which 131 were Pi's streaming lifecycle events (`turn_start`, `message_update`, `message_end`
+and so on) — the eight rows that carried meaning were buried. The assistant's answer was never
+shown at all: it only existed inside an event payload, one "原始数据" click away. And the runtime's
+own event name was invisible for Pi, because the lookup only knew Hermes' `payload.hermesEvent`.
+A console that cannot show the answer is an audit log, not a control plane.
+Decision: three rules. First, the assistant's text is a first-class thing the console shows: the
+last completed assistant message appears verbatim in its own card, and message deltas and tool
+results are rendered inline rather than hidden behind a JSON dump. Second, an event the contract
+does not model is folded into one compact line that still shows the runtime's original name
+(`payload.hermesEvent` for Hermes, `payload.runtimeEvent` for Pi) — nothing is dropped, but the
+stream noise does not get a card per chunk. Third, the server names its charset: `application/json;
+charset=utf-8`, because a client that falls back to Latin-1 turns every Chinese character in the
+agent's answer into `?`, and the console is the one place where that answer is read.
+
+## D-054: A recorded execution stays describable after the process that ran it is gone
+Status: accepted
+Context: restarting the server emptied the coordinator's live sessions, and the console immediately
+lost every execution it had ever run: `GET /executions/{id}` threw "Unknown execution" and the page
+showed a red error, while the journal — durable, on disk — still held every event of the run. The
+timeline was still readable next to it, which made the failure look arbitrary. Two things had been
+assumed rather than checked: that the runtime id could be recovered from the registry, and that the
+status could be recovered from the adapter. Neither survives a restart: the registry would name the
+server's *default* runtime, which may not be the one that ran the task, and the adapter knows
+nothing about an execution it did not start.
+Decision: the journal is the record, and the API reads from it. The runtime id is written into the
+journal with the execution (`execution.runtime`), so a reader can still name the runtime that
+produced a timeline; the status of a recorded execution is derived from its terminal event
+(`execution.completed` → `succeeded`, `execution.failed` → `failed`, `execution.cancelled` →
+`cancelled`) instead of an event name where a status belongs. The API also says whether the
+execution is still live in this process, and refuses to cancel one that is not — a refusal with a
+reason beats a failure from inside the adapter. What the server cannot prove, it does not claim: an
+execution recorded before this rule has no journaled runtime, so its runtime stays unknown rather
+than being guessed from the default.
+
+## D-055: The recovery strategy is the runtime's answer, and the rebuild runs where the task ran
+Status: accepted
+Context: the checklist asks for a session that can be recovered to be recovered, or a safe rebuild
+— and it says the four failures (client disconnect, gateway stop, agent crash, worker crash) must
+not share one strategy. The code had a plan for all of them and no way to reach it: the option
+that asks whether the session survived was never wired, so the plan always fell through to
+"rebuild", and the rebuild had no input to rebuild from — the original request only ever existed
+in the worker's memory. Worse, the rebuild would have run on the server's *default* runtime,
+because the coordinator no longer knew which runtime ran the task. A rebuild that quietly moves
+the task to another runtime is worse than no rebuild: the caller asked for Pi and got Hermes.
+Decision: three rules. First, the runtime that owns the execution answers whether its session
+survived (`isSessionResumable` on the adapter); an adapter that cannot answer has no session to
+offer, and the answer is "no". For Pi the answer is structural rather than a flag: the transcript
+lives on the agent instance inside the worker, so a worker that died took the session with it. The
+plan then says "rebuild" — and it says why. Second, the two facts a rebuild needs are journaled
+with the execution, not kept in memory: which runtime ran it (`execution.runtime`) and what it was
+asked (`execution.input`). The coordinator writes them, because the coordinator is what starts
+executions — the first attempt and the rebuild alike. Third, a rebuild continues on the runtime
+that ran the original task, looked up by that journaled id; if the runtime cannot be named, the
+rebuild is refused rather than redirected. The probe stages the failure the design calls out — a
+worker that dies mid-turn — and checks the decision, the runtime, the checkpoint and the fact that
+the rebuilt execution actually ran.

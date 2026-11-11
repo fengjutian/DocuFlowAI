@@ -109,26 +109,144 @@ const EVENT_LABELS: Record<string, string> = {
   "agent.execution.completed": "执行完成",
   "agent.execution.failed": "执行失败",
   "agent.execution.cancelled": "执行取消",
-  "agent.runtime.unknown": "未知事件"
+  "agent.runtime.unknown": "未知事件",
+  // DocuFlow's own journaled facts (audit entries), named by their category.
+  "docuflow.execution.runtime": "运行时",
+  "docuflow.execution.input": "执行请求",
+  "docuflow.execution.cancel_requested": "已请求取消",
+  "docuflow.execution.terminate_requested": "已请求终止",
+  "docuflow.context.snapshot": "上下文快照",
+  "docuflow.policy.snapshot": "策略快照",
+  "docuflow.prompt.snapshot": "提示词快照",
+  "docuflow.change.applied": "变更已应用",
+  "docuflow.permission.requested": "请求权限",
+  "docuflow.permission.resolved": "权限已裁决",
+  "docuflow.recovery.compensated": "已补偿",
+  "docuflow.recovery.rebuild": "已重建"
 };
 
 /**
  * The runtime's own event name.
  *
- * The adapter always keeps the original name in `payload.hermesEvent`, so an event the contract does
+ * Hermes keeps it in `payload.hermesEvent`, Pi in `payload.runtimeEvent`. An event the contract does
  * not model is still auditable: the UI shows the runtime's name instead of a bare "unknown".
  */
 export function runtimeEventName(data: unknown): string | undefined {
   if (!data || typeof data !== "object") return undefined;
-  const value = (data as Record<string, unknown>)["hermesEvent"];
-  return typeof value === "string" && value.trim() !== "" ? value : undefined;
+  const record = data as Record<string, unknown>;
+  for (const key of ["hermesEvent", "runtimeEvent"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim() !== "") return value;
+  }
+  return undefined;
 }
+
+/**
+ * Runtime event names that have no DocuFlow counterpart, given a readable Chinese name.
+ *
+ * Pi emits a lifecycle event per streaming step (`message_update` fires for every text chunk and
+ * every thinking chunk), so a single run can produce well over a hundred of them. Naming them keeps
+ * the timeline readable instead of a wall of "未知事件"; the raw name still shows next to the label.
+ */
+const RUNTIME_EVENT_LABELS: Record<string, string> = {
+  turn_start: "轮次开始",
+  turn_end: "轮次结束",
+  message_start: "消息开始",
+  message_end: "消息结束",
+  message_update: "消息更新",
+  tool_execution_start: "工具开始",
+  tool_execution_update: "工具更新",
+  tool_execution_end: "工具结束"
+};
 
 export function eventLabel(type: string, data?: unknown): string {
   const label = EVENT_LABELS[type] ?? type;
   if (type !== "agent.runtime.unknown") return label;
   const runtimeName = runtimeEventName(data);
-  return runtimeName ? `${label} · ${runtimeName}` : label;
+  if (!runtimeName) return label;
+  return RUNTIME_EVENT_LABELS[runtimeName] ?? label;
+}
+
+/** Joins the text parts of an Anthropic-style content array; tool calls carry no text. */
+function textFromContent(content: unknown): string | undefined {
+  if (typeof content === "string") return content.trim() === "" ? undefined : content;
+  if (!Array.isArray(content)) return undefined;
+  const parts = content
+    .map(part => {
+      if (typeof part === "string") return part;
+      if (part && typeof part === "object") {
+        const record = part as Record<string, unknown>;
+        if (record["type"] === "text" && typeof record["text"] === "string") return record["text"];
+      }
+      return "";
+    })
+    .filter(part => part !== "");
+  return parts.length > 0 ? parts.join("\n") : undefined;
+}
+
+/**
+ * The assistant's own words, when the payload carries them.
+ *
+ * Pi sends a completed message as `{ message: { content: [{ type: "text", text }] } }` and a stream
+ * chunk as `{ delta }`; Hermes passes its payload through unchanged. Without this the console only
+ * ever showed event names, and the answer the user actually asked for was one "原始数据" click away.
+ */
+export function agentMessageText(data: unknown): string | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const record = data as Record<string, unknown>;
+  for (const key of ["text", "delta"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim() !== "") return value;
+  }
+  const message = record["message"];
+  if (typeof message === "string") return message.trim() === "" ? undefined : message;
+  if (message && typeof message === "object") {
+    const messageRecord = message as Record<string, unknown>;
+    const fromContent = textFromContent(messageRecord["content"]);
+    if (fromContent) return fromContent;
+    const text = messageRecord["text"];
+    if (typeof text === "string" && text.trim() !== "") return text;
+  }
+  const fromContent = textFromContent(record["content"]);
+  if (fromContent) return fromContent;
+  const messages = record["messages"];
+  if (Array.isArray(messages)) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const entry = messages[index];
+      if (!entry || typeof entry !== "object") continue;
+      const entryRecord = entry as Record<string, unknown>;
+      if (entryRecord["role"] !== undefined && entryRecord["role"] !== "assistant") continue;
+      const text = textFromContent(entryRecord["content"]) ?? entryRecord["text"];
+      if (typeof text === "string" && text.trim() !== "") return text;
+    }
+  }
+  return undefined;
+}
+
+/** What a tool call returned, so the timeline can show why a step failed. */
+export function toolResultText(data: unknown): string | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const record = data as Record<string, unknown>;
+  for (const key of ["result", "partialResult", "error"]) {
+    const value = record[key];
+    if (typeof value === "string") return value.trim() === "" ? undefined : value;
+    if (!value || typeof value !== "object") continue;
+    const valueRecord = value as Record<string, unknown>;
+    const fromContent = textFromContent(valueRecord["content"]);
+    if (fromContent) return fromContent;
+    for (const textKey of ["text", "error"]) {
+      const text = valueRecord[textKey];
+      if (typeof text === "string" && text.trim() !== "") return text;
+    }
+  }
+  return undefined;
+}
+
+/** The tool a call was made against, so a result line says which step produced it. */
+export function toolNameOf(data: unknown): string | undefined {
+  if (!data || typeof data !== "object") return undefined;
+  const value = (data as Record<string, unknown>)["toolName"];
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
 
 /** Renders an unknown payload as readable JSON, capped so one huge delta cannot break the timeline. */
@@ -148,7 +266,12 @@ export function previewPayload(data: unknown, maxLength = 600): string {
 export function summarizePayload(data: unknown): string {
   if (!data || typeof data !== "object") return typeof data === "string" ? data : "";
   const record = data as Record<string, unknown>;
-  for (const key of ["text", "message", "tool", "operation", "toolName", "reason", "summary", "status"]) {
+  // What the agent said, or what the tool returned, beats a list of payload keys.
+  const message = agentMessageText(data);
+  if (message) return message;
+  const toolResult = toolResultText(data);
+  if (toolResult) return toolResult;
+  for (const key of ["tool", "operation", "toolName", "reason", "summary", "status", "runtimeId", "taskId"]) {
     const value = record[key];
     if (typeof value === "string" && value.trim() !== "") return value;
   }

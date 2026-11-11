@@ -6,7 +6,7 @@ import { EventBus } from "../../api/event-bus.js";
 import { UsageLedger } from "../../accounting/usage.js";
 import { SkillRegistry } from "../../skills/skill-registry.js";
 import { SkillBindingStore } from "../../skills/skill-bindings.js";
-import { InMemoryJournalStore } from "../../journal/journal.js";
+import { InMemoryJournalStore, type JournalStore } from "../../journal/journal.js";
 import { ExecutionCoordinator } from "../../orchestrator/execution-coordinator.js";
 import type { TaskExecutionService, StartTaskRequest } from "../../tasks/task-execution-service.js";
 import {
@@ -29,6 +29,11 @@ async function harness(options: {
   token?: string;
   usage?: UsageLedger;
   skills?: { registry: SkillRegistry; bindings: SkillBindingStore };
+  /**
+   * An existing journal, so a test can hand the next harness the history of a previous one.
+   * That is what a server restart looks like from the outside: same records, empty memory.
+   */
+  journal?: JournalStore;
 } = {}): Promise<Harness> {
   const starts: StartTaskRequest[] = [];
   const cancelled: string[] = [];
@@ -67,7 +72,7 @@ async function harness(options: {
     }
   };
 
-  const journal = new InMemoryJournalStore();
+  const journal = options.journal ?? new InMemoryJournalStore();
   const coordinator = new ExecutionCoordinator({ adapter, journal });
   const registry = new AgentRuntimeRegistry();
   registry.register({ id: "hermes-local", runtimeType: "hermes", adapter, version: "0.23.0" });
@@ -527,6 +532,81 @@ test("reports 501 for skills when the server has no skill surface", async () => 
   const app = await harness();
   try {
     assert.equal((await fetch(`${app.url}/api/v1/skills`)).status, 501);
+  } finally {
+    await app.close();
+  }
+});
+
+/**
+ * A journal left behind by an earlier server process.
+ *
+ * The records are what survive a restart; the live session is not. The runtime id is one of those
+ * records, because the registry alone would name the server's default runtime instead.
+ */
+async function journalOfAnEarlierProcess(): Promise<JournalStore> {
+  const journal = new InMemoryJournalStore();
+  await journal.append({
+    executionId: "exec-restarted",
+    sequence: 1,
+    eventSequence: 1,
+    kind: "runtime.event",
+    category: "execution.started",
+    recordedAt: "2026-11-11T00:00:00.000Z",
+    payload: { runtime: "pi" }
+  });
+  await journal.append({
+    executionId: "exec-restarted",
+    sequence: 2,
+    kind: "audit",
+    category: "execution.runtime",
+    recordedAt: "2026-11-11T00:00:00.000Z",
+    payload: { runtimeId: "pi-local" }
+  });
+  await journal.append({
+    executionId: "exec-restarted",
+    sequence: 3,
+    eventSequence: 2,
+    kind: "runtime.event",
+    category: "execution.cancelled",
+    recordedAt: "2026-11-11T00:00:01.000Z",
+    payload: { runtimeConfirmed: true, runtimeStopReason: "aborted" }
+  });
+  return journal;
+}
+
+test("describes a recorded execution after the server process restarted", async () => {
+  const app = await harness({ journal: await journalOfAnEarlierProcess() });
+  try {
+    const response = await fetch(`${app.url}/api/v1/executions/exec-restarted`);
+    const body = await response.json() as {
+      status: string;
+      runtimeId?: string;
+      live?: boolean;
+      checkpoint: { terminal: boolean; terminalEventType?: string };
+    };
+
+    assert.equal(response.status, 200);
+    // The status comes from the journal's terminal event, not from a runtime that is gone.
+    assert.equal(body.status, "cancelled");
+    assert.equal(body.checkpoint.terminal, true);
+    assert.equal(body.checkpoint.terminalEventType, "execution.cancelled");
+    // The runtime that ran it is the one that was journaled, not the server's default.
+    assert.equal(body.runtimeId, "pi-local");
+    // Nothing about it runs here any more, and the page has to be able to say so.
+    assert.equal(body.live, false);
+  } finally {
+    await app.close();
+  }
+});
+
+test("refuses to cancel an execution this process no longer holds", async () => {
+  const app = await harness({ journal: await journalOfAnEarlierProcess() });
+  try {
+    const response = await fetch(`${app.url}/api/v1/executions/exec-restarted/cancel`, { method: "POST" });
+    const body = await response.json() as { error: string; message: string };
+
+    assert.equal(response.status, 409);
+    assert.equal(body.error, "execution_not_live");
   } finally {
     await app.close();
   }

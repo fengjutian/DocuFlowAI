@@ -26,8 +26,30 @@ export interface ExecutionCoordinatorOptions {
   compensationSource?: (checkpoint: ExecutionCheckpoint) => Promise<AgentRuntimeEvent[]>;
   /** Whether the runtime-side session still exists. Defaults to false: assume it is gone. */
   isSessionResumable?: (executionId: string) => boolean | Promise<boolean>;
-  /** Rebuild input when the original start call is not in memory (process restart). */
-  recoveryInput?: (checkpoint: ExecutionCheckpoint) => AgentTaskInput | Promise<AgentTaskInput>;
+  /**
+   * The adapter that owns an execution whose session is gone.
+   *
+   * After a restart the coordinator has no session, and the default adapter is not necessarily the
+   * one that ran the task. Rebuilding on the default runtime would run the task somewhere the
+   * caller never chose, which is the one thing a named runtime must never do (D-047).
+   */
+  recoveringAdapter?: (executionId: string) => AgentRuntimeAdapter | undefined | Promise<AgentRuntimeAdapter | undefined>;
+  /**
+   * The registered id of the runtime behind an adapter, for example `pi-local`.
+   *
+   * It is journaled with the execution so that a reader can still name the runtime after a
+   * restart; without it the console would have to guess from the server's default.
+   */
+  runtimeIdOf?: (adapter: AgentRuntimeAdapter) => string | undefined;
+  /**
+   * Rebuild input when the original start call is not in memory (process restart).
+   *
+   * It may be unavailable: an execution that never recorded its request cannot be rebuilt, and the
+   * caller is told that instead of being handed a task that is not the one it asked for.
+   */
+  recoveryInput?: (
+    checkpoint: ExecutionCheckpoint
+  ) => AgentTaskInput | undefined | Promise<AgentTaskInput | undefined>;
 }
 
 interface Session {
@@ -75,6 +97,27 @@ export class ExecutionCoordinator {
     };
     this.sessions.set(execution.executionId, session);
 
+    // Two facts that outlive this process: which runtime ran the task, and what it was asked.
+    // A worker that dies takes its memory with it, and a rebuild needs both: the runtime to
+    // rebuild on, and the request to rebuild from.
+    const runtimeId = this.options.runtimeIdOf?.(selected);
+    if (runtimeId) {
+      await this.recordAuditFact(execution.executionId, "execution.runtime", { runtimeId });
+    }
+    await this.recordAuditFact(execution.executionId, "execution.input", {
+      projectId: input.projectId,
+      ...(input.featureId ? { featureId: input.featureId } : {}),
+      taskId: input.taskId,
+      prompt: input.prompt,
+      contextSnapshotId: input.contextSnapshotId,
+      policySnapshotId: input.policySnapshotId,
+      worktreeId: input.worktreeId,
+      workingDirectory: input.workingDirectory,
+      allowedTools: input.allowedTools,
+      timeoutSeconds: input.timeoutSeconds,
+      correlationId: input.correlationId
+    });
+
     session.unsubscribe = await selected.subscribe(execution.executionId, event => {
       this.enqueue(session, async () => {
         await recordRuntimeEvent(this.options.journal, event, session.nextJournalSequence);
@@ -100,11 +143,14 @@ export class ExecutionCoordinator {
     const checkpoint = await this.getCheckpoint(executionId, context);
     // Recovery must ask the runtime that owns the execution: a resume only works on the runtime
     // that still holds the session, and capabilities differ between runtimes.
-    const adapter = this.adapterFor(executionId);
+    const adapter = await this.owningAdapter(executionId);
     const capabilities = await adapter.getCapabilities();
+    // The runtime that owns the execution is the one that can say whether its session survived.
+    // An injected answer wins (tests drive it), otherwise the adapter is asked; an adapter that
+    // cannot answer has no session to offer.
     const sessionResumable = this.options.isSessionResumable
       ? await this.options.isSessionResumable(executionId)
-      : false;
+      : (adapter.isSessionResumable?.(executionId) ?? false);
     const plan = planRecovery(checkpoint, { capabilities, sessionResumable });
 
     if (plan.action === "stop") return { plan };
@@ -174,6 +220,30 @@ export class ExecutionCoordinator {
    */
   adapterFor(executionId: string): AgentRuntimeAdapter {
     return this.sessions.get(executionId)?.adapter ?? this.options.adapter;
+  }
+
+  /**
+   * Whether this server process still holds the live session for an execution.
+   *
+   * A restart empties the sessions but not the journal, so an execution can be recorded and
+   * describable while nothing about it is running here any more. Callers need to tell those two
+   * apart: a live execution can still be cancelled or resumed, a recorded one can only be read.
+   */
+  isLive(executionId: string): boolean {
+    return this.sessions.has(executionId);
+  }
+
+  /**
+   * The adapter that owns an execution, even when its session is gone.
+   *
+   * A live session knows its own adapter. A dead one has to be looked up, because falling back to
+   * the server's default runtime would move the task to a runtime nobody asked for.
+   */
+  private async owningAdapter(executionId: string): Promise<AgentRuntimeAdapter> {
+    const session = this.sessions.get(executionId);
+    if (session) return session.adapter;
+    const recovered = await this.options.recoveringAdapter?.(executionId);
+    return recovered ?? this.options.adapter;
   }
 
   /** The default adapter; used when no execution context identifies a runtime. */
@@ -255,7 +325,7 @@ export class ExecutionCoordinator {
       prompt: `${original.prompt}\n\n${renderCheckpoint(checkpoint)}`
     };
     // A rebuild continues on the same runtime: the checkpoint describes that runtime's work.
-    const execution = await this.start(input, this.adapterFor(checkpoint.executionId));
+    const execution = await this.start(input, await this.owningAdapter(checkpoint.executionId));
     await this.recordAuditFact(execution.executionId, "recovery.rebuild", {
       previousExecutionId: checkpoint.executionId,
       previousLastSequence: checkpoint.lastSequence,

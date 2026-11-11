@@ -96,6 +96,15 @@ export interface PiAdapterOptions {
   /** The Pi model to run. */
   model?: unknown;
   systemPrompt?: string;
+  /**
+   * How long the adapter waits for the runtime to confirm an abort before it reports the
+   * cancellation anyway.
+   *
+   * The confirmation is what makes a cancellation evidence: DocuFlow asking for a stop is not
+   * proof that the runtime stopped. A runtime that never answers must not leave the execution
+   * hanging, so the wait is bounded and the report then says the confirmation is missing.
+   */
+  cancelTimeoutMs?: number;
   now?: () => Date;
   executionIdFactory?: () => string;
 }
@@ -132,6 +141,7 @@ export class PiAdapter implements AgentRuntimeAdapter {
   private readonly executions = new Map<string, ExecutionState>();
   private readonly now: () => Date;
   private readonly executionIdFactory: () => string;
+  private readonly cancelTimeoutMs: number;
 
   constructor(
     private readonly createAgent: PiAgentFactory,
@@ -139,6 +149,7 @@ export class PiAdapter implements AgentRuntimeAdapter {
   ) {
     this.now = options.now ?? (() => new Date());
     this.executionIdFactory = options.executionIdFactory ?? (() => `exec_${randomUUID()}`);
+    this.cancelTimeoutMs = options.cancelTimeoutMs ?? 10_000;
   }
 
   /**
@@ -228,12 +239,50 @@ export class PiAdapter implements AgentRuntimeAdapter {
     return this.require(executionId).status;
   }
 
+  /**
+   * Cancels an execution.
+   *
+   * The request and the outcome are two different things. Asking Pi to stop is the request; the
+   * runtime ending the turn with an aborted stop reason is the outcome. Only the second one may
+   * be reported as a cancellation, so the terminal event waits for the runtime and carries the
+   * runtime's own account of how the turn ended.
+   */
   async cancel(executionId: string): Promise<void> {
     const state = this.require(executionId);
     if (state.terminal) return;
     state.cancelled = true;
+    state.status = "cancelling";
     state.agent.abort();
-    this.emit(state, "execution.cancelled", { reason: "cancelled by DocuFlow" });
+    void this.settleCancellation(state);
+  }
+
+  /**
+   * Waits for the runtime to confirm the abort.
+   *
+   * The runtime's own end event reports the cancellation when it arrives; this is the fallback for
+   * a runtime that never answers. It says so instead of pretending the confirmation came.
+   */
+  private async settleCancellation(state: ExecutionState): Promise<void> {
+    const settled = await Promise.race([
+      state.agent.waitForIdle().then(() => true),
+      delay(this.cancelTimeoutMs).then(() => false)
+    ]);
+    if (state.terminal) return;
+    if (settled) {
+      // The runtime settled without reporting its own end; its last word is still evidence.
+      this.emit(state, "execution.cancelled", {
+        reason: "cancelled by DocuFlow",
+        runtimeConfirmed: true,
+        runtimeStopReason: readStopReason(state.agent.state.messages) ?? "unknown"
+      });
+      return;
+    }
+    this.emit(state, "execution.cancelled", {
+      reason: "cancelled by DocuFlow",
+      runtimeConfirmed: false,
+      runtimeStopReason: "unconfirmed",
+      note: `the runtime did not confirm the abort within ${this.cancelTimeoutMs}ms`
+    });
   }
 
   /**
@@ -277,6 +326,17 @@ export class PiAdapter implements AgentRuntimeAdapter {
       state.agent.abort();
     }
     this.executions.delete(executionId);
+  }
+
+  /**
+   * Whether Pi still holds the session behind this execution.
+   *
+   * Pi's transcript lives on the agent instance, in this process. So the session survives as long
+   * as this adapter does — and dies with the worker. A worker that crashed cannot resume the
+   * session it lost; it has to rebuild the execution instead.
+   */
+  isSessionResumable(executionId: string): boolean {
+    return this.executions.has(executionId);
   }
 
   getPendingPermissions(executionId: string): RuntimePermissionRequest[] {
@@ -408,7 +468,11 @@ export class PiAdapter implements AgentRuntimeAdapter {
       case "agent_end": {
         const errorMessage = state.agent.state.errorMessage;
         if (state.cancelled) {
-          this.emit(state, "execution.cancelled", { reason: "cancelled by DocuFlow" });
+          this.emit(state, "execution.cancelled", {
+            reason: "cancelled by DocuFlow",
+            runtimeConfirmed: true,
+            runtimeStopReason: readStopReason(event.messages) ?? "unknown"
+          });
         } else if (typeof errorMessage === "string" && errorMessage.length > 0) {
           this.emit(state, "execution.failed", { error: errorMessage });
         } else {
@@ -464,4 +528,25 @@ export class PiAdapter implements AgentRuntimeAdapter {
     }
     return state;
   }
+}
+
+/**
+ * The runtime's own account of how a turn ended.
+ *
+ * Pi ends an aborted turn with `stopReason: "aborted"`, and a turn that was cut while a tool was
+ * in flight with the reason of that tool call. Either way it is the runtime talking, not DocuFlow
+ * describing its own request.
+ */
+function readStopReason(messages: unknown): string | undefined {
+  if (!Array.isArray(messages)) return undefined;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index] as { stopReason?: unknown } | undefined;
+    const stopReason = message?.stopReason;
+    if (typeof stopReason === "string") return stopReason;
+  }
+  return undefined;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolveSleep => setTimeout(resolveSleep, ms));
 }

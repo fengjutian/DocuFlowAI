@@ -9,6 +9,7 @@ import {
   Gauge,
   KeyRound,
   Loader2,
+  MessageSquare,
   Plug,
   RefreshCw,
   RotateCcw,
@@ -26,6 +27,7 @@ import { EmptyState, ErrorNotice } from "@/components/common/EmptyState";
 import { StatusBadge } from "@/components/common/StatusBadge";
 import { api } from "@/lib/api";
 import {
+  agentMessageText,
   eventLabel,
   formatClock,
   formatDuration,
@@ -33,7 +35,9 @@ import {
   formatTokens,
   previewPayload,
   runtimeEventName,
-  summarizePayload
+  summarizePayload,
+  toolNameOf,
+  toolResultText
 } from "@/lib/format";
 import { useApiData } from "@/hooks/useApiData";
 import { useExecutionEvents } from "@/state/execution-stream";
@@ -41,6 +45,9 @@ import type { DocuFlowEvent } from "@/lib/types";
 
 const EVENT_TONE: Record<string, string> = {
   "agent.execution.started": "text-sky-300",
+  "agent.message.completed": "text-sky-200",
+  "agent.message.delta": "text-sky-200/70",
+  "agent.tool.completed": "text-emerald-300",
   "agent.execution.completed": "text-emerald-300",
   "agent.execution.failed": "text-red-300",
   "agent.execution.cancelled": "text-amber-300",
@@ -76,6 +83,30 @@ export function ExecutionDetailPage() {
     return [...merged.values()].sort((a, b) => a.sequence - b.sequence);
   }, [history.data, liveEvents]);
 
+  /**
+   * The assistant's last message, in full.
+   *
+   * A run's answer is the one thing the user came for, and the timeline only carries it inside an
+   * event payload. Taking the last completed assistant message keeps the page honest about a
+   * cancelled run too: it shows what the runtime produced before the abort, not a friendly summary.
+   */
+  const lastOutput = useMemo(() => {
+    const texts: string[] = [];
+    for (const event of timeline) {
+      if (event.type !== "agent.message.completed") continue;
+      const text = agentMessageText(event.data);
+      if (text) texts.push(text);
+    }
+    if (texts.length === 0) {
+      for (const event of timeline) {
+        if (event.type !== "agent.execution.completed") continue;
+        const text = agentMessageText(event.data);
+        if (text) texts.push(text);
+      }
+    }
+    return texts.length > 0 ? texts[texts.length - 1] : undefined;
+  }, [timeline]);
+
   useEffect(() => {
     if (detail.error) toast.error(detail.error.message);
     // Only report the first failure of a given execution; polling would otherwise spam.
@@ -98,6 +129,9 @@ export function ExecutionDetailPage() {
 
   const approvals = detail.data?.pendingApprovals ?? [];
   const status = detail.data?.status;
+  // An execution recorded by an earlier server process is readable but not actionable: there is no
+  // live session to cancel, resume or rebuild from, so the buttons say so instead of failing.
+  const live = detail.data?.live !== false;
 
   return (
     <div className="space-y-4">
@@ -112,9 +146,16 @@ export function ExecutionDetailPage() {
               <StatusBadge status={status} />
             </div>
             <p className="text-xs text-muted-foreground">
+              {/* The runtime that produced this timeline, so a reader knows which one to trust. */}
+              <span className="font-mono">{detail.data?.runtimeId ?? "未知运行时"}</span> ·{" "}
               {detail.data?.checkpoint.currentStep ?? "—"} ·{" "}
               {detail.data?.checkpoint.eventCount ?? timeline.length} 条事件
             </p>
+            {live ? null : (
+              <p className="text-xs text-amber-300/90">
+                该执行由更早的服务进程运行：记录与时间线仍在，但已经没有活的会话可取消或恢复。
+              </p>
+            )}
           </div>
         </div>
 
@@ -122,7 +163,8 @@ export function ExecutionDetailPage() {
           <Button
             variant="outline"
             size="sm"
-            disabled={busy !== undefined}
+            disabled={busy !== undefined || !live}
+            title={live ? undefined : "该执行不在当前服务进程内运行，无法取消"}
             onClick={() =>
               void run("cancel", async () => {
                 await api.cancelExecution(executionId);
@@ -140,6 +182,11 @@ export function ExecutionDetailPage() {
             onClick={() =>
               void run("retry", async () => {
                 const result = await api.retryExecution(executionId);
+                // A terminal execution has nothing to recover: the plan says "stop" and no new
+                // execution is created. Navigating to an undefined id would be a dead link.
+                if (!result.execution?.executionId) {
+                  return `无需重试：${result.plan.reason}`;
+                }
                 navigate(`/executions/${result.execution.executionId}`);
                 return `已重建执行 ${result.execution.executionId}（${result.plan.reason}）`;
               })
@@ -185,44 +232,84 @@ export function ExecutionDetailPage() {
             ) : (
               <ScrollArea className="h-[440px] pr-3">
                 <ol className="space-y-2">
-                  {timeline.map(event => (
-                    <li
-                      key={`${event.id}-${event.sequence}`}
-                      className="rounded-lg border border-border/60 bg-background/40 p-3"
-                    >
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="flex min-w-0 items-center gap-2">
-                          <span
-                            className={`font-mono text-xs ${EVENT_TONE[event.type] ?? "text-muted-foreground"}`}
-                          >
+                  {timeline.map(event => {
+                    const body = agentMessageText(event.data);
+                    const toolName = toolNameOf(event.data);
+                    // One content line per row: what the agent said, or what the tool returned, or
+                    // the payload's own summary — never the same text twice.
+                    const content =
+                      body ??
+                      toolResultText(event.data) ??
+                      summarizePayload(event.data);
+                    // Pi streams a lifecycle event per chunk (`message_update` fires for every text
+                    // and thinking delta), so a single run can emit well over a hundred of them.
+                    // Rendered as full cards they bury the handful of events that carry meaning.
+                    if (event.type === "agent.runtime.unknown") {
+                      return (
+                        <li
+                          key={`${event.id}-${event.sequence}`}
+                          className="flex items-center gap-2 rounded-md border border-border/40 bg-background/20 px-3 py-1"
+                        >
+                          <span className="font-mono text-[11px] text-muted-foreground/70">
                             #{event.sequence}
                           </span>
-                          <span className="truncate text-sm">{eventLabel(event.type, event.data)}</span>
-                          {runtimeEventName(event.data) ? (
-                            <span className="hidden shrink-0 rounded border border-border/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground sm:inline">
-                              {runtimeEventName(event.data)}
+                          <span className="truncate text-[11px] text-muted-foreground">
+                            {eventLabel(event.type, event.data)}
+                          </span>
+                          <span className="truncate font-mono text-[10px] text-muted-foreground/60">
+                            {runtimeEventName(event.data)}
+                          </span>
+                          <span className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground/60">
+                            {formatClock(event.timestamp)}
+                          </span>
+                        </li>
+                      );
+                    }
+                    return (
+                      <li
+                        key={`${event.id}-${event.sequence}`}
+                        className="rounded-lg border border-border/60 bg-background/40 p-3"
+                      >
+                        <div className="flex items-center justify-between gap-3">
+                          <div className="flex min-w-0 items-center gap-2">
+                            <span
+                              className={`font-mono text-xs ${EVENT_TONE[event.type] ?? "text-muted-foreground"}`}
+                            >
+                              #{event.sequence}
                             </span>
-                          ) : null}
+                            <span className="truncate text-sm">{eventLabel(event.type, event.data)}</span>
+                            {runtimeEventName(event.data) ? (
+                              <span className="hidden shrink-0 rounded border border-border/60 px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground sm:inline">
+                                {runtimeEventName(event.data)}
+                              </span>
+                            ) : null}
+                          </div>
+                          <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
+                            {formatClock(event.timestamp)}
+                          </span>
                         </div>
-                        <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
-                          {formatClock(event.timestamp)}
-                        </span>
-                      </div>
-                      {summarizePayload(event.data) ? (
-                        <p className="mt-1 truncate text-xs text-muted-foreground">
-                          {summarizePayload(event.data)}
-                        </p>
-                      ) : null}
-                      <details className="mt-2">
-                        <summary className="cursor-pointer text-[11px] text-muted-foreground select-none">
-                          原始数据
-                        </summary>
-                        <pre className="mt-2 max-h-56 overflow-auto rounded-md border border-border/60 bg-background/70 p-2 text-[11px] whitespace-pre-wrap text-muted-foreground">
-                          {previewPayload(event.data, 4000)}
-                        </pre>
-                      </details>
-                    </li>
-                  ))}
+                        {event.type === "agent.message.completed" ? (
+                          body ? (
+                            <p className="mt-2 max-h-72 overflow-auto rounded-md border border-border/60 bg-background/60 p-2 text-xs leading-relaxed whitespace-pre-wrap text-foreground/90">
+                              {body}
+                            </p>
+                          ) : null
+                        ) : content ? (
+                          <p className="mt-1 line-clamp-3 text-xs text-muted-foreground">
+                            {toolName && content !== toolName ? `${toolName} · ${content}` : content}
+                          </p>
+                        ) : null}
+                        <details className="mt-2">
+                          <summary className="cursor-pointer text-[11px] text-muted-foreground select-none">
+                            原始数据
+                          </summary>
+                          <pre className="mt-2 max-h-56 overflow-auto rounded-md border border-border/60 bg-background/70 p-2 text-[11px] whitespace-pre-wrap text-muted-foreground">
+                            {previewPayload(event.data, 4000)}
+                          </pre>
+                        </details>
+                      </li>
+                    );
+                  })}
                 </ol>
               </ScrollArea>
             )}
@@ -230,6 +317,29 @@ export function ExecutionDetailPage() {
         </Card>
 
         <div className="space-y-4">
+          <Card className="border-border/70 bg-card/60">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <MessageSquare className="size-4 text-muted-foreground" />
+                Agent 输出
+              </CardTitle>
+              <CardDescription>
+                运行时产生的最后一条助手消息原文；执行被取消时，这里是中止前的内容。
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {lastOutput ? (
+                <ScrollArea className="max-h-72">
+                  <p className="text-xs leading-relaxed whitespace-pre-wrap text-foreground/90">
+                    {lastOutput}
+                  </p>
+                </ScrollArea>
+              ) : (
+                <p className="text-xs text-muted-foreground">该执行还没有产生助手输出。</p>
+              )}
+            </CardContent>
+          </Card>
+
           <Card className="border-border/70 bg-card/60">
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-base">

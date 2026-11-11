@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 import { HermesAdapter } from "../adapters/hermes-adapter.js";
 import { AgentRuntimeRegistry } from "../adapters/runtime-registry.js";
 import { RuntimeScheduler } from "../adapters/runtime-scheduler.js";
@@ -9,7 +10,7 @@ import { HermesHttpClient } from "../clients/http/hermes-http-client.js";
 import { CodeChangePipeline } from "../code-engine/code-change-pipeline.js";
 import { SpawnGitRunner } from "../code-engine/git-runner.js";
 import { WorktreeManager } from "../code-engine/worktree-manager.js";
-import { JsonlJournalStore } from "../journal/journal.js";
+import { JsonlJournalStore, type JournalStore } from "../journal/journal.js";
 import { ExecutionCoordinator } from "../orchestrator/execution-coordinator.js";
 import { SubagentManager } from "../orchestrator/subagent-manager.js";
 import { ImmutableRecordStore } from "../persistence/record-store.js";
@@ -31,7 +32,7 @@ import { SkillRegistry } from "../skills/skill-registry.js";
 import { SkillBindingStore, type SkillBindingEvent } from "../skills/skill-bindings.js";
 import type { ChangeRecord } from "../code-engine/change-record.js";
 import type { EvaluationResult } from "../evaluation/evaluation.js";
-import type { AgentRuntimeEvent } from "../types/adapter.js";
+import type { AgentRuntimeEvent, AgentTaskInput } from "../types/adapter.js";
 
 /**
  * Composition root.
@@ -148,6 +149,19 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     onEvent: event => {
       bus.publishRuntimeEvent(event);
       void recordUsage(event).catch(() => undefined);
+    },
+    // After a restart the session is gone, but the journal still says which runtime ran it and
+    // what was asked. Both are needed to recover: the runtime to recover on, and the input to
+    // rebuild from. Without the runtime id the rebuild would silently land on the default one.
+    recoveringAdapter: async executionId => {
+      const runtimeId = await journaledRuntimeId(journal, executionId);
+      return runtimeId ? registry.get(runtimeId) : undefined;
+    },
+    // The reverse lookup, so an execution can carry the name of the runtime that ran it.
+    runtimeIdOf: adapter => registry.list().find(entry => entry.adapter === adapter)?.id,
+    recoveryInput: async checkpoint => {
+      const input = await journaledTaskInput(journal, checkpoint.executionId);
+      return input;
     }
   });
 
@@ -234,4 +248,58 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   };
 }
 
-export { createApiServer };
+export { createApiServer, journaledRuntimeId, journaledTaskInput };
+
+/**
+ * The runtime id journaled with an execution, if the execution recorded one.
+ *
+ * The journal is the only thing that survives a worker crash, so it is also the only place that
+ * can still say which runtime ran a task.
+ */
+async function journaledRuntimeId(journal: JournalStore, executionId: string): Promise<string | undefined> {
+  const entries = await journal.read(executionId);
+  const fact = entries.find(entry => entry.category === "execution.runtime");
+  const runtimeId = fact?.payload["runtimeId"];
+  return typeof runtimeId === "string" && runtimeId !== "" ? runtimeId : undefined;
+}
+
+/**
+ * The task as it was asked, recovered from the journal.
+ *
+ * A rebuild needs the original request; the checkpoint alone only says how far the last attempt
+ * got. An execution that recorded no input cannot be rebuilt, and the caller is told so rather
+ * than handed a task that is not the one it asked for.
+ */
+async function journaledTaskInput(
+  journal: JournalStore,
+  executionId: string
+): Promise<AgentTaskInput | undefined> {
+  const entries = await journal.read(executionId);
+  const fact = entries.find(entry => entry.category === "execution.input");
+  if (!fact) return undefined;
+  const payload = fact.payload;
+  const prompt = payload["prompt"];
+  if (typeof prompt !== "string" || prompt === "") return undefined;
+  const allowedTools = payload["allowedTools"];
+  const featureId = payload["featureId"];
+  return {
+    projectId: readString(payload, "projectId"),
+    ...(typeof featureId === "string" && featureId !== "" ? { featureId } : {}),
+    taskId: readString(payload, "taskId"),
+    // The rebuild is a new run of the same request, so it gets its own run id.
+    runId: `run_${randomUUID()}`,
+    prompt,
+    contextSnapshotId: readString(payload, "contextSnapshotId"),
+    policySnapshotId: readString(payload, "policySnapshotId"),
+    worktreeId: readString(payload, "worktreeId"),
+    workingDirectory: readString(payload, "workingDirectory"),
+    allowedTools: Array.isArray(allowedTools) ? allowedTools.map(item => String(item)) : [],
+    timeoutSeconds: Number(payload["timeoutSeconds"] ?? 60),
+    correlationId: readString(payload, "correlationId")
+  };
+}
+
+function readString(payload: Record<string, unknown>, key: string): string {
+  const value = payload[key];
+  return typeof value === "string" ? value : "";
+}

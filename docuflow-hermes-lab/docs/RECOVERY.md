@@ -69,6 +69,33 @@ fire-and-forget callback.
 lists applied change records and explicitly says not to re-apply them, and records a
 `recovery.rebuild` audit entry linking the previous execution id.
 
+## Who answers "is the session still there?"
+
+The runtime that owns the execution answers, through `isSessionResumable(executionId)` on the
+adapter. An adapter that cannot answer has no session to offer, and the answer is "no": a session
+that cannot be proven is a session that must not be resumed. The server does not guess from the
+default runtime, because the default runtime may not be the one that ran the task.
+
+For Pi the answer is structural rather than a flag: the transcript lives on the agent instance,
+inside the worker process. A worker that dies took the session with it, so Pi's recovery is always
+a rebuild.
+
+## What a rebuild needs, and where it comes from
+
+A rebuild needs two things that a crash takes with the worker's memory:
+
+| Fact | Where it lives | Why |
+|---|---|---|
+| which runtime ran the task | `execution.runtime` audit entry | so the rebuild continues on the same runtime instead of the server's default |
+| what the task was asked | `execution.input` audit entry | the checkpoint says how far the last attempt got; the input says what was wanted |
+
+Both are written by `coordinator.start()`, because the coordinator is what starts executions — the
+first attempt and the rebuild alike. `recover()` reads them back through `recoveringAdapter` and
+`recoveryInput`.
+
+If the runtime cannot be named, the rebuild is refused rather than redirected; if the request cannot
+be recovered, the rebuild is refused rather than guessed.
+
 ## Journal position vs runtime sequence
 
 `JournalEntry.sequence` is journal order; `eventSequence` is the runtime's event number. Audit entries
@@ -80,3 +107,6 @@ advance the journal without consuming a runtime number, so gap detection uses `e
 - Durable storage for change records, policy snapshots and prompt snapshots (they are still objects).
 - Scheduling recovery automatically (a timer/worker); `recover()` is called explicitly.
 - Checkpoint injection is textual: the Context Engine will replace it with a structured context build.
+- Compensating a gap after a crash: `compensationSource` is not wired, so a gapped journal stops at
+  the `compensate` decision instead of recovering the events the runtime produced but the worker
+  never recorded.

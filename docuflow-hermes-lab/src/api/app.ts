@@ -9,7 +9,7 @@ import type { ExecutionCoordinator } from "../orchestrator/execution-coordinator
 import type { TaskExecutionService, StartTaskRequest } from "../tasks/task-execution-service.js";
 import { SkillDeniedError } from "../tasks/task-execution-service.js";
 import type { EvaluationCheckSpec } from "../evaluation/evaluation.js";
-import type { AgentTaskInput } from "../types/adapter.js";
+import type { AgentTaskInput, RuntimePermissionRequest } from "../types/adapter.js";
 import type { SkillBindingStore } from "../skills/skill-bindings.js";
 import type { SkillRegistry } from "../skills/skill-registry.js";
 import { SkillConflictError, SkillNotFoundError } from "../skills/skill-registry.js";
@@ -366,6 +366,11 @@ async function route(
 
   if (method === "POST" && matches(segments, ["api", "v1", "executions", ":id", "cancel"])) {
     const id = segments[3]!;
+    // Cancelling an execution this process no longer holds would fail deep inside the adapter with
+    // "Unknown execution". Saying so up front keeps the failure legible.
+    if (!deps.coordinator.isLive(id)) {
+      throw new ApiError(409, "execution_not_live", `Execution ${id} is not running in this server process`);
+    }
     await deps.coordinator.cancel(id);
     return { status: 202, body: { executionId: id, status: "cancelling" } };
   }
@@ -453,20 +458,73 @@ async function describeExecution(executionId: string, deps: ApiDependencies): Pr
   if (checkpoint.eventCount === 0) {
     throw new ApiError(404, "execution_not_found", `No execution ${executionId} is recorded`);
   }
+  // A restart empties the coordinator's live sessions but not the journal, so an execution can be
+  // recorded and fully readable while nothing about it runs in this process any more. The adapter
+  // then knows nothing about it, and asking it anyway would fail the whole request — or, worse,
+  // answer about the server's default runtime instead of the one that ran the task.
+  const live = deps.coordinator.isLive(executionId);
+  const adapter = deps.coordinator.adapterFor(executionId);
   let status: string | undefined;
-  try {
-    status = await deps.coordinator.adapterFor(executionId).getStatus(executionId);
-  } catch {
-    status = undefined;
+  let pendingApprovals: RuntimePermissionRequest[] = [];
+  if (live) {
+    try {
+      status = await adapter.getStatus(executionId);
+    } catch {
+      status = undefined;
+    }
+    try {
+      pendingApprovals = adapter.getPendingPermissions?.(executionId) ?? [];
+    } catch {
+      pendingApprovals = [];
+    }
   }
+  // Which runtime ran this execution. The adapter is the fact while the session is live; after a
+  // restart the journaled runtime id is the fact, because the registry would only name the
+  // server's default runtime and that would be a different runtime than the one that ran it.
+  const journaledRuntimeId = await journaledRuntimeIdFor(executionId, deps);
+  const runtimeId =
+    journaledRuntimeId ??
+    (live ? deps.registry.list().find(entry => entry.adapter === adapter)?.id : undefined);
   return {
     executionId,
-    status: status ?? (checkpoint.terminal ? checkpoint.terminalEventType : "unknown"),
+    runtimeId,
+    // Whether this server process still holds the session. The console uses it to stop offering
+    // "cancel" for an execution that ended in an earlier process.
+    live,
+    status: status ?? statusFromTerminalEvent(checkpoint.terminalEventType) ?? "unknown",
     checkpoint,
-    pendingApprovals: deps.coordinator.adapterFor(executionId).getPendingPermissions?.(executionId) ?? [],
+    pendingApprovals,
     // AT-204 surfaced to the caller: "completed" is a claim that needs a passing evaluation.
     completion: await deps.taskService.completionGate(executionId)
   };
+}
+
+/** The runtime id journaled when the execution started, if the execution was started at all. */
+async function journaledRuntimeIdFor(executionId: string, deps: ApiDependencies): Promise<string | undefined> {
+  const entries = await deps.journal.read(executionId);
+  const fact = entries.find(entry => entry.category === "execution.runtime");
+  const runtimeId = fact?.payload["runtimeId"];
+  return typeof runtimeId === "string" && runtimeId !== "" ? runtimeId : undefined;
+}
+
+/**
+ * The status a terminal event implies.
+ *
+ * The journal names the terminal outcome (`execution.cancelled`), while the console and the API
+ * speak in statuses (`cancelled`). Without this translation a recorded execution would be reported
+ * with an event name where a status belongs.
+ */
+function statusFromTerminalEvent(terminalEventType: string | undefined): string | undefined {
+  switch (terminalEventType) {
+    case "execution.completed":
+      return "succeeded";
+    case "execution.failed":
+      return "failed";
+    case "execution.cancelled":
+      return "cancelled";
+    default:
+      return undefined;
+  }
 }
 
 async function serveEvents(
@@ -530,7 +588,9 @@ function authorize(request: IncomingMessage, deps: ApiDependencies, response: Se
 function sendJson(response: ServerResponse, status: number, body: unknown): void {
   const payload = JSON.stringify(body);
   response.writeHead(status, {
-    "Content-Type": "application/json",
+    // The charset is explicit on purpose: browsers assume UTF-8 for JSON, but stricter clients
+    // (PowerShell 5.1 among them) fall back to Latin-1 and turn every Chinese character into `?`.
+    "Content-Type": "application/json; charset=utf-8",
     "Content-Length": Buffer.byteLength(payload)
   });
   response.end(payload);

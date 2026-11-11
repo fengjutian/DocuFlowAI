@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   Sheet,
   SheetContent,
@@ -17,6 +18,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
 import { sha256Hex } from "@/lib/hash";
+import { useApiData } from "@/hooks/useApiData";
 import type { StartTaskInput } from "@/lib/types";
 
 /**
@@ -54,6 +56,10 @@ export function NewTaskDialog({
   const [templateVersion, setTemplateVersion] = useState("1.0.0");
   const [submitting, setSubmitting] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  // The runtime that runs the task. `auto` lets the server pick a healthy one; naming a runtime
+  // is honoured or refused, never quietly redirected (D-047).
+  const [runtimeId, setRuntimeId] = useState("auto");
+  const runtimes = useApiData(() => api.listRuntimes(), []);
 
   const splitList = (raw: string) =>
     raw
@@ -88,7 +94,8 @@ export function NewTaskDialog({
       },
       modelConfig: {},
       timeoutSeconds: Number(timeoutSeconds) || 60,
-      allowedTools: splitList(allowedTools)
+      allowedTools: splitList(allowedTools),
+      runtimeId
     };
   }, [    taskId,
     projectId,
@@ -104,7 +111,8 @@ export function NewTaskDialog({
     templateName,
     templateVersion,
     timeoutSeconds,
-    allowedTools
+    allowedTools,
+    runtimeId
   ]);
 
   const submit = async () => {
@@ -175,6 +183,26 @@ export function NewTaskDialog({
               placeholder="D:\\github\\DocuFlowAI"
               onChange={event => setWorktreePath(event.target.value)}
             />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="runtime">运行时</Label>
+            <Select value={runtimeId} onValueChange={setRuntimeId}>
+              <SelectTrigger id="runtime">
+                <SelectValue placeholder="自动选择" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">自动选择（由服务端调度）</SelectItem>
+                {runtimes.data?.runtimes.map(item => (
+                  <SelectItem key={item.id} value={item.id}>
+                    {item.id} · {item.runtimeType}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              运行时由服务端注册；点名的运行时要么就用它，要么被拒绝，不会被悄悄换成别的。
+            </p>
           </div>
 
           <div className="grid grid-cols-2 gap-3">

@@ -171,6 +171,9 @@ export class TaskExecutionService {
 
     const execution = await this.options.coordinator.start(taskInput, await this.selectRuntime(request.runtimeId));
 
+    // Which runtime ran this task, and what it was asked, are journaled by the coordinator: it is
+    // the one that starts executions, and a rebuild goes through it too.
+
     const policySnapshot: PolicySnapshotRecord = {
       ...toPolicySnapshotRecord(request.policy, { createdAt: this.now().toISOString() }),
       id: policySnapshotId,

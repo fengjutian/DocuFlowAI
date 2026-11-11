@@ -75,6 +75,15 @@ export interface RuntimePermissionRequest {
 
 export interface ExecutionDetail {
   executionId: string;
+  /** The registered runtime that ran this execution, when the server can name it. */
+  runtimeId?: string;
+  /**
+   * Whether this server process still holds the live session.
+   *
+   * A recorded execution can outlive the process that ran it: the journal survives a restart, so
+   * the timeline and the final status are still readable while nothing about it runs any more.
+   */
+  live?: boolean;
   status: string;
   checkpoint: ExecutionCheckpoint;
   pendingApprovals: RuntimePermissionRequest[];
@@ -134,6 +143,13 @@ export interface StartTaskInput {
   allowedTools?: string[];
   skills?: Array<{ skillId: string; version?: string }>;
   approvedSkills?: string[];
+  /**
+   * The registered runtime that runs this task.
+   *
+   * `auto` lets the server pick a healthy runtime; omitting it uses the server's default one.
+   * Naming a runtime is honoured or refused, never quietly redirected (D-047).
+   */
+  runtimeId?: string;
 }
 
 export interface RecoveryPlan {
@@ -145,12 +161,17 @@ export interface RecoveryPlan {
 
 export interface RetryResponse {
   previousExecutionId: string;
-  execution: AgentExecution;
+  /**
+   * The new execution, when the recovery plan actually created one.
+   *
+   * A terminal execution has nothing to recover: the plan says `stop` and no execution is created.
+   */
+  execution?: AgentExecution;
   plan: RecoveryPlan;
 }
 
 export interface ResumeResponse {
-  execution: AgentExecution;
+  execution?: AgentExecution;
   plan: RecoveryPlan;
 }
 

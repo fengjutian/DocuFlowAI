@@ -231,3 +231,45 @@ test("cancel stops the run and records a single terminal event", async () => {
   );
   assert.equal(terminal.length, 1, "exactly one terminal event");
 });
+
+test("a cancellation carries the runtime's own confirmation of the abort", async () => {
+  const slowTool = {
+    name: "slow_tool",
+    label: "Slow tool",
+    description: "Waits forever",
+    parameters: { type: "object", properties: {}, required: [] },
+    execute: async (_toolCallId: string, _args: unknown, signal?: AbortSignal) => {
+      await new Promise((_resolve, reject) => {
+        const timer = setTimeout(() => _resolve(undefined), 10_000);
+        signal?.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(new Error("aborted"));
+        });
+      });
+      return { content: [{ type: "text", text: "never" }], details: {} };
+    }
+  };
+  const adapter = new PiAdapter(
+    makeFactory([
+      fauxAssistantMessage([fauxToolCall("slow_tool", {})]),
+      fauxAssistantMessage("interrupted")
+    ]),
+    { tools: [slowTool], permissionHandler: async () => ({ decision: "approve" }) }
+  );
+  const execution = await adapter.start(makeInput({ allowedTools: ["slow_tool"] }));
+  await new Promise(resolve => setTimeout(resolve, 200));
+  await adapter.cancel(execution.executionId);
+  await new Promise(resolve => setTimeout(resolve, 300));
+
+  const events: AgentRuntimeEvent[] = [];
+  await adapter.subscribe(execution.executionId, event => events.push(event));
+  const cancelled = events.find(event => event.eventType === "execution.cancelled");
+  assert.ok(cancelled, "the cancellation was recorded");
+  assert.equal(
+    cancelled.payload["runtimeConfirmed"],
+    true,
+    "the runtime ended the turn itself, so the abort reached it"
+  );
+  assert.equal(typeof cancelled.payload["runtimeStopReason"], "string");
+  assert.notEqual(cancelled.payload["runtimeStopReason"], "unconfirmed");
+});

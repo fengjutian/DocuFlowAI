@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { ExecutionCoordinator, renderCheckpoint } from "../../orchestrator/execution-coordinator.js";
+import { journaledRuntimeId, journaledTaskInput } from "../../server/runtime.js";
 import { InMemoryJournalStore } from "../../journal/journal.js";
 import {
   NO_CAPABILITIES,
@@ -42,6 +43,8 @@ function makeAdapter(options: {
   events?: AgentRuntimeEvent[];
   capabilities?: Partial<AgentCapability>;
   idPrefix?: string;
+  /** Whether this adapter still holds the session behind an execution. */
+  sessionResumable?: boolean;
 } = {}): AgentRuntimeAdapter & { starts: AgentTaskInput[]; resumed: string[]; terminated: string[]; cancelled: string[] } {
   const starts: AgentTaskInput[] = [];
   const resumed: string[] = [];
@@ -86,6 +89,9 @@ function makeAdapter(options: {
     },
     async terminate(executionId: string) {
       terminated.push(executionId);
+    },
+    isSessionResumable() {
+      return options.sessionResumable === true;
     }
   };
 }
@@ -100,10 +106,15 @@ test("journals replayed runtime events with contiguous positions and their event
   const execution = await coordinator.start(input);
   await coordinator.flush(execution.executionId);
   const entries = await journal.read(execution.executionId);
+  const runtimeEvents = entries.filter(entry => entry.kind === "runtime.event");
 
-  assert.deepEqual(entries.map(item => item.sequence), [1, 2]);
-  assert.deepEqual(entries.map(item => item.eventSequence), [1, 2]);
-  assert.deepEqual(entries.map(item => item.kind), ["runtime.event", "runtime.event"]);
+  // The journal also carries the request the execution was started with, so the runtime events
+  // start after it; what has to hold is that they are contiguous and keep their own numbering.
+  assert.deepEqual(runtimeEvents.map(item => item.eventSequence), [1, 2]);
+  const positions = runtimeEvents.map(item => item.sequence);
+  assert.deepEqual(positions, positions.map((_, index) => positions[0]! + index));
+  assert.deepEqual(entries.map(item => item.sequence), entries.map((_, index) => index + 1));
+  assert.equal(entries.some(entry => entry.category === "execution.input"), true);
 });
 
 test("audit facts share the journal without looking like missing runtime events", async () => {
@@ -118,9 +129,10 @@ test("audit facts share the journal without looking like missing runtime events"
 
   const checkpoint = await coordinator.getCheckpoint(execution.executionId);
   const entries = await journal.read(execution.executionId);
+  const change = entries.find(entry => entry.category === "change.applied");
 
-  assert.deepEqual(entries.map(item => item.sequence), [1, 2, 3]);
-  assert.equal(entries[2]!.eventSequence, undefined);
+  assert.deepEqual(entries.map(item => item.sequence), entries.map((_, index) => index + 1));
+  assert.equal(change?.eventSequence, undefined);
   assert.deepEqual(checkpoint.appliedChangeRecordIds, ["chg_1"]);
   assert.deepEqual(checkpoint.gaps, []);
 });
@@ -180,7 +192,7 @@ test("compensates a journal gap before rebuilding", async () => {
   assert.equal(result.plan.action, "compensate");
   assert.equal(result.compensated, 1);
   const entries = await journal.read(execution.executionId);
-  assert.deepEqual(entries.map(item => item.sequence), [1, 2, 3, 4]);
+  assert.deepEqual(entries.map(item => item.sequence), entries.map((_, index) => index + 1));
   assert.deepEqual(
     entries.map(item => item.eventSequence).filter((seq): seq is number => seq !== undefined).sort((a, b) => a - b),
     [1, 2, 3]
@@ -207,6 +219,95 @@ test("resumes only when the adapter advertises and confirms a live session", asy
 
   assert.equal(result.plan.action, "resume");
   assert.deepEqual(adapter.resumed, [execution.executionId]);
+});
+
+test("asks the runtime that owns the execution whether its session survived", async () => {
+  const alive = makeAdapter({
+    events: [event(1, "execution.started")],
+    capabilities: { sessionResume: true },
+    sessionResumable: true
+  });
+  const coordinator = new ExecutionCoordinator({ adapter: alive, journal: new InMemoryJournalStore() });
+
+  const execution = await coordinator.start(input);
+  const result = await coordinator.recover(execution.executionId);
+
+  // No injected answer: the owning adapter is the one that can say whether its session is there.
+  assert.equal(result.plan.action, "resume");
+  assert.deepEqual(alive.resumed, [execution.executionId]);
+});
+
+test("rebuilds when the owning runtime no longer holds the session", async () => {
+  const gone = makeAdapter({
+    events: [event(1, "execution.started")],
+    capabilities: { sessionResume: true },
+    sessionResumable: false
+  });
+  const coordinator = new ExecutionCoordinator({ adapter: gone, journal: new InMemoryJournalStore() });
+
+  const execution = await coordinator.start(input);
+  const result = await coordinator.recover(execution.executionId);
+
+  assert.equal(result.plan.action, "rebuild");
+  assert.deepEqual(gone.resumed, []);
+});
+
+test("journals the runtime and the request so a later worker can rebuild", async () => {
+  const journal = new InMemoryJournalStore();
+  const coordinator = new ExecutionCoordinator({
+    adapter: makeAdapter(),
+    journal,
+    runtimeIdOf: () => "pi-local"
+  });
+
+  const execution = await coordinator.start(input);
+  const entries = await journal.read(execution.executionId);
+  const runtimeFact = entries.find(entry => entry.category === "execution.runtime");
+  const inputFact = entries.find(entry => entry.category === "execution.input");
+
+  assert.equal(runtimeFact?.payload["runtimeId"], "pi-local");
+  assert.equal(inputFact?.payload["prompt"], input.prompt);
+  assert.equal(inputFact?.payload["taskId"], input.taskId);
+  assert.equal(inputFact?.payload["workingDirectory"], input.workingDirectory);
+});
+
+test("a restarted worker rebuilds on the runtime that ran the task", async () => {
+  const journal = new InMemoryJournalStore();
+  // The runtime that ran the task, and the server's default runtime: they are not the same.
+  const owning = makeAdapter({ idPrefix: "owning", events: [event(1, "execution.started")] });
+  const fallback = makeAdapter({ idPrefix: "fallback" });
+  const runtimes = new Map<string, AgentRuntimeAdapter>([
+    ["owning-local", owning],
+    ["hermes-local", fallback]
+  ]);
+
+  const wireRecovery = (defaultAdapter: AgentRuntimeAdapter) =>
+    new ExecutionCoordinator({
+      adapter: defaultAdapter,
+      journal,
+      runtimeIdOf: adapter => (adapter === owning ? "owning-local" : "hermes-local"),
+      recoveringAdapter: async executionId => {
+        const runtimeId = await journaledRuntimeId(journal, executionId);
+        return runtimeId ? runtimes.get(runtimeId) : undefined;
+      },
+      recoveryInput: checkpoint => journaledTaskInput(journal, checkpoint.executionId)
+    });
+
+  // The first worker starts the task on the owning runtime and then dies.
+  const first = wireRecovery(fallback);
+  const execution = await first.start(input, owning);
+
+  // The restarted worker has the journal and nothing else.
+  const restarted = wireRecovery(fallback);
+  const result = await restarted.recover(execution.executionId);
+
+  assert.equal(result.plan.action, "rebuild");
+  // The rebuild continues on the runtime that ran the original task, not on the default one.
+  assert.equal(owning.starts.length, 2);
+  assert.equal(fallback.starts.length, 0);
+  const rebuilt = owning.starts[1]!;
+  assert.match(rebuilt.prompt, /\[DOCUFLOW CHECKPOINT\]/);
+  assert.match(rebuilt.prompt, new RegExp(execution.executionId));
 });
 
 test("renders a checkpoint that forbids re-applying recorded changes", () => {

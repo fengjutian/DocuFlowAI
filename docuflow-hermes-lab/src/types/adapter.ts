@@ -107,11 +107,20 @@ export interface AgentRuntimeAdapter {
   terminate(executionId: string): Promise<void>;
 
   /**
+   * Whether the runtime still holds the session behind this execution.
+   *
+   * The four failures the design lists do not share one recovery strategy: a client that
+   * disconnected changes nothing, while a worker that died took the session with it unless the
+   * runtime keeps it somewhere else. An adapter that cannot answer omits the method, and the
+   * answer is then "no" — a session that cannot be proven is a session that must not be resumed.
+   */
+  isSessionResumable?(executionId: string): boolean;
+
+  /**
    * Optional approval surface. An adapter that cannot express approvals simply omits these; the API
    * layer then reports no pending approvals instead of inventing an answer.
    */
-  getPendingPermissions?(executionId: string): RuntimePermissionRequest[];
-  respondToPermission?(
+  getPendingPermissions?(executionId: string): RuntimePermissionRequest[];  respondToPermission?(
     executionId: string,
     requestId: string,
     response: RuntimePermissionResponse

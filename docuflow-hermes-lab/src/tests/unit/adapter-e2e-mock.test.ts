@@ -60,7 +60,9 @@ test("e2e: adapter → mock HTTP → SSE → journal → checkpoint → usage", 
     const entries = await journal.read(execution.executionId);
     assert.deepEqual(
       entries.map(entry => entry.category),
-      ["execution.started", "execution.started", "message.delta", "message.delta", "execution.completed"]
+      // The journal opens with the request the execution was started with, so a worker that dies
+      // can still rebuild it; then the runtime's own events follow in order.
+      ["execution.input", "execution.started", "execution.started", "message.delta", "message.delta", "execution.completed"]
     );
     assert.deepEqual(
       entries.filter(entry => entry.eventSequence !== undefined).map(entry => entry.eventSequence),
@@ -70,7 +72,8 @@ test("e2e: adapter → mock HTTP → SSE → journal → checkpoint → usage", 
     const checkpoint = await coordinator.getCheckpoint(execution.executionId);
     assert.equal(checkpoint.terminal, true);
     assert.equal(checkpoint.terminalEventType, "execution.completed");
-    assert.equal(checkpoint.eventCount, 5);
+    // Every journal entry counts, including the request the execution was started with.
+    assert.equal(checkpoint.eventCount, 6);
 
     // A terminal execution stops recovery instead of restarting it.
     assert.equal((await coordinator.recover(execution.executionId)).plan.action, "stop");

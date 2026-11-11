@@ -434,23 +434,22 @@ def kill_orphan_listeners() -> None:
             time.sleep(0.3)
 
 
-def _diagnose_ui_exit(args: argparse.Namespace, ui: Managed) -> None:
-    """Explain the desktop-mode failure that is easy to misread as a bug.
-
-    The Tauri window opens fine on most machines, but a broken WebView2
-    runtime on this host makes the app panic with
-    "Failed to setup app: 拒绝访问。 (os error 5)" — a runtime problem,
-    not a defect in this project.
-    """
-    if args.mode != "desktop":
-        return
+def _webview_access_denied(ui: Managed) -> bool:
+    """Return whether Tauri failed while the Windows webview was created."""
     try:
         tail = ui.log_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
+        return False
+    return "os error 5" in tail and "Failed to setup app" in tail
+
+
+def _diagnose_ui_exit(args: argparse.Namespace, ui: Managed) -> None:
+    """Explain a Windows webview creation failure without claiming it is absent."""
+    if args.mode != "desktop":
         return
-    if "os error 5" in tail or "Failed to setup app" in tail:
-        error("桌面窗口创建失败：本机 WebView2 运行时不可用（os error 5）。")
-        note("这是本机环境问题，不是本工程的代码缺陷。改用浏览器形态：")
+    if _webview_access_denied(ui):
+        error("桌面窗口创建失败：WebView2 已安装，但 Windows 拒绝创建该应用的 WebView（os error 5）。")
+        note("这不代表 WebView2 未安装；浏览器模式不受影响。手动启动方式：")
         note("    python scripts/dev.py --mode browser")
 
 
@@ -471,6 +470,11 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="端口被占用时先结束占用进程")
     parser.add_argument("--no-build", action="store_true", help="跳过后端 TypeScript 编译")
     parser.add_argument("--no-browser", action="store_true", help="browser 模式下不自动开浏览器")
+    parser.add_argument(
+        "--no-browser-fallback",
+        action="store_true",
+        help="桌面 WebView 创建失败时不要自动切换到浏览器模式",
+    )
     parser.add_argument("--stop", action="store_true", help="停止上一次运行留下的进程")
     args = parser.parse_args()
 
@@ -523,6 +527,33 @@ def main() -> int:
         while True:
             for handle in handles:
                 if handle.exited:
+                    if (
+                        handle is ui
+                        and args.mode == "desktop"
+                        and not args.no_browser_fallback
+                        and _webview_access_denied(ui)
+                    ):
+                        error("桌面 WebView 创建被 Windows 拒绝，正在自动切换到浏览器模式……")
+                        ui.kill_tree()
+                        for pid in port_owners(WEB_PORT):
+                            Managed._kill_with_taskkill(pid)
+                        deadline = time.time() + 5
+                        while time.time() < deadline and not port_is_free(WEB_PORT):
+                            time.sleep(0.2)
+                        if not port_is_free(WEB_PORT):
+                            raise RuntimeError(f"无法释放前端端口 {WEB_PORT}，浏览器模式未启动")
+
+                        ui = spawn("ui", npm_command("dev"), UI_DIR)
+                        handles[handles.index(handle)] = ui
+                        args.mode = "browser"
+                        write_pid_file(handles)
+                        wait_for_web(ui, WEB_READY_TIMEOUT_BROWSER)
+                        note(f"浏览器模式就绪：http://localhost:{WEB_PORT}")
+                        if not args.no_browser:
+                            import webbrowser
+
+                            webbrowser.open(f"http://localhost:{WEB_PORT}")
+                        break
                     error(f"[{handle.tag}] 进程已退出，退出码 {handle.exit_code}")
                     _diagnose_ui_exit(args, handle)
                     raise SystemExit(f"进程 {handle.tag} 提前退出，日志：{handle.log_path}")

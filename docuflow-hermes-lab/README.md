@@ -244,6 +244,52 @@ this is the agent-level evidence the checklist actually asks for, and keep the t
 `SECURITY_LAB_CONFIRM` is the name for the acknowledgement; the older `HERMES_SECURITY_LAB_CONFIRM`
 is still accepted.
 
+## Cancellation
+
+```bash
+npm run validate:pi-cancellation
+```
+
+Starts a real task on the Pi runtime, waits until the model is producing its answer, cancels it and
+checks that the runtime actually stopped. The report goes to `reports/phase0-pi-cancellation.json`
+with the P0-018 id.
+
+| Check | Why |
+|---|---|
+| the execution ends as `cancelled` | a cancel request that arrives too late is not a cancellation |
+| the runtime confirmed the abort (`runtimeConfirmed`) | DocuFlow asking for a stop is not evidence that the runtime stopped |
+| the runtime's stop reason is `aborted` | the runtime says the abort reached it, in its own words |
+| the model's answer never arrives | the turn was cut off, not merely marked as cancelled |
+| no event arrives after the terminal event | a runtime that keeps talking was not stopped |
+
+The cancellation is reported when the runtime confirms it, not when the request arrives: the
+terminal event waits for the runtime and carries `runtimeConfirmed` together with the runtime's own
+stop reason. The execution passes through the `cancelling` state, which is what the API's 202
+already promised. A runtime that never answers produces a cancellation marked
+`runtimeConfirmed: false` rather than an execution that hangs.
+
+## Session recovery
+
+```bash
+npm run validate:pi-session-recovery
+```
+
+Stages the failure the design names — a DocuFlow worker that dies mid-turn — and checks what the
+restarted worker does about it. The report goes to `reports/phase0-pi-session-recovery.json` with the
+P0-021 id.
+
+| Check | Why |
+|---|---|
+| the plan is `rebuild`, not `resume` | Pi's transcript lives on the agent instance, so a dead worker took the session with it; resuming a session that no longer exists is not an option |
+| the rebuild runs on `pi-local` | a rebuild that quietly moves the task to the server's default runtime is worse than no rebuild (D-047) |
+| the rebuilt request carries `[DOCUFLOW CHECKPOINT]` and names the execution it continues | a rebuild is the same work continued, not a fresh unrelated task |
+| the rebuilt execution reaches a terminal state | the plan is not the recovery: the rebuild has to actually run |
+
+The two facts a rebuild needs are journaled with the execution rather than kept in memory:
+`execution.runtime` (which runtime ran it) and `execution.input` (what it was asked). The
+coordinator writes them, because the coordinator is what starts executions — the first attempt and
+the rebuild alike.
+
 ## Code change pipeline
 
 `src/code-engine/` enforces design 7.3: the agent proposes a patch, Code Engine validates and applies
@@ -277,12 +323,15 @@ planRecovery()     stop | compensate | resume | rebuild — a decision, not a re
 
 A gap means compensate first (re-fetch and `mergeCompensated()`, which refuses conflicting content).
 `resume` requires both an advertised capability and a live session; Hermes over HTTP has neither, so
-recovery rebuilds with the checkpoint instead of pretending. See
+recovery rebuilds with the checkpoint instead of pretending. Who answers "is the session still
+there?" is the runtime that owns the execution (`isSessionResumable` on the adapter), not the
+server: an adapter that cannot answer has no session to offer. See
 [`docs/RECOVERY.md`](docs/RECOVERY.md).
 
-`ExecutionCoordinator` wires it together: `start()` journals every event through one serialized chain,
-`recordAuditFact()` puts change records and policy decisions on the same timeline, and `recover()`
-executes the plan — including a rebuild that injects `[DOCUFLOW CHECKPOINT]` and records
+`ExecutionCoordinator` wires it together: `start()` journals every event through one serialized chain
+and writes the request the execution was started with, `recordAuditFact()` puts change records and
+policy decisions on the same timeline, and `recover()` executes the plan — including a rebuild that
+injects `[DOCUFLOW CHECKPOINT]`, continues on the runtime that ran the original task, and records
 `recovery.rebuild` against the new execution.
 
 ## Snapshots and traceability
