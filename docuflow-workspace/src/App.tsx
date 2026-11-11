@@ -42,7 +42,7 @@ export default function App() {
         <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
         <NewTaskDialog open={newTaskOpen} onOpenChange={setNewTaskOpen} />
 
-        <Toaster theme="dark" position="bottom-right" richColors />
+        <Toaster position="bottom-right" richColors />
       </ExecutionStreamProvider>
     </TooltipProvider>
   );

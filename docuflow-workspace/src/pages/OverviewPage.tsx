@@ -33,25 +33,25 @@ export function OverviewPage({ onNewTask }: { onNewTask: () => void }) {
       label: "可用 Runtime",
       value: runtimes.data ? String(runtimes.data.runtimes.length) : "—",
       detail: runtimes.data?.runtimes.map(item => item.runtimeType).join(" · ") || "等待注册",
-      icon: Server, accent: "text-violet-400", glow: "from-violet-500/20"
+      icon: Server, accent: "text-violet-600 dark:text-violet-400", glow: "from-violet-500/20"
     },
     {
       label: "活跃执行", value: String(activeCount),
       detail: streamOnline ? "事件流实时同步" : `事件流 ${streamStatus}`,
-      icon: Activity, accent: "text-sky-400", glow: "from-sky-500/20"
+      icon: Activity, accent: "text-sky-600 dark:text-sky-400", glow: "from-sky-500/20"
     },
     {
       label: "待审批", value: String(pendingPermissions),
       detail: pendingPermissions > 0 ? "需要你的决策" : "当前没有阻塞项",
       icon: KeyRound,
-      accent: pendingPermissions > 0 ? "text-amber-400" : "text-emerald-400",
+      accent: pendingPermissions > 0 ? "text-amber-600 dark:text-amber-400" : "text-emerald-600 dark:text-emerald-400",
       glow: pendingPermissions > 0 ? "from-amber-500/20" : "from-emerald-500/20"
     },
     {
       label: "累计 Token",
       value: usage.data ? formatTokens(usage.data.summary.totalTokens) : "—",
       detail: usage.data ? `${usage.data.summary.executions} 次已记账执行` : "等待用量数据",
-      icon: Coins, accent: "text-fuchsia-400", glow: "from-fuchsia-500/20"
+      icon: Coins, accent: "text-fuchsia-600 dark:text-fuchsia-400", glow: "from-fuchsia-500/20"
     }
   ];
 
@@ -113,7 +113,7 @@ export function OverviewPage({ onNewTask }: { onNewTask: () => void }) {
               </div>
               <CardDescription>任务状态和事件由服务端实时推送。</CardDescription>
             </div>
-            <span className={cn("rounded-full border px-2.5 py-1 text-[11px]", streamOnline ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-400" : "border-amber-500/25 bg-amber-500/10 text-amber-400")}>
+            <span className={cn("rounded-full border px-2.5 py-1 text-[11px]", streamOnline ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400" : "border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400")}>
               {streamOnline ? "LIVE" : streamStatus.toUpperCase()}
             </span>
           </CardHeader>
@@ -160,7 +160,7 @@ export function OverviewPage({ onNewTask }: { onNewTask: () => void }) {
         <div className="space-y-5">
           <Card className="border-border/70 bg-card/65">
             <CardHeader className="pb-3">
-              <CardTitle className="flex items-center gap-2 text-base"><Boxes className="size-4 text-violet-400" />执行资源</CardTitle>
+              <CardTitle className="flex items-center gap-2 text-base"><Boxes className="size-4 text-violet-600 dark:text-violet-400" />执行资源</CardTitle>
               <CardDescription>来自 Runtime Registry 的服务端注册信息。</CardDescription>
             </CardHeader>
             <CardContent className="space-y-2">
@@ -170,7 +170,7 @@ export function OverviewPage({ onNewTask }: { onNewTask: () => void }) {
               ) : null}
               {runtimes.data?.runtimes.map(runtime => (
                 <div key={runtime.id} className="flex items-center gap-3 rounded-xl border border-border/60 bg-background/35 p-3">
-                  <span className="flex size-9 items-center justify-center rounded-lg bg-violet-500/10 text-violet-400"><Server className="size-4" /></span>
+                  <span className="flex size-9 items-center justify-center rounded-lg bg-violet-500/10 text-violet-600 dark:text-violet-400"><Server className="size-4" /></span>
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm font-medium">{runtime.id}</p>
                     <p className="truncate text-xs text-muted-foreground">{runtime.runtimeType} · {runtime.version ?? "版本未固定"}</p>
@@ -183,7 +183,7 @@ export function OverviewPage({ onNewTask }: { onNewTask: () => void }) {
                 onClick={() => navigate("/skills")}
                 className="flex w-full items-center gap-3 rounded-xl border border-border/60 bg-background/35 p-3 text-left transition-colors hover:border-brand/25 hover:bg-brand/5"
               >
-                <span className="flex size-9 items-center justify-center rounded-lg bg-sky-500/10 text-sky-400"><Sparkles className="size-4" /></span>
+                <span className="flex size-9 items-center justify-center rounded-lg bg-sky-500/10 text-sky-600 dark:text-sky-400"><Sparkles className="size-4" /></span>
                 <div className="min-w-0 flex-1">
                   <p className="text-sm font-medium">已注册技能</p>
                   <p className="text-xs text-muted-foreground">{skills.data ? `${skills.data.skills.length} 个技能可用` : "正在读取…"}</p>

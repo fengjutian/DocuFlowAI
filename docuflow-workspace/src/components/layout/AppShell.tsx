@@ -15,6 +15,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { cn } from "cn";
 import { useBackendStatus } from "@/hooks/useBackendStatus";
 import { useExecutionStream } from "@/state/execution-stream";
+import { ThemeSwitcher } from "@/components/common/ThemeSwitcher";
 
 const NAV_ITEMS = [
   { to: "/", label: "工作台总览", icon: LayoutDashboard, end: true },
@@ -131,6 +132,7 @@ export function AppShell({
             </p>
           </div>
           <div className="flex items-center gap-2">
+            <ThemeSwitcher />
             <Button variant="ghost" size="sm" onClick={onOpenSettings}>
               <Settings className="size-4" />
               设置
