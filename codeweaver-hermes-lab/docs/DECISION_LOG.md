@@ -1034,3 +1034,76 @@ stream are the same sequence space, so merging them cannot double an entry.
 Consequence: P0-019 is signed off. The rule it rests on: the live stream and the replay are two
 readings of one journal, so a client that comes back gets exactly what it missed — and exactly
 once.
+
+## D-070: A crashed runtime ends the execution; it does not get another turn
+Status: accepted
+Context: design 14.2 lists eight ways a run can go wrong and says they cannot all be answered with
+the same recovery move. Three of them are now pinned down by evidence, and this is the third.
+P0-021 pinned "the CodeWeaver worker crashed": the session is gone with the process, so the answer
+is rebuild from the checkpoint. P0-019 pinned "the client disconnected": the execution is fine, so
+the answer is replay from the journal. This entry pins "the runtime process crashed": the worker is
+still alive, the runtime is gone, and the execution has to end in a failure that says why.
+
+The obvious way to test it would have proved the wrong thing. Pi runs in-process inside CodeWeaver,
+so killing Pi kills the worker — that is P0-021's scenario wearing a different hat. A runtime crash
+needs a runtime that lives in another process, so the probe uses the pinned Hermes gateway
+(`scripts/hermes.ps1`), speaking HTTP and SSE. It starts the gateway, runs a real task through it,
+kills the gateway process while the model is still answering, and then asks the questions an
+operator would ask.
+
+Two of those questions came back wrong, and both were real defects. The first was the recovery
+path: `recover()` asked the runtime what it could do before deciding anything, so once the runtime
+was dead the answer came back 502 "Hermes capabilities request failed" — a runtime that could not
+be reached, reported in place of the fact that mattered, which is that this execution had already
+ended. The 502 was true and useless. The decision now reads the execution's own checkpoint first: a
+terminal execution gets a `stop` plan without asking the runtime anything. The runtime is consulted
+only when its answer could still change the decision.
+
+The second was the execution list. It derived the status from the coordinator's live session, and
+that session is only removed when the coordinator is terminated — so an execution that had finished
+in this process stayed `running` forever, and the console's list filled up with work that was
+already done still showing as "执行中". The journal's terminal event is the fact; `isLive` is now
+only the fallback for an execution that has no terminal event yet.
+
+Decision: a crashed runtime ends its execution in `failed`, with the failure and its reason
+recorded, and it never gets another turn. The journal keeps the whole story of the run, including
+the crash, and stays readable after the failure. Recovery for a terminal execution is `stop`, decided
+from the execution's own record, and the runtime is not asked at all.
+
+Evidence: the probe `runtime-crash-phase0` runs a real task on the real model through the pinned
+gateway and kills that gateway mid-run. Six links are asserted: `crash-was-real` (the process was
+alive before the kill and gone after it), `crash-detected` (the execution ended as `failed`),
+`crash-recorded` (the journal records the failure with the reason `stream_error`), `audit-kept`
+(the failed execution's record is still readable — 20 journal entries, trace 200), `no-silent-rerun`
+(the recovery attempt refused to re-run the model, 409, and the task still has exactly one
+execution), and `runtime-unhealthy` (the registry reports the crashed runtime as unhealthy). The
+last run: `runtimeAliveBeforeKill=true`, `runtimeAliveAfterKill=false`, 17 events before the crash
+with the model's output already in them, `status=failed`, `journalEvents=20`, `traceStatus=200`,
+`retryStatus=409` with `Recovery decided 'stop': Execution is already terminal (execution.failed)`,
+`runtimeHealthy=false`, one execution on the task.
+
+The probe was made to fail before it was trusted. Run against the unrepaired coordinator, the same
+probe exited non-zero on `no-silent-rerun` — "the recovery attempt answered 502 instead of
+refusing" — so the defect was caught by the probe rather than by inspection. The verdict logic has
+13 unit tests, most of them the cases that have to fail: a run that never crashed, a run that ended
+`running`, a journal with no reason, a trace that cannot be read, a retry that answers 200, a task
+that gained a second execution, a registry that still calls the runtime healthy, and a model that
+never produced any output — that last one is `blocked`, not `passed`, because a probe that never got
+to the crash has not tested it (D-020).
+
+The console was checked in the browser against the real gateway. A long task ran to completion and
+the list showed "已成功"; a second task was killed two seconds after it started and the list showed
+"已失败" with 85 events, while the execution that had finished in the same process no longer showed
+as "执行中" — that was the second defect, visible in the product and not only in a test. The crashed
+execution's detail page still scrolls to the end of its 85-entry timeline: a failed run keeps its
+evidence.
+
+The probe also owns what it kills. It records whether the gateway was running before it started and
+restores that state afterwards — a gateway it started is stopped again, a gateway it found running
+is brought back. A probe that leaves the machine in a different state than it found it has changed
+the subject it was measuring.
+
+Consequence: P0-020 is signed off. The rule it rests on: a crashed runtime ends the execution in
+`failed` with the crash recorded, the audit trail survives, and the model is not asked again behind
+the operator's back. The recovery decision reads the execution's own record; the runtime is only
+asked when it could still change the answer.

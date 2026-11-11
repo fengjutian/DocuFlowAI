@@ -67,12 +67,12 @@ class ControllableJournalStore extends InMemoryJournalStore {
   }
 }
 
-async function harness(options: { journal?: JournalStore } = {}): Promise<Harness> {
+async function harness(options: { journal?: JournalStore; live?: boolean } = {}): Promise<Harness> {
   const journal = options.journal ?? new InMemoryJournalStore();
   const bus = new EventBus();
   const registry = new AgentRuntimeRegistry();
   const coordinator = {
-    isLive: () => false,
+    isLive: () => options.live === true,
     getCheckpoint: async (executionId: string) => ({
       executionId,
       lastSequence: 0,
@@ -272,6 +272,32 @@ test("lists the executions the journal knows about", async () => {
     assert.equal(body.executions[0]!.taskId, "task-1", "the task comes from the journal, not from a live event");
     assert.equal(body.executions[0]!.status, "succeeded");
     assert.equal(body.executions[0]!.eventCount, 3);
+  } finally {
+    await app.close();
+  }
+});
+
+test("an execution that finished in this process is not listed as running", async () => {
+  // The coordinator keeps a session until it is terminated, not until the run finishes, so a
+  // finished execution is still "live" in its map. The journal's terminal event is the fact: the
+  // console's execution list must not keep showing a finished run as running.
+  const app = await harness({ live: true });
+  try {
+    app.record(entry(1, "execution.started"));
+    app.record(entry(2, "execution.completed"));
+    await app.journal.append({
+      executionId: EXECUTION_ID,
+      sequence: 3,
+      kind: "audit",
+      category: "execution.input",
+      recordedAt: new Date().toISOString(),
+      payload: { taskId: "task-1", projectId: "proj-1" }
+    });
+
+    const response = await fetch(`${app.url}/api/v1/executions`);
+    const body = (await response.json()) as { executions: Array<{ status: string }> };
+
+    assert.equal(body.executions[0]!.status, "succeeded");
   } finally {
     await app.close();
   }

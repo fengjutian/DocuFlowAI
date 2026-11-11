@@ -82,6 +82,19 @@ impl Editor {
         editor
     }
 
+    /// Replaces the buffer's contents with `text`.
+    ///
+    /// Loading a file starts a fresh editing session: the undo history is
+    /// cleared, because undoing past the moment the file was opened would
+    /// restore text that was never in the buffer, and the selection moves to
+    /// the start of the document.
+    pub fn load_text(&mut self, text: impl Into<String>) {
+        self.buffer = Buffer::new(text);
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.reset_selection(TextOffset(0));
+    }
+
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
     }
@@ -350,5 +363,29 @@ mod tests {
         editor.backspace().unwrap();
         assert_eq!(editor.text(), "x");
         assert_eq!(editor.caret(), TextOffset(0));
+    }
+
+    #[test]
+    fn loading_text_replaces_the_buffer_and_clears_the_history() {
+        let mut editor = Editor::new("old");
+        editor.insert("!").unwrap();
+        assert!(editor.can_undo());
+
+        editor.load_text("new content");
+        assert_eq!(editor.text(), "new content");
+        assert_eq!(editor.caret(), TextOffset(0));
+        assert!(!editor.can_undo(), "the old history must not survive a load");
+        assert!(!editor.can_redo());
+    }
+
+    #[test]
+    fn loading_text_keeps_the_buffer_editable() {
+        let mut editor = Editor::new("");
+        editor.load_text("hello");
+        editor.move_right();
+        editor.insert("!");
+        assert_eq!(editor.text(), "h!ello");
+        editor.undo().unwrap();
+        assert_eq!(editor.text(), "hello");
     }
 }

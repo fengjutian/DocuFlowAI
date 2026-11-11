@@ -160,6 +160,17 @@ export class ExecutionCoordinator {
 
   async recover(executionId: string, context?: CheckpointContext): Promise<RecoverResult> {
     const checkpoint = await this.getCheckpoint(executionId, context);
+
+    // A terminal execution has nothing to resume and nothing to rebuild.
+    //
+    // The runtime is asked for its capabilities only when that can still change the decision, and
+    // the order matters exactly when the runtime is what broke. Asking a dead runtime first turns
+    // "this execution is over" into "the runtime is unreachable" — and the answer the caller
+    // needs is the first one: the record is kept and no new run is started.
+    if (checkpoint.terminal) {
+      return { plan: planRecovery(checkpoint, { capabilities: { sessionResume: false } }) };
+    }
+
     // Recovery must ask the runtime that owns the execution: a resume only works on the runtime
     // that still holds the session, and capabilities differ between runtimes.
     const adapter = await this.owningAdapter(executionId);

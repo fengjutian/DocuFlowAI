@@ -22,6 +22,7 @@ use codeweaver_agent_ui::AgentPanel;
 /// The endpoint is a separate process, so the editor is told how to start it
 /// through the environment. Without those variables the agent panel stays
 /// empty and says so, rather than guessing a path.
+#[derive(Clone, Debug)]
 pub struct EndpointSettings {
     pub program: String,
     pub args: Vec<String>,

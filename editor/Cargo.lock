@@ -289,6 +289,7 @@ dependencies = [
  "codeweaver-agent-ui",
  "codeweaver-editor-core",
  "codeweaver-render",
+ "codeweaver-workspace",
  "pollster",
  "wgpu",
  "winit",
@@ -310,6 +311,13 @@ name = "codeweaver-text"
 version = "0.1.0"
 dependencies = [
  "ropey",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "codeweaver-workspace"
+version = "0.1.0"
+dependencies = [
  "thiserror 2.0.21",
 ]
 

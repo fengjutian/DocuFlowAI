@@ -468,6 +468,50 @@ did not pass, a journal that recorded nothing at all, and a run that ended befor
 The probe was also broken on purpose twice — replaying one position too many and switching the
 replay off — and both made it fail, because a probe that cannot fail is not evidence.
 
+## Runtime crash
+
+```bash
+npm run validate:runtime-crash
+```
+
+Signs off P0-020 (runtime process crash) against a real out-of-process runtime. The report goes to
+`reports/phase0-runtime-crash.json` and joins the Phase 0 aggregate.
+
+The runtime that crashes has to live in another process, otherwise the probe proves the wrong
+failure. Pi runs inside the CodeWeaver process, so killing it would kill the worker — that is
+P0-021's scenario. This probe uses the pinned Hermes gateway (`scripts/hermes.ps1`, HTTP + SSE): it
+runs a real task on the real model through that gateway, kills the gateway process while the model
+is still answering, and then asks the questions an operator would ask.
+
+| Link | Why |
+|---|---|
+| Crash was real | the runtime process was alive before the kill and gone after it |
+| Crash detected | the execution ended as `failed` after the runtime died |
+| Crash recorded | the journal records the failure and its reason |
+| Audit kept | the failed execution's record is still readable after the failure |
+| No silent rerun | recovery refused to run the model again, and the task still has one execution |
+| Runtime unhealthy | the registry reports the crashed runtime as unhealthy |
+
+A run in which the model never produced any output is `blocked`, not `passed`: the crash was never
+exercised (D-020).
+
+The mechanism it exercises is one rule (D-070): **a crashed runtime ends its execution, it does not
+get another turn**. The execution ends `failed` with the reason recorded, the journal keeps the
+whole story of the run and stays readable after the failure, and recovery for a terminal execution
+is `stop` — decided from the execution's own record. The runtime is only consulted when its answer
+could still change the decision. Two real defects fell out of this and are fixed: the recovery path
+used to ask the dead runtime for its capabilities first and answered 502 instead of "this execution
+has already ended", and the execution list used to derive the status from the coordinator's live
+session, so an execution that had finished in this process stayed `执行中` forever.
+
+The probe was made to fail before it was trusted: against the unrepaired coordinator it exited
+non-zero on `no-silent-rerun` ("the recovery attempt answered 502 instead of refusing"). The verdict
+logic has 13 unit tests, most of them the cases that have to fail.
+
+The probe also owns the gateway it kills: it records whether the gateway was running before it
+started and restores that state afterwards — a gateway it started is stopped again, one it found
+running is brought back.
+
 ## Multi-runtime policy and runtime scoring
 
 ```bash

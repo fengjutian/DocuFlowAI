@@ -538,11 +538,15 @@ async function listExecutions(deps: ApiDependencies): Promise<unknown> {
     const input = entries.find(entry => entry.category === "execution.input");
     const runtime = entries.find(entry => entry.category === "execution.runtime");
     const terminal = [...entries].reverse().find(entry => TERMINAL_CATEGORIES.has(entry.category));
-    // A live execution has no terminal event yet, and its status comes from the coordinator rather
-    // than from the journal — the journal has not been told anything about it since the last event.
-    const status = deps.coordinator.isLive(executionId)
-      ? "running"
-      : (terminal ? statusFromTerminalEvent(terminal.category) ?? "unknown" : "unknown");
+    // The journal's terminal event is the fact: an execution that reached one is over, whatever the
+    // coordinator's session map still holds. A session is dropped when it is terminated, not when it
+    // finishes, so "the session is live" would call every finished run of this process "running" —
+    // forever, and in the console's execution list.
+    const status = terminal
+      ? statusFromTerminalEvent(terminal.category) ?? "unknown"
+      : deps.coordinator.isLive(executionId)
+        ? "running"
+        : "unknown";
     executions.push({
       executionId,
       ...(typeof input?.payload["taskId"] === "string" ? { taskId: input.payload["taskId"] } : {}),

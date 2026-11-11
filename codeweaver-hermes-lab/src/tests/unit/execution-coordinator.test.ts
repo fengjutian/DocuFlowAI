@@ -375,3 +375,26 @@ test("finds the execution that owns a pending approval request", async () => {
   assert.equal(found, execution.executionId);
   assert.equal(await coordinator.findByPermissionRequest("req-unknown"), undefined);
 });
+
+test("a terminal execution is decided from its own record, not from the runtime that died", async () => {
+  const journal = new InMemoryJournalStore();
+  const alive = makeAdapter({ events: [event(1, "execution.started"), event(2, "execution.failed")] });
+  // The runtime is the thing that broke: asking it anything throws.
+  const crashed: AgentRuntimeAdapter = {
+    ...alive,
+    async getCapabilities(): Promise<AgentCapability> {
+      throw new Error("runtime unreachable");
+    }
+  };
+  const coordinator = new ExecutionCoordinator({ adapter: crashed, journal });
+
+  const execution = await coordinator.start(input);
+  await coordinator.flush(execution.executionId);
+  const result = await coordinator.recover(execution.executionId);
+
+  // The execution is over, so there is nothing to resume and nothing to rebuild — and that fact
+  // is in the journal, not in the runtime that just died.
+  assert.equal(result.plan.action, "stop");
+  assert.match(result.plan.reason, /already terminal \(execution\.failed\)/);
+  assert.equal(result.execution, undefined);
+});
