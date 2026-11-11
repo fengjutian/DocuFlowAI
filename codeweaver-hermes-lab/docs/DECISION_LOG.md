@@ -1024,6 +1024,13 @@ Switching the replay off made the client never receive 114 of the 118 recorded e
 `complete` link fail. Both runs exited non-zero, and both were restored before the signed-off run.
 The server-side order has its own test, `src/tests/unit/event-reconnect.test.ts`, whose two race
 cases fail on the old order (the client receives `[1]` where it should receive `[1,2]`).
+The console was checked in the browser, with a real disconnect rather than a simulated one: the API
+process was killed while the console was open. The footer said `重连中` instead of `实时`, the API
+was started again, and the console reconnected on its own — the backoff ladder is 1s, 2s, 4s, 8s —
+and the execution list came back intact, because it is read from the server's journal rather than
+from what the socket happened to carry. The detail page of an execution with 146 journal entries
+showed all 146, numbered `#1` to `#146` with nothing repeated in between: the history and the live
+stream are the same sequence space, so merging them cannot double an entry.
 Consequence: P0-019 is signed off. The rule it rests on: the live stream and the replay are two
 readings of one journal, so a client that comes back gets exactly what it missed — and exactly
 once.

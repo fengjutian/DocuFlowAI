@@ -428,6 +428,46 @@ change record, a change that never became a commit, an evaluation that did not p
 does not list the execution, a commit that resolves somewhere else, and a server that answers an
 unknown execution id with an empty chain instead of a 404.
 
+## Client disconnect and reconnect
+
+```bash
+npm run validate:pi-client-disconnect
+```
+
+Signs off P0-019 (client disconnect) on the real model through the HTTP API. The report goes to
+`reports/phase0-pi-client-disconnect.json` and joins the Phase 0 aggregate.
+
+The probe runs a real task and then behaves like a client that loses its connection: it opens the
+event stream, drops it in the middle of the run, waits for the execution to finish on its own, and
+comes back with `since`. The journal is the yardstick — the client's timeline is compared against
+the entries the server actually recorded, so a stream that quietly dropped half the run cannot pass.
+
+| Link | Why |
+|---|---|
+| Continues | the execution kept running while nobody was listening and reached a terminal state |
+| Complete | the client holds every recorded entry — no gap in the run |
+| No duplicate | the client received every entry exactly once |
+| Single execution | the task produced one execution, not a second one after the reconnect |
+| Evidence | the change landed in a commit and the acceptance check passed |
+
+A run that finished before the probe could drop the connection is recorded as `blocked`, not
+`passed`: the reconnect was never exercised, and a probe that never got to test the thing has not
+proved it (D-020).
+
+The mechanism it exercises is one rule (D-069): **the live stream and the replay are two readings of
+one journal**. The runtime event and the CodeWeaver audit fact are written to the journal first and
+published afterwards, so a live frame's `sequence` is the journal position and its `id` is
+`${executionId}:${journalPosition}`. The server subscribes before it replays, and the frames that
+arrive during the replay wait in a buffer and are flushed minus the frames the replay already
+carried — no event is lost, and none arrives twice. `GET /api/v1/executions` serves the journal's own
+list of executions, which is how a client recovers the executions that ran while it was away.
+
+The verdict logic has unit tests, most of them the cases that have to fail: a missing event, an
+event delivered twice, a second execution, a failed run, a change that never landed, a check that
+did not pass, a journal that recorded nothing at all, and a run that ended before the disconnect.
+The probe was also broken on purpose twice — replaying one position too many and switching the
+replay off — and both made it fail, because a probe that cannot fail is not evidence.
+
 ## Multi-runtime policy and runtime scoring
 
 ```bash
