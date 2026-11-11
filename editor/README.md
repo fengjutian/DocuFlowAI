@@ -5,14 +5,18 @@ GPUI 的单向状态更新、帧调度和组件化思想，但不依赖 GPUI，�
 
 ## 当前状态
 
-阶段 0 的最小原型已经包含：
+阶段 0 的原型已经包含：
 
 - 原生窗口生命周期；
 - wgpu adapter/device/surface 初始化；
 - resize、重绘和 surface 异常恢复；
+- 不可变 `FrameScene`，矩形实例批渲染与逐图元裁剪；
+- cosmic-text shaping 与 glyphon GPU 字形图集；
+- Windows IME `preedit` / `commit` 输入状态；
 - `app -> platform -> render` 的单向依赖边界。
 
-目前只绘制背景色，尚未包含文本、控件和编辑器数据模型。
+当前窗口展示一个可输入中英文的渲染验证场景。它还不是编辑器：下一步需要实现 UI
+布局/命中测试，以及独立的 Buffer、Selection 和编辑事务。
 
 ## 运行
 

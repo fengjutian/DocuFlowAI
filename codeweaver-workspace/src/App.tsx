@@ -12,6 +12,7 @@ import { RuntimesPage } from "@/pages/RuntimesPage";
 import { ExecutionsPage } from "@/pages/ExecutionsPage";
 import { ExecutionDetailPage } from "@/pages/ExecutionDetailPage";
 import { SkillsPage } from "@/pages/SkillsPage";
+import { SubagentsPage } from "@/pages/SubagentsPage";
 import { UsagePage } from "@/pages/UsagePage";
 import { TracePage } from "@/pages/TracePage";
 
@@ -33,6 +34,7 @@ export default function App() {
             <Route path="/executions" element={<ExecutionsPage onNewTask={() => setNewTaskOpen(true)} />} />
             <Route path="/executions/:executionId" element={<ExecutionDetailPage />} />
             <Route path="/skills" element={<SkillsPage />} />
+            <Route path="/subagents" element={<SubagentsPage />} />
             <Route path="/usage" element={<UsagePage />} />
             <Route path="/trace" element={<TracePage />} />
             <Route path="*" element={<Navigate to="/" replace />} />

@@ -91,6 +91,9 @@ export function SubagentsPage() {
 
   const lineage = tree.data?.lineage ?? [];
   const rootId = tree.data?.rootExecutionId;
+  // A manually typed id is not in the event stream, so the select falls back to its placeholder
+  // instead of pretending it knows an execution it has never seen.
+  const knownExecution = executions.some(item => item.executionId === selectedId);
 
   return (
     <div className="space-y-4">
@@ -110,7 +113,7 @@ export function SubagentsPage() {
         </CardHeader>
         <CardContent className="space-y-4">
           <div className="flex flex-col gap-2 sm:flex-row">
-            <Select value={selectedId} onValueChange={value => lookup(value)}>
+            <Select value={knownExecution ? selectedId : ""} onValueChange={value => lookup(value)}>
               <SelectTrigger className="w-full sm:w-96">
                 <SelectValue placeholder="选择一个父执行" />
               </SelectTrigger>
@@ -164,6 +167,8 @@ export function SubagentsPage() {
               title="还没有选择父执行"
               description="子代理委派把一次执行拆成父子两级；选中父执行后，这里会列出它派生的子执行。"
             />
+          ) : children.loading ? (
+            <p className="text-sm text-muted-foreground">读取子执行中…</p>
           ) : children.error ? (
             <ErrorNotice error={children.error} onRetry={children.refresh} />
           ) : childIds.length === 0 && !tree.loading ? (

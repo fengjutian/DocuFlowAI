@@ -14,7 +14,8 @@ const defaultInputs = [
   "reports/phase0-gateway.json",
   "reports/phase0-agent-security.json",
   "reports/phase0-pi-cancellation.json",
-  "reports/phase0-pi-session-recovery.json"
+  "reports/phase0-pi-session-recovery.json",
+  "reports/phase0-pi-subagent.json"
 ];
 
 async function main(): Promise<void> {

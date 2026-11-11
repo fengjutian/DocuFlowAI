@@ -71,13 +71,20 @@ export class SubagentManager {
       projectId: parentInput.projectId,
       workingDirectory
     };
-    const execution = await this.deps.coordinator.start(childInput);
+    // The child runs where the parent ran. Delegating to a child is not a request to move the work
+    // to another runtime: the caller named the runtime for this task, and a child that silently
+    // landed on the server's default would run under a different policy, a different tool surface
+    // and a different model (D-047, D-055).
+    const parentAdapter = this.deps.coordinator.adapterFor(request.parentExecutionId);
+    const execution = await this.deps.coordinator.start(childInput, parentAdapter);
     this.parentOfChild.set(execution.executionId, request.parentExecutionId);
 
+    const runtimeId = this.deps.coordinator.runtimeIdOf(parentAdapter);
     await this.audit(request.parentExecutionId, "subagent.spawned", {
       childExecutionId: execution.executionId,
       childTaskId: childInput.taskId,
       worktreeMode: mode,
+      ...(runtimeId ? { runtimeId } : {}),
       ...(this.childWorktrees.has(childInput.runId)
         ? { worktreePath: this.childWorktrees.get(childInput.runId) }
         : {})

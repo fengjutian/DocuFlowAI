@@ -72,6 +72,7 @@ export function ExecutionDetailPage() {
   const history = useApiData(() => api.getExecutionEvents(executionId), [executionId]);
   const usage = useApiData(() => api.getExecutionUsage(executionId), [executionId]);
   const skills = useApiData(() => api.listExecutionSkills(executionId), [executionId]);
+  const registry = useApiData(() => api.listSkills(), []);
   const liveEvents = useExecutionEvents(executionId);
 
   // The journal holds the authoritative history; the stream adds what happens after this page
@@ -105,6 +106,27 @@ export function ExecutionDetailPage() {
       }
     }
     return texts.length > 0 ? texts[texts.length - 1] : undefined;
+  }, [timeline]);
+
+  /**
+   * The skill deliveries this run recorded.
+   *
+   * A binding says a skill was attached; a delivery says its body reached the runtime. Only the
+   * second one is what the model actually read.
+   */
+  const deliveries = useMemo(() => {
+    const found: Array<{ skillId: string; version: string; deliveryMode?: string }> = [];
+    for (const event of timeline) {
+      if (event.type !== "codeweaver.skill.delivered") continue;
+      const skillId = String(event.data?.["skillId"] ?? "");
+      if (!skillId) continue;
+      found.push({
+        skillId,
+        version: String(event.data?.["version"] ?? ""),
+        deliveryMode: String(event.data?.["deliveryMode"] ?? "")
+      });
+    }
+    return found;
   }, [timeline]);
 
   useEffect(() => {
@@ -487,18 +509,42 @@ export function ExecutionDetailPage() {
                 <TabsContent value="skills" className="mt-3">
                   {skills.data?.bindings && skills.data.bindings.length > 0 ? (
                     <ul className="space-y-2">
-                      {skills.data.bindings.map(binding => (
-                        <li
-                          key={`${binding.skillId}-${binding.version}`}
-                          className="flex items-center justify-between gap-2 rounded-md border border-border/60 bg-background/40 px-2 py-1.5 text-xs"
-                        >
-                          <span className="flex items-center gap-1.5 truncate">
-                            <Sparkles className="size-3.5 text-muted-foreground" />
-                            {binding.skillId}
-                          </span>
-                          <span className="text-muted-foreground">{binding.version}</span>
-                        </li>
-                      ))}
+                      {skills.data.bindings.map(binding => {
+                        const key = `${binding.skillId}@${binding.version}`;
+                        const manifest = registry.data?.skills.find(
+                          skill => skill.skillId === binding.skillId && skill.version === binding.version
+                        );
+                        // The delivery record says the body reached the runtime. A binding without
+                        // one is a skill that was authorized and then dropped.
+                        const delivery = deliveries.find(
+                          item => item.skillId === binding.skillId && item.version === binding.version
+                        );
+                        return (
+                          <li
+                            key={`${binding.skillId}-${binding.version}`}
+                            className="space-y-1.5 rounded-md border border-border/60 bg-background/40 px-2 py-1.5 text-xs"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="flex items-center gap-1.5 truncate">
+                                <Sparkles className="size-3.5 text-muted-foreground" />
+                                {key}
+                              </span>
+                              <span className="text-muted-foreground">
+                                {delivery ? `已注入 · ${String(delivery.deliveryMode ?? "")}` : "未记录注入"}
+                              </span>
+                            </div>
+                            {manifest ? (
+                              <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded bg-background/60 p-2 text-[11px] text-muted-foreground">
+                                {manifest.content}
+                              </pre>
+                            ) : (
+                              <p className="text-[11px] text-muted-foreground">
+                                技能库中没有这一版本，无法显示它当时携带的正文。
+                              </p>
+                            )}
+                          </li>
+                        );
+                      })}
                     </ul>
                   ) : (
                     <p className="text-xs text-muted-foreground">

@@ -649,3 +649,67 @@ dev stack in `--runtime pi` mode the console lists `pi-local` (`runtimeType=nati
 `pi-local` had the model call `read_file` itself — the tool returned the actual file and the model
 answered from it. The tool surface is live inside a real execution on the runtime the product
 runs on, which is what the choice was supposed to buy.
+
+## D-061: A skill is its body; a bound skill is a delivered skill
+Status: accepted
+Context: the skill layer looked finished and was not. The registry validated manifests, the
+authorization checked permissions and runtimes against the policy snapshot, the binding store
+recorded an immutable binding per execution, and the console had a skill page — but
+`SkillManifest` carried no body at all. The console computed a SHA-256 over the Markdown the user
+typed and sent the digest without the text; the server had nothing to check the digest against and
+nothing to deliver. The skill's instructions existed only in the console's text box, and the model
+never saw them. The same gap made the checksum meaningless: it could not detect an edit, because
+there was no text to compare against.
+Two further defects sat behind it. The authorization context named a fixed runtime id
+(`hermes-local`) instead of the runtime the task actually ran on, so a skill declared for `pi-local`
+was refused on a Pi run and a `hermes-local` skill was allowed there. And the registry was held in
+memory only, so every restart emptied the skill library: a skill registered yesterday was gone
+today, which makes the whole surface a demo.
+Decision: the manifest carries the body. `content` is required, the checksum is the SHA-256 of the
+body, and the registry refuses a manifest whose checksum does not match its content — the
+immutability the versions were supposed to have becomes checkable instead of asserted. Delivery
+has exactly one channel, the task prompt: the Hermes HTTP surface accepts a single `input` string
+and no system prompt, so a second channel would have meant two behaviours for one feature. The
+body is appended after the user's prompt, the prompt snapshot hashes the composed text, and every
+delivery is journaled as `skill.delivered` with its checksum and mode — a binding without a
+delivery is a skill that was authorized and then dropped, and that has to be visible. The
+authorization context is the runtime the task will run under, resolved before the skills are
+checked; when it cannot be resolved, a runtime-specific skill is denied rather than assumed.
+The registry is persisted, so a registered skill survives the restart that would otherwise have
+emptied it.
+Evidence: the probe runs the same task twice on the real model — once without the skill, once with
+it — and the token it looks for exists only inside the skill body, so the control run cannot
+produce it by accident. Against a real MiniMax M3 on `pi-local` the control answer did not contain
+the token and the instructed answer did (`controlOutputHasToken=false`,
+`instructedOutputHasToken=true`), the delivery was recorded as `prompt_inline`, and the two runs
+had different prompt hashes. Report: `reports/phase0-pi-skill-delivery.json`. The probe's own
+verdict logic is covered by unit tests, including the case where the control run produces the
+token anyway, which fails the probe rather than crediting it.
+Consequence: a skill is no longer a permission declaration with nothing to say. It is a body the
+model reads, and the console can show what that body is.
+## D-062: A delegated child runs on the runtime its parent ran on
+Status: accepted
+Context: the delegation endpoint was wired, the manager existed and the console had no way to see
+the result. The first real run of the P0-008 probe found the defect that had been hiding behind
+that: `SubagentManager.spawn` called `coordinator.start(childInput)` without an adapter, so the
+child landed on the server's default runtime. With Pi as the default in the probe and Hermes
+registered beside it, the child was routed to Hermes and refused with "Hermes run creation
+failed" — a 502 that looked like a runtime outage and was nothing of the kind. The parent, which
+the caller had deliberately placed on `pi-local`, had its child executed somewhere else, under a
+different policy, a different tool surface and a different model. That is the failure mode D-047
+was written to prevent, one level down: a named runtime is honoured or refused, and delegation is
+not a way around it. D-055 had already settled the same question for recovery ("the rebuild runs
+where the task ran"); delegation is the same fact wearing different clothes.
+Decision: the child is started on the adapter that owns the parent execution. The manager reads it
+from the coordinator rather than taking it from the caller, so the runtime cannot be chosen twice
+or disagreed about. The spawn audit fact records the runtime id, so a reader can see where the
+child ran without reconstructing it.
+Evidence: with the fix, the P0-008 probe passes on the real model. The parent ran on `pi-local`
+and produced output; the spawn returned 201; the child ran on `pi-local` as well, in an isolated
+worktree, and reached `succeeded`; the lineage resolved from the child to the parent and from the
+parent to the root in both directions; the parent's `subagent.spawned` fact and the child's
+`subagent.parent` fact are both in the journal. Report:
+`reports/phase0-pi-subagent.json`. The console gained a delegation page that shows the children
+and the lineage of a chosen parent, so the structure is visible without reading the journal.
+Consequence: P0-008 is signed off against Pi, and the Phase 0 count is 10 of 24. The rule worth
+keeping: delegation inherits the runtime, it never chooses one.

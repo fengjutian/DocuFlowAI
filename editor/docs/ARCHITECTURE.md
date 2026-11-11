@@ -32,7 +32,7 @@ agent-acp -> editor-core transaction（待建）
 
 ## 下一层接口
 
-后续渲染层不接收业务组件，而接收一帧不可变场景：
+渲染层不接收业务组件，而接收一帧不可变 `FrameScene`：
 
 ```text
 FrameScene
@@ -40,9 +40,21 @@ FrameScene
   quads[]
   shadows[]
   glyph_runs[]
-  images[]
+  images[]（待实现）
 ```
 
 UI 层负责状态、布局、命中测试、焦点和无障碍树；渲染层只负责批处理、图集、GPU
-资源缓存和提交。该边界使 UI 测试不依赖 GPU，也使渲染 benchmark 可以使用合成场景。
+资源缓存和提交。当前矩形通过实例缓冲批量提交，裁剪由每个图元携带；文字由
+cosmic-text shaping，并通过 glyphon 的 GPU atlas 缓存字形。该边界使 UI 测试不依赖
+GPU，也使渲染 benchmark 可以使用合成场景。
+
+## 输入法边界
+
+`platform::TextInputState` 将 winit 的 IME 事件归一化为两类状态：
+
+- `preedit`：正在组合的文本，仅用于视图展示，不进入正式 Buffer；
+- `commit`：输入法确认的文本，未来必须通过一个编辑事务写入 Buffer。
+
+IME 候选窗位置应由获得文本焦点的 UI 组件按光标位置更新。当前原型已经开启原生
+IME 并处理 enabled、disabled、preedit 和 commit，候选窗定位会在编辑器视图实现时接入。
 
