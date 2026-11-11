@@ -1,5 +1,12 @@
 # Phase 0 Checklist
 
+The table below is the **baseline**: what the 24 items are and what evidence each one requires.
+The `Initial status` column is the state the project started from and is not kept in sync.
+
+The live status is the aggregated report — `reports/phase0.json`, rebuilt with
+`npm run report:phase0` — and it is the only place the counts come from. `reports/phase0.json`
+carries one entry per item with its evidence; the console does not show it yet.
+
 | ID | Verification | Initial status | Evidence required |
 |---|---|---|---|
 | P0-001 | HTTP create run | not_run | Run ID + response |

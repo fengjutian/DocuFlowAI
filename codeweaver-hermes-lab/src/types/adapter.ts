@@ -100,6 +100,15 @@ export interface AgentRuntimeAdapter {
   getStatus(executionId: string): Promise<AgentExecutionStatus>;
   cancel(executionId: string): Promise<void>;
   resume(executionId: string): Promise<AgentExecution>;
+  /**
+   * Optional: a follow-up prompt on the session this execution already used.
+   *
+   * A second turn is not a second execution. The runtime keeps the transcript, so the answer can
+   * depend on what was said before — that continuity is the whole point. A runtime that cannot
+   * continue a finished turn omits this method and says so, rather than starting a fresh run that
+   * only looks like a continuation while carrying none of the context.
+   */
+  followUp?(executionId: string, prompt: string): Promise<AgentExecution>;
   subscribe(
     executionId: string,
     handler: (event: AgentRuntimeEvent) => void

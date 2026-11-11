@@ -184,6 +184,35 @@ export class ExecutionCoordinator {
     this.sessions.delete(executionId);
   }
 
+  /**
+   * Continues a finished turn on the session the execution already used.
+   *
+   * The runtime keeps the transcript, so the new answer can depend on the earlier one — that is
+   * what makes it a second turn instead of a second execution. A runtime that cannot continue
+   * says so: starting a fresh run and calling it a continuation would look right and carry none
+   * of the context.
+   */
+  async followUp(executionId: string, prompt: string): Promise<AgentExecution> {
+    const session = this.sessions.get(executionId);
+    if (!session) {
+      throw new AgentAdapterError(
+        "execution_not_found",
+        `Execution ${executionId} is not live in this process, so it cannot be continued`
+      );
+    }
+    const adapter = session.adapter;
+    if (!adapter.followUp) {
+      throw new AgentAdapterError(
+        "unsupported_capability",
+        `Runtime ${this.runtimeIdOf(adapter) ?? "unknown"} cannot continue a finished turn`
+      );
+    }
+    // The turn boundary is a fact on the timeline, so a reader can tell where the second turn
+    // began without reconstructing it from the event stream.
+    await this.recordAuditFact(executionId, "turn.started", { prompt });
+    return adapter.followUp(executionId, prompt);
+  }
+
   /** Journaled CodeWeaver facts (change applied, policy denied) join the same timeline. */
   async recordAuditFact(executionId: string, category: string, payload: Record<string, unknown>): Promise<void> {
     const session = this.sessions.get(executionId);

@@ -303,6 +303,34 @@ export class PiAdapter implements AgentRuntimeAdapter {
     return { ...state.execution, status: "running" };
   }
 
+  /**
+   * A follow-up turn on the session the execution already used.
+   *
+   * Pi keeps the transcript on the agent, so the new prompt continues the same conversation: the
+   * answer can depend on what was said in the earlier turn. The execution keeps its identity —
+   * it is one run with two turns, not two runs — and the journal therefore carries both turns on
+   * one timeline.
+   */
+  async followUp(executionId: string, prompt: string): Promise<AgentExecution> {
+    const state = this.require(executionId);
+    if (!state.terminal) {
+      throw new AgentAdapterError("invalid_state", `Execution ${executionId} is still running`);
+    }
+    if (prompt.trim() === "") {
+      throw new AgentAdapterError("invalid_state", "A follow-up prompt must not be empty");
+    }
+    // The terminal flag is what lets the next terminal event through: the adapter records one
+    // terminal per turn, and a second one would make the audit timeline ambiguous.
+    state.terminal = false;
+    state.cancelled = false;
+    state.status = "running";
+    state.execution = { ...state.execution, status: "running" };
+    void state.agent.prompt(prompt).catch(error => {
+      this.emit(state, "execution.failed", { error: error instanceof Error ? error.message : String(error) });
+    });
+    return { ...state.execution, status: "running" };
+  }
+
   async subscribe(
     executionId: string,
     handler: (event: AgentRuntimeEvent) => void

@@ -90,4 +90,4 @@ CodeWeaver 已经具备一条可运行的最小闭环：固定的 Hermes 0.23.0 
 
 ---
 
-> 证据来源：`codeweaver-hermes-lab/reports/phase0.json`、`codeweaver-hermes-lab/reports/phase0-agent-security.json`、`codeweaver-hermes-lab/reports/phase0-agent-security-transcripts/`、`codeweaver-hermes-lab/reports/phase0-pi-subagent.json`、`codeweaver-hermes-lab/reports/phase0-pi-skill-delivery.json`、`codeweaver-hermes-lab/reports/phase0-multi-runtime-policy.json`、`codeweaver-hermes-lab/docs/DECISION_LOG.md`、`codeweaver-hermes-lab/README.md`。文中所有状态数字与结论均取自这些文件，未做推测。
+> 证据来源：`codeweaver-hermes-lab/reports/phase0.json`、`codeweaver-hermes-lab/reports/phase0-agent-security.json`、`codeweaver-hermes-lab/reports/phase0-agent-security-transcripts/`、`codeweaver-hermes-lab/reports/phase0-pi-subagent.json`、`codeweaver-hermes-lab/reports/phase0-pi-skill-delivery.json`、`codeweaver-hermes-lab/reports/phase0-pi-agent-execution.json`、`codeweaver-hermes-lab/reports/phase0-multi-runtime-policy.json`、`codeweaver-hermes-lab/docs/DECISION_LOG.md`、`codeweaver-hermes-lab/README.md`。文中所有状态数字与结论均取自这些文件，未做推测。

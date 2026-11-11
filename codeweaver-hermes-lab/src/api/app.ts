@@ -383,6 +383,17 @@ async function route(
     return { status: 202, body: { executionId: id, status: "cancelling" } };
   }
 
+  if (method === "POST" && matches(segments, ["api", "v1", "executions", ":id", "follow-up"])) {
+    const id = segments[3]!;
+    const prompt = readPrompt(body);
+    // A follow-up needs the live session: the transcript the runtime keeps lives in this process.
+    if (!deps.coordinator.isLive(id)) {
+      throw new ApiError(409, "execution_not_live", `Execution ${id} is not running in this server process`);
+    }
+    const execution = await deps.coordinator.followUp(id, prompt);
+    return { status: 202, body: { executionId: execution.executionId, status: execution.status } };
+  }
+
   if (method === "POST" && matches(segments, ["api", "v1", "executions", ":id", "retry"])) {
     const id = segments[3]!;
     const result = await deps.coordinator.recover(id);
@@ -863,6 +874,16 @@ function readDecision(body: unknown): { decision: "approve" | "deny"; reason?: s
   }
   const reason = record["reason"];
   return { decision, ...(typeof reason === "string" && reason ? { reason } : {}) };
+}
+
+/** The prompt of a follow-up turn. */
+function readPrompt(body: unknown): string {
+  const record = (body ?? {}) as Record<string, unknown>;
+  const prompt = record["prompt"];
+  if (typeof prompt !== "string" || prompt.trim() === "") {
+    throw new ApiError(400, "invalid_body", "Field 'prompt' must be a non-empty string");
+  }
+  return prompt;
 }
 
 /** The optional reason a human gives with an approval decision. */
