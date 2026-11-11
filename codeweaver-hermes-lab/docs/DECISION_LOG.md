@@ -713,3 +713,54 @@ parent to the root in both directions; the parent's `subagent.spawned` fact and 
 and the lineage of a chosen parent, so the structure is visible without reading the journal.
 Consequence: P0-008 is signed off against Pi, and the Phase 0 count is 10 of 24. The rule worth
 keeping: delegation inherits the runtime, it never chooses one.
+## D-063: A runtime is scored by what it did; a claim is not a capability
+Status: accepted
+Context: the scheduler had three strategies and the console had a runtime picker, and both were
+invisible as claims: the picker is "one runtime, chosen by hand", and nothing said how the two
+registered runtimes compared. There was no capability score at all — `skillEffectiveness()` scores
+skills, and the only capability numbers in the system were the runtime's own declaration.
+`getCapabilities()` answers "what does this runtime claim?", and a claim is the one thing a
+runtime controls, so it cannot be evidence about the runtime.
+The gap had a second half that was harder to notice: two runtimes could be registered and one
+could be picked, but nothing had ever proven that the second runtime was reachable, that naming it
+put the task on it, or that naming a runtime that does not exist was refused rather than quietly
+redirected. D-047 said the last one was the rule; there was no evidence that the rule held when two
+real runtimes were registered at once.
+Decision: a runtime's quality is a number computed from what the journal recorded, and the
+declaration is an input rather than the answer. Three dimensions of the score come straight from
+the decision log: reliability counts only decided outcomes and a failure is a failure (D-020);
+cancellation counts only cancellations the runtime itself confirmed (D-052); capability
+realization counts only capabilities that were declared, were put in play by the task, and were
+demonstrated in the records (D-043, D-008). A dimension with no evidence is dropped and its weight
+is redistributed, so a runtime is never punished for a measurement nobody took — and a runtime with
+no evidence at all has no score, which is "unmeasured", not "bad".
+The "put in play by the task" part is the subtle one. Scoring the observed set alone would credit a
+runtime for capabilities nobody asked of it and punish it for ones the model chose not to use, so
+the caller states what the workload exercised: tools were bound, a skill was bound, a subagent was
+spawned, a stop was requested, a run was resumed. What the runtime then did with that chance is
+what the records say.
+The console shows the score, the dimensions with their stated reasons, and — because a score
+computed from one measured dimension is a number that reads too well — how many of the five
+dimensions actually had evidence. The known caveat is written down rather than hidden: a runtime
+with only reliability measured scores 100, and the coverage line is what stops that from being
+read as a verdict.
+Evidence: the probe runs against both real runtimes at once — the pinned Hermes 0.23.0 gateway over
+HTTP and Pi in-process on a real MiniMax M3. All six checks passed. `round_robin` alternated
+`hermes-local > pi-local > hermes-local`; `least_loaded` picked `hermes-local` while the load was
+equal and switched to `pi-local` once `hermes-local` was marked busy; `first_healthy` picked
+`hermes-local`. The capability filter runs before the balancing (D-025): requiring
+`toolEvents=true` excluded `hermes-local`, which declares only `streaming`, and selected
+`pi-local`. Naming `pi-local` ran on `pi-local` and succeeded in 4.0 s with the requested token in
+the output; naming `hermes-local` ran on `hermes-local` and succeeded in 7.1 s; naming
+`no-such-runtime` was refused with `Unknown runtime no-such-runtime` and no execution was created.
+The two runtimes then scored from the journal: `hermes-local` 12 417 tokens per successful
+execution at 6 648 ms average, `pi-local` 208 tokens at 3 706 ms — a real, reproducible difference
+in cost and latency that no declaration could have shown. Report:
+`reports/phase0-multi-runtime-policy.json`. The probe's verdict logic has unit tests, including the
+cases where the server runs the task on a runtime nobody named, accepts a runtime that does not
+exist, or where round robin has nothing to alternate to — a probe that cannot fail is not
+evidence.
+Consequence: the runtime registry page carries a score that is computed from records and shows
+what it was computed from. The score does not join the 24-item Phase 0 list: it is a new kind of
+evidence with its own id and its own report, the same way skill delivery was kept out of the
+denominator.

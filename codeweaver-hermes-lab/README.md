@@ -333,6 +333,53 @@ The skill body is injected into the task prompt, which is the only channel every
 the Hermes HTTP surface accepts a single `input` string and no system prompt, so a second channel
 would have meant two behaviours for one feature (D-061).
 
+## Multi-runtime policy and runtime scoring
+
+```bash
+npm run validate:multi-runtime-policy
+```
+
+Runs against **both** real runtimes at once — the pinned Hermes 0.23.0 gateway over HTTP and Pi
+in-process on a real MiniMax M3 — and writes `reports/phase0-multi-runtime-policy.json`. The keys
+are read from the pinned runtime's own profile, so nothing is written to the repository and nothing
+is passed on a command line.
+
+| Check | Why |
+|---|---|
+| `round_robin` alternates between the runtimes | a scheduler that always picks the first candidate is not distributing work |
+| `least_loaded` moves off a busy runtime | the load map has to matter |
+| the capability filter runs before the balancing | D-025: a runtime that cannot do the job is not a candidate, however idle it is |
+| naming `pi-local` runs on `pi-local` | D-047: the runtime the caller asked for is the runtime that runs |
+| naming a runtime that does not exist is refused | a refusal with the name in it, not a silent fallback to the default |
+| both runtimes really finish a task | a policy that is only ever exercised against a stub proves nothing |
+
+The probe's verdict logic has unit tests, including the cases where the server runs the task on a
+runtime nobody named or accepts a runtime that does not exist — a probe that cannot fail is not
+evidence.
+
+`src/adapters/runtime-scoring.ts` turns the recorded runs into a comparable number, and
+`src/adapters/runtime-score-report.ts` reads it from the journal and the registry:
+
+```ts
+const score = scoreRuntime({
+  runtimeId: "pi-local",
+  runtimeType: "native",
+  capabilityEvidence: { declared, exercised, observed },
+  executions: observationsFromJournal(entries)
+});
+```
+
+Five dimensions, each with a stated reason and a weight: reliability, cancellation honesty
+(D-052), capability realization (D-043, D-008), evaluation outcome (D-020) and cost efficiency.
+A dimension with no evidence is dropped and its weight redistributed — a runtime is never punished
+for a measurement nobody took — and a runtime with no evidence at all has no score, which is
+"unmeasured", not "bad". The declaration is an *input*: what the runtime claims, what the task
+put in play, and what the records show are three different things.
+
+`GET /api/v1/runtimes/scores` serves the report and the console shows it, with the coverage
+("2/5 dimensions have evidence") next to the score, because a score computed from one measured
+dimension reads too well on its own (D-063).
+
 ## Code change pipeline
 
 `src/code-engine/` enforces design 7.3: the agent proposes a patch, Code Engine validates and applies
