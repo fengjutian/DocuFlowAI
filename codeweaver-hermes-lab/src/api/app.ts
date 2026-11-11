@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { AgentAdapterError } from "../types/adapter.js";
 import type { AgentRuntimeRegistry } from "../adapters/runtime-registry.js";
+import { collectRuntimeScores } from "../adapters/runtime-score-report.js";
 import type { RuntimeScheduler } from "../adapters/runtime-scheduler.js";
 import type { SubagentManager } from "../orchestrator/subagent-manager.js";
 import type { JournalStore } from "../journal/journal.js";
@@ -184,6 +185,13 @@ async function route(
         }))
       }
     };
+  }
+
+  // Before the `:id` route on purpose: `scores` is a literal segment, and a literal segment that
+  // arrives after a wildcard never gets reached.
+  if (method === "GET" && matches(segments, ["api", "v1", "runtimes", "scores"])) {
+    const report = await collectRuntimeScores({ registry: deps.registry, journal: deps.journal });
+    return { status: 200, body: report };
   }
 
   if (method === "GET" && matches(segments, ["api", "v1", "runtimes", ":id"])) {

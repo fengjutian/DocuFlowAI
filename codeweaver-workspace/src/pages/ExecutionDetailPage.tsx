@@ -510,18 +510,18 @@ export function ExecutionDetailPage() {
                   {skills.data?.bindings && skills.data.bindings.length > 0 ? (
                     <ul className="space-y-2">
                       {skills.data.bindings.map(binding => {
-                        const key = `${binding.skillId}@${binding.version}`;
+                        const key = `${binding.skillId}@${binding.skillVersion}`;
                         const manifest = registry.data?.skills.find(
-                          skill => skill.skillId === binding.skillId && skill.version === binding.version
+                          skill => skill.skillId === binding.skillId && skill.version === binding.skillVersion
                         );
                         // The delivery record says the body reached the runtime. A binding without
                         // one is a skill that was authorized and then dropped.
                         const delivery = deliveries.find(
-                          item => item.skillId === binding.skillId && item.version === binding.version
+                          item => item.skillId === binding.skillId && item.version === binding.skillVersion
                         );
                         return (
                           <li
-                            key={`${binding.skillId}-${binding.version}`}
+                            key={`${binding.skillId}-${binding.skillVersion}`}
                             className="space-y-1.5 rounded-md border border-border/60 bg-background/40 px-2 py-1.5 text-xs"
                           >
                             <div className="flex items-center justify-between gap-2">

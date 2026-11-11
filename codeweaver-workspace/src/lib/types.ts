@@ -21,6 +21,101 @@ export interface RuntimeHealth {
   error?: string;
 }
 
+/**
+ * One scoring dimension of a runtime.
+ *
+ * A dimension with no evidence is `measured: false` and carries no weight: an unmeasured runtime
+ * is not a bad runtime, it is an unmeasured one. `detail` says what was measured and why the
+ * dimension is weighted the way it is.
+ */
+export interface RuntimeScoreDimension {
+  key: string;
+  weight: number;
+  effectiveWeight: number;
+  measured: boolean;
+  /** 0..1, or null when the dimension had no evidence. */
+  score: number | null;
+  detail: string;
+  raw: Record<string, unknown>;
+}
+
+/** The raw counters behind a runtime's score. Every number here comes from a record. */
+export interface RuntimeMetrics {
+  executions: number;
+  succeeded: number;
+  failed: number;
+  cancelled: number;
+  interrupted: number;
+  unfinished: number;
+  successRate: number | null;
+  cancelRequests: number;
+  cancelConfirmed: number;
+  cancelConfirmationRate: number | null;
+  toolEventsObserved: boolean;
+  toolEventCount: number;
+  executionsWithToolEvents: number;
+  permissionEventsObserved: boolean;
+  permissionEventCount: number;
+  executionsWithPermissionEvents: number;
+  messageDeltas: number;
+  averageDurationMs: number | null;
+  totalTokens: number;
+  averageTokensPerExecution: number | null;
+  tokensPerSuccessfulExecution: number | null;
+  evaluations: number;
+  evaluationsPassed: number;
+  evaluationPassRate: number | null;
+  declaredCapabilities: string[];
+  observedCapabilities: string[];
+  /** Declared true, but the records show no evidence of it. */
+  declaredNotObserved: string[];
+  /** Demonstrated in the records, but never declared by the runtime. */
+  observedNotDeclared: string[];
+  /** Declared true, put in play by the task, and demonstrated. */
+  realizedCapabilities: string[];
+}
+
+export interface RuntimeScore {
+  runtimeId: string;
+  runtimeType: string;
+  version?: string;
+  /** 0..100, or null when no dimension had any evidence at all. */
+  score: number | null;
+  dimensions: RuntimeScoreDimension[];
+  metrics: RuntimeMetrics;
+  /** Dimensions that had no evidence and therefore carried no weight. */
+  unmeasuredDimensions: string[];
+}
+
+export interface RuntimeComparisonRow {
+  runtimeId: string;
+  runtimeType: string;
+  version?: string;
+  score: number | null;
+  successRate: number | null;
+  cancelConfirmationRate: number | null;
+  capabilityRealization: number | null;
+  evaluationPassRate: number | null;
+  averageDurationMs: number | null;
+  tokensPerSuccessfulExecution: number | null;
+  declaredCapabilities: string[];
+  observedCapabilities: string[];
+}
+
+export interface RuntimeComparison {
+  /** Highest score first; runtimes without a score come last. */
+  rows: RuntimeComparisonRow[];
+  lines: string[];
+}
+
+export interface RuntimeScoreReport {
+  runtimes: RuntimeScore[];
+  comparison: RuntimeComparison;
+  /** Executions in the journal that named no runtime; counted, attributed to nobody. */
+  unattributedExecutions: number;
+  executionsInJournal: number;
+}
+
 export type AgentRuntimeType = "hermes" | "native" | "acp" | "external";
 
 export type AgentExecutionStatus =
@@ -222,11 +317,20 @@ export interface SkillManifest {
   deprecated?: boolean;
 }
 
+/**
+ * A skill bound to one execution.
+ *
+ * The field is `skillVersion`, not `version`: the binding names the exact skill version the
+ * execution ran, and a binding that cannot name it cannot answer "which skill did this run use".
+ */
 export interface SkillBinding {
+  id?: string;
   skillId: string;
-  version: string;
+  skillVersion: string;
   executionId?: string;
-  status?: string;
+  policyId?: string;
+  enabled?: boolean;
+  createdAt?: string;
   [key: string]: unknown;
 }
 

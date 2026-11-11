@@ -188,6 +188,69 @@ test("lists registered runtimes", async () => {
   }
 });
 
+test("scores the runtimes from what the journal recorded", async () => {
+  const journal = new InMemoryJournalStore();
+  await journal.append({
+    executionId: "exec-1",
+    sequence: 1,
+    kind: "audit",
+    category: "execution.runtime",
+    recordedAt: "2026-11-11T00:00:00.000Z",
+    payload: { runtimeId: "hermes-local" }
+  });
+  await journal.append({
+    executionId: "exec-1",
+    sequence: 2,
+    eventSequence: 1,
+    kind: "runtime.event",
+    category: "execution.started",
+    recordedAt: "2026-11-11T00:00:01.000Z",
+    payload: {}
+  });
+  await journal.append({
+    executionId: "exec-1",
+    sequence: 3,
+    eventSequence: 2,
+    kind: "runtime.event",
+    category: "execution.completed",
+    recordedAt: "2026-11-11T00:00:04.000Z",
+    payload: {}
+  });
+
+  const app = await harness({ journal });
+  try {
+    const response = await fetch(`${app.url}/api/v1/runtimes/scores`);
+    const body = await response.json() as {
+      runtimes: Array<{ runtimeId: string; metrics: { executions: number; succeeded: number } }>;
+      comparison: { rows: Array<{ runtimeId: string }> };
+      executionsInJournal: number;
+    };
+
+    assert.equal(response.status, 200);
+    assert.equal(body.executionsInJournal, 1);
+    const hermes = body.runtimes.find(item => item.runtimeId === "hermes-local");
+    assert.equal(hermes?.metrics.executions, 1);
+    assert.equal(hermes?.metrics.succeeded, 1);
+    assert.equal(body.comparison.rows[0]?.runtimeId, "hermes-local");
+  } finally {
+    await app.close();
+  }
+});
+
+test("a runtime id of 'scores' is not mistaken for a runtime name", async () => {
+  const app = await harness();
+  try {
+    const response = await fetch(`${app.url}/api/v1/runtimes/scores`);
+    assert.equal(response.status, 200);
+
+    // The literal route wins over the `:id` wildcard, and a real name still resolves as a runtime.
+    const named = await fetch(`${app.url}/api/v1/runtimes/hermes-local`);
+    assert.equal(named.status, 200);
+  } finally {
+    await app.close();
+  }
+});
+
 test("creates an execution for a task", async () => {
   const app = await harness();
   try {

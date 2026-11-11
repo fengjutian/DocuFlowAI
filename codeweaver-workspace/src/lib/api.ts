@@ -11,6 +11,7 @@ import type {
   RuntimeEntry,
   RuntimeHealth,
   RuntimePermissionRequest,
+  RuntimeScoreReport,
   SkillBinding,
   SkillManifest,
   StartTaskInput,
@@ -90,6 +91,9 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 
 export const api = {
   listRuntimes: () => request<{ runtimes: RuntimeEntry[] }>("/api/v1/runtimes"),
+
+  /** The capability score of every runtime, computed from what the journal recorded. */
+  runtimeScores: () => request<RuntimeScoreReport>("/api/v1/runtimes/scores"),
 
   healthCheck: (runtimeId: string) =>
     request<RuntimeHealth>(`/api/v1/runtimes/${encodeURIComponent(runtimeId)}/health-check`, {
