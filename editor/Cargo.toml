@@ -8,6 +8,7 @@ members = [
     "crates/platform",
     "crates/render",
     "crates/text",
+    "crates/ui",
     "crates/workspace",
 ]
 default-members = ["crates/app"]

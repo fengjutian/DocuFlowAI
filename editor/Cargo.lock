@@ -315,6 +315,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "codeweaver-ui"
+version = "0.1.0"
+dependencies = [
+ "codeweaver-text",
+]
+
+[[package]]
 name = "codeweaver-workspace"
 version = "0.1.0"
 dependencies = [

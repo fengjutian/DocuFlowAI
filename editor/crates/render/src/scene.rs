@@ -84,6 +84,14 @@ pub struct Quad {
     pub clip: Rect,
 }
 
+/// The family a run of text is drawn in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextFamily {
+    #[default]
+    SansSerif,
+    Monospace,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct GlyphRun {
     pub text: String,
@@ -92,6 +100,7 @@ pub struct GlyphRun {
     pub color: Color,
     pub font_size: f32,
     pub line_height: f32,
+    pub family: TextFamily,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -100,6 +109,7 @@ pub struct TextStyle {
     pub color: Color,
     pub font_size: f32,
     pub line_height: f32,
+    pub family: TextFamily,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -140,6 +150,7 @@ impl FrameScene {
                 color: style.color,
                 font_size: style.font_size,
                 line_height: style.line_height,
+                family: style.family,
             });
         }
     }

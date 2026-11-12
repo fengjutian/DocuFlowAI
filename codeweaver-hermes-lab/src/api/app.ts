@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { AgentAdapterError } from "../types/adapter.js";
 import type { AgentRuntimeRegistry } from "../adapters/runtime-registry.js";
+import { AuditTimelineService } from "../persistence/audit-timeline.js";
 import { collectRuntimeScores } from "../adapters/runtime-score-report.js";
 import type { RuntimeScheduler } from "../adapters/runtime-scheduler.js";
 import type { SubagentManager } from "../orchestrator/subagent-manager.js";
@@ -240,6 +241,38 @@ async function route(
     // Design 15: "从任务查询所有 Hermes 执行记录" — the task is the head of the chain.
     const traces = await deps.taskService.traceTask(taskId);
     return { status: 200, body: { taskId, executions: traces } };
+  }
+
+  if (method === "GET" && matches(segments, ["api", "v1", "audit", "timeline"])) {
+    // Design 15: "从审计事件还原完整执行过程". The timeline is read from the journal — the same
+    // append-only record the live stream replays — so it cannot disagree with what a client was
+    // told while it was listening.
+    const executionId = url.searchParams.get("executionId");
+    if (executionId) {
+      // An execution that never existed must be told apart from one that recorded nothing: an empty
+      // timeline for a mistyped id reads exactly like a real but silent run.
+      await assertExecutionRecorded(executionId, deps);
+    }
+    const since = url.searchParams.get("since");
+    if (since !== null && Number.isNaN(Date.parse(since))) {
+      throw new ApiError(400, "invalid_since", "since must be an ISO timestamp");
+    }
+    const rawLimit = url.searchParams.get("limit");
+    let limit: number | undefined;
+    if (rawLimit !== null) {
+      limit = Number(rawLimit);
+      if (!Number.isInteger(limit) || limit <= 0) {
+        throw new ApiError(400, "invalid_limit", "limit must be a positive integer");
+      }
+    }
+    const timeline = await new AuditTimelineService(deps.journal).build({
+      ...(url.searchParams.get("taskId") ? { taskId: url.searchParams.get("taskId")! } : {}),
+      ...(executionId ? { executionId } : {}),
+      ...(url.searchParams.get("category") ? { category: url.searchParams.get("category")! } : {}),
+      ...(since ? { since } : {}),
+      ...(limit !== undefined ? { limit } : {})
+    });
+    return { status: 200, body: timeline };
   }
 
   // Before the `:id` route on purpose: the list is a literal segment, and a literal segment that

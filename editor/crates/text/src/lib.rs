@@ -171,6 +171,31 @@ impl Buffer {
         self.rope.len_lines()
     }
 
+    /// The byte range of a line, without its line break.
+    ///
+    /// The last line of a document that ends with a newline is empty, which
+    /// matches how an editor shows the cursor on the line after the last one.
+    pub fn line_range(&self, line: usize) -> Range<TextOffset> {
+        let line = line.min(self.rope.len_lines().saturating_sub(1));
+        let start_char = self.rope.line_to_char(line);
+        let end_char = self.rope.line_to_char(line + 1);
+        // The line break belongs to the line, but not to its text. The last
+        // line of a document without a trailing newline has no break, and
+        // dropping a character there would lose text.
+        let end_char = if end_char > start_char && self.rope.char(end_char - 1) == '\n' {
+            end_char - 1
+        } else {
+            end_char
+        };
+        TextOffset(self.rope.char_to_byte(start_char))..TextOffset(self.rope.char_to_byte(end_char))
+    }
+
+    /// The text of a line, without its line break.
+    pub fn line_text(&self, line: usize) -> String {
+        let range = self.line_range(line);
+        self.slice(range)
+    }
+
     pub fn version(&self) -> BufferVersion {
         self.version
     }
@@ -495,5 +520,40 @@ mod tests {
             &buffer.slice(TextOffset(49_995)..TextOffset(50_012)),
             "aaaaamiddleaaaaaa"
         );
+    }
+
+    #[test]
+    fn lines_are_addressed_by_index() {
+        let buffer = Buffer::new("first\nsecond\nthird\n");
+        assert_eq!(buffer.line_count(), 4);
+        assert_eq!(buffer.line_text(0), "first");
+        assert_eq!(buffer.line_text(1), "second");
+        assert_eq!(buffer.line_text(2), "third");
+        // A document that ends with a newline has an empty last line.
+        assert_eq!(buffer.line_text(3), "");
+        assert_eq!(buffer.line_range(1), TextOffset(6)..TextOffset(12));
+    }
+
+    #[test]
+    fn a_document_without_a_trailing_newline_has_no_empty_last_line() {
+        let buffer = Buffer::new("only\nline");
+        assert_eq!(buffer.line_count(), 2);
+        assert_eq!(buffer.line_text(1), "line");
+    }
+
+    #[test]
+    fn an_empty_document_has_one_empty_line() {
+        let buffer = Buffer::new("");
+        assert_eq!(buffer.line_count(), 1);
+        assert_eq!(buffer.line_text(0), "");
+        assert_eq!(buffer.line_range(0), TextOffset(0)..TextOffset(0));
+    }
+
+    #[test]
+    fn unicode_lines_keep_their_boundaries() {
+        let buffer = Buffer::new("中文\nline\n");
+        assert_eq!(buffer.line_count(), 3);
+        assert_eq!(buffer.line_text(0), "中文");
+        assert_eq!(buffer.line_range(0), TextOffset(0)..TextOffset(6));
     }
 }

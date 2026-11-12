@@ -7,7 +7,7 @@ use glyphon::{
     Attrs, Buffer, Cache, Color as TextColor, Family, FontSystem, Metrics, Resolution, Shaping,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
-pub use scene::{Color, FrameScene, GlyphRun, Point, Quad, Rect, Size, TextStyle};
+pub use scene::{Color, FrameScene, GlyphRun, Point, Quad, Rect, Size, TextFamily, TextStyle};
 use thiserror::Error;
 use winit::{dpi::PhysicalSize, window::Window};
 
@@ -62,6 +62,98 @@ pub struct Renderer {
     quad_buffer: wgpu::Buffer,
     quad_capacity: usize,
     text: TextState,
+}
+
+/// The measured shape of a run of text.
+///
+/// The renderer is the only place that knows how the text is actually shaped,
+/// so the editor asks it where every character ends up instead of guessing
+/// from a font size. Guessing is how a caret ends up between two characters.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MeasuredText {
+    /// The x offset of every byte boundary, in logical pixels.
+    ///
+    /// The vector has one more entry than the text has bytes: the last entry
+    /// is the width of the whole run. The bytes inside one character share
+    /// the character's start offset.
+    pub boundaries: Vec<f32>,
+    /// The width of the run.
+    pub width: f32,
+}
+
+impl MeasuredText {
+    /// The x offset of a byte offset within the measured text.
+    pub fn offset_at(&self, byte_offset: usize) -> f32 {
+        self.boundaries
+            .get(byte_offset)
+            .copied()
+            .unwrap_or(self.width)
+    }
+}
+
+impl Renderer {
+    /// Measures a run of text the way the renderer would draw it.
+    ///
+    /// The measurement uses the same shaping path as the drawing, so a caret
+    /// placed with these numbers lands exactly on the glyph.
+    pub fn measure_text(&mut self, text: &str, font_size: f32, family: TextFamily) -> MeasuredText {
+        if text.is_empty() {
+            return MeasuredText {
+                boundaries: vec![0.0],
+                width: 0.0,
+            };
+        }
+
+        let mut buffer = Buffer::new(
+            &mut self.text.font_system,
+            Metrics::new(font_size, font_size * 1.3),
+        );
+        buffer.set_text(
+            &mut self.text.font_system,
+            text,
+            &Attrs::new().family(match family {
+                TextFamily::SansSerif => Family::SansSerif,
+                TextFamily::Monospace => Family::Monospace,
+            }),
+            Shaping::Advanced,
+        );
+        let layout = buffer.layout_runs();
+
+        // The x offset of the start of every character cluster.
+        let mut marks: Vec<Option<f32>> = vec![None; text.len() + 1];
+        let mut width = 0.0;
+        for run in layout {
+            for glyph in run.glyphs {
+                if glyph.start < marks.len() {
+                    marks[glyph.start] = Some(glyph.x);
+                }
+            }
+            width += run.line_w;
+        }
+        if let Some(last) = marks.last_mut() {
+            *last = Some(width);
+        }
+
+        // The bytes inside one character have no glyph of their own; they
+        // share the character's start offset.
+        let mut last = 0.0;
+        let mut boundaries = Vec::with_capacity(marks.len());
+        for mark in marks {
+            let offset = match mark {
+                Some(offset) => {
+                    last = offset;
+                    offset
+                }
+                None => last,
+            };
+            boundaries.push(offset);
+        }
+
+        MeasuredText {
+            boundaries,
+            width,
+        }
+    }
 }
 
 impl Renderer {
@@ -240,7 +332,10 @@ impl Renderer {
             buffer.set_text(
                 &mut self.text.font_system,
                 &run.text,
-                &Attrs::new().family(Family::SansSerif),
+                &Attrs::new().family(match run.family {
+                    TextFamily::SansSerif => Family::SansSerif,
+                    TextFamily::Monospace => Family::Monospace,
+                }),
                 Shaping::Advanced,
             );
             buffer.shape_until_scroll(&mut self.text.font_system, false);
