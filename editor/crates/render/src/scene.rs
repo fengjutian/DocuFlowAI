@@ -93,7 +93,7 @@ pub struct Quad {
 }
 
 /// The family a run of text is drawn in.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TextFamily {
     #[default]
     SansSerif,

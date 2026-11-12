@@ -1,6 +1,6 @@
 mod scene;
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use bytemuck::{Pod, Zeroable};
 use glyphon::{
@@ -42,12 +42,11 @@ struct QuadInstance {
 }
 
 struct TextState {
-    font_system: FontSystem,
+    shaper: TextShaper,
     swash_cache: SwashCache,
     atlas: TextAtlas,
     viewport: Viewport,
     renderer: TextRenderer,
-    buffers: Vec<Buffer>,
 }
 
 /// Owns all GPU resources for one window and consumes immutable `FrameScene`s.
@@ -91,65 +90,328 @@ impl MeasuredText {
     }
 }
 
+/// Measures text the way the renderer draws it.
+///
+/// Measuring needs the font system and the shaping, but no GPU. Keeping that
+/// apart from the renderer means the measurements can be taken on their own —
+/// by the benchmarks, and by anything that only needs to know where the
+/// characters of a run of text are.
+///
+/// Shaping a line is the most expensive thing the editor does: a line of
+/// thirty characters costs about as much as a frame is allowed to take. The
+/// text on screen does not change from frame to frame, so every shaped run is
+/// kept and reused.
+pub struct TextShaper {
+    font_system: FontSystem,
+    shapes: ShapeCache,
+}
+
+/// How many shaped runs are kept at the same time.
+///
+/// The editor only draws the lines that are on screen, so a few thousand
+/// runs are more than enough. When the cache is full the run that has not
+/// been used for the longest time is dropped.
+const SHAPE_CACHE_CAPACITY: usize = 2048;
+
+/// The key a shaped run is cached under.
+///
+/// The text is part of the key: two runs with the same text, size and family
+/// are shaped the same way.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ShapeKey {
+    text: String,
+    font_size: u32,
+    line_height: u32,
+    family: TextFamily,
+    width: Option<u32>,
+    height: Option<u32>,
+}
+
+/// A shaped run of text: the glyphs to draw and where the bytes are.
+struct ShapedText {
+    /// The buffer the glyphs are drawn from.
+    buffer: Buffer,
+    /// The x offset of every byte boundary, in the units the text was shaped
+    /// at.
+    boundaries: Vec<f32>,
+    /// The width of the run.
+    width: f32,
+}
+
+impl ShapedText {
+    /// The buffer the glyphs are drawn from.
+    fn buffer(&self) -> &Buffer {
+        &self.buffer
+    }
+}
+
+/// A handle to a shaped run in the cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShapeId(usize);
+
+/// One entry of the shape cache.
+struct CacheEntry {
+    key: ShapeKey,
+    shaped: ShapedText,
+    /// When the entry was last used, so the oldest one can be dropped.
+    used: u64,
+}
+
+/// The shaped runs the editor has already paid for.
+struct ShapeCache {
+    entries: Vec<Option<CacheEntry>>,
+    index: HashMap<ShapeKey, usize>,
+    free: Vec<usize>,
+    clock: u64,
+}
+
+impl ShapeCache {
+    fn new() -> Self {
+        ShapeCache {
+            entries: Vec::new(),
+            index: HashMap::new(),
+            free: Vec::new(),
+            clock: 0,
+        }
+    }
+
+    /// Returns the run for `key`, shaping it when it is not cached yet.
+    fn get_or_shape(&mut self, key: ShapeKey, shape: impl FnOnce() -> ShapedText) -> ShapeId {
+        self.clock += 1;
+        let clock = self.clock;
+
+        if let Some(&index) = self.index.get(&key) {
+            if let Some(entry) = self.entries[index].as_mut() {
+                entry.used = clock;
+            }
+            return ShapeId(index);
+        }
+
+        let shaped = shape();
+        let index = match self.free.pop() {
+            Some(index) => {
+                self.entries[index] = Some(CacheEntry {
+                    key: key.clone(),
+                    shaped,
+                    used: clock,
+                });
+                index
+            }
+            None => {
+                if self.entries.len() >= SHAPE_CACHE_CAPACITY {
+                    self.drop_the_oldest();
+                }
+                self.entries.push(Some(CacheEntry {
+                    key: key.clone(),
+                    shaped,
+                    used: clock,
+                }));
+                self.entries.len() - 1
+            }
+        };
+        self.index.insert(key, index);
+        ShapeId(index)
+    }
+
+    /// The shaped run a handle points at.
+    fn get(&self, id: ShapeId) -> &ShapedText {
+        &self
+            .entries
+            .get(id.0)
+            .and_then(|entry| entry.as_ref())
+            .expect("the run was cached")
+            .shaped
+    }
+
+    /// Drops the run that has not been used for the longest time.
+    fn drop_the_oldest(&mut self) {
+        let oldest = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| entry.as_ref().map(|entry| (entry.used, index)))
+            .min_by_key(|(used, _)| *used)
+            .map(|(_, index)| index);
+        if let Some(index) = oldest
+            && let Some(entry) = self.entries[index].take()
+        {
+            self.index.remove(&entry.key);
+            self.free.push(index);
+        }
+    }
+}
+
+impl Default for TextShaper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TextShaper {
+    pub fn new() -> Self {
+        TextShaper {
+            font_system: FontSystem::new(),
+            shapes: ShapeCache::new(),
+        }
+    }
+
+    /// Measures a run of text at `font_size`.
+    ///
+    /// The measurement uses the same shaping path as the drawing, so a caret
+    /// placed with these numbers lands exactly on the glyph.
+    pub fn measure(&mut self, text: &str, font_size: f32, family: TextFamily) -> MeasuredText {
+        // The line height only moves the text up and down; the horizontal
+        // positions the caret needs do not depend on it.
+        let line_height = font_size * 1.3;
+        let key = ShapeKey {
+            text: text.to_owned(),
+            font_size: font_size.to_bits(),
+            line_height: line_height.to_bits(),
+            family,
+            width: None,
+            height: None,
+        };
+        let TextShaper {
+            font_system,
+            shapes,
+        } = self;
+        let id = shapes.get_or_shape(key, || {
+            shape_text(
+                font_system,
+                text,
+                font_size,
+                line_height,
+                family,
+                None,
+                None,
+            )
+        });
+        let shaped = shapes.get(id);
+        MeasuredText {
+            boundaries: shaped.boundaries.clone(),
+            width: shaped.width,
+        }
+    }
+
+    /// Drops every shaped run.
+    ///
+    /// The shapes are only wrong when the font or the size changes, and then
+    /// all of them are wrong at once.
+    pub fn clear_cache(&mut self) {
+        self.shapes = ShapeCache::new();
+    }
+
+    /// Shapes a run of text the way the drawing does, and keeps it.
+    ///
+    /// The size of the run is part of the shape: the drawing gives a run a
+    /// width so the renderer does not wrap the text a second time.
+    pub fn shape(
+        &mut self,
+        text: &str,
+        font_size: f32,
+        line_height: f32,
+        family: TextFamily,
+        width: Option<f32>,
+        height: Option<f32>,
+    ) -> ShapeId {
+        let key = ShapeKey {
+            text: text.to_owned(),
+            font_size: font_size.to_bits(),
+            line_height: line_height.to_bits(),
+            family,
+            width: width.map(f32::to_bits),
+            height: height.map(f32::to_bits),
+        };
+        let TextShaper {
+            font_system,
+            shapes,
+        } = self;
+        shapes.get_or_shape(key, || {
+            shape_text(
+                font_system,
+                text,
+                font_size,
+                line_height,
+                family,
+                width,
+                height,
+            )
+        })
+    }
+}
+
+/// Shapes a run of text and works out where its byte boundaries are.
+fn shape_text(
+    font_system: &mut FontSystem,
+    text: &str,
+    font_size: f32,
+    line_height: f32,
+    family: TextFamily,
+    width: Option<f32>,
+    height: Option<f32>,
+) -> ShapedText {
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, line_height));
+    if let Some(width) = width {
+        buffer.set_size(font_system, Some(width), height);
+    }
+    buffer.set_text(
+        font_system,
+        text,
+        &Attrs::new().family(match family {
+            TextFamily::SansSerif => Family::SansSerif,
+            TextFamily::Monospace => Family::Monospace,
+        }),
+        Shaping::Advanced,
+    );
+    buffer.shape_until_scroll(font_system, false);
+
+    // The x offset of the start of every character cluster.
+    let mut marks: Vec<Option<f32>> = vec![None; text.len() + 1];
+    let mut run_width: f32 = 0.0;
+    for run in buffer.layout_runs() {
+        for glyph in run.glyphs {
+            if glyph.start < marks.len() {
+                marks[glyph.start] = Some(glyph.x);
+            }
+        }
+        // Every run of a line reports the width of the whole line, so the
+        // runs are not added up: a line with two scripts has two runs, and
+        // adding them would make the line twice as wide as it is.
+        run_width = run_width.max(run.line_w);
+    }
+    if let Some(last) = marks.last_mut() {
+        *last = Some(run_width);
+    }
+
+    // The bytes inside one character have no glyph of their own; they
+    // share the character's start offset.
+    let mut last = 0.0;
+    let mut boundaries = Vec::with_capacity(marks.len());
+    for mark in marks {
+        let offset = match mark {
+            Some(offset) => {
+                last = offset;
+                offset
+            }
+            None => last,
+        };
+        boundaries.push(offset);
+    }
+
+    ShapedText {
+        buffer,
+        boundaries,
+        width: run_width,
+    }
+}
+
 impl Renderer {
     /// Measures a run of text the way the renderer would draw it.
     ///
     /// The measurement uses the same shaping path as the drawing, so a caret
     /// placed with these numbers lands exactly on the glyph.
     pub fn measure_text(&mut self, text: &str, font_size: f32, family: TextFamily) -> MeasuredText {
-        if text.is_empty() {
-            return MeasuredText {
-                boundaries: vec![0.0],
-                width: 0.0,
-            };
-        }
-
-        let mut buffer = Buffer::new(
-            &mut self.text.font_system,
-            Metrics::new(font_size, font_size * 1.3),
-        );
-        buffer.set_text(
-            &mut self.text.font_system,
-            text,
-            &Attrs::new().family(match family {
-                TextFamily::SansSerif => Family::SansSerif,
-                TextFamily::Monospace => Family::Monospace,
-            }),
-            Shaping::Advanced,
-        );
-        let layout = buffer.layout_runs();
-
-        // The x offset of the start of every character cluster.
-        let mut marks: Vec<Option<f32>> = vec![None; text.len() + 1];
-        let mut width = 0.0;
-        for run in layout {
-            for glyph in run.glyphs {
-                if glyph.start < marks.len() {
-                    marks[glyph.start] = Some(glyph.x);
-                }
-            }
-            width += run.line_w;
-        }
-        if let Some(last) = marks.last_mut() {
-            *last = Some(width);
-        }
-
-        // The bytes inside one character have no glyph of their own; they
-        // share the character's start offset.
-        let mut last = 0.0;
-        let mut boundaries = Vec::with_capacity(marks.len());
-        for mark in marks {
-            let offset = match mark {
-                Some(offset) => {
-                    last = offset;
-                    offset
-                }
-                None => last,
-            };
-            boundaries.push(offset);
-        }
-
-        MeasuredText { boundaries, width }
+        self.text.shaper.measure(text, font_size, family)
     }
 }
 
@@ -205,12 +467,11 @@ impl Renderer {
         let renderer =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
         let text = TextState {
-            font_system: FontSystem::new(),
+            shaper: TextShaper::new(),
             swash_cache: SwashCache::new(),
             atlas,
             viewport,
             renderer,
-            buffers: Vec::new(),
         };
 
         Ok(Self {
@@ -315,35 +576,40 @@ impl Renderer {
                 height: self.size.height,
             },
         );
-        self.text.buffers.clear();
+
+        // Every run is shaped once and then kept: the text on screen does not
+        // change from frame to frame, and shaping a line is the most
+        // expensive thing the editor does.
+        let mut ids = Vec::with_capacity(scene.glyph_runs.len());
         for run in &scene.glyph_runs {
-            let mut buffer = Buffer::new(
-                &mut self.text.font_system,
-                Metrics::new(run.font_size * scale, run.line_height * scale),
-            );
-            buffer.set_size(
-                &mut self.text.font_system,
+            ids.push(self.text.shaper.shape(
+                &run.text,
+                run.font_size * scale,
+                run.line_height * scale,
+                run.family,
                 Some(run.bounds.size.width * scale),
                 Some(run.bounds.size.height * scale),
-            );
-            buffer.set_text(
-                &mut self.text.font_system,
-                &run.text,
-                &Attrs::new().family(match run.family {
-                    TextFamily::SansSerif => Family::SansSerif,
-                    TextFamily::Monospace => Family::Monospace,
-                }),
-                Shaping::Advanced,
-            );
-            buffer.shape_until_scroll(&mut self.text.font_system, false);
-            self.text.buffers.push(buffer);
+            ));
         }
+
+        let TextState {
+            shaper,
+            swash_cache,
+            atlas,
+            viewport,
+            renderer,
+            ..
+        } = &mut self.text;
+        let TextShaper {
+            font_system,
+            shapes,
+        } = shaper;
         let areas: Vec<_> = scene
             .glyph_runs
             .iter()
-            .zip(&self.text.buffers)
-            .map(|(run, buffer)| TextArea {
-                buffer,
+            .zip(&ids)
+            .map(|(run, id)| TextArea {
+                buffer: shapes.get(*id).buffer(),
                 left: run.bounds.origin.x * scale,
                 top: run.bounds.origin.y * scale,
                 scale: 1.0,
@@ -362,14 +628,14 @@ impl Renderer {
                 custom_glyphs: &[],
             })
             .collect();
-        self.text.renderer.prepare(
+        renderer.prepare(
             &self.device,
             &self.queue,
-            &mut self.text.font_system,
-            &mut self.text.atlas,
-            &self.text.viewport,
+            font_system,
+            atlas,
+            viewport,
             areas,
-            &mut self.text.swash_cache,
+            swash_cache,
         )?;
         Ok(())
     }
@@ -455,4 +721,71 @@ fn create_rect_pipeline(
         multiview: None,
         cache: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FONT_SIZE: f32 = 16.0;
+
+    #[test]
+    fn the_width_of_a_line_is_the_sum_of_its_characters() {
+        let mut shaper = TextShaper::new();
+        // A line with two scripts is shaped as more than one run, and every
+        // run of a line reports the width of the whole line. Adding the runs
+        // up would make the line twice as wide as it is.
+        let text = "abc 中文";
+        let measured = shaper.measure(text, FONT_SIZE, TextFamily::Monospace);
+        let mut characters = 0.0;
+        for character in text.chars() {
+            characters += shaper
+                .measure(&character.to_string(), FONT_SIZE, TextFamily::Monospace)
+                .width;
+        }
+        assert!(
+            (measured.width - characters).abs() < 0.5,
+            "the line is {} wide, its characters are {characters} wide",
+            measured.width
+        );
+    }
+
+    #[test]
+    fn a_measured_line_reports_where_every_byte_is() {
+        let mut shaper = TextShaper::new();
+        let measured = shaper.measure("abc", FONT_SIZE, TextFamily::Monospace);
+        // One more boundary than the text has bytes.
+        assert_eq!(measured.boundaries.len(), 4);
+        assert_eq!(measured.boundaries[0], 0.0);
+        assert!(measured.boundaries[3] > measured.boundaries[2]);
+        assert!((measured.boundaries[3] - measured.width).abs() < 0.001);
+    }
+
+    #[test]
+    fn the_bytes_of_one_character_share_its_start_offset() {
+        let mut shaper = TextShaper::new();
+        let measured = shaper.measure("中", FONT_SIZE, TextFamily::Monospace);
+        // "中" is three bytes.
+        assert_eq!(measured.boundaries.len(), 4);
+        assert_eq!(measured.boundaries[0], 0.0);
+        assert_eq!(measured.boundaries[1], 0.0);
+        assert_eq!(measured.boundaries[2], 0.0);
+        assert!(measured.boundaries[3] > 0.0);
+    }
+
+    #[test]
+    fn a_measured_line_does_not_change_when_it_is_measured_again() {
+        let mut shaper = TextShaper::new();
+        let first = shaper.measure("abc", FONT_SIZE, TextFamily::Monospace);
+        let second = shaper.measure("abc", FONT_SIZE, TextFamily::Monospace);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn an_empty_line_has_no_width() {
+        let mut shaper = TextShaper::new();
+        let measured = shaper.measure("", FONT_SIZE, TextFamily::Monospace);
+        assert_eq!(measured.width, 0.0);
+        assert_eq!(measured.boundaries, vec![0.0]);
+    }
 }

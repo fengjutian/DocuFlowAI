@@ -6,7 +6,7 @@
 //! are on screen.
 
 use codeweaver_editor_core::Editor;
-use codeweaver_render::{Color, FrameScene, Rect, Renderer, TextFamily, TextStyle};
+use codeweaver_render::{Color, FrameScene, Rect, Renderer, TextFamily, TextShaper, TextStyle};
 use codeweaver_text::{Buffer, TextOffset};
 use codeweaver_ui::{
     LineMetrics, TextLayout, TextMeasurer, ViewState, VisualLine, caret_shape, selection_rects,
@@ -298,6 +298,31 @@ impl<'a> RendererMeasurer<'a> {
 impl TextMeasurer for RendererMeasurer<'_> {
     fn measure(&mut self, text: &str, font_size: f32) -> LineMetrics {
         let measured = self.renderer.measure_text(text, font_size, self.family);
+        LineMetrics {
+            boundaries: measured.boundaries,
+            width: measured.width,
+        }
+    }
+}
+
+/// Measures text with a shaper, without a renderer.
+///
+/// The real font stack does not need a GPU, so the measurements can be taken
+/// without a window — the benchmarks need exactly those numbers.
+pub struct ShaperMeasurer<'a> {
+    shaper: &'a mut TextShaper,
+    family: TextFamily,
+}
+
+impl<'a> ShaperMeasurer<'a> {
+    pub fn new(shaper: &'a mut TextShaper, family: TextFamily) -> Self {
+        ShaperMeasurer { shaper, family }
+    }
+}
+
+impl TextMeasurer for ShaperMeasurer<'_> {
+    fn measure(&mut self, text: &str, font_size: f32) -> LineMetrics {
+        let measured = self.shaper.measure(text, font_size, self.family);
         LineMetrics {
             boundaries: measured.boundaries,
             width: measured.width,

@@ -86,11 +86,19 @@ function Save-Window([IntPtr]$handle, [string]$path) {
     # A minimised window has no client area to draw into, and a window that
     # was never shown does not redraw. Restore it and give it a new size, so
     # the editor paints the frame the check is about.
-    [Win32]::ShowWindow($handle, 9) | Out-Null
-    [Win32]::SetWindowPos($handle, $TOPMOST, 40, 40, 1281, 801, $SWP_SHOWWINDOW) | Out-Null
-    Start-Sleep -Seconds 2
+    #
+    # Something else on the machine now and then minimises the window a
+    # moment after it appears, so the restore is retried: a check that fails
+    # because the window was not on screen says nothing about the editor.
     $rect = New-Object Win32+RECT
-    [Win32]::GetClientRect($handle, [ref]$rect) | Out-Null
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        [Win32]::ShowWindow($handle, 9) | Out-Null
+        [Win32]::SetWindowPos($handle, $TOPMOST, 40, 40, 1281, 801, $SWP_SHOWWINDOW) | Out-Null
+        Start-Sleep -Seconds 2
+        [Win32]::GetClientRect($handle, [ref]$rect) | Out-Null
+        if ($rect.Right -gt 0 -and $rect.Bottom -gt 0) { break }
+        Write-Output "the window has no client area (attempt $($attempt + 1)), restoring it again"
+    }
     if ($rect.Right -le 0 -or $rect.Bottom -le 0) {
         throw 'the editor window has no client area to capture'
     }

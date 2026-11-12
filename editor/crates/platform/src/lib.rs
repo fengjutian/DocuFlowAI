@@ -1,5 +1,5 @@
 mod agent;
-mod editor_view;
+pub mod editor_view;
 mod input;
 
 use std::{path::PathBuf, sync::Arc};
