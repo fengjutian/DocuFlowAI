@@ -546,18 +546,6 @@ function clamp01(value: number): number {
   return Math.min(1, Math.max(0, value));
 }
 
-function pickNumber(source: Record<string, unknown>, keys: readonly string[]): number | undefined {
-  for (const key of keys) {
-    const value = source[key];
-    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
-  }
-  return undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function formatRate(value: number | null): string {
   return value === null ? "n/a" : value.toFixed(3);
 }
