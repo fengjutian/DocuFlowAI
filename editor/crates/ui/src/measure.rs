@@ -87,6 +87,9 @@ mod tests {
         let metrics = measurer.measure("中文", 16.0);
         assert_eq!(metrics.width, 20.0);
         // The bytes inside one character share its start offset.
-        assert_eq!(metrics.boundaries, vec![0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 20.0]);
+        assert_eq!(
+            metrics.boundaries,
+            vec![0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 20.0]
+        );
     }
 }

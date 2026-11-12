@@ -7,7 +7,9 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::{Context, Result};
 use codeweaver_agent_acp::ToolStatus;
 use codeweaver_editor_core::Editor;
-use codeweaver_render::{Color, FrameScene, Point, Rect, Renderer, RendererError, Size, TextFamily, TextStyle};
+use codeweaver_render::{
+    Color, FrameScene, Point, Rect, Renderer, RendererError, Size, TextFamily, TextStyle,
+};
 use codeweaver_workspace::{Document, Workspace};
 use editor_view::{EditorView, LINE_HEIGHT, RendererMeasurer};
 use input::TextInputState;
@@ -179,8 +181,11 @@ impl NativeApplication {
         if !body.contains(cursor) {
             return;
         }
-        self.view
-            .press(&mut self.editor, cursor.x - body.origin.x, cursor.y - body.origin.y);
+        self.view.press(
+            &mut self.editor,
+            cursor.x - body.origin.x,
+            cursor.y - body.origin.y,
+        );
         self.keep_caret_visible(scale_factor);
     }
 
@@ -193,8 +198,11 @@ impl NativeApplication {
             return;
         };
         let body = editor_body_rect(self.window_size(scale_factor));
-        self.view
-            .drag(&mut self.editor, cursor.x - body.origin.x, cursor.y - body.origin.y);
+        self.view.drag(
+            &mut self.editor,
+            cursor.x - body.origin.x,
+            cursor.y - body.origin.y,
+        );
     }
 
     /// Moves the caret one visual line up or down.
@@ -209,6 +217,20 @@ impl NativeApplication {
         self.view.scroll(delta, total_lines);
         self.rebuild_layout(scale_factor);
         self.view.move_vertical(&mut self.editor, delta);
+    }
+
+    /// Scrolls the body by a number of lines.
+    fn scroll_body(&mut self, lines: isize) {
+        let total_lines = self.editor.buffer().line_count();
+        self.view.scroll(lines, total_lines);
+    }
+
+    /// Scrolls the body the way the wheel was turned.
+    ///
+    /// A positive delta means the wheel was turned away from the user, which
+    /// shows the text above.
+    fn scroll_body_by_wheel(&mut self, delta: f32) {
+        self.scroll_body(-(delta as isize));
     }
 
     /// Handles the keys that drive the agent.
@@ -434,10 +456,12 @@ impl ApplicationHandler for NativeApplication {
                     x: position.x as f32 / scale_factor as f32,
                     y: position.y as f32 / scale_factor as f32,
                 });
+                eprintln!("cursor moved to {:?}", self.cursor);
                 self.drag_body(scale_factor);
                 window.request_redraw();
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                eprintln!("mouse input {button:?} {state:?}");
                 if button == MouseButton::Left {
                     let scale_factor = window.scale_factor();
                     match state {
@@ -449,14 +473,13 @@ impl ApplicationHandler for NativeApplication {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
-                    MouseScrollDelta::LineDelta(lines) => lines as isize,
-                    MouseScrollDelta::PixelDelta(pixels) => (pixels / LINE_HEIGHT as f64) as isize,
+                    MouseScrollDelta::LineDelta(lines, _) => lines as isize,
+                    MouseScrollDelta::PixelDelta(pixels) => {
+                        (pixels.x / LINE_HEIGHT as f64) as isize
+                    }
                 };
                 if lines != 0 {
-                    // A positive delta means the wheel was turned away from
-                    // the user, which shows the text above.
-                    let total_lines = self.editor.buffer().line_count();
-                    self.view.scroll(-lines, total_lines);
+                    self.scroll_body_by_wheel(lines as f32);
                     window.request_redraw();
                 }
             }
@@ -544,9 +567,11 @@ impl ApplicationHandler for NativeApplication {
                     &self.editor,
                     &self.input,
                     &mut self.view,
-                    self.agent.as_ref(),
-                    self.agent_error.as_deref(),
-                    status_line,
+                    Chrome {
+                        agent: self.agent.as_ref(),
+                        agent_error: self.agent_error.as_deref(),
+                        status_line,
+                    },
                 );
                 match renderer.render(&scene, scale_factor) {
                     Ok(()) => {}
@@ -569,15 +594,20 @@ impl ApplicationHandler for NativeApplication {
     }
 }
 
+/// The parts of the frame that are not the text body.
+struct Chrome<'a> {
+    agent: Option<&'a AgentSession>,
+    agent_error: Option<&'a str>,
+    status_line: String,
+}
+
 fn build_scene(
     renderer: &mut Renderer,
     size: Size,
     editor_state: &Editor,
     input: &TextInputState,
     view: &mut EditorView,
-    agent: Option<&AgentSession>,
-    agent_error: Option<&str>,
-    status_line: String,
+    chrome: Chrome<'_>,
 ) -> FrameScene {
     let viewport = Rect::new(0.0, 0.0, size.width, size.height);
     let body = editor_body_rect(size);
@@ -624,7 +654,7 @@ fn build_scene(
     );
     // The status line sits under the heading.
     scene.push_text(
-        status_line,
+        chrome.status_line,
         Rect::new(56.0, 38.0, size.width - 72.0, 22.0),
         TextStyle {
             clip: viewport,
@@ -635,9 +665,15 @@ fn build_scene(
         },
     );
 
-    view.draw(&mut scene, editor_state, input.preedit(), body, &mut measurer);
+    view.draw(
+        &mut scene,
+        editor_state,
+        input.preedit(),
+        body,
+        &mut measurer,
+    );
 
-    push_agent_panel(&mut scene, size, agent, agent_error);
+    push_agent_panel(&mut scene, size, chrome.agent, chrome.agent_error);
     scene
 }
 
@@ -757,6 +793,9 @@ mod tests {
     use super::*;
     use std::fs;
 
+    use codeweaver_text::TextOffset;
+    use codeweaver_ui::MonospaceMeasurer;
+
     /// A scratch file inside the crate's own directory.
     fn scratch(name: &str) -> PathBuf {
         let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-scratch");
@@ -831,5 +870,56 @@ mod tests {
         let app = NativeApplication::new(None).expect("the application starts");
         assert_eq!(app.editor.text(), "");
         assert!(app.status_line().contains("untitled"));
+    }
+
+    /// An application with a laid out body, for the checks that need one.
+    fn app_with_body(text: &str) -> NativeApplication {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.editor.load_text(text);
+        let mut measurer = MonospaceMeasurer::new(10.0);
+        app.view
+            .layout(app.editor.buffer(), 1000.0, 200.0, &mut measurer);
+        app
+    }
+
+    #[test]
+    fn the_wheel_turned_towards_the_user_scrolls_down() {
+        let mut app = app_with_body("one\ntwo\nthree\nfour\n");
+        // The wheel reports a negative delta when it is turned towards the
+        // user.
+        app.scroll_body_by_wheel(-3.0);
+        assert_eq!(app.view.view.first_line, 3);
+        app.scroll_body_by_wheel(2.0);
+        assert_eq!(app.view.view.first_line, 1);
+    }
+
+    #[test]
+    fn the_body_never_scrolls_past_the_end_of_the_document() {
+        let mut app = app_with_body("one\ntwo\n");
+        app.scroll_body_by_wheel(-100.0);
+        // The document has three lines, the last one empty.
+        assert_eq!(app.view.view.first_line, 2);
+    }
+
+    #[test]
+    fn the_caret_moves_a_visual_line_at_a_time() {
+        let mut app = app_with_body("first\nsecond\n");
+        app.editor.select_range(TextOffset(3), TextOffset(3));
+        app.move_caret_vertically(1.0, 1);
+        // The caret keeps its column: three characters into the next line.
+        assert_eq!(app.editor.caret().0, 9);
+        app.move_caret_vertically(1.0, -1);
+        assert_eq!(app.editor.caret().0, 3);
+    }
+
+    #[test]
+    fn the_caret_stays_on_screen_when_it_leaves_the_view() {
+        let mut app = app_with_body(&"line\n".repeat(20));
+        app.editor.select_range(TextOffset(99), TextOffset(99));
+        app.keep_caret_visible(1.0);
+        assert!(
+            app.view.view.first_line > 0,
+            "the view must follow the caret"
+        );
     }
 }

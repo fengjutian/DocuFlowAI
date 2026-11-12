@@ -289,6 +289,8 @@ dependencies = [
  "codeweaver-agent-ui",
  "codeweaver-editor-core",
  "codeweaver-render",
+ "codeweaver-text",
+ "codeweaver-ui",
  "codeweaver-workspace",
  "pollster",
  "wgpu",

@@ -35,8 +35,12 @@ export interface ExecutionCoordinatorOptions {
    * The journal position is the only sequence the replay and the live stream can both speak, so the
    * live stream carries the record rather than the raw runtime event. A client that reconnects with
    * `since` then has one number to compare, and the two sides cannot disagree about what it means.
+   *
+   * A promise is awaited: a caller that has to know the record is complete before it answers (the
+   * usage ledger writes its record from the terminal entry) gets the answer it asked for instead of
+   * a race with a write that is still in flight.
    */
-  onRecorded?: (entry: JournalEntry) => void;
+  onRecorded?: (entry: JournalEntry) => void | Promise<void>;
   /** Fetches runtime events the journal never received; required for `compensate`. */
   compensationSource?: (checkpoint: ExecutionCheckpoint) => Promise<AgentRuntimeEvent[]>;
   /** Whether the runtime-side session still exists. Defaults to false: assume it is gone. */
@@ -146,7 +150,7 @@ export class ExecutionCoordinator {
         // can be lost by a client that reconnects in between: it is in neither the replay nor the
         // live stream. The journal is the source of truth, so the live stream carries the record.
         this.options.onEvent?.(event);
-        this.options.onRecorded?.(entry);
+        await this.options.onRecorded?.(entry);
       });
     });
     return execution;
@@ -264,7 +268,7 @@ export class ExecutionCoordinator {
         session.nextJournalSequence += 1;
         // A CodeWeaver fact is on the timeline too, so the live stream carries it like any other
         // event: design 13 lists `code.diff.applied` and `evaluation.completed` as events.
-        this.options.onRecorded?.(entry);
+        await this.options.onRecorded?.(entry);
       });
       await session.chain;
       return;

@@ -15,4 +15,4 @@ pub mod view;
 
 pub use layout::{TextLayout, VisualLine};
 pub use measure::{LineMetrics, MonospaceMeasurer, TextMeasurer};
-pub use view::{caret_shape, selection_rects, CaretShape, SelectionRect, ViewState};
+pub use view::{CaretShape, SelectionRect, ViewState, caret_shape, selection_rects};

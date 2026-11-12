@@ -71,11 +71,6 @@ impl EditorView {
         }
     }
 
-    /// The layout of the text that is on screen.
-    pub fn current_layout(&self) -> &TextLayout {
-        &self.layout
-    }
-
     /// Rebuilds the layout when the text, the scroll position or the size of
     /// the body changed.
     pub fn layout(
@@ -105,11 +100,6 @@ impl EditorView {
             measurer,
         );
         self.built = built;
-    }
-
-    /// The offset at a point in the body, relative to the body's top left.
-    pub fn offset_at(&self, x: f32, y: f32) -> Option<usize> {
-        self.layout.hit_test(x, y)
     }
 
     /// Places the caret at a point and starts a drag from there.
@@ -192,7 +182,8 @@ impl EditorView {
             return;
         }
         let line = buffer.line_of_offset(caret);
-        self.view.ensure_line_visible(line, visible_lines, total_lines);
+        self.view
+            .ensure_line_visible(line, visible_lines, total_lines);
     }
 
     /// Draws the body: the selection, the text and the caret.
@@ -320,7 +311,7 @@ mod tests {
     use codeweaver_ui::MonospaceMeasurer;
 
     fn view_of(text: &str) -> (EditorView, Editor) {
-        let mut editor = Editor::new(text);
+        let editor = Editor::new(text);
         let mut view = EditorView::new();
         let mut measurer = MonospaceMeasurer::new(10.0);
         view.layout(editor.buffer(), 1000.0, 200.0, &mut measurer);

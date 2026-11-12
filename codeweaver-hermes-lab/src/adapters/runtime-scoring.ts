@@ -1,6 +1,7 @@
 import type { EvaluationVerdict } from "../evaluation/evaluation.js";
 import type { JournalEntry } from "../journal/journal.js";
 import type { AgentCapability, AgentRuntimeType } from "../types/adapter.js";
+import { extractTokenUsage } from "../accounting/token-usage.js";
 
 /**
  * Runtime capability scoring (multi-model execution policy).
@@ -513,47 +514,11 @@ function observationFromJournal(executionId: string, entries: readonly JournalEn
 /**
  * Token usage out of a terminal event payload.
  *
- * Runtimes report usage differently: the Hermes gateway sends `usage.total_tokens`, Pi puts the
- * counters on the assistant message inside the event's messages. Both are read, and a payload
- * without usage yields nothing rather than a zero that would look like a free run.
+ * The accounting ledger reads the same payload with the same reader (`accounting/token-usage.ts`).
+ * Two readers is how a payload ends up accounted for in one place and not the other, and the
+ * runtime that was missed was the primary one.
  */
-export function extractTokenUsage(payload: Record<string, unknown>): {
-  promptTokens?: number;
-  completionTokens?: number;
-  totalTokens?: number;
-} {
-  let promptTokens: number | undefined;
-  let completionTokens: number | undefined;
-  let totalTokens: number | undefined;
-
-  const usage = isRecord(payload["usage"]) ? payload["usage"] : undefined;
-  if (usage) {
-    promptTokens = pickNumber(usage, ["prompt_tokens", "input_tokens", "tokens_in", "promptTokens", "input"]);
-    completionTokens = pickNumber(
-      usage,
-      ["completion_tokens", "output_tokens", "tokens_out", "completionTokens", "output"]
-    );
-    totalTokens = pickNumber(usage, ["total_tokens", "tokens_total", "totalTokens", "total"]);
-  }
-
-  if (totalTokens === undefined) {
-    const messages = Array.isArray(payload["messages"]) ? payload["messages"] : [];
-    for (const message of messages) {
-      if (!isRecord(message)) continue;
-      const messageUsage = isRecord(message["usage"]) ? message["usage"] : undefined;
-      if (!messageUsage) continue;
-      promptTokens ??= pickNumber(messageUsage, ["input", "prompt_tokens", "input_tokens"]);
-      completionTokens ??= pickNumber(messageUsage, ["output", "completion_tokens", "output_tokens"]);
-      totalTokens ??= pickNumber(messageUsage, ["totalTokens", "total_tokens", "tokens_total"]);
-    }
-  }
-
-  return {
-    ...(promptTokens !== undefined ? { promptTokens } : {}),
-    ...(completionTokens !== undefined ? { completionTokens } : {}),
-    ...(totalTokens !== undefined ? { totalTokens } : {})
-  };
-}
+export { extractTokenUsage };
 
 function evaluationVerdictFromJournal(auditFacts: readonly JournalEntry[]): EvaluationVerdict | undefined {
   const fact = [...auditFacts]

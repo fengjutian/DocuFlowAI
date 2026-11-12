@@ -226,7 +226,6 @@ function TimelineSummary({ timeline }: { timeline: AuditTimeline }) {
  * change stage — it is not filled in to look complete.
  */
 function ExecutionCards({ timeline }: { timeline: AuditTimeline }) {
-  const byExecution = new Map(timeline.executions.map(execution => [execution.executionId, execution]));
   const itemsByExecution = new Map<string, AuditTimelineItem[]>();
   for (const item of timeline.items) {
     const bucket = itemsByExecution.get(item.executionId) ?? [];

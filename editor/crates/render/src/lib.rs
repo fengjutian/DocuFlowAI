@@ -149,10 +149,7 @@ impl Renderer {
             boundaries.push(offset);
         }
 
-        MeasuredText {
-            boundaries,
-            width,
-        }
+        MeasuredText { boundaries, width }
     }
 }
 

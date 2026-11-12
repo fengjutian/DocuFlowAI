@@ -11,6 +11,8 @@ codeweaver-agent-acp = { path = "../agent-acp" }
 codeweaver-agent-ui = { path = "../agent-ui" }
 codeweaver-editor-core = { path = "../editor-core" }
 codeweaver-render = { path = "../render" }
+codeweaver-text = { path = "../text" }
+codeweaver-ui = { path = "../ui" }
 codeweaver-workspace = { path = "../workspace" }
 pollster.workspace = true
 wgpu.workspace = true

@@ -1107,3 +1107,71 @@ Consequence: P0-020 is signed off. The rule it rests on: a crashed runtime ends 
 `failed` with the crash recorded, the audit trail survives, and the model is not asked again behind
 the operator's back. The recovery decision reads the execution's own record; the runtime is only
 asked when it could still change the answer.
+
+## D-071: The audit timeline reconstructs a run from the recorded events
+Status: accepted
+Context: design 15 lists what a traceability layer must answer, and one of the answers was missing:
+"从审计事件还原完整执行过程". P0-024 delivered the others — from a task, from a commit, from an
+execution, the chain of records that belong together. But a chain is a set of links, not a sequence.
+"Which records belong to this run" and "what happened, and in what order" are different questions,
+and only the second one reconstructs a process. The journal held every event, but nothing could read
+them back as a timeline: the execution page showed the live stream of one execution, the trace
+showed the links of one execution, and nothing crossed executions at all.
+
+Decision: the audit timeline is that entry point, and it is read from the journal — the same
+append-only record the live stream replays (D-069), so a timeline can never disagree with what a
+client was told while it was listening. Its order has two parts, because two orders exist: inside
+one execution the order is the journal position and is never second-guessed; across executions the
+order is the recorded time. The merge interleaves whole executions by time and never reorders an
+execution's own events, so a timestamp that disagrees with the recorded order cannot scramble a run.
+A hole in the journal is reported as a gap, and an execution whose timestamps disagree with its own
+order is reported as such — the timeline says what it knows and where it is unsure.
+
+Evidence: the probe `audit-timeline-phase0` runs the same task twice on the real model, so the
+timeline has to hold more than one execution and put them in the recorded order. The yardstick is
+the journal itself: the timeline must hold every recorded event of every execution exactly once —
+a timeline that quietly dropped half a run would otherwise look complete. Seven links are
+asserted: `journal-covered` (the timeline holds all 271 recorded events, once each, against the
+counts the server's own journal endpoint reports), `ordered` (ordered by the recorded time, and
+every execution keeps its own journal order), `correlated` (both runs of the task are on one
+timeline and carry the task), `process` (the stages reconstruct as started → tool → change →
+evaluation → completed), `evidence` (the commit and the passing verdict are readable from the
+timeline itself — an audit timeline that only carried event names would not be a record of what
+happened), `task-scope` (asking for the task returns the whole tree, not one execution) and
+`not-found` (an execution that was never recorded is refused with a 404 instead of answered with
+an empty timeline). The verdict logic has 14 unit tests, most of them the cases that have to fail:
+a dropped event, an invented event, a repeated event, events running backwards in time, an
+execution's own events reordered, one of the task's runs missing, a run that does not name the
+task, stages that cannot be reconstructed, a timeline without the commit, a timeline without a
+passing verdict, a task timeline that holds only one run, and an unknown execution answered with
+200.
+
+Two defects fell out of it, and the second one was the probe's own.
+
+The first was the journal's. `recordedAt` meant two different things: for a runtime event it was
+the time the runtime emitted the event, for a CodeWeaver fact it was the time the fact was
+written. The two disagree — the runtime's first event is emitted before the facts that precede it
+in the journal are written — so the journal's timestamps contradicted its own order, and a
+timeline built on them could not be ordered. The fix gives the field one meaning: `recordedAt` is
+now when the entry was written, which is the same clock the facts use and the same order the
+journal position carries. The runtime's own time is not lost — it moves into the payload as
+`eventTimestamp`, where it belongs. The two unit tests for this fail on the old implementation and
+pass on the new one.
+
+The second was the probe's. It waited for the runtime to say "succeeded" and then measured — but
+the runtime says it before the journal has caught up, because the terminal event is written through
+the coordinator's queue. The probe measured a moving target and the coverage link failed by
+exactly the two entries that had not been written yet. A probe that measures a moving target is
+not evidence of anything, so it now waits for the recorded terminal event and for the event count
+to stop moving. The rule it follows is the one the rest of the system already follows: the
+journal's terminal event is the fact, not the runtime's claim.
+
+The console was checked in the browser against a real run. The new 「审计时间线」page reads the
+timeline from the server, shows every execution with the stages it went through, and reports the
+runs whose recorded timestamps disagree with their own order — which is what the executions
+recorded before the fix look like. The run recorded after the fix shows no such warning, and its
+99 events are ordered.
+
+Consequence: P0-022 is signed off. The rule it rests on: a timeline is read from the journal and
+nothing else, one execution keeps its journal order, the recorded time only interleaves
+executions, and what the journal cannot vouch for is reported rather than smoothed away.

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { AgentRuntimeEvent } from "../types/adapter.js";
 import type { RecordStore } from "../persistence/record-store.js";
+import { extractTokenUsage } from "./token-usage.js";
 
 /**
  * Cost and usage accounting (design 19 / AT-206).
@@ -17,6 +18,8 @@ export interface UsageRecord {
   model: string;
   promptTokens: number;
   completionTokens: number;
+  /** Tokens served from the provider's cache, when the runtime reports them separately. */
+  cachedTokens?: number;
   totalTokens: number;
   durationMs: number;
   startedAt?: string;
@@ -27,6 +30,7 @@ export interface UsageSummary {
   executions: number;
   promptTokens: number;
   completionTokens: number;
+  cachedTokens: number;
   totalTokens: number;
   durationMs: number;
   byModel: Array<{ model: string; executions: number; totalTokens: number }>;
@@ -60,44 +64,47 @@ export class UsageLedger {
   }
 
   /**
-   * Derives a usage record from a terminal runtime event.
+   * Derives a usage record from a runtime payload.
    *
-   * `durationMs` comes from the caller because the coordinator knows when the run started; the event
-   * only carries token counters, and treating a missing duration as zero would understate cost.
+   * The payload is the runtime's own report — the terminal event's payload, whether it arrives as
+   * an event or as the journal entry that recorded it. Both runtimes are read by one extractor
+   * (`token-usage.ts`), so a runtime whose counters live somewhere unusual is accounted for here
+   * exactly as it is in the runtime score.
+   *
+   * `durationMs` comes from the caller because the record's timing is the audit trail's: the
+   * journal knows when the run started and when it ended, and a duration taken from anywhere else
+   * would be a second opinion about the same run.
    */
-  async recordFromEvent(
-    event: AgentRuntimeEvent,
+  async recordFromPayload(
+    executionId: string,
+    payload: Record<string, unknown>,
     timing: { durationMs: number; startedAt?: string; finishedAt?: string }
   ): Promise<UsageRecord | undefined> {
-    const payload = event.payload as Record<string, unknown>;
-    const usage = (payload["usage"] ?? payload["token_usage"] ?? payload) as Record<string, unknown>;
-    const promptTokens = pickNumber(usage, ["prompt_tokens", "input_tokens", "tokens_in", "promptTokens"]);
-    const completionTokens = pickNumber(usage, ["completion_tokens", "output_tokens", "tokens_out", "completionTokens"]);
-    const totalTokens = pickNumber(usage, ["total_tokens", "tokens_total", "totalTokens"])
-      ?? (promptTokens !== undefined && completionTokens !== undefined
-        ? promptTokens + completionTokens
-        : undefined);
-    if (totalTokens === undefined) return undefined;
+    const usage = extractTokenUsage(payload);
+    if (usage.totalTokens === undefined) return undefined;
 
-    const model = typeof payload["model"] === "string"
-      ? payload["model"]
-      : typeof usage["model"] === "string"
-        ? usage["model"]
-        : "unknown";
-
-    const existing = this.records.get(event.executionId);
+    const existing = this.records.get(executionId);
     return this.record({
       // One usage row per execution: the record id is the execution id so a restart can find it.
-      id: existing?.id ?? this.options.idFactory?.() ?? usageRecordId(event.executionId),
-      executionId: event.executionId,
-      model,
-      promptTokens: promptTokens ?? 0,
-      completionTokens: completionTokens ?? 0,
-      totalTokens,
+      id: existing?.id ?? this.options.idFactory?.() ?? usageRecordId(executionId),
+      executionId,
+      model: usage.model ?? "unknown",
+      promptTokens: usage.promptTokens ?? 0,
+      completionTokens: usage.completionTokens ?? 0,
+      ...(usage.cachedTokens !== undefined ? { cachedTokens: usage.cachedTokens } : {}),
+      totalTokens: usage.totalTokens,
       durationMs: Math.max(0, timing.durationMs),
       ...(timing.startedAt ? { startedAt: timing.startedAt } : {}),
       ...(timing.finishedAt ? { finishedAt: timing.finishedAt } : {})
     });
+  }
+
+  /** Derives a usage record from a terminal runtime event. */
+  async recordFromEvent(
+    event: AgentRuntimeEvent,
+    timing: { durationMs: number; startedAt?: string; finishedAt?: string }
+  ): Promise<UsageRecord | undefined> {
+    return this.recordFromPayload(event.executionId, event.payload as Record<string, unknown>, timing);
   }
 
   forExecution(executionId: string): UsageRecord | undefined {
@@ -113,11 +120,13 @@ export class UsageLedger {
     const byModel = new Map<string, { executions: number; totalTokens: number }>();
     let promptTokens = 0;
     let completionTokens = 0;
+    let cachedTokens = 0;
     let totalTokens = 0;
     let durationMs = 0;
     for (const record of records) {
       promptTokens += record.promptTokens;
       completionTokens += record.completionTokens;
+      cachedTokens += record.cachedTokens ?? 0;
       totalTokens += record.totalTokens;
       durationMs += record.durationMs;
       const entry = byModel.get(record.model) ?? { executions: 0, totalTokens: 0 };
@@ -129,6 +138,7 @@ export class UsageLedger {
       executions: records.length,
       promptTokens,
       completionTokens,
+      cachedTokens,
       totalTokens,
       durationMs,
       byModel: [...byModel.entries()]
@@ -140,14 +150,6 @@ export class UsageLedger {
 
 function usageRecordId(executionId: string): string {
   return `use_${createHash("sha256").update(executionId).digest("hex").slice(0, 24)}`;
-}
-
-function pickNumber(source: Record<string, unknown>, keys: readonly string[]): number | undefined {
-  for (const key of keys) {
-    const value = source[key];
-    if (typeof value === "number" && Number.isFinite(value) && value >= 0) return value;
-  }
-  return undefined;
 }
 
 /** Kept for callers that want an id without an execution id (tests, ad-hoc records). */

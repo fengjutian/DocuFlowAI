@@ -1,0 +1,5 @@
+The quick brown fox jumps over the lazy dog.
+中文输入测试：编辑器应该把这段文字按等宽字体画出来，并且光标能落在正确的位置。
+A very long line that should wrap when the viewport is narrower than the line itself: 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789 0123456789
+	tab indented line
+last line without a newline

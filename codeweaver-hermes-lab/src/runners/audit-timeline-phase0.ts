@@ -72,7 +72,12 @@ export interface AuditTimelineView {
 export interface AuditTimelineClient {
   /** Starts the task and returns its execution id. */
   start(input: { taskId: string; prompt: string; allowedTools: string[] }): Promise<string>;
-  status(executionId: string): Promise<string>;
+  /** The execution's own state: the status, the recorded terminal event and the event count. */
+  execution(executionId: string): Promise<{
+    status: string;
+    terminalEventType?: string;
+    eventCount: number;
+  }>;
   /** The raw journal of one execution — the yardstick the timeline is measured against. */
   logs(executionId: string): Promise<{ count: number; entries: Array<{ sequence: number }> }>;
   timeline(query: { taskId?: string; executionId?: string }): Promise<AuditTimelineView>;
@@ -286,8 +291,10 @@ export async function executeAuditTimeline(
     allowedTools: ["read_file", "request_diff", "request_apply_diff", "evaluate_changes"]
   });
   evidence.push(`firstExecutionId=${firstExecutionId}`);
-  const firstStatus = await waitForTerminal(client, firstExecutionId, options.runTimeoutMs ?? 300_000);
-  evidence.push(`firstStatus=${firstStatus}`);
+  const first = await waitForTerminal(client, firstExecutionId, options.runTimeoutMs ?? 300_000);
+  evidence.push(`firstStatus=${first.status}`);
+  evidence.push(`firstTerminalEvent=${first.terminalEventType ?? "none"}`);
+  evidence.push(`firstJournalEvents=${first.eventCount}`);
 
   // The same task, run again. Two executions of one task are what makes the timeline a correlation
   // rather than a list: the reader has to see both runs, in the order they happened.
@@ -304,8 +311,10 @@ export async function executeAuditTimeline(
     allowedTools: ["read_file", "request_diff", "request_apply_diff", "evaluate_changes"]
   });
   evidence.push(`secondExecutionId=${secondExecutionId}`);
-  const secondStatus = await waitForTerminal(client, secondExecutionId, options.runTimeoutMs ?? 300_000);
-  evidence.push(`secondStatus=${secondStatus}`);
+  const second = await waitForTerminal(client, secondExecutionId, options.runTimeoutMs ?? 300_000);
+  evidence.push(`secondStatus=${second.status}`);
+  evidence.push(`secondTerminalEvent=${second.terminalEventType ?? "none"}`);
+  evidence.push(`secondJournalEvents=${second.eventCount}`);
 
   const timeline = await client.timeline({});
   const taskTimeline = await client.timeline({ taskId });
@@ -339,8 +348,8 @@ export async function executeAuditTimeline(
     evidence.push(`${link.name}:${link.ok ? "ok" : "missing"} ${link.detail}`);
   }
 
-  if (firstStatus !== "succeeded") failures.push(`the first run ended as '${firstStatus}'`);
-  if (secondStatus !== "succeeded") failures.push(`the second run ended as '${secondStatus}'`);
+  if (first.status !== "succeeded") failures.push(`the first run ended as '${first.status}'`);
+  if (second.status !== "succeeded") failures.push(`the second run ended as '${second.status}'`);
   for (const link of judgement.links) {
     if (!link.ok) failures.push(`the ${link.name} link does not hold: ${link.detail}`);
   }
@@ -356,20 +365,41 @@ export async function executeAuditTimeline(
   };
 }
 
+/**
+ * Waits until the run is over *in the record*, not in the runtime's own claim.
+ *
+ * The runtime says "succeeded" before the journal has caught up: the terminal event is written
+ * through the coordinator's queue, so a probe that measures the moment the runtime reports success
+ * measures a moving target — and a timeline read too early is short by exactly the entries that
+ * had not been written yet. The probe waits for the recorded terminal event and for the event count
+ * to stop moving.
+ */
 async function waitForTerminal(
   client: AuditTimelineClient,
   executionId: string,
   timeoutMs: number
-): Promise<string> {
+): Promise<{ status: string; terminalEventType?: string; eventCount: number }> {
   const deadline = Date.now() + timeoutMs;
-  const terminal = new Set(["succeeded", "failed", "cancelled", "interrupted"]);
   let status = "unknown";
+  let terminalEventType: string | undefined;
+  let eventCount = -1;
+  let lastCount = -1;
+  let stableReads = 0;
   while (Date.now() < deadline) {
-    status = await client.status(executionId);
-    if (terminal.has(status)) return status;
+    const detail = await client.execution(executionId);
+    status = detail.status;
+    terminalEventType = detail.terminalEventType;
+    eventCount = detail.eventCount;
+    if (terminalEventType && eventCount === lastCount) {
+      stableReads += 1;
+      if (stableReads >= 2) break;
+    } else {
+      stableReads = 0;
+    }
+    lastCount = eventCount;
     await sleep(300);
   }
-  return status;
+  return { status, ...(terminalEventType ? { terminalEventType } : {}), eventCount };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -513,10 +543,19 @@ function httpClient(baseUrl: string, workspace: string): AuditTimelineClient {
       const created = (await response.json()) as { execution: { executionId: string } };
       return created.execution.executionId;
     },
-    status: async executionId => {
+    execution: async executionId => {
       const response = await fetch(`${baseUrl}/api/v1/executions/${encodeURIComponent(executionId)}`);
-      const body = (await response.json()) as { status?: string };
-      return String(body.status ?? "unknown");
+      const body = (await response.json()) as {
+        status?: string;
+        checkpoint?: { terminalEventType?: string; eventCount?: number };
+      };
+      return {
+        status: String(body.status ?? "unknown"),
+        ...(body.checkpoint?.terminalEventType
+          ? { terminalEventType: body.checkpoint.terminalEventType }
+          : {}),
+        eventCount: Number(body.checkpoint?.eventCount ?? -1)
+      };
     },
     logs: async executionId => {
       const response = await fetch(`${baseUrl}/api/v1/executions/${encodeURIComponent(executionId)}/logs`);

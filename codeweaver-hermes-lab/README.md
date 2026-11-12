@@ -512,6 +512,50 @@ The probe also owns the gateway it kills: it records whether the gateway was run
 started and restores that state afterwards — a gateway it started is stopped again, one it found
 running is brought back.
 
+## Audit timeline
+
+```bash
+npm run validate:audit-timeline
+```
+
+Signs off P0-022 (audit timeline) on the real model. The report goes to
+`reports/phase0-audit-timeline.json` and joins the Phase 0 aggregate.
+
+Design 15 asks for one thing more than the trace can answer: "从审计事件还原完整执行过程". The
+trace is the set of records that belong together; a timeline is the sequence they happened in. The
+probe runs the same task twice on the real model, so the timeline has to hold more than one
+execution and put them in the recorded order. The yardstick is the journal itself — the timeline
+must hold every recorded event of every execution exactly once, compared against the counts the
+server's own journal endpoint reports.
+
+| Link | Why |
+|---|---|
+| Journal covered | the timeline holds every recorded event, once each, and nothing else |
+| Ordered | ordered by the recorded time, and every execution keeps its own journal order |
+| Correlated | both runs of the task are on one timeline and carry the task |
+| Process | the stages reconstruct: started → tool → change → evaluation → completed |
+| Evidence | the commit and the passing verdict are readable from the timeline itself |
+| Task scope | asking for the task returns the whole tree, not one execution |
+| Not found | an execution that was never recorded is refused with a 404 |
+
+The mechanism it exercises is one rule (D-071): **the timeline is read from the journal and nothing
+else**. Inside one execution the order is the journal position and is never second-guessed; across
+executions the recorded time interleaves them. A hole in the journal is reported as a gap, and an
+execution whose timestamps disagree with its own order is reported as such rather than smoothed
+away.
+
+Two defects fell out of it. The journal's `recordedAt` meant two different things — the runtime's
+emit time for a runtime event, the write time for a CodeWeaver fact — so the journal's timestamps
+contradicted its own order and no timeline could be ordered from them; the field now means one
+thing (when the entry was written) and the runtime's own time moved into the payload as
+`eventTimestamp`. The second one was the probe's: it waited for the runtime to report success and
+then measured, but the runtime says so before the journal has caught up — the probe now waits for
+the recorded terminal event and for the event count to stop moving.
+
+The console has a 「审计时间线」page for it: it reads the timeline from the server, shows every
+execution with the stages it went through, and calls out the runs whose recorded timestamps
+disagree with their own order.
+
 ## Multi-runtime policy and runtime scoring
 
 ```bash

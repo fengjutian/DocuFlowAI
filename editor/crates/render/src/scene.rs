@@ -37,6 +37,14 @@ impl Rect {
         self.origin.y + self.size.height
     }
 
+    /// Whether the point is inside the rectangle.
+    pub fn contains(self, point: Point) -> bool {
+        point.x >= self.origin.x
+            && point.x <= self.max_x()
+            && point.y >= self.origin.y
+            && point.y <= self.max_y()
+    }
+
     pub fn intersection(self, other: Self) -> Option<Self> {
         let x = self.origin.x.max(other.origin.x);
         let y = self.origin.y.max(other.origin.y);
@@ -177,5 +185,14 @@ mod tests {
             Rect::new(20.0, 20.0, 10.0, 10.0),
         );
         assert!(scene.quads.is_empty());
+    }
+
+    #[test]
+    fn a_rectangle_knows_which_points_it_covers() {
+        let rect = Rect::new(10.0, 20.0, 30.0, 40.0);
+        assert!(rect.contains(Point { x: 10.0, y: 20.0 }));
+        assert!(rect.contains(Point { x: 40.0, y: 60.0 }));
+        assert!(!rect.contains(Point { x: 9.0, y: 20.0 }));
+        assert!(!rect.contains(Point { x: 10.0, y: 61.0 }));
     }
 }

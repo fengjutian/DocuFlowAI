@@ -29,6 +29,7 @@ platform -> agent-ui -> agent-acp
 platform -> editor-core -> text
 platform -> workspace
 platform -> render
+platform -> ui -> text
 ```
 
 `agent-acp` 是纯传输层，只依赖 serde；`agent-ui` 是编辑器的会话模型。阶段 2
@@ -37,6 +38,11 @@ platform -> render
 `workspace` 是文件系统的唯一入口：UI 不直接读写文件，只调用
 `Workspace::open` / `Workspace::save`。保存前会检查文件在磁盘上是否被改过，
 被改过就拒绝写入。
+
+`ui` 是正文区域的布局与命中测试，只依赖 `text`，**不依赖 `render`**：它需要
+知道字符落在哪，但字体与整形只有渲染器知道，于是 `ui` 声明 `TextMeasurer`
+trait，由 `platform` 用 `Renderer::measure_text` 实现并注入。换行只由 `ui` 做
+一次，渲染器不再二次折行。详见 [ADR-0005](adr/0005-ui-layer.md)。
 
 禁止事项：
 

@@ -10,7 +10,7 @@ import { HermesHttpClient } from "../clients/http/hermes-http-client.js";
 import { CodeChangePipeline } from "../code-engine/code-change-pipeline.js";
 import { SpawnGitRunner } from "../code-engine/git-runner.js";
 import { WorktreeManager } from "../code-engine/worktree-manager.js";
-import { JsonlJournalStore, type JournalStore } from "../journal/journal.js";
+import { JsonlJournalStore, type JournalEntry, type JournalStore } from "../journal/journal.js";
 import { ExecutionCoordinator } from "../orchestrator/execution-coordinator.js";
 import { SubagentManager } from "../orchestrator/subagent-manager.js";
 import { ImmutableRecordStore } from "../persistence/record-store.js";
@@ -32,7 +32,7 @@ import { SkillRegistry, type SkillManifestRecord } from "../skills/skill-registr
 import { SkillBindingStore, type SkillBindingEvent } from "../skills/skill-bindings.js";
 import type { ChangeRecord } from "../code-engine/change-record.js";
 import type { EvaluationResult } from "../evaluation/evaluation.js";
-import type { AgentRuntimeEvent, AgentTaskInput } from "../types/adapter.js";
+import type { AgentTaskInput } from "../types/adapter.js";
 
 /**
  * Composition root.
@@ -116,21 +116,28 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   const usage = new UsageLedger(
     new ImmutableRecordStore<UsageRecord>(config.dataDir, "usage")
   );
-  const startedAt = new Map<string, string>();
 
   const TERMINAL = new Set(["execution.completed", "execution.failed", "execution.cancelled"]);
-  const recordUsage = async (event: AgentRuntimeEvent): Promise<void> => {
-    if (event.eventType === "execution.started") {
-      if (!startedAt.has(event.executionId)) startedAt.set(event.executionId, event.timestamp);
-      return;
-    }
-    if (!TERMINAL.has(event.eventType)) return;
-    const began = startedAt.get(event.executionId);
-    const durationMs = began ? Math.max(0, Date.parse(event.timestamp) - Date.parse(began)) : 0;
-    await usage.recordFromEvent(event, {
+  /**
+   * Accounts a run from the journal.
+   *
+   * The accounting reads the record, not the live event stream: the journal is where the run's
+   * history actually is, and it is the only thing that survives a restart. The timing comes from the
+   * same journal, so the duration in the ledger and the span in the audit trail are the same number
+   * rather than two measurements of the same run.
+   */
+  const recordUsage = async (entry: JournalEntry): Promise<void> => {
+    if (!TERMINAL.has(entry.category)) return;
+    const entries = await journal.read(entry.executionId);
+    const started = entries.find(item => item.category === "execution.started");
+    const startedAt = started?.recordedAt;
+    const finishedAt = entry.recordedAt;
+    const durationMs =
+      startedAt && finishedAt ? Math.max(0, Date.parse(finishedAt) - Date.parse(startedAt)) : 0;
+    await usage.recordFromPayload(entry.executionId, entry.payload, {
       durationMs,
-      ...(began ? { startedAt: began } : {}),
-      finishedAt: event.timestamp
+      ...(startedAt ? { startedAt } : {}),
+      finishedAt
     });
   };
 
@@ -146,14 +153,15 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   const coordinator = new ExecutionCoordinator({
     adapter,
     journal,
-    onEvent: event => {
-      void recordUsage(event).catch(() => undefined);
-    },
     // The live stream carries what was recorded, so its sequence is the journal position — the same
     // number a reconnect asks to resume from. Runtime events and CodeWeaver's own facts both go
     // through here, because both are on the timeline.
-    onRecorded: entry => {
+    onRecorded: async entry => {
       bus.publish(journalEntryToEvent(entry));
+      // The ledger is written from the terminal entry and awaited, so "the run is over in the
+      // journal" and "the run is accounted for" are the same moment — not a race with a write that
+      // is still in flight.
+      await recordUsage(entry);
     },
     // After a restart the session is gone, but the journal still says which runtime ran it and
     // what was asked. Both are needed to recover: the runtime to recover on, and the input to
