@@ -1,0 +1,4 @@
+The second file of the workbench fixture.
+
+Clicking this file in the tree opens it in a tab of its own, and that tab
+comes to the front.

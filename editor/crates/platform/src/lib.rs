@@ -20,7 +20,7 @@ use codeweaver_syntax::{Highlight, Language};
 use codeweaver_text::TextOffset;
 use codeweaver_ui::TextMeasurer;
 use codeweaver_workspace::{ChangeDetector, Document, ExternalChange, FileTree, Workspace};
-use codeweaver_workbench::{close_decision, CloseDecision, TabBar, TabId};
+use codeweaver_workbench::{close_decision, CloseDecision, Tab, TabBar, TabId};
 use completion::CompletionPopup;
 use editor_view::{
     BodyOverlay, EditorView, FindOverlay, LINE_HEIGHT, MarkSeverity, RendererMeasurer,
@@ -40,13 +40,25 @@ use winit::{
 use agent::AgentSession;
 pub use agent::EndpointSettings;
 
+/// The sizes at which the highlighter gives up.
+///
+/// The policy is a product decision, so it is re-exported: the caller of the
+/// editor decides how big a file may be before the editor stops colouring it.
+pub use codeweaver_syntax::HighlightPolicy;
+
 const WINDOW_TITLE: &str = "CodeWeaver";
+
+/// The height of the strip the tabs are drawn in.
+const TAB_BAR_HEIGHT: f32 = 34.0;
+/// The width of the panel the file tree is drawn in.
+const SIDEBAR_WIDTH: f32 = 220.0;
 
 /// The question the window is asking the user.
 ///
 /// The window asks a question when the answer is not the editor's to give:
 /// whether a file with unsaved changes may be closed, and what to do about a
 /// file that changed on disk while it was open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Prompt {
     /// A tab with unsaved changes is about to be closed.
     CloseDirty {
@@ -60,6 +72,25 @@ pub enum Prompt {
         /// Whether the file is gone rather than changed.
         removed: bool,
     },
+}
+
+impl Prompt {
+    /// The question, in words, and the keys that answer it.
+    fn text(&self) -> String {
+        match self {
+            Prompt::CloseDirty { .. } => {
+                "这个标签有未保存的修改。\nS 保存并关闭 · D 不保存直接关闭 · Esc 取消".to_owned()
+            }
+            Prompt::ChangedOnDisk { removed, .. } => {
+                if *removed {
+                    "这个文件在磁盘上被删除了。\nR 关闭这个标签 · I 先不管".to_owned()
+                } else {
+                    "这个文件在磁盘上被改过了。\nR 重新加载（丢弃我的修改） · S 保留我的修改（覆盖磁盘） · I 先不管"
+                        .to_owned()
+                }
+            }
+        }
+    }
 }
 
 pub struct NativeApplication {
@@ -123,6 +154,8 @@ impl NativeApplication {
         let mut tabs = TabBar::new();
         let mut panes: Vec<EditorPane> = Vec::new();
         let mut server = None;
+        let mut detector = ChangeDetector::new();
+        let mut tree = None;
 
         match path {
             Some(path) => {
@@ -150,6 +183,13 @@ impl NativeApplication {
                         Err(error) => eprintln!("could not start the language server: {error}"),
                     }
                 }
+                // The file is watched from the start, so a change behind the
+                // editor's back is noticed and not silently overwritten.
+                if let Some(document) = pane.document.as_ref() {
+                    detector.watch(document.path(), document.fingerprint());
+                }
+                // The tree of files shows the folder the open file is in.
+                tree = path.parent().map(|root| FileTree::new(root.to_path_buf()));
                 panes.push(pane);
             }
             None => {
@@ -160,7 +200,9 @@ impl NativeApplication {
         }
 
         // The server has been told about the text that is there now.
-        let server_version = server.as_ref().map(|_| panes[0].editor.version());
+        if server.is_some() {
+            panes[0].server_version = Some(panes[0].editor.version());
+        }
 
         Ok(NativeApplication {
             window: None,
@@ -180,18 +222,14 @@ impl NativeApplication {
             tabs,
             panes,
             active: 0,
-            tree: None,
-            detector: ChangeDetector::new(),
+            tree,
+            detector,
             prompt: None,
         })
     }
 
     /// The pane that is on screen.
-    fn pane(&self) -> &EditorPane {
-        &self.panes[self.active]
-    }
-
-    /// The pane that is on screen.
+    #[cfg(test)]
     fn pane_mut(&mut self) -> &mut EditorPane {
         &mut self.panes[self.active]
     }
@@ -220,6 +258,27 @@ impl NativeApplication {
     /// The editor's buffer, for the callers that edit it.
     pub fn editor_mut(&mut self) -> &mut Editor {
         &mut self.panes[self.active].editor
+    }
+
+    /// The view of the text on screen.
+    pub fn view(&self) -> &EditorView {
+        &self.panes[self.active].view
+    }
+
+    /// The view of the text on screen, for the callers that move it.
+    pub fn view_mut(&mut self) -> &mut EditorView {
+        &mut self.panes[self.active].view
+    }
+
+    /// Sets the sizes at which the highlighter gives up.
+    ///
+    /// A file that is over the limit is not parsed and not coloured, but it
+    /// is still edited, saved and searched. The policy applies to every file
+    /// that is open, and to the files that are opened later.
+    pub fn set_highlight_policy(&mut self, policy: HighlightPolicy) {
+        for pane in &mut self.panes {
+            pane.set_policy(policy);
+        }
     }
 
     /// The file that is open, if any.
@@ -413,9 +472,23 @@ impl NativeApplication {
         let pane = &mut self.panes[self.active];
         let version = pane.editor.version();
         let visible = pane.view.visible_range();
+        let bytes = pane.editor.buffer().len().0;
+        let lines = pane.editor.buffer().line_count();
+
+        // A file that is too big is not parsed at all. The decision is made
+        // here, on the thread that draws the picture, so the text of a huge
+        // file is never copied for a parse that will not happen: the cost of
+        // typing in a big file does not grow with the file.
+        if !pane.policy.allows(bytes, lines) {
+            pane.asked = Some((version, visible));
+            let changed = !pane.degraded || !pane.highlights.is_empty();
+            pane.degraded = true;
+            pane.highlights.clear();
+            return changed;
+        }
+
         if pane.asked.as_ref() != Some(&(version, visible.clone())) {
             let text = pane.editor.text();
-            let lines = pane.editor.buffer().line_count();
             pane.syntax.request(version, text, visible.clone(), lines);
             pane.asked = Some((version, visible));
         }
@@ -461,13 +534,165 @@ impl NativeApplication {
     }
 
     /// Makes the file tree show the directory of a file.
+    ///
+    /// The tree follows the file that was opened: a tree of the folder of the
+    /// file in front of the user is the tree they are working in.
     fn show_tree_of(&mut self, path: &Path) {
         let Some(root) = path.parent() else {
             return;
         };
-        if self.tree.is_none() {
+        let follows = self
+            .tree
+            .as_ref()
+            .map(|tree| tree.root() == root)
+            .unwrap_or(false);
+        if !follows {
             self.tree = Some(FileTree::new(root.to_path_buf()));
         }
+    }
+
+    /// Handles the keys of the question the window is asking.
+    ///
+    /// While the window is asking, it takes every key: a question that can be
+    /// answered by typing into the document is not a question.
+    fn handle_prompt_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
+        let Some(prompt) = self.prompt else {
+            return false;
+        };
+        let letter = match key {
+            Key::Character(character) => character
+                .as_ref()
+                .chars()
+                .next()
+                .map(|letter| letter.to_ascii_lowercase()),
+            _ => None,
+        };
+        match (prompt, letter) {
+            (Prompt::CloseDirty { tab }, Some('s')) => {
+                self.prompt = None;
+                self.save_tab(tab);
+                self.close_tab_by_id(tab);
+            }
+            (Prompt::CloseDirty { tab }, Some('d')) => {
+                self.prompt = None;
+                self.close_tab_by_id(tab);
+            }
+            (Prompt::ChangedOnDisk { tab, removed }, Some('r')) => {
+                self.prompt = None;
+                if removed {
+                    self.close_tab_by_id(tab);
+                } else {
+                    self.reload_tab(tab);
+                }
+            }
+            (Prompt::ChangedOnDisk { tab, .. }, Some('s')) => {
+                self.prompt = None;
+                self.save_over_tab(tab);
+            }
+            // Anything else leaves the question without an answer, which is
+            // the same as saying "not now".
+            _ => {
+                self.prompt = None;
+            }
+        }
+        true
+    }
+
+    /// Reads the file of a tab again, throwing away the changes in the buffer.
+    fn reload_tab(&mut self, tab: TabId) {
+        let Some(index) = self.tabs.index_of(tab) else {
+            return;
+        };
+        let Some(path) = self.panes[index]
+            .document
+            .as_ref()
+            .map(|document| document.path().to_path_buf())
+        else {
+            return;
+        };
+        match self.workspace.open(&path) {
+            Ok(document) => {
+                let text = document.saved_text().to_owned();
+                self.panes[index].editor.load_text(text);
+                self.panes[index].document = Some(document);
+                self.status = Some(format!("已重新加载 {}", path.display()));
+            }
+            Err(error) => {
+                self.status = Some(format!("重新加载失败：{error}"));
+            }
+        }
+    }
+
+    /// Writes the buffer of a tab over the file, even though the file changed.
+    ///
+    /// The user was asked and said so; this is the answer to that question.
+    fn save_over_tab(&mut self, tab: TabId) {
+        let Some(index) = self.tabs.index_of(tab) else {
+            return;
+        };
+        let Some(path) = self.panes[index]
+            .document
+            .as_ref()
+            .map(|document| document.path().to_path_buf())
+        else {
+            return;
+        };
+        let text = self.panes[index].editor.text();
+        // The file is read again first, so that the fingerprint the workspace
+        // checks against is the one of the file that is on disk now.
+        match self.workspace.open(&path) {
+            Ok(mut document) => match self.workspace.save(&mut document, &text) {
+                Ok(()) => {
+                    self.panes[index].document = Some(document);
+                    self.detector
+                        .watch(self.panes[index].document.as_ref().unwrap().path(), self.panes[index].document.as_ref().unwrap().fingerprint());
+                    self.status = Some(format!("已覆盖 {}", path.display()));
+                }
+                Err(error) => {
+                    self.status = Some(format!("保存失败：{error}"));
+                }
+            },
+            Err(error) => {
+                self.status = Some(format!("保存失败：{error}"));
+            }
+        }
+    }
+
+    /// Brings the tab that was clicked to the front.
+    fn press_tab_bar(&mut self, point: Point, size: Size) {
+        let strip = {
+            let Some(renderer) = self.renderer.as_mut() else {
+                return;
+            };
+            let mut measurer = RendererMeasurer::new(renderer, TextFamily::SansSerif);
+            tab_strip(self.tabs.tabs(), self.active, size, &mut measurer)
+        };
+        self.activate_tab_at(point, &strip);
+    }
+
+    /// Brings the tab under the point to the front.
+    fn activate_tab_at(&mut self, point: Point, strip: &shell::TabStrip) {
+        if let Some(id) = strip.hit(point)
+            && let Some(index) = self.tabs.index_of(id)
+        {
+            self.activate_tab(index);
+        }
+    }
+
+    /// Opens the file that was clicked, or opens and closes the directory.
+    fn press_file_tree(&mut self, point: Point, size: Size) {
+        let Some(tree) = self.tree.as_mut() else {
+            return;
+        };
+        let rows = shell::tree_rows(tree.nodes(), sidebar_rect(size));
+        let Some(row) = shell::tree_hit(&rows, point) else {
+            return;
+        };
+        if row.directory {
+            tree.toggle(&row.path);
+            return;
+        }
+        self.open_file(&row.path);
     }
 
     /// The agent's transcript so far.
@@ -630,7 +855,18 @@ impl NativeApplication {
         let Some(cursor) = self.cursor else {
             return;
         };
-        let body = editor_body_rect(self.window_size(scale_factor));
+        let size = self.window_size(scale_factor);
+        // The tab strip and the file tree are around the text: a click there
+        // is not a click in the document.
+        if tab_bar_rect(size).contains(cursor) {
+            self.press_tab_bar(cursor, size);
+            return;
+        }
+        if sidebar_rect(size).contains(cursor) {
+            self.press_file_tree(cursor, size);
+            return;
+        }
+        let body = editor_body_rect(size);
         if !body.contains(cursor) {
             return;
         }
@@ -741,7 +977,15 @@ impl NativeApplication {
             }
             // Ctrl+S saves the open file.
             's' => {
-                self.save_document();
+                if let Some(tab) = self.tabs.active().map(|tab| tab.id) {
+                    self.save_tab(tab);
+                    self.sync_dirty_flags();
+                }
+                true
+            }
+            // Ctrl+W closes the tab that is in front.
+            'w' => {
+                self.request_close(self.active);
                 true
             }
             // Ctrl+. cancels the running turn.
@@ -951,30 +1195,19 @@ impl NativeApplication {
         if self.panes[self.active].errors > 0 || self.panes[self.active].warnings > 0 {
             status.push_str(&format!("  ·  ✕ {}  ⚠ {}", self.panes[self.active].errors, self.panes[self.active].warnings));
         }
+        // A file that is too big is not coloured, and the user is told why:
+        // a document that quietly loses its colours looks broken.
+        if self.panes[self.active].degraded {
+            let policy = self.panes[self.active].policy;
+            status.push_str(&format!(
+                "  ·  降级模式：文件超过 {} 字节或 {} 行，不做语法高亮",
+                policy.max_bytes, policy.max_lines
+            ));
+        }
         if let Some(message) = self.status.as_ref() {
             status.push_str(&format!("  ·  {message}"));
         }
         status
-    }
-
-    /// Writes the buffer back to the open file.
-    fn save_document(&mut self) {
-        let Some(mut document) = self.panes[self.active].document.take() else {
-            self.status = Some("没有打开的文件".to_owned());
-            return;
-        };
-
-        let text = self.panes[self.active].editor.text();
-        match self.workspace.save(&mut document, &text) {
-            Ok(()) => {
-                self.status = Some(format!("已保存 {}", document.display_path()));
-            }
-            Err(error) => {
-                self.status = Some(format!("保存失败：{error}"));
-                eprintln!("could not save the document: {error}");
-            }
-        }
-        self.panes[self.active].document = Some(document);
     }
 
     /// Starts an agent turn with the editor's current text as the prompt.
@@ -1144,6 +1377,11 @@ impl ApplicationHandler for NativeApplication {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                // While the window is asking a question, it takes every key.
+                if self.handle_prompt_key(&event.logical_key.as_ref()) {
+                    window.request_redraw();
+                    return;
+                }
                 if self.handle_agent_key(&event.logical_key.as_ref()) {
                     window.request_redraw();
                     return;
@@ -1267,6 +1505,8 @@ impl ApplicationHandler for NativeApplication {
                 self.rebuild_layout(scale_factor);
                 self.keep_caret_visible(scale_factor);
                 self.tell_server_about_the_change();
+                // The tab now says that it has changes that are not on disk.
+                self.sync_dirty_flags();
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
@@ -1305,6 +1545,7 @@ impl ApplicationHandler for NativeApplication {
                     return;
                 };
                 let pane = &mut self.panes[self.active];
+                let prompt_text = self.prompt.as_ref().map(|prompt| prompt.text());
                 let scene = build_scene(
                     renderer,
                     renderer.logical_size(scale_factor),
@@ -1319,6 +1560,10 @@ impl ApplicationHandler for NativeApplication {
                         find: self.find.as_ref(),
                         marks: &pane.marks,
                         completion: self.completion.as_ref(),
+                        tabs: self.tabs.tabs(),
+                        active: self.active,
+                        tree: self.tree.as_ref(),
+                        prompt: prompt_text.as_deref(),
                     },
                 );
                 match renderer.render(&scene, scale_factor) {
@@ -1353,6 +1598,14 @@ struct Chrome<'a> {
     marks: &'a [editor_view::Mark],
     /// The list of completions, when it is open.
     completion: Option<&'a CompletionPopup>,
+    /// The tabs that are open.
+    tabs: &'a [Tab],
+    /// The tab that is on screen.
+    active: usize,
+    /// The files of the workspace.
+    tree: Option<&'a FileTree>,
+    /// The question the window is asking, if it is asking one.
+    prompt: Option<&'a str>,
 }
 
 /// The matches of a search that was not run.
@@ -1411,14 +1664,6 @@ fn build_scene(
 
         // The highlights were made on the highlighter's own thread; they are
         // the ones that belong to the text that is on screen.
-        let visible = view.visible_range();
-        let highlights = highlights;
-
-        scene.push_quad(
-            Rect::new(0.0, 0.0, 40.0, size.height),
-            Color::rgb(0.075, 0.086, 0.11),
-            viewport,
-        );
         scene.push_quad(body, Color::rgb(0.075, 0.086, 0.11), viewport);
         scene.push_quad(
             Rect::new(body.origin.x, body.origin.y, 3.0, body.size.height),
@@ -1435,7 +1680,7 @@ fn build_scene(
         );
         scene.push_text(
             heading,
-            Rect::new(56.0, 16.0, size.width - 72.0, 28.0),
+            Rect::new(SIDEBAR_WIDTH + 16.0, TAB_BAR_HEIGHT + 6.0, size.width - 72.0, 28.0),
             TextStyle {
                 clip: viewport,
                 color: Color::rgb(0.78, 0.82, 0.90),
@@ -1447,7 +1692,12 @@ fn build_scene(
         // The status line sits under the heading.
         scene.push_text(
             chrome.status_line,
-            Rect::new(56.0, 38.0, size.width - 72.0, 22.0),
+            Rect::new(
+                SIDEBAR_WIDTH + 16.0,
+                TAB_BAR_HEIGHT + 26.0,
+                size.width - 72.0,
+                22.0,
+            ),
             TextStyle {
                 clip: viewport,
                 color: Color::rgb(0.55, 0.60, 0.70),
@@ -1476,6 +1726,23 @@ fn build_scene(
     // The find bar is drawn in the sans-serif face, so it gets a measurer of
     // its own.
     let mut ui_measurer = RendererMeasurer::new(renderer, TextFamily::SansSerif);
+
+    // The strip of tabs and the tree of files are part of the window, not of
+    // the text: they are drawn around it. The strip is laid out here so that
+    // the place of a tab is worked out the same way twice — once to draw it,
+    // once to click it.
+    let strip = tab_strip(chrome.tabs, chrome.active, size, &mut ui_measurer);
+    push_tab_bar(&mut scene, viewport, tab_bar_rect(size), &strip.items);
+    if let Some(tree) = chrome.tree {
+        let rows = shell::tree_rows(tree.nodes(), sidebar_rect(size));
+        push_file_tree(&mut scene, viewport, sidebar_rect(size), &rows);
+    }
+
+    // The question the window is asking is drawn last, over everything.
+    if let Some(prompt) = chrome.prompt {
+        push_prompt(&mut scene, viewport, size, prompt);
+    }
+
     push_find_bar(&mut scene, size, body, chrome.find, &mut ui_measurer);
 
     // The list of completions floats under the caret.
@@ -1500,17 +1767,228 @@ fn agent_panel_rect(size: Size) -> Rect {
     Rect::new(size.width - width, 0.0, width, size.height)
 }
 
+/// The area the tab strip is drawn in.
+fn tab_bar_rect(size: Size) -> Rect {
+    let panel = agent_panel_rect(size);
+    Rect::new(
+        0.0,
+        0.0,
+        (panel.origin.x - 16.0).max(1.0),
+        TAB_BAR_HEIGHT,
+    )
+}
+
+/// Works out where the tabs are drawn.
+///
+/// The drawing and the clicking both go through here: a tab that is drawn in
+/// one place and clicked in another is a tab that cannot be clicked.
+fn tab_strip(
+    tabs: &[Tab],
+    active: usize,
+    size: Size,
+    measurer: &mut dyn TextMeasurer,
+) -> shell::TabStrip {
+    let dirty: Vec<bool> = tabs.iter().map(|tab| tab.dirty).collect();
+    shell::TabStrip::layout(tabs, &dirty, active, tab_bar_rect(size), measurer)
+}
+
+/// The area the file tree is drawn in.
+fn sidebar_rect(size: Size) -> Rect {
+    Rect::new(
+        0.0,
+        TAB_BAR_HEIGHT,
+        SIDEBAR_WIDTH,
+        (size.height - TAB_BAR_HEIGHT - 32.0).max(1.0),
+    )
+}
+
 /// The area the text body is drawn in.
 fn editor_body_rect(size: Size) -> Rect {
     let panel = agent_panel_rect(size);
-    let left = 56.0;
+    let left = SIDEBAR_WIDTH + 16.0;
     let right = panel.origin.x - 16.0;
     Rect::new(
         left,
-        52.0,
+        TAB_BAR_HEIGHT + 44.0,
         (right - left).max(1.0),
-        (size.height - 84.0).max(1.0),
+        (size.height - TAB_BAR_HEIGHT - 76.0).max(1.0),
     )
+}
+
+/// Draws the tab strip.
+///
+/// The tab that is on screen is lighter than the others, and a tab with
+/// unsaved changes carries a dot: a tab that is not marked is a tab whose
+/// changes the user cannot see.
+fn push_tab_bar(
+    scene: &mut FrameScene,
+    viewport: Rect,
+    strip: Rect,
+    items: &[shell::TabItem],
+) {
+    scene.push_quad(strip, Color::rgb(0.10, 0.12, 0.16), viewport);
+    scene.push_quad(
+        Rect::new(strip.origin.x, strip.origin.y + strip.size.height - 1.0, strip.size.width, 1.0),
+        Color::rgb(0.20, 0.23, 0.29),
+        viewport,
+    );
+
+    for item in items {
+        let rect = item.rect;
+        let background = if item.active {
+            Color::rgb(0.16, 0.19, 0.25)
+        } else {
+            Color::rgb(0.12, 0.14, 0.18)
+        };
+        scene.push_quad(rect, background, viewport);
+        if item.active {
+            scene.push_quad(
+                Rect::new(rect.origin.x, rect.origin.y, rect.size.width, 2.0),
+                Color::rgb(0.30, 0.58, 0.96),
+                viewport,
+            );
+        }
+        let text = Rect::new(
+            rect.origin.x + shell::TAB_PADDING,
+            rect.origin.y + 7.0,
+            (rect.size.width - shell::TAB_PADDING * 2.0).max(1.0),
+            20.0,
+        );
+        scene.push_text(
+            item.title.clone(),
+            text,
+            TextStyle {
+                clip: viewport,
+                color: if item.active {
+                    Color::rgb(0.88, 0.90, 0.94)
+                } else {
+                    Color::rgb(0.58, 0.62, 0.70)
+                },
+                font_size: 13.0,
+                line_height: 18.0,
+                family: TextFamily::SansSerif,
+            },
+        );
+        if item.dirty {
+            scene.push_text(
+                "●",
+                Rect::new(
+                    rect.origin.x + rect.size.width - shell::TAB_PADDING - 4.0,
+                    rect.origin.y + 6.0,
+                    16.0,
+                    20.0,
+                ),
+                TextStyle {
+                    clip: viewport,
+                    color: Color::rgb(0.30, 0.58, 0.96),
+                    font_size: 11.0,
+                    line_height: 16.0,
+                    family: TextFamily::SansSerif,
+                },
+            );
+        }
+    }
+}
+
+/// Draws the file tree.
+///
+/// A directory that is open shows a down arrow, a closed one a right arrow;
+/// the depth of a row is shown by how far it is indented.
+fn push_file_tree(
+    scene: &mut FrameScene,
+    viewport: Rect,
+    panel: Rect,
+    rows: &[shell::TreeRow],
+) {
+    scene.push_quad(panel, Color::rgb(0.10, 0.12, 0.16), viewport);
+    scene.push_quad(
+        Rect::new(
+            panel.origin.x + panel.size.width - 1.0,
+            panel.origin.y,
+            1.0,
+            panel.size.height,
+        ),
+        Color::rgb(0.20, 0.23, 0.29),
+        viewport,
+    );
+    for row in rows {
+        let indent = panel.origin.x + 8.0 + row.depth as f32 * shell::INDENT;
+        let marker = if row.directory {
+            if row.expanded { "▾" } else { "▸" }
+        } else {
+            ""
+        };
+        let label = if marker.is_empty() {
+            row.name.clone()
+        } else {
+            format!("{marker} {}", row.name)
+        };
+        scene.push_text(
+            label,
+            Rect::new(
+                indent,
+                row.rect.origin.y + 3.0,
+                (panel.origin.x + panel.size.width - indent - 8.0).max(1.0),
+                18.0,
+            ),
+            TextStyle {
+                clip: viewport,
+                color: if row.directory {
+                    Color::rgb(0.76, 0.80, 0.88)
+                } else {
+                    Color::rgb(0.60, 0.64, 0.72)
+                },
+                font_size: 13.0,
+                line_height: 18.0,
+                family: TextFamily::SansSerif,
+            },
+        );
+    }
+}
+
+/// Draws the question the window is asking.
+///
+/// The question is drawn over everything else, because a question that can be
+/// missed is not a question.
+fn push_prompt(scene: &mut FrameScene, viewport: Rect, size: Size, text: &str) {
+    let width = (size.width * 0.6).clamp(320.0, 720.0);
+    let height = 132.0;
+    let box_rect = Rect::new(
+        (size.width - width) / 2.0,
+        (size.height - height) / 2.0,
+        width,
+        height,
+    );
+    // The window behind the question is dimmed, so the question is the thing
+    // the eye goes to.
+    scene.push_quad(viewport, Color::rgb(0.02, 0.03, 0.05), viewport);
+    scene.push_quad(box_rect, Color::rgb(0.13, 0.15, 0.20), viewport);
+    scene.push_quad(
+        Rect::new(
+            box_rect.origin.x,
+            box_rect.origin.y,
+            box_rect.size.width,
+            3.0,
+        ),
+        Color::rgb(0.30, 0.58, 0.96),
+        viewport,
+    );
+    scene.push_text(
+        text.to_owned(),
+        Rect::new(
+            box_rect.origin.x + 20.0,
+            box_rect.origin.y + 18.0,
+            (box_rect.size.width - 40.0).max(1.0),
+            44.0,
+        ),
+        TextStyle {
+            clip: viewport,
+            color: Color::rgb(0.90, 0.92, 0.96),
+            font_size: 14.0,
+            line_height: 20.0,
+            family: TextFamily::SansSerif,
+        },
+    );
 }
 
 /// The place of the find bar in the corner of the editor body.
@@ -1784,8 +2262,8 @@ mod tests {
         fs::write(&path, "line one\nline two\n").unwrap();
 
         let app = NativeApplication::new(Some(path.clone())).expect("the application starts");
-        assert_eq!(app.editor.text(), "line one\nline two\n");
-        assert_eq!(app.editor.caret().0, 0);
+        assert_eq!(app.editor().text(), "line one\nline two\n");
+        assert_eq!(app.editor().caret().0, 0);
     }
 
     #[test]
@@ -1794,13 +2272,13 @@ mod tests {
         fs::write(&path, "original\n").unwrap();
 
         let mut app = NativeApplication::new(Some(path.clone())).expect("the application starts");
-        app.editor.insert("edited ").unwrap();
+        app.editor_mut().insert("edited ").unwrap();
         assert!(
             app.status_line().contains('●'),
             "the file must show as changed"
         );
 
-        app.save_document();
+        app.save_tab(active_tab(&app));
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "edited original\n");
         assert!(
@@ -1816,13 +2294,13 @@ mod tests {
         fs::write(&path, "original\n").unwrap();
 
         let mut app = NativeApplication::new(Some(path.clone())).expect("the application starts");
-        app.editor.insert("mine ").unwrap();
+        app.editor_mut().insert("mine ").unwrap();
 
         // Something else writes the file after the editor opened it.
         std::thread::sleep(std::time::Duration::from_millis(20));
         fs::write(&path, "somebody else wrote this\n").unwrap();
 
-        app.save_document();
+        app.save_tab(active_tab(&app));
 
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
@@ -1830,6 +2308,11 @@ mod tests {
             "the outside change must survive"
         );
         assert!(app.status_line().contains("保存失败"));
+    }
+
+    /// The tab that is on screen.
+    fn active_tab(app: &NativeApplication) -> TabId {
+        app.tabs.active().expect("a tab is open").id
     }
 
     #[test]
@@ -1843,17 +2326,19 @@ mod tests {
     #[test]
     fn an_application_without_a_file_starts_on_an_empty_document() {
         let app = NativeApplication::new(None).expect("the application starts");
-        assert_eq!(app.editor.text(), "");
+        assert_eq!(app.editor().text(), "");
         assert!(app.status_line().contains("untitled"));
     }
 
     /// An application with a laid out body, for the checks that need one.
     fn app_with_body(text: &str) -> NativeApplication {
         let mut app = NativeApplication::new(None).expect("the application starts");
-        app.editor.load_text(text);
         let mut measurer = MonospaceMeasurer::new(10.0);
-        app.view
-            .layout(app.editor.buffer(), 1000.0, 200.0, &mut measurer);
+        let pane = app.pane_mut();
+        pane.editor.load_text(text);
+        pane
+            .view
+            .layout(pane.editor.buffer(), 1000.0, 200.0, &mut measurer);
         app
     }
 
@@ -1863,9 +2348,9 @@ mod tests {
         // The wheel reports a negative delta when it is turned towards the
         // user.
         app.scroll_body_by_wheel(-3.0);
-        assert_eq!(app.view.view.first_line, 3);
+        assert_eq!(app.view().view.first_line, 3);
         app.scroll_body_by_wheel(2.0);
-        assert_eq!(app.view.view.first_line, 1);
+        assert_eq!(app.view().view.first_line, 1);
     }
 
     #[test]
@@ -1873,27 +2358,27 @@ mod tests {
         let mut app = app_with_body("one\ntwo\n");
         app.scroll_body_by_wheel(-100.0);
         // The document has three lines, the last one empty.
-        assert_eq!(app.view.view.first_line, 2);
+        assert_eq!(app.view().view.first_line, 2);
     }
 
     #[test]
     fn the_caret_moves_a_visual_line_at_a_time() {
         let mut app = app_with_body("first\nsecond\n");
-        app.editor.select_range(TextOffset(3), TextOffset(3));
+        app.editor_mut().select_range(TextOffset(3), TextOffset(3));
         app.move_caret_vertically(1.0, 1);
         // The caret keeps its column: three characters into the next line.
-        assert_eq!(app.editor.caret().0, 9);
+        assert_eq!(app.editor().caret().0, 9);
         app.move_caret_vertically(1.0, -1);
-        assert_eq!(app.editor.caret().0, 3);
+        assert_eq!(app.editor().caret().0, 3);
     }
 
     #[test]
     fn the_caret_stays_on_screen_when_it_leaves_the_view() {
         let mut app = app_with_body(&"line\n".repeat(20));
-        app.editor.select_range(TextOffset(99), TextOffset(99));
+        app.editor_mut().select_range(TextOffset(99), TextOffset(99));
         app.keep_caret_visible(1.0);
         assert!(
-            app.view.view.first_line > 0,
+            app.view().view.first_line > 0,
             "the view must follow the caret"
         );
     }
@@ -1901,39 +2386,43 @@ mod tests {
     #[test]
     fn adding_a_caret_below_gives_every_caret_a_neighbour() {
         let mut app = app_with_body("one\ntwo\nthree\n");
-        app.editor.select_range(TextOffset(1), TextOffset(1));
-        assert!(app.view.add_cursor_vertically(&mut app.editor, 1));
-        assert_eq!(app.editor.cursor_count(), 2);
+        let pane = app.pane_mut();
+        pane.editor.select_range(TextOffset(1), TextOffset(1));
+        assert!(pane.view.add_cursor_vertically(&mut pane.editor, 1));
+        assert_eq!(pane.editor.cursor_count(), 2);
         // The new caret keeps the column: the second character of the line
         // below.
-        assert_eq!(app.editor.carets(), vec![TextOffset(1), TextOffset(5)]);
+        assert_eq!(pane.editor.carets(), vec![TextOffset(1), TextOffset(5)]);
     }
 
     #[test]
     fn adding_a_caret_at_the_edge_of_the_document_does_nothing() {
         let mut app = app_with_body("one\ntwo\n");
         // The last line of the document has no line below it.
-        app.editor.select_range(TextOffset(8), TextOffset(8));
-        assert!(!app.view.add_cursor_vertically(&mut app.editor, 1));
-        assert_eq!(app.editor.cursor_count(), 1);
+        let pane = app.pane_mut();
+        pane.editor.select_range(TextOffset(8), TextOffset(8));
+        assert!(!pane.view.add_cursor_vertically(&mut pane.editor, 1));
+        assert_eq!(pane.editor.cursor_count(), 1);
     }
 
     #[test]
     fn typing_writes_at_every_caret() {
         let mut app = app_with_body("one\ntwo\n");
-        app.editor.select_range(TextOffset(1), TextOffset(1));
-        app.view.add_cursor_vertically(&mut app.editor, 1);
-        app.editor.insert("X").unwrap();
-        assert_eq!(app.editor.text(), "oXne\ntXwo\n");
+        let pane = app.pane_mut();
+        pane.editor.select_range(TextOffset(1), TextOffset(1));
+        pane.view.add_cursor_vertically(&mut pane.editor, 1);
+        pane.editor.insert("X").unwrap();
+        assert_eq!(pane.editor.text(), "oXne\ntXwo\n");
     }
 
     #[test]
     fn holding_shift_extends_the_selection_to_the_line_below() {
         let mut app = app_with_body("one\ntwo\n");
-        app.editor.select_range(TextOffset(1), TextOffset(1));
-        assert!(app.view.extend_vertical(&mut app.editor, 1));
+        let pane = app.pane_mut();
+        pane.editor.select_range(TextOffset(1), TextOffset(1));
+        assert!(pane.view.extend_vertical(&mut pane.editor, 1));
         assert_eq!(
-            app.editor.selection().range(app.editor.buffer()),
+            pane.editor.selection().range(pane.editor.buffer()),
             TextOffset(1)..TextOffset(5)
         );
     }
@@ -1941,7 +2430,7 @@ mod tests {
     /// An application with the find bar open.
     fn app_with_find(text: &str) -> NativeApplication {
         let mut app = NativeApplication::new(None).expect("the application starts");
-        app.editor.load_text(text);
+        app.editor_mut().load_text(text);
         app.modifiers = ModifiersState::CONTROL;
         app.handle_find_key(&character("f"));
         app.modifiers = ModifiersState::default();
@@ -1974,7 +2463,7 @@ mod tests {
         let mut app = app_with_find("one two one");
         app.handle_find_bar_key(&character("o"), Some("o"));
         // The text goes into the query, not into the document.
-        assert_eq!(app.editor.text(), "one two one");
+        assert_eq!(app.editor().text(), "one two one");
         let find = app.find.as_ref().expect("the find bar is open");
         assert_eq!(find.query(), "o");
         assert_eq!(find.match_count(), 3);
@@ -1993,7 +2482,7 @@ mod tests {
         app.handle_find_bar_key(&character("o"), Some("o"));
         app.modifiers = ModifiersState::ALT;
         app.handle_find_bar_key(&named(NamedKey::Enter), None);
-        assert_eq!(app.editor.cursor_count(), 3);
+        assert_eq!(app.editor().cursor_count(), 3);
     }
 
     #[test]
@@ -2005,5 +2494,420 @@ mod tests {
         app.handle_find_bar_key(&named(NamedKey::Enter), None);
         let find = app.find.as_ref().expect("the find bar is open");
         assert_eq!(find.current_index(), 1);
+    }
+
+    /// A directory of scratch files for the checks that need more than one.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-scratch").join(name);
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).expect("the scratch directory can be created");
+        directory
+    }
+
+    #[test]
+    fn opening_a_second_file_gives_a_second_tab() {
+        let directory = scratch_dir("tabs");
+        let first = directory.join("first.txt");
+        let second = directory.join("second.txt");
+        fs::write(&first, "one\n").unwrap();
+        fs::write(&second, "two\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(first.clone())).expect("the application starts");
+        assert_eq!(app.tabs.len(), 1);
+
+        assert!(app.open_file(&second));
+
+        assert_eq!(app.tabs.len(), 2, "the second file has its own tab");
+        assert_eq!(app.panes.len(), 2, "every tab has its own buffer");
+        assert_eq!(app.active, 1, "the file that was opened is in front");
+        assert_eq!(app.editor().text(), "two\n");
+        assert_eq!(
+            app.tabs.tabs()[0].title,
+            "first.txt",
+            "the tab shows the name of the file"
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_already_open_comes_to_the_front_instead() {
+        let directory = scratch_dir("tabs-same");
+        let first = directory.join("first.txt");
+        let second = directory.join("second.txt");
+        fs::write(&first, "one\n").unwrap();
+        fs::write(&second, "two\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(first.clone())).expect("the application starts");
+        app.open_file(&second);
+        assert_eq!(app.active, 1);
+
+        // The first file is opened again.
+        assert!(app.open_file(&first));
+
+        assert_eq!(app.tabs.len(), 2, "the file is not opened twice");
+        assert_eq!(app.panes.len(), 2, "and it does not get a second buffer");
+        assert_eq!(app.active, 0, "the tab that was there comes to the front");
+    }
+
+    #[test]
+    fn closing_a_tab_brings_another_one_to_the_front() {
+        let directory = scratch_dir("tabs-close");
+        let first = directory.join("first.txt");
+        let second = directory.join("second.txt");
+        fs::write(&first, "one\n").unwrap();
+        fs::write(&second, "two\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(first.clone())).expect("the application starts");
+        app.open_file(&second);
+
+        app.close_tab(1);
+
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.active, 0);
+        assert_eq!(app.editor().text(), "one\n");
+    }
+
+    #[test]
+    fn closing_the_last_tab_leaves_an_empty_editor() {
+        let directory = scratch_dir("tabs-last");
+        let only = directory.join("only.txt");
+        fs::write(&only, "one\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(only)).expect("the application starts");
+        app.close_tab(0);
+
+        assert_eq!(app.tabs.len(), 1, "there is always a tab to type into");
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.editor().text(), "");
+    }
+
+    #[test]
+    fn an_edit_marks_the_tab_as_changed() {
+        let directory = scratch_dir("dirty");
+        let file = directory.join("file.txt");
+        fs::write(&file, "original\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file.clone())).expect("the application starts");
+        app.editor_mut().insert("edited ").unwrap();
+        app.sync_dirty_flags();
+
+        assert!(app.tabs.tabs()[0].dirty, "the tab has changes that are not on disk");
+
+        app.save_tab(active_tab(&app));
+        app.sync_dirty_flags();
+
+        assert!(!app.tabs.tabs()[0].dirty, "a saved tab has no changes");
+    }
+
+    #[test]
+    fn only_the_edited_tab_is_marked_as_changed() {
+        let directory = scratch_dir("dirty-one");
+        let first = directory.join("first.txt");
+        let second = directory.join("second.txt");
+        fs::write(&first, "one\n").unwrap();
+        fs::write(&second, "two\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(first.clone())).expect("the application starts");
+        app.open_file(&second);
+        app.editor_mut().insert("edited ").unwrap();
+        app.sync_dirty_flags();
+
+        assert!(!app.tabs.tabs()[0].dirty, "the other tab is untouched");
+        assert!(app.tabs.tabs()[1].dirty, "the tab in front is changed");
+    }
+
+    #[test]
+    fn closing_a_tab_with_unsaved_changes_asks_first() {
+        let directory = scratch_dir("close-ask");
+        let file = directory.join("file.txt");
+        fs::write(&file, "original\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file.clone())).expect("the application starts");
+        app.editor_mut().insert("edited ").unwrap();
+        app.sync_dirty_flags();
+
+        app.request_close(0);
+
+        assert_eq!(
+            app.prompt,
+            Some(Prompt::CloseDirty {
+                tab: active_tab(&app)
+            }),
+            "the window has to ask before the work is thrown away"
+        );
+        assert_eq!(app.tabs.len(), 1, "the tab is still there");
+    }
+
+    #[test]
+    fn a_tab_without_changes_is_closed_without_a_question() {
+        let directory = scratch_dir("close-quiet");
+        let file = directory.join("file.txt");
+        fs::write(&file, "original\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.request_close(0);
+
+        assert!(app.prompt.is_none(), "nothing to ask about");
+        assert_eq!(app.tabs.len(), 1, "an empty editor takes its place");
+    }
+
+    #[test]
+    fn throwing_the_changes_away_closes_the_tab_and_leaves_the_file_alone() {
+        let directory = scratch_dir("close-discard");
+        let file = directory.join("file.txt");
+        fs::write(&file, "original\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file.clone())).expect("the application starts");
+        app.editor_mut().insert("edited ").unwrap();
+        app.sync_dirty_flags();
+        app.request_close(0);
+
+        assert!(app.handle_prompt_key(&character("d")));
+
+        assert!(app.prompt.is_none());
+        assert_eq!(app.tabs.len(), 1, "the tab was closed");
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "original\n",
+            "the file on disk is untouched"
+        );
+    }
+
+    #[test]
+    fn saving_the_changes_closes_the_tab_and_writes_the_file() {
+        let directory = scratch_dir("close-save");
+        let file = directory.join("file.txt");
+        fs::write(&file, "original\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file.clone())).expect("the application starts");
+        app.editor_mut().insert("edited ").unwrap();
+        app.sync_dirty_flags();
+        app.request_close(0);
+
+        assert!(app.handle_prompt_key(&character("s")));
+
+        assert!(app.prompt.is_none());
+        assert_eq!(app.tabs.len(), 1, "the tab was closed");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "edited original\n");
+    }
+
+    #[test]
+    fn a_file_that_changed_on_disk_is_asked_about() {
+        let directory = scratch_dir("changed-on-disk");
+        let file = directory.join("file.txt");
+        fs::write(&file, "original\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file.clone())).expect("the application starts");
+
+        // Somebody else writes the file. The text is longer, so the change
+        // cannot be hidden by the clock's resolution.
+        fs::write(&file, "somebody else wrote this\n").unwrap();
+
+        assert!(app.poll_disk(), "the change is noticed");
+        assert_eq!(
+            app.prompt,
+            Some(Prompt::ChangedOnDisk {
+                tab: active_tab(&app),
+                removed: false
+            })
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_asked_about_is_not_asked_about_twice() {
+        let directory = scratch_dir("changed-once");
+        let file = directory.join("file.txt");
+        fs::write(&file, "original\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file.clone())).expect("the application starts");
+        fs::write(&file, "somebody else wrote this\n").unwrap();
+
+        assert!(app.poll_disk());
+        assert!(!app.poll_disk(), "the change was already reported");
+    }
+
+    #[test]
+    fn reloading_throws_the_changes_in_the_buffer_away() {
+        let directory = scratch_dir("changed-reload");
+        let file = directory.join("file.txt");
+        fs::write(&file, "original\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file.clone())).expect("the application starts");
+        app.editor_mut().insert("mine ").unwrap();
+        fs::write(&file, "somebody else wrote this\n").unwrap();
+        app.poll_disk();
+
+        assert!(app.handle_prompt_key(&character("r")));
+
+        assert_eq!(
+            app.editor().text(),
+            "somebody else wrote this\n",
+            "the file on disk is what the buffer holds now"
+        );
+    }
+
+    #[test]
+    fn saving_over_a_change_writes_the_buffer_to_the_file() {
+        let directory = scratch_dir("changed-save");
+        let file = directory.join("file.txt");
+        fs::write(&file, "original\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file.clone())).expect("the application starts");
+        app.editor_mut().insert("mine ").unwrap();
+        fs::write(&file, "somebody else wrote this\n").unwrap();
+        app.poll_disk();
+
+        assert!(app.handle_prompt_key(&character("s")));
+
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "mine original\n",
+            "the user was asked and said so"
+        );
+    }
+
+    #[test]
+    fn the_file_tree_shows_the_folder_of_the_open_file() {
+        let directory = scratch_dir("tree");
+        let file = directory.join("file.txt");
+        fs::write(&file, "one\n").unwrap();
+
+        let app = NativeApplication::new(Some(file)).expect("the application starts");
+        let tree = app.tree.as_ref().expect("the tree of files is there");
+        assert_eq!(tree.root(), directory.as_path());
+    }
+
+    #[test]
+    fn the_file_tree_lists_the_files_of_the_folder() {
+        let directory = scratch_dir("tree-files");
+        fs::write(directory.join("one.txt"), "one\n").unwrap();
+        fs::write(directory.join("two.txt"), "two\n").unwrap();
+        let file = directory.join("one.txt");
+
+        let app = NativeApplication::new(Some(file)).expect("the application starts");
+        let tree = app.tree.as_ref().expect("the tree of files is there");
+        let names: Vec<&str> = tree.nodes().iter().map(|node| node.name.as_str()).collect();
+        assert!(
+            names.contains(&"one.txt") && names.contains(&"two.txt"),
+            "the tree shows the files of the folder, got {names:?}"
+        );
+    }
+
+    /// An application whose body is laid out, so the highlighter has a range
+    /// of the text to work on.
+    fn app_with_layout(app: &mut NativeApplication) {
+        let mut measurer = MonospaceMeasurer::new(10.0);
+        let pane = app.pane_mut();
+        pane.view
+            .layout(pane.editor.buffer(), 1000.0, 200.0, &mut measurer);
+    }
+
+    /// Waits for the highlighter to answer.
+    ///
+    /// The highlighter runs on a thread of its own, so the answer is not there
+    /// the moment it is asked for. The wait is bounded: a highlighter that
+    /// never answers fails the test instead of hanging it.
+    fn wait_for_syntax(app: &mut NativeApplication) -> bool {
+        for _ in 0..400 {
+            if app.pump_syntax() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn a_file_within_the_limit_is_highlighted() {
+        let directory = scratch_dir("highlighted");
+        let file = directory.join("file.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app_with_layout(&mut app);
+
+        assert!(wait_for_syntax(&mut app), "the highlighter answers");
+        assert!(!app.panes[app.active].degraded, "the file is small enough");
+        assert!(
+            !app.panes[app.active].highlights.is_empty(),
+            "the text is coloured"
+        );
+    }
+
+    #[test]
+    fn a_file_over_the_limit_is_not_parsed_at_all() {
+        let directory = scratch_dir("degraded");
+        let file = directory.join("file.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app_with_layout(&mut app);
+        app.pane_mut().set_policy(HighlightPolicy {
+            max_bytes: 1,
+            max_lines: 1,
+        });
+
+        assert!(
+            app.pump_syntax(),
+            "the window has to say that the file is too big"
+        );
+        assert!(app.panes[app.active].degraded, "the file is not coloured");
+        assert!(app.panes[app.active].highlights.is_empty());
+        assert!(
+            app.status_line().contains("降级模式"),
+            "the status line says why, got {}",
+            app.status_line()
+        );
+    }
+
+    #[test]
+    fn a_degraded_file_can_still_be_edited_and_saved() {
+        let directory = scratch_dir("degraded-editable");
+        let file = directory.join("file.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file.clone())).expect("the application starts");
+        app_with_layout(&mut app);
+        app.pane_mut().set_policy(HighlightPolicy {
+            max_bytes: 1,
+            max_lines: 1,
+        });
+        app.pump_syntax();
+
+        app.editor_mut().insert("// edited\n").unwrap();
+        app.save_tab(active_tab(&app));
+
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "// edited\nfn main() {}\n",
+            "a file without colours is still a file"
+        );
+    }
+
+    #[test]
+    fn clicking_a_tab_brings_it_to_the_front() {
+        let directory = scratch_dir("tabs-click");
+        let first = directory.join("first.txt");
+        let second = directory.join("second.txt");
+        fs::write(&first, "one\n").unwrap();
+        fs::write(&second, "two\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(first.clone())).expect("the application starts");
+        app.open_file(&second);
+        assert_eq!(app.active, 1);
+
+        // The strip is laid out and hit the same way as it is drawn.
+        let size = Size::new(1200.0, 800.0);
+        let mut measurer = MonospaceMeasurer::new(13.0);
+        let strip = tab_strip(app.tabs.tabs(), app.active, size, &mut measurer);
+        let first_tab = strip.items[0].rect;
+        let point = Point {
+            x: first_tab.origin.x + 4.0,
+            y: first_tab.origin.y + 4.0,
+        };
+
+        app.activate_tab_at(point, &strip);
+
+        assert_eq!(app.active, 0, "the tab that was clicked is in front");
     }
 }

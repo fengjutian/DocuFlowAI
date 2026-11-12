@@ -164,11 +164,7 @@ impl SyntaxWorker {
 fn run(requests: Receiver<Job>, results: std::sync::mpsc::Sender<Outcome>, language: Option<Language>) {
     let mut syntax = Syntax::new();
     syntax.set_language(language);
-    loop {
-        let Ok(first) = requests.recv() else {
-            // The window is gone: the thread has nothing left to do.
-            break;
-        };
+    while let Ok(first) = requests.recv() {
 
         // Only the newest *highlight* matters. A backlog of parses would make
         // the highlighter answer questions nobody is waiting for any more.

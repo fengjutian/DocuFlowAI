@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 
 use codeweaver_render::{Point, Rect};
-use codeweaver_ui::{LineMetrics, TextMeasurer};
+use codeweaver_ui::TextMeasurer;
 use codeweaver_workbench::{Tab, TabId};
 
 /// The height of one row of the file tree.
@@ -137,14 +137,4 @@ pub fn title_of(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .map(|name| name.to_owned())
         .unwrap_or_else(|| path.display().to_string())
-}
-
-/// The width a text needs, with a measurer that knows the font.
-pub fn width_of(text: &str, font_size: f32, measurer: &mut dyn TextMeasurer) -> f32 {
-    measurer.measure(text, font_size).width
-}
-
-/// The metrics of a text, for the callers that need more than its width.
-pub fn metrics_of(text: &str, font_size: f32, measurer: &mut dyn TextMeasurer) -> LineMetrics {
-    measurer.measure(text, font_size)
 }

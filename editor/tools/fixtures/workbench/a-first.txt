@@ -1,0 +1,5 @@
+The first file of the workbench fixture.
+
+The check opens this file, clicks the second file in the tree, and types a
+character into the buffer. The first file is the one that is open when the
+editor starts, so its tab is the first one in the strip.

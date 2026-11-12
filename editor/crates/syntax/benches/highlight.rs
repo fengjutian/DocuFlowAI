@@ -22,7 +22,7 @@
 
 use std::time::{Duration, Instant};
 
-use codeweaver_syntax::{Language, Syntax};
+use codeweaver_syntax::{HighlightPolicy, Language, Syntax, SyntaxWorker};
 use codeweaver_text::{Buffer, TextEdit, TextOffset, Transaction};
 
 /// The statistics a benchmark reports.
@@ -182,12 +182,129 @@ fn bench_highlights(lines: usize, visible: usize) -> Measurement {
 /// The cold number is the cost of opening a file, which happens once. The
 /// plan allows three seconds for a hundred megabyte file, and ten thousand
 /// lines is far smaller than that.
+///
+/// The last four numbers are the ones V0.4.0 added. The parse moved to a
+/// thread of its own, so the numbers that matter for a frame are the ones the
+/// thread that draws the picture pays:
+///
+/// - `ui_decision` is what that thread does with a file that is too big to be
+///   coloured: the decision whether to parse it at all. It happens on the
+///   way of every keystroke, so it has to be far inside a frame.
+/// - `ui_handoff` is what that thread pays for a file that *is* coloured: the
+///   copy of the text for the other thread. The copy is the only part of the
+///   highlighter that is left on this thread, so it has to fit in a frame.
+/// - `background` is the whole round trip over the channel, parse included.
+///   It is not on the frame's way, so its budget is about the user waiting
+///   for the colours, not about the frame.
+///
+/// The big file is measured twice on purpose: once over the limit, where the
+/// answer has to come back saying "degraded" instead of parsing, and once
+/// under it, where the parse really happens.
 const BUDGETS: &[(&str, f64)] = &[
     ("parse_cold/10000-lines", 300.0),
     ("parse_warm/2000-lines", 12.0),
     ("parse_warm/10000-lines", 35.0),
     ("highlights/10000-lines/40-visible", 1.0),
+    ("ui_decision/60000-lines", 1.0),
+    ("ui_handoff/20000-lines", 16.0),
+    ("background/60000-lines", 100.0),
+    ("background/20000-lines", 2000.0),
 ];
+
+/// The number of lines that fit on the screen.
+const VISIBLE_LINES: usize = 40;
+
+/// A file with exactly `lines` lines of Rust.
+///
+/// The size of the file is what the policy looks at, so the number of lines
+/// has to be the real one and not a name.
+fn source_of(lines: usize) -> String {
+    let mut text = String::with_capacity(lines * 28);
+    for index in 0..lines {
+        if index % 1000 == 0 {
+            text.push_str("fn function() {}\n");
+        } else {
+            text.push_str("let value = 1; // a line of code\n");
+        }
+    }
+    text
+}
+
+/// Measures what the thread that draws the picture does with a file that is
+/// too big to be coloured.
+///
+/// This is the case the background highlighter exists for: the parse is not
+/// on this thread any more, and a file over the limit is not parsed at all.
+/// What is left here is the decision, and it has to be small.
+fn bench_ui_decision(lines: usize) -> Measurement {
+    let buffer = Buffer::new(source_of(lines));
+    let policy = HighlightPolicy::default();
+    let mut measurement = Measurement::new(format!("ui_decision/{lines}-lines"));
+    for _ in 0..100 {
+        let start = Instant::now();
+        let allowed = policy.allows(buffer.len().0, buffer.line_count());
+        measurement.record(start.elapsed());
+        std::hint::black_box(allowed);
+    }
+    measurement
+}
+
+/// Measures what the thread that draws the picture pays for a file that is
+/// still coloured: the copy of the text for the highlighter on the other
+/// thread.
+fn bench_ui_handoff(lines: usize) -> Measurement {
+    let buffer = Buffer::new(source_of(lines));
+    let mut measurement = Measurement::new(format!("ui_handoff/{lines}-lines"));
+    for _ in 0..50 {
+        let start = Instant::now();
+        let text = buffer.text();
+        measurement.record(start.elapsed());
+        std::hint::black_box(text.len());
+    }
+    measurement
+}
+
+/// Waits for the answer of the highlighter.
+fn wait_for(worker: &mut SyntaxWorker) -> Option<codeweaver_syntax::Outcome> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(outcome) = worker.poll() {
+            return Some(outcome);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Measures the whole round trip of the background highlighter.
+///
+/// The request goes to the other thread, the text is parsed there, and the
+/// answer comes back. A new version every round, so every round is a full
+/// parse and not the check that says the text did not change.
+///
+/// The range that is asked for is the range that is on screen, the way the
+/// editor asks for it: the whole document is parsed, but only the text the
+/// user can see is turned into highlights.
+fn bench_background(lines: usize) -> Measurement {
+    let text = source_of(lines);
+    let bytes = text.len();
+    let visible = (bytes * VISIBLE_LINES / lines).min(bytes);
+    let mut worker = SyntaxWorker::new(Some(Language::Rust));
+    let mut measurement = Measurement::new(format!("background/{lines}-lines"));
+    for round in 0..5u64 {
+        // The copy is what the thread that draws the picture pays, and it is
+        // measured on its own: this case is about the other thread.
+        let copy = text.clone();
+        let start = Instant::now();
+        worker.request(round + 1, copy, 0..visible, lines);
+        let outcome = wait_for(&mut worker);
+        measurement.record(start.elapsed());
+        std::hint::black_box(outcome.map(|outcome| outcome.degraded));
+    }
+    measurement
+}
 
 fn main() {
     let measurements: Vec<Measurement> = vec![
@@ -195,6 +312,10 @@ fn main() {
         bench_parse_warm(2_000),
         bench_parse_warm(10_000),
         bench_highlights(10_000, 40),
+        bench_ui_decision(60_000),
+        bench_ui_handoff(20_000),
+        bench_background(60_000),
+        bench_background(20_000),
     ];
 
     println!(

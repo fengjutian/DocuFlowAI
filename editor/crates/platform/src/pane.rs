@@ -16,7 +16,7 @@
 use std::ops::Range;
 
 use codeweaver_editor_core::Editor;
-use codeweaver_syntax::{Highlight, Language, SyntaxWorker};
+use codeweaver_syntax::{Highlight, HighlightPolicy, Language, SyntaxWorker};
 use codeweaver_text::BufferVersion;
 use codeweaver_workspace::Document;
 use codeweaver_workbench::TabId;
@@ -35,6 +35,13 @@ pub struct EditorPane {
     pub view: EditorView,
     /// The highlighter, on a thread of its own.
     pub syntax: SyntaxWorker,
+    /// The sizes at which the highlighter gives up.
+    ///
+    /// The policy is kept here as well as in the worker: the pane has to
+    /// decide whether a file is too big *before* it copies the text over, and
+    /// the worker has to decide again on its own thread. The two are always
+    /// the same.
+    pub policy: HighlightPolicy,
     /// The highlights of the last answer of the highlighter.
     pub highlights: Vec<Highlight>,
     /// Whether the document is too big to be highlighted.
@@ -65,6 +72,7 @@ impl EditorPane {
             document: None,
             view: EditorView::new(),
             syntax: SyntaxWorker::new(language),
+            policy: HighlightPolicy::default(),
             highlights: Vec::new(),
             degraded: false,
             marks: Vec::new(),
@@ -85,6 +93,7 @@ impl EditorPane {
             document: Some(document),
             view: EditorView::new(),
             syntax: SyntaxWorker::new(language),
+            policy: HighlightPolicy::default(),
             highlights: Vec::new(),
             degraded: false,
             marks: Vec::new(),
@@ -94,6 +103,18 @@ impl EditorPane {
             server_version: None,
             asked: None,
         }
+    }
+
+    /// Sets the sizes at which the highlighter gives up.
+    ///
+    /// The new limits are used by the pane and by the worker, so that the two
+    /// never disagree about whether a file is too big.
+    pub fn set_policy(&mut self, policy: HighlightPolicy) {
+        if self.policy == policy {
+            return;
+        }
+        self.policy = policy;
+        self.syntax.set_policy(policy);
     }
 
     /// Whether the document has changes that are not on disk yet.
