@@ -15,7 +15,7 @@ use codeweaver_syntax::{Language, Syntax};
 use codeweaver_text::TextOffset;
 use codeweaver_ui::TextMeasurer;
 use codeweaver_workspace::{Document, Workspace};
-use editor_view::{EditorView, FindOverlay, LINE_HEIGHT, RendererMeasurer};
+use editor_view::{BodyOverlay, EditorView, FindOverlay, LINE_HEIGHT, RendererMeasurer};
 use find::{FindBar, FindField};
 use input::TextInputState;
 use winit::{
@@ -876,8 +876,10 @@ fn build_scene(
             editor_state,
             input.preedit(),
             body,
-            overlay,
-            highlights,
+            BodyOverlay {
+                find: overlay,
+                highlights,
+            },
             &mut measurer,
         );
     }

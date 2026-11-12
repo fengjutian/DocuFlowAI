@@ -471,15 +471,15 @@ impl EditorView {
             Some(_) => measurer.measure(preedit, FONT_SIZE).width,
             None => 0.0,
         };
-        for (start, end, kind) in pieces {
-            let mut x = body.origin.x + line.offset_at(start);
+        for piece in pieces {
+            let mut x = body.origin.x + line.offset_at(piece.start);
             // The text after the composition is pushed to the right by it.
             if let Some(split) = split
-                && start >= split
+                && piece.start >= split
             {
                 x += width;
             }
-            push_piece(scene, line, start, end, kind, x, y, body, clip);
+            push_piece(scene, line, &piece, x, y, body, clip);
         }
         if let Some(split) = split {
             push_text(
@@ -524,25 +524,43 @@ fn pieces_of(line: &VisualLine, highlights: &[Highlight], split: Option<usize>) 
         let start = highlight.range.start.max(line.range.start);
         let end = highlight.range.end.min(line.range.end);
         if start > cursor {
-            pieces.push((cursor, start, None));
+            pieces.push(Piece {
+                start: cursor,
+                end: start,
+                kind: None,
+            });
         }
-        pieces.push((start, end, Some(highlight.kind)));
+        pieces.push(Piece {
+            start,
+            end,
+            kind: Some(highlight.kind),
+        });
         cursor = end;
     }
     if cursor < line.range.end {
-        pieces.push((cursor, line.range.end, None));
+        pieces.push(Piece {
+            start: cursor,
+            end: line.range.end,
+            kind: None,
+        });
     }
 
     let Some(split) = split else {
         return pieces;
     };
     let mut split_pieces: Vec<Piece> = Vec::with_capacity(pieces.len() + 1);
-    for (start, end, kind) in pieces {
-        if start < split && split < end {
-            split_pieces.push((start, split, kind));
-            split_pieces.push((split, end, kind));
+    for piece in pieces {
+        if piece.start < split && split < piece.end {
+            split_pieces.push(Piece {
+                end: split,
+                ..piece
+            });
+            split_pieces.push(Piece {
+                start: split,
+                ..piece
+            });
         } else {
-            split_pieces.push((start, end, kind));
+            split_pieces.push(piece);
         }
     }
     split_pieces
@@ -552,16 +570,14 @@ fn pieces_of(line: &VisualLine, highlights: &[Highlight], split: Option<usize>) 
 fn push_piece(
     scene: &mut FrameScene,
     line: &VisualLine,
-    start: usize,
-    end: usize,
-    kind: Option<HighlightKind>,
+    piece: &Piece,
     x: f32,
     y: f32,
     body: Rect,
     clip: Rect,
 ) {
-    let text = &line.text[start - line.range.start..end - line.range.start];
-    let color = kind.map(highlight_color).unwrap_or(TEXT_COLOR);
+    let text = &line.text[piece.start - line.range.start..piece.end - line.range.start];
+    let color = piece.kind.map(highlight_color).unwrap_or(TEXT_COLOR);
     push_text(scene, text, x, y, body, clip, color);
 }
 
@@ -654,6 +670,18 @@ mod tests {
         (view, editor)
     }
 
+    /// The overlay of a body that has nothing on it.
+    fn no_overlay(highlights: &[Highlight]) -> BodyOverlay<'_> {
+        BodyOverlay {
+            find: FindOverlay {
+                bar: None,
+                matches: &[],
+                current: None,
+            },
+            highlights,
+        }
+    }
+
     #[test]
     fn a_click_places_the_caret_at_the_closest_character() {
         let (mut view, mut editor) = view_of("abc\ndef\n");
@@ -693,12 +721,7 @@ mod tests {
             &editor,
             "",
             Rect::new(0.0, 0.0, 1000.0, 200.0),
-            FindOverlay {
-                bar: None,
-                matches: &[],
-                current: None,
-            },
-            &[],
+            no_overlay(&[]),
             &mut measurer,
         );
 
@@ -724,12 +747,7 @@ mod tests {
             &editor,
             "",
             Rect::new(0.0, 0.0, 1000.0, 200.0),
-            FindOverlay {
-                bar: None,
-                matches: &[],
-                current: None,
-            },
-            &[],
+            no_overlay(&[]),
             &mut measurer,
         );
 
@@ -758,12 +776,7 @@ mod tests {
             &editor,
             "",
             Rect::new(0.0, 0.0, 1000.0, 200.0),
-            FindOverlay {
-                bar: None,
-                matches: &[],
-                current: None,
-            },
-            highlights,
+            no_overlay(highlights),
             &mut measurer,
         );
 
@@ -790,12 +803,7 @@ mod tests {
             &editor,
             "",
             Rect::new(0.0, 0.0, 1000.0, 200.0),
-            FindOverlay {
-                bar: None,
-                matches: &[],
-                current: None,
-            },
-            &[],
+            no_overlay(&[]),
             &mut measurer,
         );
 
