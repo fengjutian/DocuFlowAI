@@ -83,6 +83,17 @@ test("skips unhealthy runtimes", async () => {
   assert.equal((await scheduler.select()).runtimeId, "well");
 });
 
+test("never schedules a disabled runtime", async () => {
+  const registry = registryWith([
+    { id: "disabled", adapter: adapter() },
+    { id: "enabled", adapter: adapter() }
+  ]);
+  registry.setEnabled("disabled", false);
+  const scheduler = new RuntimeScheduler(registry, { strategy: "first_healthy" });
+
+  assert.equal((await scheduler.select()).runtimeId, "enabled");
+});
+
 test("requires the requested capabilities", async () => {
   const registry = registryWith([
     { id: "plain", adapter: adapter() },

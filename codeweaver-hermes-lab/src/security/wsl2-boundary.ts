@@ -89,7 +89,7 @@ export class Wsl2BoundaryProvider implements CheckPlanningProvider {
 
   async run(spec: BoundarySpec, script: string, timeoutMs: number): Promise<ProbeOutcome> {
     await this.stage(script);
-    const outcome = await this.guest(["--", "bash", "-c", this.boundaryCommand(spec)], timeoutMs);
+    const outcome = await this.guest(["--", "bash", "-c", this.boundaryCommand(spec.workspaceDir)], timeoutMs);
     return outcome;
   }
 

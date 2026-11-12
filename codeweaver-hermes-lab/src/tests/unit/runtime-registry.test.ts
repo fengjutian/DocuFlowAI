@@ -59,6 +59,24 @@ test("reports a missing runtime rather than returning an undefined adapter", () 
   assert.equal(registry.unregister("nope"), false);
 });
 
+test("keeps disabled runtimes visible while refusing new work and health probes", async () => {
+  const registry = new AgentRuntimeRegistry();
+  const adapter = stubAdapter(true);
+  registry.register({ id: "hermes-local", runtimeType: "hermes", adapter });
+
+  registry.setEnabled("hermes-local", false);
+
+  assert.equal(registry.list()[0]!.enabled, false);
+  assert.equal(registry.get("hermes-local"), undefined);
+  assert.throws(() => registry.require("hermes-local"), /disabled/);
+  const report = await registry.healthCheckAll();
+  assert.equal(report.runtimes[0]!.healthy, false);
+  assert.match(report.runtimes[0]!.error ?? "", /disabled/i);
+
+  registry.setEnabled("hermes-local", true);
+  assert.equal(registry.require("hermes-local"), adapter);
+});
+
 test("aggregates health across runtimes and marks the report unhealthy if any fails", async () => {
   const registry = new AgentRuntimeRegistry({ now: () => new Date("2026-11-09T00:00:00.000Z") });
   registry.register({ id: "hermes-local", runtimeType: "hermes", adapter: stubAdapter(true) });

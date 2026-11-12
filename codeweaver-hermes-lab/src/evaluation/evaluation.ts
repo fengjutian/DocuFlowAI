@@ -218,7 +218,16 @@ export async function evaluateChecks(
             }
           }
         : {}),
-      ...(check.approval ? { approval: check.approval } : {})
+      ...(check.approval ? { approval: check.approval } : {}),
+      ...(outcome.boundary
+        ? {
+            boundary: {
+              established: outcome.boundary.established,
+              description: outcome.boundary.description,
+              ...(outcome.boundary.error ? { error: outcome.boundary.error } : {})
+            }
+          }
+        : {})
     });
   }
 

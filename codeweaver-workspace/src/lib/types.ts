@@ -9,6 +9,7 @@ export interface RuntimeEntry {
   id: string;
   runtimeType: string;
   version: string | null;
+  enabled: boolean;
   metadata: Record<string, unknown>;
 }
 

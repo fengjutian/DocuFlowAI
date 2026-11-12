@@ -124,6 +124,8 @@ export async function withAgentRuntime<T>(options: {
   workspace: string;
   projectId: string;
   model?: string;
+  /** The host path boundary the server has, when it has one. */
+  boundary?: { backend: "wsl2"; distro?: string };
   run: (client: AgentArmClient) => Promise<T>;
 }): Promise<T> {
   const dataDir = await mkdtemp(join(tmpdir(), "codeweaver-agent-arm-"));
@@ -135,7 +137,8 @@ export async function withAgentRuntime<T>(options: {
     repository: options.workspace,
     hermesBaseUrl: "http://127.0.0.1:9",
     hermesTimeoutMs: 5_000,
-    pi: { provider: "minimax-cn", model: options.model ?? "MiniMax-M3" }
+    pi: { provider: "minimax-cn", model: options.model ?? "MiniMax-M3" },
+    ...(options.boundary ? { boundary: options.boundary } : {})
   });
   await runtime.ready();
   const server = await createApiServer(runtime.deps).listen(0);

@@ -130,6 +130,8 @@ pub struct Client {
     sync_kind: Arc<Mutex<TextDocumentSyncKind>>,
     /// The document that was opened before the handshake was done.
     waiting: Arc<Mutex<Option<Waiting>>>,
+    /// The last lines the server wrote to its error output.
+    errors: Arc<Mutex<Vec<String>>>,
     reader: Option<JoinHandle<()>>,
     child: Option<Child>,
 }
@@ -175,7 +177,6 @@ impl Client {
             let errors = Arc::clone(&errors);
             move || read_errors(stderr, errors)
         });
-
         let reader = {
             let pending = Arc::clone(&pending);
             let running = Arc::clone(&running);
@@ -216,9 +217,19 @@ impl Client {
             ready,
             sync_kind,
             waiting,
+            errors,
             reader: Some(reader),
             child: Some(child),
         })
+    }
+
+    /// The last lines the server wrote to its error output.
+    ///
+    /// A server that does not start says why on its error output, and this
+    /// is where that text is.
+    pub fn stderr_tail(&self) -> String {
+        let errors = self.errors.lock().expect("the error lock is not poisoned");
+        errors.join("\n")
     }
 
     /// Whether the server has finished its handshake.

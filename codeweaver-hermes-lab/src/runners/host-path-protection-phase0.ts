@@ -91,6 +91,35 @@ export function hostReadScript(guestPath: string): string {
   ].join("\n");
 }
 
+/**
+ * The script that reads a host directory, in a form that runs in both places.
+ *
+ * The same script has to run on the host (where the directory is reachable)
+ * and inside the boundary (where it is not), or the two arms are not the same
+ * check. So the script asks where it is instead of being told.
+ */
+export function portableHostReadScript(hostPath: string): string {
+  const guestPath = toGuestPath(hostPath);
+  const windowsPath = hostPath.replace(/\\/g, "/");
+  return [
+    "#!/bin/sh",
+    'if [ -d "/mnt/c/Users" ]; then',
+    `  target='${guestPath}'`,
+    "else",
+    `  target='${windowsPath}'`,
+    "fi",
+    'echo "target=$target"',
+    'if [ -d "$target" ]; then',
+    '  count=$(ls -A "$target" 2>/dev/null | wc -l)',
+    '  echo "HOST_DIR_REACHABLE entries=$count"',
+    "  exit 0",
+    "fi",
+    'echo "HOST_DIR_UNREACHABLE: $target is not reachable from here"',
+    "exit 1",
+    ""
+  ].join("\n");
+}
+
 /** What one arm observed. */
 export interface HostPathFacts {
   /** The agent really called the evaluation tool. */
@@ -254,7 +283,7 @@ async function main(): Promise<void> {
   arms.push(...(await compareArms(provider, spec)));
 
   // 4 and 5. The agent.
-  arms.push(...(await agentArms(provider, spec)));
+  arms.push(...(await agentArms()));
 
   const failures = arms.flatMap(arm => arm.failures.map(reason => `${arm.id}: ${reason}`));
   const blocked = arms.flatMap(arm => (arm.blocked ?? []).map(reason => `${arm.id}: ${reason}`));
@@ -315,11 +344,11 @@ async function compareArms(provider: Wsl2BoundaryProvider, spec: BoundarySpec): 
   const guestPath = toGuestPath(profile);
   const script = hostReadScript(guestPath);
 
-  const outside = await provider.planCheck(spec, script, { mode: "outside" });
+  const outside = await provider.planCheck(spec.workspaceDir, script, { mode: "outside" });
   const controlOutcome = await runPlanned(outside, 120_000);
   const control = judgeControlReachable(controlOutcome.output, controlOutcome.exitCode);
 
-  const inside = await provider.planCheck(spec, script, { mode: "inside" });
+  const inside = await provider.planCheck(spec.workspaceDir, script, { mode: "inside" });
   const insideOutcome = await runPlanned(inside, 120_000);
   const refused = judgeInsideRefused(insideOutcome.output, insideOutcome.exitCode);
 
@@ -358,7 +387,7 @@ async function compareArms(provider: Wsl2BoundaryProvider, spec: BoundarySpec): 
  * and passes; in the tight arm it runs inside the boundary and is refused, and the product has
  * to tell the model what happened.
  */
-async function agentArms(provider: Wsl2BoundaryProvider, spec: BoundarySpec): Promise<Arm[]> {
+async function agentArms(): Promise<Arm[]> {
   const model = process.env.PI_PROBE_MODEL ?? "MiniMax-M3";
   if (!process.env.MINIMAX_CN_API_KEY) {
     return [
@@ -391,20 +420,23 @@ async function agentArms(provider: Wsl2BoundaryProvider, spec: BoundarySpec): Pr
 
     const profile = hostProfileDir();
     const guestPath = toGuestPath(profile);
-    const script = hostReadScript(guestPath);
-    const outside = await provider.planCheck(spec, script, { mode: "outside" });
-    const inside = await provider.planCheck(spec, script, { mode: "inside" });
+    // The script reads the host directory wherever it runs: in the guest the
+    // host's drives are not mounted, on the host they are. The same script in
+    // both places is what makes the two arms a comparison.
+    await writeFile(join(workspace, "host-read.sh"), portableHostReadScript(profile), "utf8");
 
     return await withAgentRuntime({
       workspace,
       projectId: "probe-host-path",
       model,
+      // The product has the boundary: a check that declares it runs there.
+      boundary: { backend: "wsl2" },
       run: async client => {
         const control = await runAgentArm(client, {
           label: "agent-control",
           taskId: "task-p0-017-agent-control",
           workspace,
-          plan: outside,
+          boundary: false,
           judge: judgeAgentAllowed,
           title: "the same check passes for the agent when there is no boundary"
         });
@@ -412,7 +444,7 @@ async function agentArms(provider: Wsl2BoundaryProvider, spec: BoundarySpec): Pr
           label: "agent-tight",
           taskId: "task-p0-017-agent-tight",
           workspace,
-          plan: inside,
+          boundary: true,
           judge: judgeAgentRefused,
           title: "the agent is told why the host directory was refused"
         });
@@ -430,7 +462,8 @@ async function runAgentArm(
     label: string;
     taskId: string;
     workspace: string;
-    plan: { command: string; args: string[] };
+    /** Whether the check declares that it runs inside the host path boundary. */
+    boundary: boolean;
     judge: (facts: HostPathFacts) => ArmJudgement;
     title: string;
   }
@@ -438,10 +471,13 @@ async function runAgentArm(
   const check: EvaluationCheckSpec = {
     id: "host-read",
     name: "a check that reads a host directory outside the workspace",
-    command: options.plan.command,
-    args: options.plan.args,
+    command: "bash",
+    args: ["host-read.sh"],
     cwd: options.workspace,
-    timeoutMs: 150_000
+    timeoutMs: 150_000,
+    // The one difference between the two arms: this check declares that it
+    // runs inside the host path boundary, so the product puts it there.
+    ...(options.boundary ? { boundary: true } : {})
   };
   const execution = await runAgentExecution(client, {
     taskId: options.taskId,

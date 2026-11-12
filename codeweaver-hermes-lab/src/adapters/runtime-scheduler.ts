@@ -44,6 +44,7 @@ export class RuntimeScheduler {
   async select(options: SelectOptions = {}): Promise<Selection> {
     const candidates = this.registry
       .list()
+      .filter(entry => entry.enabled !== false)
       .filter(entry => !options.runtimeType || entry.runtimeType === options.runtimeType);
     if (candidates.length === 0) {
       throw new AgentAdapterError(

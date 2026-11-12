@@ -196,11 +196,31 @@ test("lists registered runtimes", async () => {
   const app = await harness();
   try {
     const response = await fetch(`${app.url}/api/v1/runtimes`);
-    const body = await response.json() as { runtimes: Array<{ id: string; version: string }> };
+    const body = await response.json() as { runtimes: Array<{ id: string; version: string; enabled: boolean }> };
 
     assert.equal(response.status, 200);
     assert.deepEqual(body.runtimes.map(item => item.id), ["hermes-local"]);
     assert.equal(body.runtimes[0]!.version, "0.23.0");
+    assert.equal(body.runtimes[0]!.enabled, true);
+  } finally {
+    await app.close();
+  }
+});
+
+test("disables and re-enables a registered runtime", async () => {
+  const app = await harness();
+  try {
+    const disabled = await fetch(`${app.url}/api/v1/runtimes/hermes-local/disable`, { method: "POST" });
+    assert.equal(disabled.status, 200);
+    assert.deepEqual(await disabled.json(), { id: "hermes-local", enabled: false });
+
+    const list = await fetch(`${app.url}/api/v1/runtimes`);
+    const body = await list.json() as { runtimes: Array<{ enabled: boolean }> };
+    assert.equal(body.runtimes[0]!.enabled, false);
+
+    const enabled = await fetch(`${app.url}/api/v1/runtimes/hermes-local/enable`, { method: "POST" });
+    assert.equal(enabled.status, 200);
+    assert.deepEqual(await enabled.json(), { id: "hermes-local", enabled: true });
   } finally {
     await app.close();
   }

@@ -104,6 +104,12 @@ export const api = {
       method: "POST"
     }),
 
+  setRuntimeEnabled: (runtimeId: string, enabled: boolean) =>
+    request<{ id: string; enabled: boolean }>(
+      `/api/v1/runtimes/${encodeURIComponent(runtimeId)}/${enabled ? "enable" : "disable"}`,
+      { method: "POST" }
+    ),
+
   startTask: (taskId: string, input: StartTaskInput) =>
     request<StartTaskResponse>(`/api/v1/tasks/${encodeURIComponent(taskId)}/executions`, {
       method: "POST",

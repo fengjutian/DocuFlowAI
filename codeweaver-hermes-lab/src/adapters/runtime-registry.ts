@@ -13,6 +13,8 @@ export interface AgentRuntimeRegistration {
   /** Version string of the runtime binary or API the adapter was pinned to. */
   version?: string;
   metadata?: Record<string, string>;
+  /** Disabled runtimes remain visible for audit and can be enabled again, but receive no new work. */
+  enabled?: boolean;
 }
 
 export interface RuntimeHealth {
@@ -50,7 +52,7 @@ export class AgentRuntimeRegistry {
     if (this.registrations.has(registration.id)) {
       throw new AgentAdapterError("invalid_state", `Runtime ${registration.id} is already registered`);
     }
-    this.registrations.set(registration.id, registration);
+    this.registrations.set(registration.id, { ...registration, enabled: registration.enabled ?? true });
   }
 
   unregister(id: string): boolean {
@@ -62,7 +64,8 @@ export class AgentRuntimeRegistry {
   }
 
   get(id: string): AgentRuntimeAdapter | undefined {
-    return this.registrations.get(id)?.adapter;
+    const registration = this.registrations.get(id);
+    return registration?.enabled === false ? undefined : registration?.adapter;
   }
 
   require(id: string): AgentRuntimeAdapter {
@@ -70,7 +73,20 @@ export class AgentRuntimeRegistry {
     if (!registration) {
       throw new AgentAdapterError("execution_not_found", `Runtime ${id} is not registered`);
     }
+    if (registration.enabled === false) {
+      throw new AgentAdapterError("invalid_state", `Runtime ${id} is disabled`);
+    }
     return registration.adapter;
+  }
+
+  setEnabled(id: string, enabled: boolean): AgentRuntimeRegistration {
+    const registration = this.registrations.get(id);
+    if (!registration) {
+      throw new AgentAdapterError("execution_not_found", `Runtime ${id} is not registered`);
+    }
+    const updated = { ...registration, enabled };
+    this.registrations.set(id, updated);
+    return updated;
   }
 
   list(): AgentRuntimeRegistration[] {
@@ -85,7 +101,16 @@ export class AgentRuntimeRegistry {
   async healthCheckAll(timeoutMs = 5_000): Promise<RuntimeHealthReport> {
     const checkedAt = this.now().toISOString();
     const runtimes = await Promise.all(
-      this.list().map(async registration => this.checkOne(registration, timeoutMs, checkedAt))
+      this.list().map(async registration => registration.enabled === false
+        ? {
+            id: registration.id,
+            runtimeType: registration.runtimeType,
+            healthy: false,
+            checkedAt,
+            latencyMs: 0,
+            error: "Runtime is disabled"
+          }
+        : this.checkOne(registration, timeoutMs, checkedAt))
     );
     return {
       checkedAt,

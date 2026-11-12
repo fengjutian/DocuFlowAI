@@ -146,7 +146,7 @@ export class AcpAgentServer {
             promptCapabilities: { image: false, audio: false, embeddedContext: false },
             mcpCapabilities: { http: false, sse: false }
           },
-          agentInfo: { name: "codeweaver", version: "0.1.0" }
+          agentInfo: { name: "codeweaver", version: "0.2.0" }
         };
       }
       case "session/new": {

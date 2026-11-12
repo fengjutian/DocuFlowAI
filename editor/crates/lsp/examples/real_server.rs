@@ -19,7 +19,15 @@ fn main() {
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("crates/lsp/src/lib.rs"));
-    let path = path.canonicalize().expect("the file is there");
+    // The path is made absolute by hand: the canonical one on Windows begins
+    // with `\\?\`, which the server does not understand.
+    let path = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .expect("the working directory is there")
+            .join(path)
+    };
     let root = path
         .parent()
         .and_then(|parent| parent.parent())
@@ -27,12 +35,19 @@ fn main() {
         .unwrap_or_else(|| PathBuf::from("."));
 
     println!("opening {} in {}", path.display(), root.display());
-    let config = ServerConfig::new("rust-analyzer", Vec::new());
+    let program = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "rust-analyzer".to_owned());
+    let config = ServerConfig::new(program, Vec::new());
     let client = Client::start(&config, &root).expect("the server starts");
 
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(120);
     while !client.is_ready() {
-        assert!(Instant::now() < deadline, "the server did not say hello");
+        assert!(
+            Instant::now() < deadline,
+            "the server did not say hello:\n{}",
+            client.stderr_tail()
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
     println!("the server is ready");

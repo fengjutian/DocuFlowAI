@@ -9,6 +9,8 @@ import { UsageLedger, type UsageRecord } from "../accounting/usage.js";
 import { HermesHttpClient } from "../clients/http/hermes-http-client.js";
 import { CodeChangePipeline } from "../code-engine/code-change-pipeline.js";
 import { SpawnGitRunner } from "../code-engine/git-runner.js";
+import { BoundaryCommandRunner } from "../evaluation/boundary-runner.js";
+import { Wsl2BoundaryProvider } from "../security/wsl2-boundary.js";
 import { WorktreeManager } from "../code-engine/worktree-manager.js";
 import { JsonlJournalStore, type JournalEntry, type JournalStore } from "../journal/journal.js";
 import { ExecutionCoordinator } from "../orchestrator/execution-coordinator.js";
@@ -56,6 +58,14 @@ export interface RuntimeConfig {
    * task may name it with `runtimeId`. Absent means this server runs Hermes only.
    */
   pi?: { provider: string; model: string };
+  /**
+   * The host path boundary, when the server has one.
+   *
+   * A check that declares `boundary: true` runs in it: a guest where the
+   * host's directories are not mounted and the network has no route. Without a
+   * boundary such a check is blocked rather than run on the host.
+   */
+  boundary?: { backend: "wsl2"; distro?: string };
 }
 
 export function loadConfigFromEnv(env: NodeJS.ProcessEnv = process.env): RuntimeConfig {
@@ -193,6 +203,15 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     // The scheduler reads the registry at call time, so a runtime registered later (Pi is created
     // during `ready()`) is still visible to it.
     const scheduler = new RuntimeScheduler(registry);
+  // The boundary runner is only built when a boundary is configured: a server
+  // without one must not pretend that a check ran behind a boundary.
+  const boundaryRunner = config.boundary
+    ? new BoundaryCommandRunner({
+        provider: new Wsl2BoundaryProvider({
+          ...(config.boundary.distro ? { distro: config.boundary.distro } : {})
+        })
+      })
+    : undefined;
     const taskService = new TaskExecutionService({
       git,
       coordinator,
@@ -203,6 +222,7 @@ export function createRuntime(config: RuntimeConfig): Runtime {
       // started by the subagent manager, and its request is the only place its policy is named.
       journal,
       skills: { registry: skillRegistry, bindings: skillBindings },
+      ...(boundaryRunner ? { boundaryRunner } : {}),
       // `auto` asks the scheduler to choose a healthy, capable runtime. Every other id names one
       // registered runtime exactly, so a task never lands on a runtime the caller did not pick.
       resolveRuntime: async runtimeId => {

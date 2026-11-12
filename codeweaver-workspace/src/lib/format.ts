@@ -63,6 +63,7 @@ const STATUS_LABELS: Record<string, string> = {
   interrupted: "已中断",
   completed: "已完成",
   healthy: "健康",
+  disabled: "已禁用",
   passed: "通过",
   blocked: "受阻",
   unknown: "未知"

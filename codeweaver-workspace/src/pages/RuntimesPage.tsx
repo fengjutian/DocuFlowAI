@@ -5,7 +5,6 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { EmptyState, ErrorNotice } from "@/components/common/EmptyState";
 import { StatusBadge } from "@/components/common/StatusBadge";
 import { api } from "@/lib/api";
@@ -31,6 +30,7 @@ export function RuntimesPage() {
   const [health, setHealth] = useState<Record<string, RuntimeHealth>>({});
   const [checking, setChecking] = useState<string | undefined>(undefined);
   const [expanded, setExpanded] = useState<string | undefined>(undefined);
+  const [updating, setUpdating] = useState<string | undefined>(undefined);
 
   const check = async (runtimeId: string) => {
     setChecking(runtimeId);
@@ -44,6 +44,19 @@ export function RuntimesPage() {
       toast.error(error instanceof Error ? error.message : String(error));
     } finally {
       setChecking(undefined);
+    }
+  };
+
+  const setEnabled = async (runtimeId: string, enabled: boolean) => {
+    setUpdating(runtimeId);
+    try {
+      await api.setRuntimeEnabled(runtimeId, enabled);
+      await runtimes.refresh();
+      toast.success(`${runtimeId} 已${enabled ? "启用" : "禁用"}`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      setUpdating(undefined);
     }
   };
 
@@ -72,6 +85,7 @@ export function RuntimesPage() {
                   <TableHead>ID</TableHead>
                   <TableHead>类型</TableHead>
                   <TableHead>版本</TableHead>
+                  <TableHead>状态</TableHead>
                   <TableHead>健康</TableHead>
                   <TableHead>探活时间</TableHead>
                   <TableHead className="text-right">操作</TableHead>
@@ -86,6 +100,9 @@ export function RuntimesPage() {
                       <TableCell className="text-xs">{runtime.runtimeType}</TableCell>
                       <TableCell className="text-xs text-muted-foreground">
                         {runtime.version ?? "-"}
+                      </TableCell>
+                      <TableCell>
+                        <StatusBadge status={runtime.enabled ? "healthy" : "disabled"} />
                       </TableCell>
                       <TableCell>
                         {report ? (
@@ -108,7 +125,7 @@ export function RuntimesPage() {
                             size="sm"
                             variant="outline"
                             onClick={() => void check(runtime.id)}
-                            disabled={checking === runtime.id}
+                            disabled={!runtime.enabled || checking === runtime.id}
                           >
                             {checking === runtime.id ? (
                               <Loader2 className="size-4 animate-spin" />
@@ -117,16 +134,15 @@ export function RuntimesPage() {
                             )}
                             健康检查
                           </Button>
-                          <Tooltip>
-                            <TooltipTrigger asChild>
-                              <span>
-                                <Button size="sm" variant="ghost" disabled>
-                                  禁用
-                                </Button>
-                              </span>
-                            </TooltipTrigger>
-                            <TooltipContent>后端尚未实现 disable 接口（设计 12.1 已定义，未落地）</TooltipContent>
-                          </Tooltip>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            disabled={updating === runtime.id}
+                            onClick={() => void setEnabled(runtime.id, !runtime.enabled)}
+                          >
+                            {updating === runtime.id ? <Loader2 className="size-4 animate-spin" /> : null}
+                            {runtime.enabled ? "禁用" : "启用"}
+                          </Button>
                         </div>
                       </TableCell>
                     </TableRow>

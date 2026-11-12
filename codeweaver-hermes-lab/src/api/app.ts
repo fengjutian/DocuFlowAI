@@ -185,6 +185,7 @@ async function route(
           id: entry.id,
           runtimeType: entry.runtimeType,
           version: entry.version ?? null,
+          enabled: entry.enabled !== false,
           metadata: entry.metadata ?? {}
         }))
       }
@@ -209,10 +210,23 @@ async function route(
         id: entry.id,
         runtimeType: entry.runtimeType,
         version: entry.version ?? null,
+        enabled: entry.enabled !== false,
         metadata: entry.metadata ?? {},
         health: health.runtimes.find(item => item.id === id) ?? null
       }
     };
+  }
+
+  if (method === "POST" && matches(segments, ["api", "v1", "runtimes", ":id", "disable"])) {
+    const id = segments[3]!;
+    const entry = deps.registry.setEnabled(id, false);
+    return { status: 200, body: { id: entry.id, enabled: false } };
+  }
+
+  if (method === "POST" && matches(segments, ["api", "v1", "runtimes", ":id", "enable"])) {
+    const id = segments[3]!;
+    const entry = deps.registry.setEnabled(id, true);
+    return { status: 200, body: { id: entry.id, enabled: true } };
   }
 
   if (method === "POST" && matches(segments, ["api", "v1", "runtimes", ":id", "health-check"])) {

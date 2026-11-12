@@ -120,6 +120,14 @@ export interface TaskExecutionServiceOptions {
    * silently redirected. The special id `auto` lets the server pick.
    */
   resolveRuntime?: (runtimeId: string) => AgentRuntimeAdapter | undefined | Promise<AgentRuntimeAdapter | undefined>;
+  /**
+   * The runner that puts a check behind the host path boundary.
+   *
+   * A check that declares `boundary: true` runs in the boundary. Without this
+   * runner such a check is blocked rather than run on the host, because a
+   * check that ran somewhere else is not the check that was asked for.
+   */
+  boundaryRunner?: CommandRunner;
   now?: () => Date;
   runIdFactory?: () => string;
   snapshotIdFactory?: (prefix: string) => string;
@@ -359,7 +367,8 @@ export class TaskExecutionService {
   ): Promise<EvaluationResult> {
     const result = await evaluateChecks(executionId, checks, options.runner, {
       ...(options.changeRecordId ? { changeRecordId: options.changeRecordId } : {}),
-      ...(options.commitSha ? { commitSha: options.commitSha } : {})
+      ...(options.commitSha ? { commitSha: options.commitSha } : {}),
+      ...(this.options.boundaryRunner ? { boundaryRunner: this.options.boundaryRunner } : {})
     });
     await this.options.stores.evaluations.put(result);
     await this.options.coordinator.recordAuditFact(executionId, "evaluation.completed", {
