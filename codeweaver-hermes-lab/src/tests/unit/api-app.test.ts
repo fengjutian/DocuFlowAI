@@ -212,7 +212,9 @@ test("disables and re-enables a registered runtime", async () => {
   try {
     const disabled = await fetch(`${app.url}/api/v1/runtimes/hermes-local/disable`, { method: "POST" });
     assert.equal(disabled.status, 200);
-    assert.deepEqual(await disabled.json(), { id: "hermes-local", enabled: false });
+    // The answer says what the disable left running: disabling stops new work and keeps the
+    // sessions that are already running (DF-0303).
+    assert.deepEqual(await disabled.json(), { id: "hermes-local", enabled: false, runningExecutions: [] });
 
     const list = await fetch(`${app.url}/api/v1/runtimes`);
     const body = await list.json() as { runtimes: Array<{ enabled: boolean }> };

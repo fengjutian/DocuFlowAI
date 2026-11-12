@@ -323,6 +323,20 @@ export class ExecutionCoordinator {
   }
 
   /**
+   * The executions that are running right now, with the adapter each of them belongs to.
+   *
+   * Disabling a runtime has to say what it leaves behind (DF-0303): "stopped taking new work" and
+   * "these sessions are still running" are two different facts, and the operator needs the second
+   * one to tell an immediate cut from a drain.
+   */
+  liveExecutions(): Array<{ executionId: string; adapter: AgentRuntimeAdapter }> {
+    return [...this.sessions.entries()].map(([executionId, session]) => ({
+      executionId,
+      adapter: session.adapter
+    }));
+  }
+
+  /**
    * The adapter that owns an execution, even when its session is gone.
    *
    * A live session knows its own adapter. A dead one has to be looked up, because falling back to

@@ -32,13 +32,26 @@ export class RuntimeScheduler {
   private readonly load = new Map<string, number>();
   private readonly strategy: SchedulingStrategy;
   private readonly healthTimeoutMs: number;
+  private readonly defaultRuntimeId: (() => string | undefined) | undefined;
 
   constructor(
     private readonly registry: AgentRuntimeRegistry,
-    options: { strategy?: SchedulingStrategy; healthTimeoutMs?: number } = {}
+    options: {
+      strategy?: SchedulingStrategy;
+      healthTimeoutMs?: number;
+      /**
+       * The runtime that unnamed work goes to.
+       *
+       * It is a getter because the default is a configuration value that can change while the
+       * server runs, and a scheduler that captured it once would keep routing work to the runtime
+       * the operator just replaced.
+       */
+      defaultRuntimeId?: () => string | undefined;
+    } = {}
   ) {
     this.strategy = options.strategy ?? "least_loaded";
     this.healthTimeoutMs = options.healthTimeoutMs ?? 5_000;
+    this.defaultRuntimeId = options.defaultRuntimeId;
   }
 
   async select(options: SelectOptions = {}): Promise<Selection> {
@@ -74,7 +87,7 @@ export class RuntimeScheduler {
       );
     }
 
-    const chosen = this.pick(capable);
+    const chosen = this.choose(capable);
     return { runtimeId: chosen.id, adapter: chosen.adapter, registration: chosen };
   }
 
@@ -109,6 +122,29 @@ export class RuntimeScheduler {
       }
     }
     return result;
+  }
+
+  /**
+   * Picks the runtime that runs the work.
+   *
+   * Two rules, in this order:
+   *
+   * 1. The default runtime wins. It is an explicit operator choice, so it is not bound by the
+   *    priority tiers — the tiers decide who works when no default is configured. A default
+   *    runtime that is disabled or unhealthy is not a candidate at all, so this cannot route work
+   *    to a runtime the operator turned off.
+   * 2. Otherwise only the highest priority tier is eligible, and the strategy decides inside it.
+   *    Lower tiers are not a fallback: a tier is a deliberate choice to keep a runtime idle.
+   */
+  private choose(candidates: readonly AgentRuntimeRegistration[]): AgentRuntimeRegistration {
+    const preferred = this.defaultRuntimeId?.();
+    if (preferred) {
+      const match = candidates.find(entry => entry.id === preferred);
+      if (match) return match;
+    }
+    const topPriority = Math.max(...candidates.map(entry => entry.priority ?? 0));
+    const tier = candidates.filter(entry => (entry.priority ?? 0) === topPriority);
+    return this.pick(tier);
   }
 
   private pick(candidates: readonly AgentRuntimeRegistration[]): AgentRuntimeRegistration {

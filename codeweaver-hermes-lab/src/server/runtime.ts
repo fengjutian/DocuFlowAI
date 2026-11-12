@@ -3,6 +3,9 @@ import { randomUUID } from "node:crypto";
 import { HermesAdapter } from "../adapters/hermes-adapter.js";
 import { AgentRuntimeRegistry } from "../adapters/runtime-registry.js";
 import { RuntimeScheduler } from "../adapters/runtime-scheduler.js";
+import { RuntimeConfigService } from "../adapters/runtime-config-service.js";
+import { RuntimeConfigStore } from "../persistence/runtime-config.js";
+import { RuntimeConfigAuditLog } from "../persistence/runtime-config-audit.js";
 import { createApiServer, type ApiDependencies } from "../api/app.js";
 import { EventBus, journalEntryToEvent } from "../api/event-bus.js";
 import { UsageLedger, type UsageRecord } from "../accounting/usage.js";
@@ -34,7 +37,7 @@ import { SkillRegistry, type SkillManifestRecord } from "../skills/skill-registr
 import { SkillBindingStore, type SkillBindingEvent } from "../skills/skill-bindings.js";
 import type { ChangeRecord } from "../code-engine/change-record.js";
 import type { EvaluationResult } from "../evaluation/evaluation.js";
-import type { AgentTaskInput } from "../types/adapter.js";
+import { AgentAdapterError, type AgentTaskInput } from "../types/adapter.js";
 
 /**
  * Composition root.
@@ -160,6 +163,14 @@ export function createRuntime(config: RuntimeConfig): Runtime {
   const registry = new AgentRuntimeRegistry();
   registry.register({ id: "hermes-local", runtimeType: "hermes", adapter, version: "pinned" });
 
+  // The persistent configuration of the runtimes: what the operator decided, kept on disk so it
+  // survives a restart (DF-0301). The service owns the file, the registry and the audit log.
+  const runtimeConfig = new RuntimeConfigService({
+    registry,
+    store: new RuntimeConfigStore(config.dataDir),
+    audit: new RuntimeConfigAuditLog(config.dataDir)
+  });
+
   const coordinator = new ExecutionCoordinator({
     adapter,
     journal,
@@ -176,9 +187,13 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     // After a restart the session is gone, but the journal still says which runtime ran it and
     // what was asked. Both are needed to recover: the runtime to recover on, and the input to
     // rebuild from. Without the runtime id the rebuild would silently land on the default one.
+    //
+    // The adapter is found even for a disabled runtime: disabling stops new work, it does not cut
+    // the sessions that are already running on it (DF-0303). A rebuild has to land on the runtime
+    // the execution actually ran on.
     recoveringAdapter: async executionId => {
       const runtimeId = await journaledRuntimeId(journal, executionId);
-      return runtimeId ? registry.get(runtimeId) : undefined;
+      return runtimeId ? registry.adapterOf(runtimeId) : undefined;
     },
     // The reverse lookup, so an execution can carry the name of the runtime that ran it.
     runtimeIdOf: adapter => registry.list().find(entry => entry.adapter === adapter)?.id,
@@ -201,8 +216,11 @@ export function createRuntime(config: RuntimeConfig): Runtime {
     new ImmutableRecordStore<SkillBindingEvent>(config.dataDir, "bindings")
   );
     // The scheduler reads the registry at call time, so a runtime registered later (Pi is created
-    // during `ready()`) is still visible to it.
-    const scheduler = new RuntimeScheduler(registry);
+    // during `ready()`) is still visible to it. The default runtime is read the same way: the
+    // operator can replace it while the server runs.
+    const scheduler = new RuntimeScheduler(registry, {
+      defaultRuntimeId: () => runtimeConfig.defaultRuntimeId
+    });
   // The boundary runner is only built when a boundary is configured: a server
   // without one must not pretend that a check ran behind a boundary.
   const boundaryRunner = config.boundary
@@ -230,7 +248,27 @@ export function createRuntime(config: RuntimeConfig): Runtime {
           const selection = await scheduler.select({ requiredCapabilities: { streaming: true } });
           return selection.adapter;
         }
-        return registry.get(runtimeId);
+        if (runtimeId === "default") {
+          // The runtime the operator made the default one. When there is none, or when it is
+          // disabled, the caller falls back to the server's own default runtime.
+          const defaultId = runtimeConfig.defaultRuntimeId;
+          if (!defaultId) return undefined;
+          const registration = registry.registrationOf(defaultId);
+          if (!registration || registration.enabled === false) return undefined;
+          return registration.adapter;
+        }
+        const registration = registry.registrationOf(runtimeId);
+        if (!registration) return undefined;
+        if (registration.enabled === false) {
+          // A disabled runtime is refused with a reason that says it is disabled. Answering
+          // "unknown runtime" would send the operator looking for a runtime that is right there
+          // (DF-0303).
+          throw new AgentAdapterError(
+            "invalid_state",
+            `Runtime ${runtimeId} is disabled and does not accept new tasks`
+          );
+        }
+        return registration.adapter;
       }
     });
   const subagents = new SubagentManager({ coordinator, worktrees });
@@ -256,10 +294,14 @@ export function createRuntime(config: RuntimeConfig): Runtime {
       usage,
       scheduler,
       subagents,
+      runtimeConfig,
       skills: { registry: skillRegistry, bindings: skillBindings },
       ...(config.token ? { token: config.token } : {})
     },
     ready: async () => {
+      // The configuration comes first. A configuration that cannot be read stops the server before
+      // it accepts any work, instead of after it has already routed some (DF-0302).
+      await runtimeConfig.load();
       await usage.load();
       await skillBindings.load();
       await skillRegistry.load();

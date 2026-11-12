@@ -418,15 +418,26 @@ export class TaskExecutionService {
    *
    * A request that names a runtime is honoured or refused, never quietly redirected: running a task
    * on a different runtime than the caller asked for would change which policy and tools apply.
+   *
+   * A request that names no runtime asks for the `default` one: the runtime the operator made the
+   * default, and — when there is none — the server's own default runtime (DF-0301).
    */
   private async selectRuntime(runtimeId: string | undefined): Promise<AgentRuntimeAdapter | undefined> {
-    if (!runtimeId) return undefined;
+    const requested = runtimeId?.trim() ? runtimeId : undefined;
     const resolve = this.options.resolveRuntime;
     if (!resolve) {
-      throw new Error(`Runtime ${runtimeId} was requested but this server has no runtime registry`);
+      if (requested) {
+        throw new Error(`Runtime ${requested} was requested but this server has no runtime registry`);
+      }
+      return undefined;
     }
-    const adapter = await resolve(runtimeId);
-    if (!adapter) throw new Error(`Unknown runtime ${runtimeId}`);
+    const adapter = await resolve(requested ?? "default");
+    if (!adapter) {
+      // No default runtime is configured: the server's own default runtime is the answer. A named
+      // runtime that cannot be resolved is a mistake the caller has to hear about.
+      if (!requested) return undefined;
+      throw new Error(`Unknown runtime ${requested}`);
+    }
     return adapter;
   }
 

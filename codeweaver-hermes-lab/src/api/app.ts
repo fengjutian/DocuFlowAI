@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { AgentAdapterError } from "../types/adapter.js";
 import type { AgentRuntimeRegistry } from "../adapters/runtime-registry.js";
+import type { RuntimeConfigService } from "../adapters/runtime-config-service.js";
 import { AuditTimelineService } from "../persistence/audit-timeline.js";
 import { collectRuntimeScores } from "../adapters/runtime-score-report.js";
 import type { RuntimeScheduler } from "../adapters/runtime-scheduler.js";
@@ -41,6 +42,11 @@ export interface ApiDependencies {
   skills?: { registry: SkillRegistry; bindings: SkillBindingStore };
   /** Optional multi-runtime selection; absent means only the `auto` runtime id is unavailable. */
   scheduler?: RuntimeScheduler;
+  /**
+   * Optional persistent runtime configuration; absent means the enable/disable endpoints change the
+   * live state only and nothing is written down or audited.
+   */
+  runtimeConfig?: RuntimeConfigService;
   /** Optional subagent spawning; absent means the server cannot delegate to a child execution. */
   subagents?: SubagentManager;
   /** When set, every request must present `Authorization: Bearer <token>`. */
@@ -154,7 +160,7 @@ async function handleRequest(
 
     if (!authorize(request, deps, response)) return;
 
-    const body = method === "POST" ? await readJsonBody(request) : undefined;
+    const body = method === "POST" || method === "PATCH" ? await readJsonBody(request) : undefined;
     const result = await route(method, url, body, deps);
     sendJson(response, result.status, result.body);
   } catch (error) {
@@ -178,6 +184,7 @@ async function route(
   const segments = url.pathname.split("/").filter(Boolean);
 
   if (method === "GET" && matches(segments, ["api", "v1", "runtimes"])) {
+    const defaultRuntimeId = deps.runtimeConfig?.defaultRuntimeId;
     return {
       status: 200,
       body: {
@@ -186,6 +193,9 @@ async function route(
           runtimeType: entry.runtimeType,
           version: entry.version ?? null,
           enabled: entry.enabled !== false,
+          priority: entry.priority ?? 0,
+          tags: [...(entry.tags ?? [])],
+          isDefault: defaultRuntimeId === entry.id,
           metadata: entry.metadata ?? {}
         }))
       }
@@ -197,6 +207,31 @@ async function route(
   if (method === "GET" && matches(segments, ["api", "v1", "runtimes", "scores"])) {
     const report = await collectRuntimeScores({ registry: deps.registry, journal: deps.journal });
     return { status: 200, body: report };
+  }
+
+  // The persisted configuration and the operation record (DF-0304). Both live under `config`
+  // because they are about the configuration, not about an execution.
+  if (method === "GET" && matches(segments, ["api", "v1", "runtimes", "config"])) {
+    if (!deps.runtimeConfig) {
+      throw new ApiError(501, "runtime_config_not_configured", "Runtime configuration is not wired into this server");
+    }
+    return { status: 200, body: deps.runtimeConfig.describe() };
+  }
+
+  if (method === "GET" && matches(segments, ["api", "v1", "runtimes", "config", "history"])) {
+    if (!deps.runtimeConfig) {
+      throw new ApiError(501, "runtime_config_not_configured", "Runtime configuration is not wired into this server");
+    }
+    const rawLimit = url.searchParams.get("limit");
+    let limit: number | undefined;
+    if (rawLimit !== null) {
+      limit = Number(rawLimit);
+      if (!Number.isInteger(limit) || limit <= 0) {
+        throw new ApiError(400, "invalid_limit", "limit must be a positive integer");
+      }
+    }
+    const history = await deps.runtimeConfig.history(limit ?? 100);
+    return { status: 200, body: { history } };
   }
 
   if (method === "GET" && matches(segments, ["api", "v1", "runtimes", ":id"])) {
@@ -211,22 +246,79 @@ async function route(
         runtimeType: entry.runtimeType,
         version: entry.version ?? null,
         enabled: entry.enabled !== false,
+        priority: entry.priority ?? 0,
+        tags: [...(entry.tags ?? [])],
+        isDefault: deps.runtimeConfig?.defaultRuntimeId === entry.id,
         metadata: entry.metadata ?? {},
-        health: health.runtimes.find(item => item.id === id) ?? null
+        health: health.runtimes.find(item => item.id === id) ?? null,
+        runningExecutions: runningExecutionsOf(deps, id)
       }
     };
   }
 
+  // The configuration of one runtime: priority, tags and the enabled switch (DF-0301).
+  if (method === "PATCH" && matches(segments, ["api", "v1", "runtimes", ":id"])) {
+    const id = segments[3]!;
+    const patch = readRuntimePatch(body);
+    const actor = readActor(body);
+    if (deps.runtimeConfig) {
+      const entry = await deps.runtimeConfig.update(id, patch, actor);
+      return {
+        status: 200,
+        body: { id, enabled: entry.enabled, priority: entry.priority, tags: entry.tags }
+      };
+    }
+    const updated = deps.registry.update(id, patch);
+    return {
+      status: 200,
+      body: {
+        id,
+        enabled: updated.enabled !== false,
+        priority: updated.priority ?? 0,
+        tags: [...(updated.tags ?? [])]
+      }
+    };
+  }
+
+  // The runtime that unnamed work goes to. Setting it is a configuration change like any other.
+  if (method === "POST" && matches(segments, ["api", "v1", "runtimes", "default"])) {
+    const runtimeId = readDefaultRuntimeId(body);
+    const actor = readActor(body);
+    if (deps.runtimeConfig) {
+      await deps.runtimeConfig.setDefault(runtimeId, actor);
+      return { status: 200, body: { defaultRuntimeId: deps.runtimeConfig.defaultRuntimeId ?? null } };
+    }
+    throw new ApiError(501, "runtime_config_not_configured", "Runtime configuration is not wired into this server");
+  }
+
   if (method === "POST" && matches(segments, ["api", "v1", "runtimes", ":id", "disable"])) {
     const id = segments[3]!;
-    const entry = deps.registry.setEnabled(id, false);
-    return { status: 200, body: { id: entry.id, enabled: false } };
+    const actor = readActor(body);
+    if (deps.runtimeConfig) {
+      await deps.runtimeConfig.setEnabled(id, false, actor);
+    } else {
+      deps.registry.setEnabled(id, false);
+    }
+    // Disabling stops new work and keeps the sessions that are already running (DF-0303), so the
+    // answer says what is still running instead of pretending the runtime went away.
+    return {
+      status: 200,
+      body: { id, enabled: false, runningExecutions: runningExecutionsOf(deps, id) }
+    };
   }
 
   if (method === "POST" && matches(segments, ["api", "v1", "runtimes", ":id", "enable"])) {
     const id = segments[3]!;
-    const entry = deps.registry.setEnabled(id, true);
-    return { status: 200, body: { id: entry.id, enabled: true } };
+    const actor = readActor(body);
+    if (deps.runtimeConfig) {
+      await deps.runtimeConfig.setEnabled(id, true, actor);
+    } else {
+      deps.registry.setEnabled(id, true);
+    }
+    return {
+      status: 200,
+      body: { id, enabled: true, runningExecutions: runningExecutionsOf(deps, id) }
+    };
   }
 
   if (method === "POST" && matches(segments, ["api", "v1", "runtimes", ":id", "health-check"])) {
@@ -1133,6 +1225,81 @@ function readReason(body: unknown): string | undefined {
   const record = (body ?? {}) as Record<string, unknown>;
   const reason = record["reason"];
   return typeof reason === "string" && reason.trim() !== "" ? reason : undefined;
+}
+
+/**
+ * The configuration a caller wants to change (DF-0301).
+ *
+ * Every field is optional, and a field that is not named is not changed. The values are validated
+ * here rather than deeper down, so a bad priority is refused at the edge with a legible reason.
+ */
+function readRuntimePatch(body: unknown): { enabled?: boolean; priority?: number; tags?: string[] } {
+  const record = (body ?? {}) as Record<string, unknown>;
+  const patch: { enabled?: boolean; priority?: number; tags?: string[] } = {};
+  if (record["enabled"] !== undefined) {
+    if (typeof record["enabled"] !== "boolean") {
+      throw new ApiError(400, "invalid_body", "Field 'enabled' must be a boolean");
+    }
+    patch.enabled = record["enabled"];
+  }
+  if (record["priority"] !== undefined) {
+    const priority = record["priority"];
+    if (typeof priority !== "number" || !Number.isFinite(priority)) {
+      throw new ApiError(400, "invalid_body", "Field 'priority' must be a finite number");
+    }
+    patch.priority = priority;
+  }
+  if (record["tags"] !== undefined) {
+    const tags = record["tags"];
+    if (!Array.isArray(tags) || tags.some(tag => typeof tag !== "string")) {
+      throw new ApiError(400, "invalid_body", "Field 'tags' must be an array of strings");
+    }
+    patch.tags = tags.map(tag => tag as string);
+  }
+  if (Object.keys(patch).length === 0) {
+    throw new ApiError(400, "invalid_body", "A configuration change must name at least one field");
+  }
+  return patch;
+}
+
+/** The default runtime, or `null` to clear it. */
+function readDefaultRuntimeId(body: unknown): string | undefined {
+  const record = (body ?? {}) as Record<string, unknown>;
+  const runtimeId = record["runtimeId"];
+  if (runtimeId === null) return undefined;
+  if (typeof runtimeId !== "string" || runtimeId.trim() === "") {
+    throw new ApiError(400, "invalid_body", "Field 'runtimeId' must be a runtime id or null");
+  }
+  return runtimeId;
+}
+
+/**
+ * Who made a configuration change.
+ *
+ * This is a hint for the audit log, not an identity: the loopback server has no user accounts, so
+ * the caller names itself. It is capped and stripped so a log line cannot be filled with noise.
+ */
+function readActor(body: unknown): string {
+  const record = (body ?? {}) as Record<string, unknown>;
+  const actor = record["actor"];
+  if (typeof actor !== "string" || actor.trim() === "") return "api";
+  return actor.trim().slice(0, 64);
+}
+
+/**
+ * The executions that are still running on a runtime.
+ *
+ * Disabling a runtime stops new work but keeps the sessions that are already running (DF-0303), so
+ * the answer has to say which ones they are.
+ */
+function runningExecutionsOf(deps: ApiDependencies, runtimeId: string): string[] {
+  const registration = deps.registry.registrationOf(runtimeId);
+  if (!registration) return [];
+  return deps.coordinator
+    .liveExecutions()
+    .filter(item => item.adapter === registration.adapter)
+    .map(item => item.executionId)
+    .sort();
 }
 
 /**
