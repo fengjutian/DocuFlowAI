@@ -10,7 +10,7 @@ use std::{ops::Range, path::PathBuf, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use codeweaver_agent_acp::ToolStatus;
 use codeweaver_editor_core::Editor;
-use codeweaver_lsp::{Client as LspClient, LspEvent};
+use codeweaver_lsp::{Client as LspClient, LspEvent, ServerConfig};
 use codeweaver_render::{
     Color, FrameScene, Point, Rect, Renderer, RendererError, Size, TextFamily, TextStyle,
 };
@@ -84,6 +84,21 @@ pub struct NativeApplication {
 impl NativeApplication {
     /// Creates the application, opening `path` when one is given.
     pub fn new(path: Option<PathBuf>) -> Result<Self> {
+        Self::build(path, None)
+    }
+
+    /// Creates the application with a language server of the caller's
+    /// choosing.
+    ///
+    /// Without this, the server of the language of the file is used: the
+    /// editor knows `rust-analyzer` and `gopls`, but nothing else.
+    pub fn with_language_server(path: Option<PathBuf>, server: ServerConfig) -> Result<Self> {
+        Self::build(path, Some(server))
+    }
+
+    /// Creates the application, with the language server to use when it is
+    /// given.
+    fn build(path: Option<PathBuf>, server_config: Option<ServerConfig>) -> Result<Self> {
         let mut editor = Editor::new("");
         let workspace = Workspace::detached();
         let mut document = None;
@@ -109,7 +124,7 @@ impl NativeApplication {
         let mut document_uri = None;
         if let Some(document) = document.as_ref()
             && let Some(language) = Language::from_path(document.path())
-            && let Some(config) = lsp::server_for(language)
+            && let Some(config) = server_config.clone().or_else(|| lsp::server_for(language))
         {
             let root = lsp::workspace_root(document.path());
             match LspClient::start(&config, &root) {
@@ -498,10 +513,7 @@ impl NativeApplication {
         }
 
         // Ctrl+Space asks the server what could come next.
-        if self.modifiers.control_key()
-            && let Key::Character(character) = key
-            && character.as_ref() == " "
-        {
+        if self.modifiers.control_key() && is_space(key) {
             self.request_completion();
             return true;
         }
@@ -630,6 +642,14 @@ impl NativeApplication {
         find.open(&mut self.editor, false);
         find.type_text(&self.editor, query);
         self.find = Some(find);
+    }
+
+    /// Asks the language server what could come next at the caret.
+    ///
+    /// This is what the editor does when it is started with `--complete`, so
+    /// that the list of completions can be looked at without a keyboard.
+    pub fn open_completion(&mut self) {
+        self.request_completion();
     }
 
     /// The status line: the open file, whether it changed, and the last
@@ -1037,6 +1057,18 @@ struct Chrome<'a> {
 
 /// The matches of a search that was not run.
 const NO_MATCHES: &[Range<TextOffset>] = &[];
+
+/// Whether a key is the space bar.
+///
+/// The window system may say that the space is a named key or that it is a
+/// character, and both are the space.
+fn is_space<T: AsRef<str>>(key: &Key<T>) -> bool {
+    match key {
+        Key::Named(NamedKey::Space) => true,
+        Key::Character(character) => character.as_ref() == " ",
+        _ => false,
+    }
+}
 
 fn build_scene(
     renderer: &mut Renderer,

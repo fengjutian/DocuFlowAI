@@ -7,5 +7,6 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+codeweaver-lsp = { path = "../lsp" }
 codeweaver-platform = { path = "../platform" }
 

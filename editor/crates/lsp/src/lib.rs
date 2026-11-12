@@ -313,10 +313,14 @@ impl Client {
             return Ok(());
         }
 
-        let changes = if self.sync_kind() == TextDocumentSyncKind::Full {
-            vec![TextChange::whole(text)]
-        } else {
-            changes.to_vec()
+        let changes = match self.sync_kind() {
+            // The server wants the ranges that changed. The caller worked
+            // them out; when it could not, it sent the whole document.
+            TextDocumentSyncKind::Incremental => changes.to_vec(),
+            // The server wants the whole document, or did not say what it
+            // wants: the whole document is right in both cases, because a
+            // change without a range replaces the document.
+            _ => vec![TextChange::whole(text)],
         };
         self.notify(
             "textDocument/didChange",

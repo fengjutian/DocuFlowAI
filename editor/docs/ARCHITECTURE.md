@@ -28,6 +28,7 @@ agent-acp -> editor-core transaction（待建）
 platform -> agent-ui -> agent-acp
 platform -> editor-core -> text
 platform -> syntax -> text
+platform -> lsp -> text
 platform -> workspace
 platform -> render
 platform -> ui -> text
@@ -49,6 +50,12 @@ trait，由 `platform` 用 `Renderer::measure_text` 实现并注入。换行只�
 `text`（要字节偏移和改动记录），**不依赖 `editor-core`（不需要选区模型），
 也不依赖 `render`（颜色是 platform 的事）**。详见
 [ADR-0009](adr/0009-syntax-highlighting.md)。
+
+`lsp` 是语言服务器客户端：起子进程、收发 LSP 消息、把协议里的位置（行 + UTF-16
+列）换算成字节偏移。它只依赖 `text` 和 serde，**不依赖 `render`、不依赖
+`editor-core`**；颜色和界面都是 platform 的事。进程本身由 `platform` 启动
+（UI 不启动进程），诊断和补全在 platform 里画。详见
+[ADR-0010](adr/0010-language-server.md)。
 
 禁止事项：
 

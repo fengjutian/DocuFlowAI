@@ -22,6 +22,7 @@
 | [ADR-0007](0007-multiple-selections.md) | 选区是列表，编辑一次应用全部光标 | 已接受 |
 | [ADR-0008](0008-find-and-replace.md) | 查找替换建在多光标地基上，搜索是分块的 | 已接受 |
 | [ADR-0009](0009-syntax-highlighting.md) | 语法高亮用 tree-sitter，查询自带，解析增量 | 已接受 |
+| [ADR-0010](0010-language-server.md) | 语言服务器走 LSP，自建轻客户端，诊断与补全先落地 | 已接受 |
 
 ## 待补
 

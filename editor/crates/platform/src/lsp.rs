@@ -132,8 +132,11 @@ mod tests {
         }
         let project = fixture.join("workspace-fixture").join("project");
         std::fs::create_dir_all(project.join("src")).expect("the fixture is made");
-        std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"fixture\"\n")
-            .expect("the manifest is written");
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .expect("the manifest is written");
 
         let root = workspace_root(&project.join("src").join("main.rs"));
         assert_eq!(root, project);

@@ -31,6 +31,12 @@ $rustSample = Join-Path $logs 'sample.rs'
 $shot = Join-Path $logs 'window-check.png'
 $findShot = Join-Path $logs 'window-check-find.png'
 $syntaxShot = Join-Path $logs 'window-check-syntax.png'
+$lspShot = Join-Path $logs 'window-check-lsp.png'
+$completionShot = Join-Path $logs 'window-check-completion.png'
+# The language server of the check is not a real one: it says that the
+# first line of the file is wrong, so that the underline can be looked for
+# without waiting for a real server to think about the file.
+$fakeServer = Join-Path $root 'target\debug\fake-lsp-server.exe'
 
 $sig = @'
 using System;
@@ -130,15 +136,31 @@ $MATCH_RGB = To-Screen @(0.58, 0.46, 0.11)
 # string.
 $KEYWORD_RGB = To-Bytes @(0.76, 0.36, 0.90)
 $STRING_RGB = To-Bytes @(0.68, 0.82, 0.42)
+# The underline of a thing the language server found wrong.
+$ERROR_RGB = To-Screen @(0.75, 0.10, 0.10)
+# The row of the list of completions that is picked.
+$COMPLETION_RGB = To-Screen @(0.18, 0.30, 0.52)
 
 if (-not (Test-Path $exe)) {
     throw "the editor is not built; run 'cargo build -p codeweaver-editor' first"
 }
+if (-not (Test-Path $fakeServer)) {
+    throw "the language server of the check is not built; run 'cargo build -p codeweaver-lsp --bin fake-lsp-server' first"
+}
 # The check drives the editor that is on disk, so that one has to be the one
 # the sources describe. `cargo test` does not build it: it only builds the
 # test harness next to it.
-$newest = Get-ChildItem -Path (Join-Path $root 'crates') -Recurse -Include *.rs |
-    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+#
+# Only the crates the editor is made of are looked at: the examples and the
+# tests of a crate are not part of the editor, and a change in one of them
+# says nothing about the editor being out of date.
+$editorCrates = @('app', 'platform', 'render', 'text', 'syntax', 'lsp', 'ui', 'workspace', 'editor-core', 'agent-acp', 'agent-ui')
+$newest = $editorCrates | ForEach-Object {
+    $crate = Join-Path $root "crates\$_"
+    if (Test-Path $crate) {
+        Get-ChildItem -Path (Join-Path $crate 'src') -Recurse -Include *.rs -ErrorAction SilentlyContinue
+    }
+} | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if ($newest -and (Get-Item $exe).LastWriteTime -lt $newest.LastWriteTime) {
     throw "the editor is older than its sources; run 'cargo build -p codeweaver-editor' first"
 }
@@ -450,6 +472,61 @@ try {
         }
         Write-Output 'the strings are highlighted'
         $syntaxPicture.Dispose()
+    }
+    finally {
+        Stop-Process -Id $editor.Process.Id -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 400
+    }
+
+    # The fourth run: the editor with a language server. The server says
+    # that the first line of the file is wrong, and the thing it found wrong
+    # is underlined.
+    $editor = Start-Editor @($rustSample, '--lsp', ('"{0}"' -f $fakeServer))
+    $handle = $editor.Handle
+    try {
+        # The server has to say hello, be told about the file and answer
+        # before the underline is there, so the window is looked at a few
+        # times before the check gives up.
+        $underlined = 0
+        for ($attempt = 1; $attempt -le 8; $attempt++) {
+            Start-Sleep -Milliseconds 800
+            $lspResult = Save-Window $handle $lspShot
+            $underlined = Count-Color $lspResult.Bitmap $lspResult.Left $lspResult.Top $lspResult.Width $lspResult.Height $ERROR_RGB 22
+            if ($underlined -ge 10) { break }
+            $lspResult.Bitmap.Dispose()
+        }
+        Write-Output "error underline pixels: $underlined"
+        if ($underlined -lt 10) {
+            throw 'the thing the language server found wrong was not underlined'
+        }
+        Write-Output 'the diagnostics of the language server are shown'
+        $lspResult.Bitmap.Dispose()
+    }
+    finally {
+        Stop-Process -Id $editor.Process.Id -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 400
+    }
+
+    # The fifth run: the same server, but the editor asks it what could come
+    # next, and the list of answers is shown under the caret.
+    $editor = Start-Editor @($rustSample, '--lsp', ('"{0}"' -f $fakeServer), '--complete')
+    $handle = $editor.Handle
+    try {
+        # The server has to answer before the list is there.
+        $listed = 0
+        for ($attempt = 1; $attempt -le 8; $attempt++) {
+            Start-Sleep -Milliseconds 800
+            $listResult = Save-Window $handle $completionShot
+            $listed = Count-Color $listResult.Bitmap $listResult.Left $listResult.Top $listResult.Width $listResult.Height $COMPLETION_RGB 12
+            if ($listed -ge 100) { break }
+            $listResult.Bitmap.Dispose()
+        }
+        Write-Output "completion list pixels: $listed"
+        if ($listed -lt 100) {
+            throw 'the list of completions was not shown'
+        }
+        Write-Output 'the list of completions is shown'
+        $listResult.Bitmap.Dispose()
     }
     finally {
         Stop-Process -Id $editor.Process.Id -Force -ErrorAction SilentlyContinue

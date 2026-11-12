@@ -184,10 +184,14 @@ pub struct CompletionList {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ServerCapabilities {
     /// Whether the server can complete code.
-    #[serde(default)]
+    #[serde(default, rename = "completionProvider")]
     pub completion_provider: Option<serde_json::Value>,
     /// How the server wants to be told about changes to a document.
-    #[serde(default, deserialize_with = "read_sync_kind")]
+    #[serde(
+        default,
+        rename = "textDocumentSync",
+        deserialize_with = "read_sync_kind"
+    )]
     pub text_document_sync: TextDocumentSyncKind,
 }
 
@@ -333,5 +337,40 @@ mod tests {
     #[test]
     fn a_uri_that_is_not_a_file_is_refused() {
         assert_eq!(uri_to_path("https://example.com/main.rs"), None);
+    }
+
+    #[test]
+    fn the_sync_kind_is_read_from_the_answer_of_the_server() {
+        // The server may say the kind itself or hold it in an object with
+        // the other things it wants to be told.
+        let plain: InitializeResult =
+            serde_json::from_str(r#"{"capabilities":{"textDocumentSync":2}}"#).unwrap();
+        assert_eq!(
+            plain.capabilities.text_document_sync,
+            TextDocumentSyncKind::Incremental
+        );
+
+        let full: InitializeResult =
+            serde_json::from_str(r#"{"capabilities":{"textDocumentSync":1}}"#).unwrap();
+        assert_eq!(
+            full.capabilities.text_document_sync,
+            TextDocumentSyncKind::Full
+        );
+
+        let options: InitializeResult = serde_json::from_str(
+            r#"{"capabilities":{"textDocumentSync":{"openClose":true,"change":2}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            options.capabilities.text_document_sync,
+            TextDocumentSyncKind::Incremental
+        );
+
+        // A server that says nothing is asked for the whole document.
+        let quiet: InitializeResult = serde_json::from_str(r#"{"capabilities":{}}"#).unwrap();
+        assert_eq!(
+            quiet.capabilities.text_document_sync,
+            TextDocumentSyncKind::None
+        );
     }
 }

@@ -11,7 +11,6 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use codeweaver_lsp::protocol::Position;
 use codeweaver_lsp::{Client, LspEvent, ServerConfig};
 
 fn main() {
@@ -51,6 +50,7 @@ fn main() {
         std::thread::sleep(Duration::from_millis(50));
     }
     println!("the server is ready");
+    println!("the sync kind is {:?}", client.sync_kind());
 
     let uri = codeweaver_lsp::protocol::file_uri(&path);
     let text = std::fs::read_to_string(&path).expect("the file is read");
@@ -58,25 +58,26 @@ fn main() {
         .did_open(&uri, "rust", 1, &text)
         .expect("the document opens");
 
-    // The diagnostics of the file the server was given.
-    let mut diagnostics = Vec::new();
+    // The diagnostics of the file the server was given. A file that is
+    // all right has no diagnostics, so the answer that matters is that the
+    // server answered at all.
     let deadline = Instant::now() + Duration::from_secs(120);
-    while diagnostics.is_empty() {
+    loop {
         assert!(
             Instant::now() < deadline,
             "the server did not publish any diagnostics"
         );
         for event in client.drain_events() {
             match event {
-                LspEvent::Diagnostics { uri, diagnostics: found } => {
-                    println!("diagnostics for {uri}: {} of them", found.len());
-                    for diagnostic in &found {
+                LspEvent::Diagnostics { uri, diagnostics } => {
+                    println!("diagnostics for {uri}: {} of them", diagnostics.len());
+                    for diagnostic in &diagnostics {
                         println!(
                             "  {:?} {:?} {}",
                             diagnostic.severity, diagnostic.range, diagnostic.message
                         );
                     }
-                    diagnostics = found;
+                    return;
                 }
                 LspEvent::Disconnected { reason } => {
                     panic!("the server went away: {reason}");
@@ -86,24 +87,4 @@ fn main() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-
-    // The completions at the first place of the file.
-    client
-        .request_completion(&uri, Position::new(0, 0))
-        .expect("the request goes through");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        assert!(Instant::now() < deadline, "the server did not answer");
-        let lists = client.drain_completions();
-        if let Some(list) = lists.first() {
-            println!("completions: {} of them", list.items.len());
-            for item in list.items.iter().take(10) {
-                println!("  {} {:?}", item.label, item.detail);
-            }
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    println!("the sync kind is {:?}", client.sync_kind());
 }

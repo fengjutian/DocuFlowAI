@@ -100,8 +100,8 @@ pub fn word_start(buffer: &Buffer, caret: usize) -> usize {
     let column = caret.saturating_sub(start).min(text.len());
     let prefix = &text[..column];
     // The word is the run of letters and digits that ends at the caret.
-    let word = prefix
-        .trim_end_matches(|character: char| character.is_alphanumeric() || character == '_');
+    let word =
+        prefix.trim_end_matches(|character: char| character.is_alphanumeric() || character == '_');
     start + word.len()
 }
 
