@@ -293,6 +293,7 @@ dependencies = [
  "codeweaver-ui",
  "codeweaver-workspace",
  "pollster",
+ "serde_json",
  "wgpu",
  "winit",
 ]

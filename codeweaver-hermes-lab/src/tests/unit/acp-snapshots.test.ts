@@ -71,7 +71,13 @@ async function harness(
     evaluations: new ImmutableRecordStore<EvaluationResult>(storeRoot, "evaluations")
   };
   const journal = new InMemoryJournalStore();
-  const coordinator = new ExecutionCoordinator({ adapter: adapter(), journal });
+  const defaultAdapter = adapter();
+  const coordinator = new ExecutionCoordinator({
+    adapter: defaultAdapter,
+    journal,
+    // Which runtime ran is a fact on the timeline; the harness names the adapter it hands out.
+    runtimeIdOf: candidate => (candidate === defaultAdapter ? "pi-local" : undefined)
+  });
   const worktrees = new WorktreeManager(git, join(repo, ".worktrees"), { repository: repo });
   const taskService = new TaskExecutionService({
     git,
@@ -79,7 +85,9 @@ async function harness(
     changes: new CodeChangePipeline(git, worktrees),
     stores,
     traceability: new TraceabilityQuery(stores, journal),
-    ...(overrides.resolveRuntime ? { resolveRuntime: overrides.resolveRuntime } : {})
+    ...(overrides.resolveRuntime
+      ? { resolveRuntime: overrides.resolveRuntime }
+      : { resolveRuntime: async (id: string) => (id === "pi-local" ? defaultAdapter : undefined) })
   });
 
   const warnings: string[] = [];
@@ -186,8 +194,7 @@ test("acp: the editor session runs on the runtime it names", async () => {
   const storeRoot = await mkdtemp(join(tmpdir(), "codeweaver-acp-runtime-store-"));
   try {
     const { journal, backend } = await harness(repo, storeRoot, {
-      runtimeId: "pi-local",
-      resolveRuntime: id => (id === "pi-local" ? adapter() : undefined)
+      runtimeId: "pi-local"
     });
     const session = await backend.createSession({ cwd: repo });
     const stopReason = await backend.prompt(session.sessionId, "do the thing", () => undefined);
