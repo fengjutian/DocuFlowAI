@@ -154,6 +154,11 @@ export function isWithin(child: string, parent: string): boolean {
   return !rel.split(/[\\/]/).includes("..");
 }
 
+/** True when two paths name the same location, case-insensitively on Windows. */
+export function samePath(left: string, right: string): boolean {
+  return normalizeCase(resolve(left)) === normalizeCase(resolve(right));
+}
+
 function normalizeCase(path: string): string {
   return process.platform === "win32" ? path.toLowerCase() : path;
 }

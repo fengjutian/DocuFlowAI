@@ -12,6 +12,7 @@ import type { ExecutionCheckpoint } from "../journal/checkpoint.js";
 import type { TaskExecutionService, StartTaskRequest } from "../tasks/task-execution-service.js";
 import { SkillDeniedError } from "../tasks/task-execution-service.js";
 import type { EvaluationCheckSpec } from "../evaluation/evaluation.js";
+import type { CommandApproval } from "../evaluation/command-policy.js";
 import type { AgentTaskInput, RuntimePermissionRequest } from "../types/adapter.js";
 import type { SkillBindingStore } from "../skills/skill-bindings.js";
 import type { SkillRegistry } from "../skills/skill-registry.js";
@@ -1003,6 +1004,7 @@ function parseEvaluationChecks(raw: unknown, field: string): EvaluationCheckSpec
     if (args !== undefined && (!Array.isArray(args) || !args.every(arg => typeof arg === "string"))) {
       throw new ApiError(400, "invalid_body", `${field}[${index}].args must be an array of strings`);
     }
+    const approval = check["approval"];
     return {
       id: typeof check["id"] === "string" ? check["id"] : `check-${index + 1}`,
       name: typeof check["name"] === "string" ? check["name"] : `check-${index + 1}`,
@@ -1010,9 +1012,47 @@ function parseEvaluationChecks(raw: unknown, field: string): EvaluationCheckSpec
       args: Array.isArray(args) ? (args as string[]) : [],
       ...(typeof check["cwd"] === "string" ? { cwd: check["cwd"] } : {}),
       ...(typeof check["timeoutMs"] === "number" ? { timeoutMs: check["timeoutMs"] } : {}),
-      ...(typeof check["expectExitCode"] === "number" ? { expectExitCode: check["expectExitCode"] } : {})
+      ...(typeof check["expectExitCode"] === "number" ? { expectExitCode: check["expectExitCode"] } : {}),
+      ...(approval !== undefined
+        ? { approval: readCommandApproval(approval, `${field}[${index}].approval`) }
+        : {})
     };
   });
+}
+
+/**
+ * A human decision about one exact command.
+ *
+ * All four fields are required: an approval that does not name the command it was given for could
+ * be replayed for any other command, and an approval that does not name a person is nobody's
+ * decision.
+ */
+function readCommandApproval(raw: unknown, field: string): CommandApproval {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new ApiError(400, "invalid_body", `Field '${field}' must be an object`);
+  }
+  const value = raw as Record<string, unknown>;
+  const approvedBy = value["approvedBy"];
+  if (typeof approvedBy !== "string" || approvedBy.trim() === "") {
+    throw new ApiError(400, "invalid_body", `Field '${field}.approvedBy' must be a non-empty string`);
+  }
+  const reason = value["reason"];
+  if (typeof reason !== "string" || reason.trim() === "") {
+    throw new ApiError(400, "invalid_body", `Field '${field}.reason' must be a non-empty string`);
+  }
+  const approvedAt = value["approvedAt"];
+  if (typeof approvedAt !== "string" || approvedAt.trim() === "") {
+    throw new ApiError(400, "invalid_body", `Field '${field}.approvedAt' must be an ISO timestamp`);
+  }
+  const commandFingerprint = value["commandFingerprint"];
+  if (typeof commandFingerprint !== "string" || commandFingerprint.trim() === "") {
+    throw new ApiError(
+      400,
+      "invalid_body",
+      `Field '${field}.commandFingerprint' must be the fingerprint of the command it approves`
+    );
+  }
+  return { approvedBy, reason, approvedAt, commandFingerprint };
 }
 
 function readDecision(body: unknown): { decision: "approve" | "deny"; reason?: string } {

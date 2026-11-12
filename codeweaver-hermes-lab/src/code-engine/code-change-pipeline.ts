@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { evaluatePermission, type PolicySnapshot } from "../policy/permission-policy.js";
+import { scopeViolationFor, type WorktreeScope } from "../policy/worktree-scope.js";
 import { buildApplyRecord, type ApprovalRecord, type ChangeRecord } from "./change-record.js";
 import { proposeChange, type ChangeProposal } from "./diff-analysis.js";
 import { gitOrThrow, type GitRunner } from "./git-runner.js";
@@ -53,6 +54,16 @@ export class CodeChangePipeline {
     return proposeChange(patch);
   }
 
+  /**
+   * The worktree scope of an execution: its own directory and the worktrees of its repository.
+   *
+   * The write path and the read path ask this the same question, so a patch cannot be held to a
+   * different boundary than a read.
+   */
+  async worktreeScope(own: string): Promise<WorktreeScope> {
+    return { own: await this.worktrees.canonical(own), worktrees: await this.worktrees.listAll(own) };
+  }
+
   async apply(request: ApplyChangeRequest): Promise<ApplyOutcome> {
     const proposal = this.propose(request.patch);
 
@@ -70,6 +81,18 @@ export class CodeChangePipeline {
         proposal,
         reasons: outside.map(path => `Path '${path}' is outside the authorized worktree scope`)
       };
+    }
+
+    // The directory boundary above says "inside the directory"; the scope says "inside my
+    // worktree". Another worktree can live inside this directory — a child agent's worktree under
+    // the checkout the execution runs in — and a patch that reaches into it has to be refused
+    // before anything is written.
+    const scope = await this.worktreeScope(request.worktreePath);
+    for (const target of targets) {
+      const violation = await scopeViolationFor(target, scope);
+      if (violation) {
+        return { status: "denied", proposal, reasons: [violation] };
+      }
     }
 
     // AT-105: a drifted worktree must not receive a patch computed against a different tree.

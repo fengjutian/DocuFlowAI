@@ -65,6 +65,9 @@ function recorder(checks: EvaluationCheckSpec[] = []): Recorder {
       policyCalls += 1;
       return policy();
     },
+    async worktreeScope(worktreePath) {
+      return { own: worktreePath, worktrees: [worktreePath] };
+    },
     evaluationChecksFor: () => checks,
     async applyProposedChange(executionId, patch, options) {
       applied.push({ executionId, patch, ...(options?.commitMessage ? { commitMessage: options.commitMessage } : {}) });

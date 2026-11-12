@@ -79,6 +79,39 @@ export class WorktreeManager {
     return inside;
   }
 
+  /**
+   * Every worktree of the repository `at` belongs to, canonicalized.
+   *
+   * The repository is the one that holds `at`, not the manager's repository: an execution may run in
+   * a checkout the server knows nothing about, and the worktrees that matter for its scope are that
+   * checkout's. Listing them is what lets the scope tell "my worktree" from "another worktree".
+   *
+   * A directory that is not in a repository has no worktrees and returns an empty list. A
+   * repository whose worktree list cannot be read is an error, not an empty list: a scope that
+   * cannot be established must not be mistaken for a scope with nothing in it.
+   */
+  async listAll(at: string): Promise<string[]> {
+    const result = await this.git.run(["worktree", "list", "--porcelain"], { cwd: at });
+    if (result.code !== 0) {
+      const inside = await this.git.run(["rev-parse", "--git-dir"], { cwd: at });
+      if (inside.code !== 0) return [];
+      throw new GitCommandError(["worktree", "list", "--porcelain"], result);
+    }
+    const paths: string[] = [];
+    for (const line of result.stdout.split(/\r?\n/)) {
+      if (!line.startsWith("worktree ")) continue;
+      const entry = line.slice("worktree ".length).trim();
+      if (!entry) continue;
+      paths.push(await safeRealpath(entry));
+    }
+    return paths;
+  }
+
+  /** Canonical path of a directory: the real path when it exists, the resolved path when it does not. */
+  async canonical(path: string): Promise<string> {
+    return safeRealpath(path);
+  }
+
   async head(worktreePath: string): Promise<string> {
     const result = await gitOrThrow(this.git, ["rev-parse", "HEAD"], { cwd: worktreePath });
     return result.stdout.trim();

@@ -2,6 +2,7 @@ import type { ApplyOutcome } from "../code-engine/code-change-pipeline.js";
 import type { ChangeProposal } from "../code-engine/diff-analysis.js";
 import type { EvaluationCheckSpec, EvaluationResult } from "../evaluation/evaluation.js";
 import type { PolicySnapshot } from "../policy/permission-policy.js";
+import type { WorktreeScope } from "../policy/worktree-scope.js";
 import type { AgentTaskInput } from "../types/adapter.js";
 import { createCodeWeaverTools, type CodeWeaverTool, type CodeWeaverToolContext } from "./codeweaver-tools.js";
 
@@ -23,6 +24,8 @@ import { createCodeWeaverTools, type CodeWeaverTool, type CodeWeaverToolContext 
 export interface ExecutionToolService {
   /** The policy snapshot an execution runs under, reconstructed for the policy engine. */
   policyFor(executionId: string): Promise<PolicySnapshot>;
+  /** The worktree scope of an execution: its own directory and the repository's worktrees. */
+  worktreeScope(worktreePath: string): Promise<WorktreeScope>;
   /** The acceptance checks the execution was started with. */
   evaluationChecksFor(executionId: string): readonly EvaluationCheckSpec[];
   /** Applies a proposed patch through the Code Engine. */
@@ -63,6 +66,8 @@ export class CodeWeaverToolBinder {
       // Resolved on every call: the policy snapshot is written after the run starts, and the tool
       // must see the snapshot the execution actually runs under.
       policy: () => this.options.service.policyFor(executionId),
+      // Resolved on every call: the worktrees of the repository change while an execution runs.
+      worktreeScope: () => this.options.service.worktreeScope(input.workingDirectory),
       propose: patch => this.options.propose(patch),
       apply: (patch, applyOptions) =>
         this.options.service.applyProposedChange(executionId, patch, applyOptions ?? {}),

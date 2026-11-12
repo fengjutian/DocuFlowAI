@@ -201,3 +201,48 @@ test("denies a patch that git cannot apply cleanly", async () => {
   assert.match(outcome.reasons[0]!, /does not apply cleanly/);
   assert.equal(git.calls.filter(call => call.args[0] === "apply").length, 1);
 });
+
+/**
+ * Another worktree of the same repository, nested inside this execution's worktree. The directory
+ * boundary cannot see it: the path is inside the execution's own directory, so only the worktree
+ * scope can keep a patch out of it.
+ */
+const nestedWorktree = resolve(worktree, "nested-wt");
+
+function gitWithWorktrees(...paths: string[]): FakeGit {
+  const listing = paths
+    .map(path => `worktree ${path}\nHEAD ${baseSha}\ndetached\n`)
+    .join("\n");
+  return new FakeGit(args =>
+    args[0] === "worktree" && args[1] === "list"
+      ? { code: 0, stdout: listing, stderr: "" }
+      : undefined
+  );
+}
+
+test("denies a patch that targets another worktree nested in this one", async () => {
+  const git = gitWithWorktrees(resolve("repo"), worktree, nestedWorktree);
+  const foreignPatch = [
+    "diff --git a/nested-wt/secret.txt b/nested-wt/secret.txt",
+    "--- a/nested-wt/secret.txt",
+    "+++ b/nested-wt/secret.txt",
+    "@@ -1 +1 @@",
+    "-SECRET",
+    "+TAMPERED",
+    ""
+  ].join("\n");
+  const outcome = await pipelineWith(git).apply(request({ patch: foreignPatch }));
+
+  assert.equal(outcome.status, "denied");
+  if (outcome.status !== "denied") return;
+  assert.match(outcome.reasons[0]!, /not this execution's worktree/);
+  assert.equal(git.calls.some(call => call.args[0] === "apply"), false, "nothing was written");
+});
+
+test("applies a patch inside its own worktree when the repository has other worktrees", async () => {
+  const git = gitWithWorktrees(resolve("repo"), worktree, nestedWorktree);
+  const outcome = await pipelineWith(git).apply(request());
+
+  assert.equal(outcome.status, "applied");
+  assert.equal(git.calls.filter(call => call.args[0] === "apply").length, 2);
+});

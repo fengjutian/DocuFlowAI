@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { SpawnCommandRunner, type CommandRunner } from "../../evaluation/command-runner.js";
+import { commandFingerprint } from "../../evaluation/command-policy.js";
 import { completionGate, evaluateChecks, type EvaluationCheckSpec } from "../../evaluation/evaluation.js";
 
 function fakeRunner(exitCode: number | null, overrides: { timedOut?: boolean } = {}): CommandRunner {
@@ -84,4 +85,80 @@ test("runs real commands without a shell and captures exit codes", async () => {
   }], runner);
   assert.equal(failing.verdict, "failed");
   assert.equal(failing.checks[0]!.exitCode, 3);
+});
+
+/**
+ * A dangerous command is not run because it was written down.
+ *
+ * These cases have to fail on an implementation that runs the check first and asks afterwards: the
+ * process has to stay unstarted, and the refusal has to keep the completion gate closed.
+ */
+function recordingRunner(): { runner: CommandRunner; calls: string[][] } {
+  const calls: string[][] = [];
+  return {
+    calls,
+    runner: {
+      async run(command, args) {
+        calls.push([command, ...args]);
+        return { code: 0, stdout: "out", stderr: "", timedOut: false };
+      }
+    }
+  };
+}
+
+test("refuses a dangerous check that nobody approved, without running it", async () => {
+  const { runner, calls } = recordingRunner();
+  const result = await evaluateChecks("exec-1", [{
+    id: "dangerous",
+    name: "remove the build directory",
+    command: "rm",
+    args: ["-rf", "build"]
+  }], runner);
+
+  assert.equal(calls.length, 0, "the process must not start");
+  assert.equal(result.verdict, "blocked");
+  assert.equal(result.checks[0]!.refusal?.code, "dangerous_without_approval");
+  assert.match(result.checks[0]!.output, /refused/);
+  assert.equal(completionGate(result).allowed, false);
+});
+
+test("refuses a dangerous check whose approval was given for another command", async () => {
+  const { runner, calls } = recordingRunner();
+  const result = await evaluateChecks("exec-1", [{
+    id: "dangerous",
+    name: "remove the build directory",
+    command: "rm",
+    args: ["-rf", "build"],
+    approval: {
+      approvedBy: "alice",
+      reason: "approved for a different command",
+      approvedAt: "2026-11-12T00:00:00.000Z",
+      commandFingerprint: commandFingerprint("rm", ["-rf", "everything"])
+    }
+  }], runner);
+
+  assert.equal(calls.length, 0, "the process must not start");
+  assert.equal(result.verdict, "blocked");
+  assert.equal(result.checks[0]!.refusal?.code, "approval_mismatch");
+  assert.match(result.checks[0]!.output, /different command/);
+});
+
+test("runs a dangerous check when the approval names that exact command", async () => {
+  const { runner, calls } = recordingRunner();
+  const result = await evaluateChecks("exec-1", [{
+    id: "dangerous",
+    name: "remove the build directory",
+    command: "rm",
+    args: ["-rf", "build"],
+    approval: {
+      approvedBy: "alice",
+      reason: "the build output can go",
+      approvedAt: "2026-11-12T00:00:00.000Z",
+      commandFingerprint: commandFingerprint("rm", ["-rf", "build"])
+    }
+  }], runner);
+
+  assert.equal(calls.length, 1, "the approved command runs");
+  assert.equal(result.verdict, "passed");
+  assert.equal(result.checks[0]!.approval?.approvedBy, "alice");
 });

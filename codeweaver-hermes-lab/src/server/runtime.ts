@@ -199,6 +199,9 @@ export function createRuntime(config: RuntimeConfig): Runtime {
       changes,
       stores,
       traceability,
+      // The journal answers for the executions this service did not start: a delegated child is
+      // started by the subagent manager, and its request is the only place its policy is named.
+      journal,
       skills: { registry: skillRegistry, bindings: skillBindings },
       // `auto` asks the scheduler to choose a healthy, capable runtime. Every other id names one
       // registered runtime exactly, so a task never lands on a runtime the caller did not pick.

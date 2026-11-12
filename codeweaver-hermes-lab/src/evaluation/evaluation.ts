@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { SpawnCommandRunner, type CommandRunner } from "./command-runner.js";
+import { approvalCovers, classifyCommand, type CommandApproval } from "./command-policy.js";
 
 /**
  * Evaluation Engine (design 14.1 EVALUATION_FAILED / AT-204).
@@ -17,6 +18,13 @@ export interface EvaluationCheckSpec {
   cwd?: string;
   timeoutMs?: number;
   expectExitCode?: number;
+  /**
+   * A human decision about this exact command.
+   *
+   * A dangerous command runs only with one: the approval carries the fingerprint of the command it
+   * was given for, so it cannot be moved to another command.
+   */
+  approval?: CommandApproval;
 }
 
 export interface EvaluationCheckResult {
@@ -26,6 +34,10 @@ export interface EvaluationCheckResult {
   exitCode: number | null;
   durationMs: number;
   output: string;
+  /** Set when the check was refused before it ran. */
+  refusal?: { code: "dangerous_without_approval" | "approval_mismatch"; reasons: string[] };
+  /** The approval that let the command run, when one did. */
+  approval?: CommandApproval;
 }
 
 export interface EvaluationResult {
@@ -60,6 +72,31 @@ export async function evaluateChecks(
   for (const check of checks) {
     const checkStarted = Date.now();
     const expected = check.expectExitCode ?? 0;
+
+    // A dangerous command does not run because it was written down. It runs because a human
+    // approved that exact command — and the approval is bound to it by its fingerprint.
+    const classification = classifyCommand(check.command, check.args);
+    if (classification.dangerous && !approvalCovers(check.approval, check.command, check.args)) {
+      const mismatch = check.approval !== undefined;
+      const code = mismatch ? "approval_mismatch" : "dangerous_without_approval";
+      const explanation = mismatch
+        ? `the approval was given for a different command (approved ${check.approval!.commandFingerprint.slice(0, 12)}, this command is ${classification.fingerprint.slice(0, 12)})`
+        : `no approval was given for it (${classification.reasons.join("; ")})`;
+      results.push({
+        id: check.id,
+        name: check.name,
+        verdict: "blocked",
+        exitCode: null,
+        durationMs: Date.now() - checkStarted,
+        output:
+          `refused: '${[check.command, ...check.args].join(" ")}' is classified as dangerous and ${explanation}. ` +
+          `The command was not run.`,
+        refusal: { code, reasons: classification.reasons },
+        ...(check.approval ? { approval: check.approval } : {})
+      });
+      continue;
+    }
+
     const outcome = await runner.run(check.command, check.args, {
       ...(check.cwd ? { cwd: check.cwd } : {}),
       ...(check.timeoutMs ? { timeoutMs: check.timeoutMs } : {})
@@ -75,7 +112,8 @@ export async function evaluateChecks(
       verdict,
       exitCode: outcome.code,
       durationMs: Date.now() - checkStarted,
-      output: truncate(`${outcome.stdout}\n${outcome.stderr}`)
+      output: truncate(`${outcome.stdout}\n${outcome.stderr}`),
+      ...(check.approval ? { approval: check.approval } : {})
     });
   }
 

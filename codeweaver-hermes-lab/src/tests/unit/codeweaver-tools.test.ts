@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { proposeChange, type ChangeProposal } from "../../code-engine/diff-analysis.js";
@@ -110,6 +110,60 @@ test("read_file denies when the policy snapshot expired", async () => {
   const result = await read.execute("call-1", { path: "readme.md" });
   assert.equal(result.details["denied"], true);
   assert.match(String(result.details["reason"]), /expired/);
+});
+
+test("read_file denies a file that belongs to another worktree of the same repository", async () => {
+  const dir = await worktree();
+  // Another worktree of the same repository, created inside this one: the directory boundary
+  // cannot see it, so only the worktree scope can keep the read out of it.
+  const foreign = join(dir, "other-wt");
+  await mkdir(foreign, { recursive: true });
+  await writeFile(join(foreign, "secret.txt"), "OTHER-WORKTREE-SECRET\n", "utf8");
+  const read = tool(
+    "read_file",
+    context({
+      worktreePath: dir,
+      worktreeScope: async () => ({ own: dir, worktrees: [dir, foreign] })
+    })
+  );
+
+  const result = await read.execute("call-1", { path: join(foreign, "secret.txt") });
+  assert.equal(result.details["denied"], true);
+  assert.equal(result.details["reason"], "outside_worktree_scope");
+  assert.doesNotMatch(result.content[0]!.text, /OTHER-WORKTREE-SECRET/, "the other worktree's content is not returned");
+});
+
+test("read_file still reads a file in its own worktree when the scope is known", async () => {
+  const dir = await worktree();
+  const foreign = join(dir, "other-wt");
+  const read = tool(
+    "read_file",
+    context({
+      worktreePath: dir,
+      worktreeScope: async () => ({ own: dir, worktrees: [dir, foreign] })
+    })
+  );
+
+  const result = await read.execute("call-1", { path: "readme.md" });
+  assert.equal(result.content[0]!.text, "hello\n");
+  assert.notEqual(result.details["denied"], true);
+});
+
+test("read_file denies when the worktree scope cannot be verified", async () => {
+  const dir = await worktree();
+  const read = tool(
+    "read_file",
+    context({
+      worktreePath: dir,
+      worktreeScope: async () => {
+        throw new Error("git worktree list failed");
+      }
+    })
+  );
+
+  const result = await read.execute("call-1", { path: "readme.md" });
+  assert.equal(result.details["denied"], true);
+  assert.equal(result.details["reason"], "scope_unverifiable");
 });
 
 test("request_diff inspects a patch without writing anything", async () => {

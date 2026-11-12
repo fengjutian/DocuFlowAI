@@ -375,6 +375,11 @@ export function NewTaskDialog({
             <p className="text-xs text-muted-foreground">
               检查在工作区里独立运行，决定「完成门禁」是否放行；没有检查时运行会以「无评估结果」收尾。
             </p>
+            <p className="text-xs text-muted-foreground">
+              危险命令（删除、提权、发布、管道进 shell 等）默认被拒绝：只有针对
+              <span className="font-mono">这一条命令</span>
+              的审批才能放行，审批不能挪用到别的命令。
+            </p>
           </div>
 
           <div className="grid grid-cols-2 gap-3">

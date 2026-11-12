@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { resolve as resolvePath } from "node:path";
 import { evaluatePermission, isWithin, type PolicySnapshot } from "../policy/permission-policy.js";
+import { scopeViolationFor, type WorktreeScope } from "../policy/worktree-scope.js";
 import type { ChangeProposal } from "../code-engine/diff-analysis.js";
 import type { ApplyOutcome } from "../code-engine/code-change-pipeline.js";
 import type { EvaluationCheckSpec, EvaluationResult } from "../evaluation/evaluation.js";
@@ -26,6 +27,13 @@ export interface CodeWeaverToolContext {
    * see the same snapshot the execution runs under — not a guess and not a stale one.
    */
   policy: () => PolicySnapshot | Promise<PolicySnapshot>;
+  /**
+   * The worktree scope of this execution: its own directory and the repository's worktrees.
+   *
+   * Resolved on every call, not once: a worktree can appear while the execution runs — a delegated
+   * child gets its own — and a scope that does not see it cannot keep the execution out of it.
+   */
+  worktreeScope?: () => Promise<WorktreeScope>;
   /** Proposes a diff without touching the worktree. */
   propose: (patch: string) => ChangeProposal;
   /** Applies a patch through the Code Engine. */
@@ -112,6 +120,32 @@ function createReadFileTool(context: CodeWeaverToolContext, now: () => Date): Co
           reason: "outside_worktree",
           path: target
         });
+      }
+      // A directory is not a worktree. Another worktree can sit inside this one — a child agent's
+      // worktree under the checkout the execution runs in — and then the boundary above would let
+      // the read straight into it. The scope asks which worktree owns the path, and the answer has
+      // to be this execution's own worktree.
+      if (context.worktreeScope) {
+        let scope: WorktreeScope;
+        try {
+          scope = await context.worktreeScope();
+        } catch (error) {
+          // A scope that cannot be established is not a scope with nothing in it.
+          return textResult(
+            `read_file denied: the worktree scope could not be verified (${
+              error instanceof Error ? error.message : String(error)
+            })`,
+            { denied: true, reason: "scope_unverifiable", path: target }
+          );
+        }
+        const violation = await scopeViolationFor(target, scope);
+        if (violation) {
+          return textResult(`read_file denied: ${violation}`, {
+            denied: true,
+            reason: "outside_worktree_scope",
+            path: target
+          });
+        }
       }
       const evaluation = evaluatePermission(
         { operation: "read_file", paths: [target], worktreePath: context.worktreePath },
@@ -265,20 +299,30 @@ function createEvaluateChangesTool(context: CodeWeaverToolContext): CodeWeaverTo
         ? declared.filter(check => requested.includes(check.id))
         : [...declared];
       const result = await context.evaluate(selected);
-      return textResult(
-        `${result.verdict}: ${result.summary}`,
-        {
-          verdict: result.verdict,
-          evaluationId: result.id,
-          checks: result.checks.map(check => ({
-            id: check.id,
-            name: check.name,
-            verdict: check.verdict,
-            exitCode: check.exitCode,
-            output: check.output
-          }))
-        }
-      );
+      const refusals = result.checks
+        .filter(check => check.refusal)
+        .map(check => `${check.name}: ${check.output}`);
+      // The agent has to be told why a check did not run: a verdict without the reason looks like
+      // a flaky check, and the model cannot answer the task around a failure it cannot see.
+      const text =
+        refusals.length > 0
+          ? `${result.verdict}: ${result.summary}\n${refusals.join("\n")}`
+          : `${result.verdict}: ${result.summary}`;
+      return textResult(text, {
+        verdict: result.verdict,
+        evaluationId: result.id,
+        checks: result.checks.map(check => ({
+          id: check.id,
+          name: check.name,
+          verdict: check.verdict,
+          exitCode: check.exitCode,
+          output: check.output,
+          ...(check.refusal ? { refusal: check.refusal } : {}),
+          ...(check.approval
+            ? { approval: { approvedBy: check.approval.approvedBy, reason: check.approval.reason } }
+            : {})
+        }))
+      });
     }
   };
 }

@@ -132,6 +132,8 @@ async function setup(options: {
     changes,
     stores,
     traceability,
+    // The journal answers for the executions this service did not start — a delegated child.
+    journal,
     skills: { registry: skillRegistry, bindings: skillBindings },
     runIdFactory: () => "run-1",
     snapshotIdFactory: prefix => `${prefix}-1`,
@@ -482,6 +484,56 @@ test("binds a high-risk skill once it is approved", async () => {
 
     assert.equal(result.skills.length, 1);
     assert.equal(result.skills[0]!.skillId, "deploy");
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("a delegated child resolves the policy it was given, scoped to its own workspace", async () => {
+  const { repo, service, journal, request } = await setup();
+  try {
+    const started = await service.startTask(request);
+
+    // A delegated child is started by the subagent manager, not by this service. Its request — and
+    // with it the policy it runs under — is in the journal (D-055).
+    const childWorktree = join(repo, "child-worktree");
+    await journal.append({
+      executionId: "exec-child",
+      sequence: 1,
+      kind: "audit",
+      category: "execution.input",
+      recordedAt: "2026-11-12T00:00:00.000Z",
+      payload: {
+        taskId: "task-1",
+        prompt: "read the file",
+        contextSnapshotId: started.contextSnapshot.id,
+        policySnapshotId: started.policySnapshot.id,
+        worktreeId: "wt-child",
+        workingDirectory: childWorktree,
+        allowedTools: ["read_file"],
+        timeoutSeconds: 30,
+        correlationId: "corr-child"
+      }
+    });
+
+    const policy = await service.policyFor("exec-child");
+
+    // The child inherits the parent's capabilities...
+    assert.deepEqual(policy.grantedCapabilities, ["*"]);
+    // ...but it is scoped to its own workspace, not to the parent's: a child that could act in the
+    // parent's workspace would not be isolated from it.
+    assert.deepEqual(policy.allowedPaths, [childWorktree]);
+    assert.equal(policy.executionId, "exec-child");
+    assert.equal(policy.worktreeId, "wt-child");
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+  }
+});
+
+test("an execution with no journaled request has no policy to read", async () => {
+  const { repo, service } = await setup();
+  try {
+    await assert.rejects(() => service.policyFor("exec-never-started"), /No policy snapshot is linked/);
   } finally {
     await rm(repo, { recursive: true, force: true });
   }

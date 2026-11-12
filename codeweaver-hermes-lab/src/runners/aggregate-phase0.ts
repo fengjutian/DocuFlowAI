@@ -22,7 +22,10 @@ const defaultInputs = [
   "reports/phase0-pi-client-disconnect.json",
   "reports/phase0-runtime-crash.json",
   "reports/phase0-audit-timeline.json",
-  "reports/phase0-accounting.json"
+  "reports/phase0-accounting.json",
+  "reports/phase0-parallel-agents.json",
+  "reports/phase0-worktree-isolation.json",
+  "reports/phase0-command-approval.json"
 ];
 
 async function main(): Promise<void> {

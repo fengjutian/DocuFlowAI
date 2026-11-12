@@ -12,6 +12,7 @@ import {
   type EvaluationResult
 } from "../evaluation/evaluation.js";
 import type { ExecutionCoordinator } from "../orchestrator/execution-coordinator.js";
+import type { JournalStore } from "../journal/journal.js";
 import type { RecordStore } from "../persistence/record-store.js";
 import {
   assertContextSnapshot,
@@ -24,6 +25,7 @@ import {
 } from "../persistence/records.js";
 import type { TraceStores, TraceabilityQuery } from "../persistence/traceability.js";
 import type { PolicySnapshot } from "../policy/permission-policy.js";
+import type { WorktreeScope } from "../policy/worktree-scope.js";
 import type { SkillBinding, SkillBindingStore } from "../skills/skill-bindings.js";
 import { composePromptWithSkills, describeDeliveries } from "../skills/skill-delivery.js";
 import { summarizeSkillEffectiveness, type SkillEffectiveness } from "../skills/skill-effectiveness.js";
@@ -101,6 +103,15 @@ export interface TaskExecutionServiceOptions {
   changes: CodeChangePipeline;
   stores: TraceStores;
   traceability: TraceabilityQuery;
+  /**
+   * The journal, for executions this service did not start.
+   *
+   * A delegated child is started by the subagent manager, not here, so it has no session in this
+   * service. Its request — the prompt, the runtime, the policy and the workspace it runs in — travels
+   * with it in the journal, the same way the runtime id and the task input do (D-055). Without the
+   * journal here, a delegated child's tool surface has no policy to read and every tool call fails.
+   */
+  journal?: JournalStore;
   /** Optional skill support: without it, `skills` in a request is rejected rather than ignored. */
   skills?: { registry: SkillRegistry; bindings: SkillBindingStore };
   /**
@@ -273,6 +284,16 @@ export class TaskExecutionService {
   }
 
   /**
+   * The worktree scope of an execution: its own directory and the worktrees of its repository.
+   *
+   * The tool surface asks for this on every call, because the worktrees of the repository can
+   * change while an execution runs — a delegated child gets one of its own.
+   */
+  async worktreeScope(worktreePath: string): Promise<WorktreeScope> {
+    return this.options.changes.worktreeScope(worktreePath);
+  }
+
+  /**
    * Applies a proposed patch for an execution that this service started, then records it in three
    * places: the change store, the journal (so checkpoints see it) and the trace.
    */
@@ -366,7 +387,15 @@ export class TaskExecutionService {
    */
   async policyFor(executionId: string): Promise<PolicySnapshot> {
     const session = this.sessions.get(executionId);
-    const record = await this.resolvePolicy(executionId, session?.policySnapshotId);
+    if (session) {
+      const record = await this.resolvePolicy(executionId, session.policySnapshotId);
+      return toEvaluatorSnapshot(record);
+    }
+    // A delegated child was not started by this service, so it has no session here. Its policy
+    // travels with its request, and the request is in the journal.
+    const delegated = await this.delegatedPolicy(executionId);
+    if (delegated) return delegated;
+    const record = await this.resolvePolicy(executionId, undefined);
     return toEvaluatorSnapshot(record);
   }
 
@@ -469,8 +498,49 @@ export class TaskExecutionService {
       record => record.executionId === executionId
     );
     const context = prompt ? await this.options.stores.contextSnapshots.get(prompt.contextSnapshotId) : undefined;
-    if (!context) throw new Error(`No context snapshot is linked to execution ${executionId}`);
-    return context;
+    if (context) return context;
+    // A delegated child's request names the context snapshot it was given. The journal is where that
+    // request is, so the child resolves the same context its parent did.
+    const request = await this.journaledRequest(executionId);
+    const contextSnapshotId = request?.["contextSnapshotId"];
+    if (typeof contextSnapshotId === "string" && contextSnapshotId !== "") {
+      const found = await this.options.stores.contextSnapshots.get(contextSnapshotId);
+      if (found) return found;
+    }
+    throw new Error(`No context snapshot is linked to execution ${executionId}`);
+  }
+
+  /**
+   * The policy a delegated child runs under.
+   *
+   * It inherits its parent's capabilities, but it is scoped to the workspace it was given: a child
+   * that could act in the parent's workspace would not be isolated from it, and the tool surface
+   * would stop being the place where the isolation is enforced.
+   */
+  private async delegatedPolicy(executionId: string): Promise<PolicySnapshot | undefined> {
+    const request = await this.journaledRequest(executionId);
+    const policySnapshotId = request?.["policySnapshotId"];
+    if (typeof policySnapshotId !== "string" || policySnapshotId === "") return undefined;
+    const record = await this.options.stores.policySnapshots.get(policySnapshotId);
+    if (!record) return undefined;
+    const inherited = toEvaluatorSnapshot(record);
+    const workingDirectory = request?.["workingDirectory"];
+    if (typeof workingDirectory !== "string" || workingDirectory === "") return inherited;
+    const worktreeId = request?.["worktreeId"];
+    return {
+      ...inherited,
+      executionId,
+      worktreeId: typeof worktreeId === "string" && worktreeId !== "" ? worktreeId : inherited.worktreeId,
+      allowedPaths: [workingDirectory]
+    };
+  }
+
+  /** The request an execution was started with, as the journal recorded it. */
+  private async journaledRequest(executionId: string): Promise<Record<string, unknown> | undefined> {
+    const journal = this.options.journal;
+    if (!journal) return undefined;
+    const entries = await journal.read(executionId);
+    return entries.find(entry => entry.category === "execution.input")?.payload;
   }
 
   private async resolvePolicy(executionId: string, knownId?: string): Promise<PolicySnapshotRecord> {

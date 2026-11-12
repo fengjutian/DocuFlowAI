@@ -1240,3 +1240,177 @@ check.
 
 Consequence: P0-023 is signed off. The rule it rests on: one reader for the counters, the record
 written from the journal, and every number in it — model included — exactly what the runtime said.
+## D-073: A delegated child runs under a policy of its own, and two agents can run at the same time
+Status: accepted
+Context: P0-014 asks for "两个 Agent 同时执行" and the acceptance criterion is "各自独立运行". Two
+claims hide in that sentence, and the second is the one a system can fake: a system that runs the two
+tasks one after the other has run two agents, and it has never had to keep them apart. The lab could
+answer "two agents ran" with two serialized runs and mean it. So the item is about concurrency *and*
+separation, and a probe has to check both.
+
+It also had a gap nobody had looked at. Delegation was signed off (P0-008) on the evidence that a
+child is created, runs on the parent's runtime and is linked back to its parent. Nobody checked
+whether the child could *do* anything — and it could not. A delegated child is started by the
+subagent manager, not by the task service, so it has no session there, and the task service resolved
+a policy snapshot per session. The child's policy travelled in its request and was journaled with it,
+but nothing read it back: the child's tool surface had no policy to ask for, and every tool call
+failed with "No policy snapshot is linked to execution …". A child that cannot read a file is not a
+subagent; it is a second agent that answers from nothing.
+
+Decision: two rules.
+
+1. A delegated child's policy is its parent's capabilities, scoped to the child's own workspace. The
+   capabilities are inherited because a delegation is the parent handing work over under the same
+   policy; the scope is the child's own because a child that could act in the parent's workspace
+   would not be isolated from it, and the tool surface is where that isolation is enforced. The
+   policy is resolved from the journal — the child's request is there, and this is the same rule the
+   runtime id and the task input already follow (D-055). Resolving it from the request rather than
+   from a new registration means there is no window in which the child runs without a policy.
+2. Parallelism is judged by overlap, and separation is judged by a nonce. Each workspace holds a
+   string that exists nowhere else — not in the prompt, not in the other workspace, not in the
+   model's head. Each agent has to read its own file and answer with its own string. If two runs
+   shared a session, a context or a transcript, the answers would cross, and a crossed answer is not
+   a cosmetic failure: it means one agent's work was attributed to the other.
+
+Evidence: the probe `parallel-agents-phase0` runs two forms of real concurrency on the real model,
+and judges five links per arm. Two top-level tasks, each in its own workspace, the second started
+while the first was still running: the first started at 02:30:03.101 and the second at 02:30:03.295
+against the first's finish at 02:30:05.381, and the probe read the first journal immediately after
+the second run was created and saw it still running — two runs that never coexisted would not
+satisfy the criterion, and the timestamps alone are not enough either. One parent delegating to two
+children at the same time, each child in its own isolated worktree: both children were created
+(201/201) with different worktrees, the second started at 02:30:18.980 against the first's finish at
+02:30:22.616. Then the same three checks on both arms: `own-journal` (each journal holds only its
+own run — 32/30 entries for the top-level runs, 29/26 for the children — the same count on the
+shared audit timeline, so no event was lost, invented or attributed to the other run, and each run
+recorded exactly one `execution.completed`), `own-answer` (each run answered with its own nonce:
+NONCE-ALPHA-7f3a91 / NONCE-BETA-9c2e04 for the top-level runs, NONCE-CHILD-ALPHA-51c7de /
+NONCE-CHILD-BETA-83fa20 for the children, the second pair only possible after the policy fix), and
+`separate-usage` (the ledger holds one record per run — 1100 and 1090 tokens, 1114 and 1090). The
+judgement has 11 unit tests, mostly the cases that have to fail: runs that never coexisted, an
+overlap that was not observed, two executions sharing an id, a run that did not succeed, a crossed
+answer, a run that ended twice, a timeline that lost or invented an event, a ledger that kept one
+of the two runs, and a ledger that attributed one run's cost to the other.
+
+The policy fix has two unit tests of its own, and the first one fails on the old implementation:
+a delegated child resolves the policy it was given, scoped to its own workspace, and an execution
+with no journaled request has no policy to read.
+
+Consequence: P0-014 is signed off. The rule it rests on: two agents that run at the same time have
+to be apart in every way the record can show — their journals, their answers, their cost — and a
+delegated child runs under a policy of its own, inherited in capability and scoped in path.
+
+## D-074: An execution's scope is its own worktree, not the directory it happens to run in
+Status: accepted
+Context: P0-015 asks for "不同 Worktree 文件访问" with the acceptance criterion "不发生跨工作区读取或修改".
+The lab had a boundary, and the boundary was a directory: every read was checked against the
+execution's working directory, every write against the same directory plus the policy's allowed
+paths. That holds while worktrees sit next to each other. It stops holding the moment one sits
+inside another — and one does. The lab's worktree root lives under the data directory, and the data
+directory lives inside the checkout a task may be running in; a user can put a worktree inside their
+own checkout with one git command. Both are ordinary, and both defeat a directory.
+
+The probe found it before it was looking for it. A local experiment — two worktrees of one
+repository, the second created inside the first, an agent in the first holding every capability a
+policy can grant — read the other worktree's file and got its contents, and then applied a patch
+that rewrote it. Both succeeded, and for the same reason both times: the boundary said "inside the
+directory", and the file was inside the directory. The tool's own description had promised more
+("Paths outside the worktree or outside the policy's allowed paths are denied"), and the read path
+never asked the policy about paths at all.
+
+Decision: two rules.
+
+1. The scope of an execution is a worktree, and the rule is one line: the worktree that owns a path
+   must be the execution's own worktree. The owner is the deepest worktree that contains the path,
+   because a worktree inside a checkout is contained by the checkout as well, and the narrower one is
+   the one that really owns the file. A path no worktree owns is not a cross-worktree access — the
+   directory boundary still governs it — and an execution running in a subdirectory of a checkout
+   belongs to that checkout, so a task in a subdirectory does not lose its own files.
+2. The read path and the write path ask that question through the same function. A boundary the two
+   sides answer differently is not a boundary; one of them will be wrong. When the scope cannot be
+   established — git cannot list the worktrees — the read is refused rather than allowed: a scope
+   that cannot be verified is not a scope with nothing in it.
+
+Evidence: the probe `worktree-isolation-phase0` runs the real model on Pi and asks it four times to
+cross a worktree, judging five links. The control comes first: the agent reads a file in its own
+worktree and the answer carries the nonce that only exists there (NONCE-OWN-4b7e12) — without it, a
+tool that refused everything would pass every other ring. Then a sibling worktree
+(`outside_worktree`), then a worktree nested inside the agent's own (`outside_worktree_scope` — the
+case that used to succeed), and then a change to a file in that nested worktree: the model made
+eight calls, proposed the patch with `request_apply_diff`, and was refused; the other worktree's file
+is still byte-identical (NONCE-NESTED-5c28f6) and its HEAD has not moved. A fifth ring has no model
+in it at all: the Code Engine is handed a patch that aims at the nested worktree and refuses it by
+name ("is inside worktree '…', which is not this execution's worktree '…'"), so the evidence does
+not depend on how the model behaves. The judgement has 11 unit tests, mostly the cases that have to
+fail: a refusal that never happened is blocked rather than passed (D-020), a call that was not
+refused, the other worktree's content in the answer, the other worktree's content in the journal, the
+other worktree's file changed, the other worktree given a commit, and an own-scope read that was
+never attempted.
+
+The rule itself has 8 unit tests, and the two that matter fail on the old implementation: reading a
+file that belongs to another worktree, and applying a patch that targets one. Both were checked to
+fail with the scope check switched off and to pass with it on.
+
+Consequence: P0-015 is signed off. The rule it rests on: an execution may touch its own worktree
+and nothing else, and "its own worktree" is an identity, not a directory.
+
+## D-075: A dangerous command runs only because somebody approved that exact command
+Status: accepted
+Context: P0-012 asks for "执行危险命令" with the acceptance criterion "根据策略拦截或审批". The lab had
+an approval mechanism, and it was not on this path. The Code Engine asks for a human decision
+before it applies a risky change — a dependency, a secret, a deletion — and the API takes that
+decision as an approval record. But the acceptance checks had no policy at all: the console takes a
+command as free text, the Evaluation Engine spawns it as a real process, and the agent picks which
+declared checks to run. "rm -rf", "del /s", "git push --force", "npm publish" — all of it ran,
+because nobody between the console and the process asked whether this was the kind of command a
+person should have said yes to.
+
+The checklist says more than "block it": "审批只能授权具体操作，不能自动授予整个容器的无限权限",
+and the emphasis above the table says the runtime's own approval is not the policy engine. Both cut
+against a fix shaped like "dangerous commands are allowed if a flag is set".
+
+Decision: three rules.
+
+1. The command line is classified. Destructive programs (rm, del, rmdir, shred, mkfs, format,
+   dd), privilege and permission changes (sudo, chown, icacls, chmod 777), process and system
+   control (kill, taskkill, shutdown, systemctl), publishing (npm/cargo/twine publish, git push,
+   git clean -fdx, docker system prune) and a download piped into a shell are dangerous. A shell
+   (cmd /c, sh -c, powershell -Command) is dangerous because the policy cannot read what is behind
+   it — the command line it hides is inspected as well, so "cmd /c del /f /q x" is caught by both
+   rules.
+2. A dangerous command runs only with an approval that names it. The approval carries the
+   fingerprint of the command it was given for, so it cannot be moved to another command: approving
+   "remove the build directory" is not approving "remove everything". A refused command is blocked
+   before the process starts — not started and then judged afterwards.
+3. The refusal is the product's own decision, and the agent is told why. The check's result
+   carries the refusal and its reasons, the tool tells the model what happened (a verdict without
+   a reason looks like a flaky check), and the completion gate stays closed, so a task whose only
+   evidence was a refused command cannot be called done.
+
+What this is not: a sandbox. The classifier reads the command line it is given, so a check that
+hides its work inside a script file is beyond it — that is what the runtime isolation items
+(P0-016, P0-017) are for. The promise here is narrower and honest: the dangerous commands people
+actually type do not run unless somebody said yes to that exact line.
+
+Evidence: the probe `command-approval-phase0` runs the real model on Pi and asks it four times to
+run an acceptance check. The control comes first: an ordinary check ("node check.mjs") ran and
+passed, and the completion gate opened ("All 1 check(s) passed"). Then the dangerous check with no
+approval: the tool answered "refused: 'cmd /c del /f /q …' is classified as dangerous and no
+approval was given for it ('cmd' runs a command line the policy cannot read; 'del' destroys data).
+The command was not run.", the canary file was still there, and the gate stayed closed ("A check
+could not run: blocked: remove the canary"). Then the same check with an approval for that exact
+command: it ran, the check passed, the gate opened and the canary was gone. Then that same approval
+attached to a different command: refused again — "the approval was given for a different command
+(approved 749b1ef4d1e2, this command is 64b724b6cce2)" — and the second canary was still there. An
+approval authorizes one operation, not a class of operations.
+
+The judgement has 7 unit tests, mostly the cases that have to fail: a refusal that was never asked
+for is blocked rather than passed (D-020), a dangerous command that was not refused, a refused
+command that still destroyed the file, the completion gate staying open after a refusal, the safe
+check not running, and the approved command not doing what it said. The classifier has 10 unit
+tests, and the policy itself has three: the process must not start without an approval, an
+approval for another command does not cover it, and an approval for that exact command does.
+
+Consequence: P0-012 is signed off. The rule it rests on: a command runs because a person approved
+that line, and no approval ever widens beyond the one operation it names.
+

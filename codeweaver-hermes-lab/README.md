@@ -596,6 +596,109 @@ are one number rather than two measurements of the same run.
 The console's 「用量统计」page shows the cached tokens next to the prompt tokens, because the runtime
 counts them separately and a total its parts cannot explain is a number nobody can check.
 
+## Parallel agents
+
+```bash
+npm run validate:parallel-agents
+```
+
+Signs off P0-014 (two agents at the same time, each running on its own) on the real model. The report
+goes to `reports/phase0-parallel-agents.json` and joins the Phase 0 aggregate.
+
+Two claims hide in "两个 Agent 同时执行 / 各自独立运行", and the second one is the one a system can
+fake: a system that runs the two tasks one after the other has run two agents, and it has never had
+to keep them apart. The probe therefore runs two forms of real concurrency and judges both.
+
+| Link | Why |
+|---|---|
+| two-runs | two distinct executions, both finished on their own |
+| overlapped | the second run started before the first finished, and the probe saw the first one still running at that moment — two runs that never coexisted are not a parallel run |
+| own-journal | each journal holds only its own run, the shared audit timeline holds the same count, and each run recorded exactly one terminal event |
+| own-answer | each run answered with its own nonce and not the other's |
+| separate-usage | the ledger keeps one record per run, so the two runs are also two rows of cost |
+
+The yardstick for "independent" is a nonce: each workspace holds a string that exists nowhere else —
+not in the prompt, not in the other workspace, not in the model's head — and each agent has to read
+its own file and answer with its own string. If two runs shared a session, a context or a
+transcript, the answers would cross, and a crossed answer means one agent's work was attributed to
+the other.
+
+The probe also found a real defect. A delegated child is started by the subagent manager, not by the
+task service, so it had no policy snapshot — and the task surface asked for one on every tool call,
+so every call failed with "No policy snapshot is linked to execution …". A child that cannot read a
+file is not a subagent. The fix follows the rule the runtime id and the task input already follow
+(D-055): the child's request is in the journal, so the policy is resolved from there. The child
+inherits its parent's capabilities and is scoped to its own workspace (D-073).
+
+## Worktree isolation
+
+```bash
+npm run validate:worktree-isolation
+```
+
+Signs off P0-015 (不同 Worktree 文件访问 / 不发生跨工作区读取或修改) on the real model. The report
+goes to `reports/phase0-worktree-isolation.json` and joins the Phase 0 aggregate.
+
+An execution's file scope is its own **worktree**, not the directory it happens to run in. That
+distinction is the whole item: a worktree of the same repository can sit inside the directory an
+agent runs in — the lab's own worktree root lives under the data directory, which lives inside the
+checkout — and a boundary made of directories lets the agent straight into it.
+
+| Link | Why |
+|---|---|
+| own-scope-readable | the agent reads a file in its own worktree and the nonce comes back — without this, a tool that refuses everything would pass every other ring |
+| attempt-made | the agent really called the tool; a refusal that was never asked for proves nothing (D-020) |
+| refused | the call was refused, with the reason in the journal |
+| no-leak | the other worktree's string is in neither the answer nor the journal |
+| other-worktree-untouched | the other worktree's file is byte-identical and its HEAD has not moved |
+
+The probe runs four arms on the real model: the control, a sibling worktree, a worktree nested
+inside the agent's own, and a change aimed at that nested worktree. A fifth ring has no model in it
+at all — the Code Engine is handed the patch directly and has to refuse it by name, so the evidence
+does not depend on how the model behaves.
+
+The probe found the gap it was written for. With a worktree nested inside the agent's own, the read
+returned the other worktree's content and a patch rewrote the file — both succeeded, because the
+boundary said "inside the directory" and the file was inside the directory. The rule now is one
+line, in `src/policy/worktree-scope.ts`: **the worktree that owns a path must be the execution's own
+worktree**. The read path and the write path ask that question through the same function, and when
+the scope cannot be established the read is refused rather than allowed (D-074).
+
+## Dangerous commands and approvals
+
+```bash
+npm run validate:command-approval
+```
+
+Signs off P0-012 (执行危险命令 / 根据策略拦截或审批) on the real model. The report goes to
+`reports/phase0-command-approval.json` and joins the Phase 0 aggregate.
+
+An acceptance check is a real process, so a task can point it at anything — and the console takes
+that command as free text. The agent may only narrow the declared checks, never introduce one, so
+the danger arrives with the declaration. Nothing asked about it: `rm -rf`, `del /s`,
+`git push --force`, `npm publish` all ran, because nobody between the console and the process
+asked whether this was the kind of command a person should have said yes to.
+
+| Link | Why |
+|---|---|
+| attempt-made | the agent really ran the check; a refusal that was never asked for proves nothing (D-020) |
+| command-refused | the command was refused, with the reason in the tool's answer |
+| file-untouched | the file the command would have destroyed is still there |
+| gate-closed | the completion gate stayed closed, so the task cannot be called done |
+| command-ran / file-destroyed | the approved command really ran, and really did what it said |
+
+The rule is three lines in `src/evaluation/command-policy.ts`: the command line is classified, a
+dangerous command runs only with an approval that names it, and the refusal is the product's own
+decision — the agent is told why, and the gate stays closed.
+
+An approval carries the **fingerprint of the command it was given for**, so it cannot be moved:
+approving "remove the build directory" is not approving "remove everything". The probe proves it
+by attaching one approval to a second, different command and watching it be refused.
+
+This is not a sandbox, and the README says so plainly: the classifier reads the command line it is
+given, so a check that hides its work in a script file is beyond it — that is what P0-016 and
+P0-017 are for (D-075).
+
 ## Multi-runtime policy and runtime scoring
 
 ```bash
