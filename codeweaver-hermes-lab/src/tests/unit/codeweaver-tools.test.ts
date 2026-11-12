@@ -307,3 +307,100 @@ test("evaluate_changes without declared checks reports no evidence", async () =>
   assert.equal(result.details["verdict"], "blocked");
   assert.equal(result.details["reason"], "no_checks_declared");
 });
+
+test("evaluate_changes tells the model which resource limit stopped the check", async () => {
+  // The limit lives in the details, but the details are not what the model reads: a check that
+  // was stopped by the memory limit has to say so in the text, or the agent cannot tell a
+  // resource limit apart from a flaky check.
+  const evaluate = tool(
+    "evaluate_changes",
+    context({
+      evaluationChecks: () => [
+        { id: "allocate", name: "the allocating check", command: "node", args: ["allocate.mjs"] }
+      ],
+      evaluate: async selected => ({
+        id: "eval-1",
+        executionId: "exec-1",
+        checks: selected.map(check => ({
+          id: check.id,
+          name: check.name,
+          verdict: "failed" as const,
+          exitCode: 1,
+          durationMs: 12,
+          output:
+            "RangeError: Array buffer allocation failed\n[sandbox] the check exceeded the memory limit of 128 MB",
+          limitHit: "memory" as const
+        })),
+        verdict: "failed" as const,
+        startedAt: "2026-11-12T00:00:00.000Z",
+        finishedAt: "2026-11-12T00:00:01.000Z",
+        summary: "failed: the allocating check"
+      })
+    })
+  );
+
+  const result = await evaluate.execute("call-1", {});
+  const text = result.content[0]!.text;
+  assert.match(text, /failed/, "the verdict is there");
+  assert.match(text, /memory limit of 128 MB/, "the limit is named to the model");
+});
+
+test("evaluate_changes explains a check that could not run at all", async () => {
+  const evaluate = tool(
+    "evaluate_changes",
+    context({
+      evaluationChecks: () => [
+        { id: "allocate", name: "the allocating check", command: "node", args: ["allocate.mjs"] }
+      ],
+      evaluate: async selected => ({
+        id: "eval-1",
+        executionId: "exec-1",
+        checks: selected.map(check => ({
+          id: check.id,
+          name: check.name,
+          verdict: "blocked" as const,
+          exitCode: null,
+          durationMs: 12,
+          output: "[sandbox] the check did not run inside a sandbox: the sandbox helper is missing"
+        })),
+        verdict: "blocked" as const,
+        startedAt: "2026-11-12T00:00:00.000Z",
+        finishedAt: "2026-11-12T00:00:01.000Z",
+        summary: "blocked: the allocating check"
+      })
+    })
+  );
+
+  const result = await evaluate.execute("call-1", {});
+  assert.match(result.content[0]!.text, /did not run inside a sandbox/);
+});
+
+test("evaluate_changes says nothing extra when every check passed", async () => {
+  const evaluate = tool(
+    "evaluate_changes",
+    context({
+      evaluationChecks: () => [
+        { id: "build", name: "Build", command: "npm", args: ["run", "build"] }
+      ],
+      evaluate: async selected => ({
+        id: "eval-1",
+        executionId: "exec-1",
+        checks: selected.map(check => ({
+          id: check.id,
+          name: check.name,
+          verdict: "passed" as const,
+          exitCode: 0,
+          durationMs: 1,
+          output: "ok"
+        })),
+        verdict: "passed" as const,
+        startedAt: "2026-11-12T00:00:00.000Z",
+        finishedAt: "2026-11-12T00:00:01.000Z",
+        summary: "1/1 checks passed"
+      })
+    })
+  );
+
+  const result = await evaluate.execute("call-1", {});
+  assert.equal(result.content[0]!.text, "passed: 1/1 checks passed");
+});

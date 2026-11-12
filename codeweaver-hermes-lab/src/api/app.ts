@@ -13,6 +13,7 @@ import type { TaskExecutionService, StartTaskRequest } from "../tasks/task-execu
 import { SkillDeniedError } from "../tasks/task-execution-service.js";
 import type { EvaluationCheckSpec } from "../evaluation/evaluation.js";
 import type { CommandApproval } from "../evaluation/command-policy.js";
+import { validateSandboxLimits, type SandboxLimits } from "../evaluation/sandbox-limits.js";
 import type { AgentTaskInput, RuntimePermissionRequest } from "../types/adapter.js";
 import type { SkillBindingStore } from "../skills/skill-bindings.js";
 import type { SkillRegistry } from "../skills/skill-registry.js";
@@ -1005,6 +1006,7 @@ function parseEvaluationChecks(raw: unknown, field: string): EvaluationCheckSpec
       throw new ApiError(400, "invalid_body", `${field}[${index}].args must be an array of strings`);
     }
     const approval = check["approval"];
+    const limits = check["limits"];
     return {
       id: typeof check["id"] === "string" ? check["id"] : `check-${index + 1}`,
       name: typeof check["name"] === "string" ? check["name"] : `check-${index + 1}`,
@@ -1015,9 +1017,46 @@ function parseEvaluationChecks(raw: unknown, field: string): EvaluationCheckSpec
       ...(typeof check["expectExitCode"] === "number" ? { expectExitCode: check["expectExitCode"] } : {}),
       ...(approval !== undefined
         ? { approval: readCommandApproval(approval, `${field}[${index}].approval`) }
+        : {}),
+      ...(limits !== undefined
+        ? { limits: readSandboxLimits(limits, `${field}[${index}].limits`) }
         : {})
     };
   });
+}
+
+/**
+ * The resource limits one check runs under.
+ *
+ * The limits are validated here rather than at run time: a limit that cannot be applied is not a
+ * limit, and the caller has to hear about it while they are still typing the task.
+ */
+function readSandboxLimits(raw: unknown, field: string): SandboxLimits {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new ApiError(400, "invalid_body", `Field '${field}' must be an object`);
+  }
+  const limits = raw as Record<string, unknown>;
+  const readNumber = (key: string): number | undefined => {
+    const value = limits[key];
+    if (value === undefined) return undefined;
+    if (typeof value !== "number" || !Number.isFinite(value)) {
+      throw new ApiError(400, "invalid_body", `Field '${field}.${key}' must be a number`);
+    }
+    return value;
+  };
+  const memoryMb = readNumber("memoryMb");
+  const cpuRatePercent = readNumber("cpuRatePercent");
+  const processLimit = readNumber("processLimit");
+  const parsed: SandboxLimits = {
+    ...(memoryMb !== undefined ? { memoryMb } : {}),
+    ...(cpuRatePercent !== undefined ? { cpuRatePercent } : {}),
+    ...(processLimit !== undefined ? { processLimit } : {})
+  };
+  const violations = validateSandboxLimits(parsed);
+  if (violations.length > 0) {
+    throw new ApiError(400, "invalid_body", `Field '${field}' is unusable: ${violations.join("; ")}`);
+  }
+  return parsed;
 }
 
 /**

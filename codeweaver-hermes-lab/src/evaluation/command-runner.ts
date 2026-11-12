@@ -1,14 +1,26 @@
 import { spawn } from "node:child_process";
+import type { SandboxOutcome } from "./sandbox-runner.js";
+import type { SandboxLimits } from "./sandbox-limits.js";
 
 export interface CommandOutcome {
   code: number | null;
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** What the sandbox did with the command, when it ran inside one. */
+  sandbox?: SandboxOutcome;
+}
+
+/** How a command is run. */
+export interface CommandRunOptions {
+  cwd?: string;
+  timeoutMs?: number;
+  /** The resource limits the command runs under, when it runs inside a sandbox. */
+  limits?: SandboxLimits;
 }
 
 export interface CommandRunner {
-  run(command: string, args: string[], options?: { cwd?: string; timeoutMs?: number }): Promise<CommandOutcome>;
+  run(command: string, args: string[], options?: CommandRunOptions): Promise<CommandOutcome>;
 }
 
 /** Evidence has to come from a real process, so tests and checks run without a shell wrapper. */

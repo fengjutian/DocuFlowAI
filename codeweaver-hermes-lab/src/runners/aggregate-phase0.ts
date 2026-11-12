@@ -25,7 +25,14 @@ const defaultInputs = [
   "reports/phase0-accounting.json",
   "reports/phase0-parallel-agents.json",
   "reports/phase0-worktree-isolation.json",
-  "reports/phase0-command-approval.json"
+  "reports/phase0-command-approval.json",
+  // The editor's own evidence: the editor's ACP client drives the real endpoint. It lives in the
+  // editor crate because the client is the editor's code, and it lands here in the same shape as
+  // every other Phase 0 report.
+  "reports/phase0-acp-editor.json",
+  // The sandbox limits: the acceptance checks run inside a Windows job object with memory, CPU
+  // and process limits, and the probe shows the limits biting.
+  "reports/phase0-sandbox-limits.json"
 ];
 
 async function main(): Promise<void> {

@@ -453,6 +453,18 @@ fn dispatch(
                 .remove(&id)
                 .is_some();
             if is_turn {
+                // A turn the endpoint refused ends with an error, not with a result. The reason in
+                // that error is the only thing that says what went wrong, so it is carried over:
+                // a turn that failed as "unknown" is a failure nobody can act on.
+                if let Some(error) = message.get("error") {
+                    let reason = error
+                        .get("message")
+                        .and_then(|message| message.as_str())
+                        .unwrap_or("the agent endpoint refused the turn")
+                        .to_owned();
+                    let _ = events.send(SessionEvent::Disconnected { reason });
+                    return;
+                }
                 let reason = message
                     .get("result")
                     .and_then(|result| result.get("stopReason"))
@@ -582,4 +594,48 @@ fn parse_permission_request(message: &Value) -> Option<PermissionRequest> {
             })
             .unwrap_or_default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Feeds one frame through the dispatcher and returns the events it produced.
+    fn events_for(frame: &str) -> Vec<SessionEvent> {
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let turns = Arc::new(Mutex::new(HashMap::new()));
+        let (sender, events) = channel();
+        turns
+            .lock()
+            .expect("the turn lock is not poisoned")
+            .insert(7, "sess-1".to_owned());
+        dispatch(frame, &pending, &turns, &sender);
+        events.try_iter().collect()
+    }
+
+    #[test]
+    fn a_refused_turn_carries_the_endpoints_reason() {
+        let events = events_for(
+            r#"{"jsonrpc":"2.0","id":7,"error":{"code":-32000,"message":"Unknown runtime no-such-runtime"}}"#,
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            SessionEvent::Disconnected { reason } => {
+                assert_eq!(reason, "Unknown runtime no-such-runtime");
+            }
+            other => panic!("expected the refusal to be reported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_finished_turn_reports_its_stop_reason() {
+        let events = events_for(r#"{"jsonrpc":"2.0","id":7,"result":{"stopReason":"end_turn"}}"#);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            SessionEvent::TurnCompleted {
+                stop_reason: StopReason::EndTurn
+            }
+        ));
+    }
 }

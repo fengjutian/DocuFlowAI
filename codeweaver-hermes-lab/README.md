@@ -696,8 +696,63 @@ approving "remove the build directory" is not approving "remove everything". The
 by attaching one approval to a second, different command and watching it be refused.
 
 This is not a sandbox, and the README says so plainly: the classifier reads the command line it is
-given, so a check that hides its work in a script file is beyond it — that is what P0-016 and
-P0-017 are for (D-075).
+given, so a check that hides its work in a script file is beyond it — that is what P0-016 is for
+(the kernel-enforced limits below) and what P0-017 still is for (the runtime itself behind an OS
+boundary) (D-075).
+
+## Sandbox resource limits
+
+```bash
+npm run validate:sandbox-limits
+```
+
+Signs off P0-016 (沙箱资源限制). The report goes to `reports/phase0-sandbox-limits.json` and joins
+the Phase 0 aggregate.
+
+The checklist asked for a sandbox with memory, CPU and process limits, and it was written against
+Docker. Docker is gone, but the limits were never a Docker feature: on Windows they are a **job
+object**, and the thing they limit is the acceptance check — a real process on the user's machine
+that CodeWeaver starts on an agent's behalf. The helper is `scripts/sandbox-run.ps1` (PowerShell
+with the job object API compiled in, because Node cannot create one), and the Evaluation Engine's
+default runner is that helper, so every check runs inside the boundary whether anyone asked for it
+or not.
+
+| Limit | How it is enforced | What the kernel answers |
+|---|---|---|
+| memory | `JOB_OBJECT_LIMIT_JOB_MEMORY` | the allocation fails: `RangeError: Array buffer allocation failed` |
+| processes | `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` | the spawn fails: `Error: spawn UNKNOWN` (errno -4094, `ERROR_NOT_ENOUGH_QUOTA`) |
+| CPU | job CPU rate control | the check is throttled, not stopped — its own clock is the evidence |
+
+Two rules keep this honest:
+
+- **A limit that cannot be established is not a limit.** A missing helper, a non-Windows host or
+  unusable numbers mean the check does *not* run unsandboxed: the exit code stays unknown and the
+  check is blocked. The same rule the worktree scope follows (D-074).
+- **A limit that was hit is named.** The check's output carries `[sandbox] the check exceeded the
+  memory limit of 128 MB`, the record carries `limitHit`, and the model reads the same sentence —
+  "the check failed" and "the check was stopped by the memory limit" are different facts, and only
+  one of them tells the agent what to change.
+
+The probe has five arms. Four go through the Evaluation Engine: a control (an ordinary check runs
+inside the job object and the gate opens), the memory limit (512 MB passes under 1024 MB, is
+stopped under 128 MB), the process limit (twenty children pass without a limit, are stopped under
+four), and the CPU limit (521 ms against 1969 ms under a 1% cap on a 22-processor machine — the
+check's own clock, because the engine's `durationMs` includes the helper's startup in both arms).
+
+The fifth arm is the agent, and it is the one that changed the product. A real model on the real Pi
+runtime is asked to run the acceptance check that allocates too much; the control arm is the same
+check with room to run. The tight arm found that the limit reason was in the tool's `details`, and
+`details` is not what a model reads — the tool's text said only "failed". `explainCheck` now pulls
+the `[sandbox]` line out and speaks it to the model, and a check that could not run at all explains
+itself the same way. The unit test for it is watched failing: replace that line with a generic
+"the check did not pass" and two tests turn red.
+
+An agent that never ran the check is `blocked`, not `passed` (D-020): a refusal that was never
+asked for proves nothing.
+
+What this is not: the limits cover the processes **CodeWeaver starts**. Putting the whole runtime
+behind an OS boundary (AppContainer, then Windows Sandbox or Hyper-V) is P0-017, still blocked on
+that evidence (`doc/HERMES_NATIVE_PLAN.md`).
 
 ## Multi-runtime policy and runtime scoring
 
@@ -1134,6 +1189,49 @@ Current gaps, stated up front: snapshots **are** captured per prompt through `Ta
 (git base SHA of `cwd`, a cwd-scoped policy snapshot, prompt snapshot, audit entries), but policy is
 recorded rather than enforced at this layer — enforcement still happens in the Code Engine and the
 sandbox. Approvals are bridged through `session/request_permission`, and an unanswered prompt denies.
+
+## ACP editor connection
+
+Both ends existed; nothing had ever connected them. The editor's own client — the same
+`codeweaver-agent-acp` code the editor uses — now drives the **real** endpoint against the **real**
+runtime with a **real** model:
+
+```bash
+# From editor/. The key is read from the Hermes profile and never typed into a command line.
+cargo run -p codeweaver-platform --example acp_real_runtime
+```
+
+The example creates a throwaway git workspace whose one file holds a nonce, names the runtime
+(`CODEWEAVER_ACP_RUNTIME_ID=pi-local`), asks the model to read that file with `read_file` and reply
+with its exact content, and then judges the turn on four counts that can each fail alone: a tool
+call happened, it was `read_file`, the turn ended with `EndTurn`, and the transcript carries the
+nonce. The report lands in `reports/phase0-acp-editor.json` — the shape the Phase 0 aggregate reads,
+so the item joins the same checklist as the server-side probes.
+
+It also runs a **control arm** that costs no tokens: the same client, the same endpoint, but
+naming a runtime that is not registered — the endpoint must refuse it by name ("Unknown runtime
+no-such-runtime"). An endpoint that quietly ran the task on some other runtime would pass the main
+arm too, so the control is what makes the main arm mean something. A run the provider refuses for
+lack of quota is reported as `blocked`, not `failed`: the check did not happen, it was not
+contradicted (D-020).
+
+Three defects came out of running it, and all three are fixed:
+
+1. **The endpoint named no runtime.** Every editor task landed on the server's default (Hermes)
+   while the product's primary runtime is Pi (D-042, D-060). `CODEWEAVER_ACP_RUNTIME_ID` names one
+   exactly, and a runtime that is not registered is refused rather than replaced (D-047).
+2. **Tool calls arrived without their name.** Pi carries `toolName`, Hermes carries `tool`, and the
+   ACP layer read only the second — so every tool call was labelled "tool". The call was real; its
+   name was not. Both keys are read in one place now (`toolTitle`).
+3. **A failed run said nothing.** `execution.failed` carries the reason and the ACP layer dropped
+   it, so the editor showed an empty transcript and a refusal. The reason crosses over now; a
+   failure with no reason forwards nothing, because "the run failed" is the one sentence nobody can
+   act on.
+
+What this is not: the probe drives the editor's ACP client, not Zed's GUI session. `client/PIN.json`
+records the client base the editor is built on (Zed 1.29.0); the probe reads it through the UTF-8
+BOM the provisioning script leaves behind, because a pin that reads as "unknown" looks like a fact
+about the client and is not one.
 
 ## Test status vocabulary
 

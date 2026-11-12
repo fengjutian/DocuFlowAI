@@ -265,3 +265,18 @@ test("acp: a tool call without a name still reaches the editor", () => {
   assert.equal(update?.sessionUpdate, "tool_call");
   assert.equal(update?.title, "tool");
 });
+
+test("acp: a failed run tells the editor why it failed", () => {
+  const failed: AgentRuntimeEvent = {
+    ...toolStarted({}),
+    eventType: "execution.failed",
+    payload: { error: "429 rate_limit_error: token plan limit reached" }
+  };
+  const update = toSessionUpdate(failed);
+  assert.equal(update?.sessionUpdate, "agent_message_chunk");
+  assert.match(String((update?.content as { text?: string } | undefined)?.text), /rate_limit_error/);
+
+  // A failure with nothing in it says nothing: "the run failed" is the one thing the person in
+  // front of the editor cannot act on, so there is nothing to forward.
+  assert.equal(toSessionUpdate({ ...failed, payload: {} }), undefined);
+});

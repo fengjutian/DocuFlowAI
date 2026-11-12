@@ -281,6 +281,15 @@ export function toSessionUpdate(event: AgentRuntimeEvent): AcpSessionUpdate | un
         toolCallId: String(event.payload["toolCallId"] ?? event.payload["tool"] ?? event.eventId),
         status: "failed"
       };
+    case "execution.failed": {
+      // A run that dies without saying why looks like a run that never started. The reason is in
+      // the event, and the ACP layer is the only thing that carries it across, so the editor does
+      // not have to go looking for it.
+      const reason = failureReason(event);
+      return reason
+        ? { sessionUpdate: "agent_message_chunk", content: { type: "text", text: reason } }
+        : undefined;
+    }
     default:
       return undefined;
   }
@@ -314,6 +323,20 @@ function payloadText(payload: Record<string, unknown>): string {
 export function toolTitle(event: AgentRuntimeEvent, fallback = "tool"): string {
   const value = event.payload["toolName"] ?? event.payload["tool"];
   return typeof value === "string" && value !== "" ? value : fallback;
+}
+
+/**
+ * Why the run failed, as the runtime said it.
+ *
+ * An empty reason is not a reason: a failure with nothing in it is reported as "the run failed",
+ * which is the one thing the person in front of the editor cannot act on.
+ */
+export function failureReason(event: AgentRuntimeEvent): string | undefined {
+  for (const key of ["error", "message", "reason"]) {
+    const value = event.payload[key];
+    if (typeof value === "string" && value.trim() !== "") return value.trim();
+  }
+  return undefined;
 }
 
 /** Hermes may carry the approval id at a few keys; the adapter uses the same order. */

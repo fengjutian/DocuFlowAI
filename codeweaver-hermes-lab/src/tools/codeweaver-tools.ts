@@ -4,7 +4,7 @@ import { evaluatePermission, isWithin, type PolicySnapshot } from "../policy/per
 import { scopeViolationFor, type WorktreeScope } from "../policy/worktree-scope.js";
 import type { ChangeProposal } from "../code-engine/diff-analysis.js";
 import type { ApplyOutcome } from "../code-engine/code-change-pipeline.js";
-import type { EvaluationCheckSpec, EvaluationResult } from "../evaluation/evaluation.js";
+import type { EvaluationCheckResult, EvaluationCheckSpec, EvaluationResult } from "../evaluation/evaluation.js";
 
 /**
  * The tool surface CodeWeaver exposes to a runtime (design 7.2).
@@ -299,14 +299,19 @@ function createEvaluateChangesTool(context: CodeWeaverToolContext): CodeWeaverTo
         ? declared.filter(check => requested.includes(check.id))
         : [...declared];
       const result = await context.evaluate(selected);
-      const refusals = result.checks
-        .filter(check => check.refusal)
-        .map(check => `${check.name}: ${check.output}`);
       // The agent has to be told why a check did not run: a verdict without the reason looks like
       // a flaky check, and the model cannot answer the task around a failure it cannot see.
+      //
+      // Four kinds of check need their reason spelled out, and each of them carries it in the
+      // output: a refusal (D-075), a resource limit that stopped the check, a check that could
+      // not run at all, and a plain failure. A check that ran out of memory and a check that
+      // simply failed are different facts, and only one of them tells the agent what to change.
+      const explanations = result.checks
+        .filter(check => check.refusal || check.limitHit || check.verdict !== "passed")
+        .map(check => `${check.name}: ${explainCheck(check)}`);
       const text =
-        refusals.length > 0
-          ? `${result.verdict}: ${result.summary}\n${refusals.join("\n")}`
+        explanations.length > 0
+          ? `${result.verdict}: ${result.summary}\n${explanations.join("\n")}`
           : `${result.verdict}: ${result.summary}`;
       return textResult(text, {
         verdict: result.verdict,
@@ -337,6 +342,21 @@ function renderProposal(proposal: ChangeProposal): string {
     lines.push(`- [${risk.blocked ? "blocked" : "approval"}] ${risk.message}`);
   }
   return lines.join("\n");
+}
+
+/**
+ * The reason one check did not pass, in the words the agent will read.
+ *
+ * The sandbox note is the line that names the limit, and it sits at the end of the output, so it
+ * is pulled out on its own: a model that reads "the check failed" learns nothing, and one that
+ * reads "the check exceeded the memory limit of 128 MB" knows what to change.
+ */
+function explainCheck(check: EvaluationCheckResult): string {
+  const sandboxNote = /^\[sandbox\].*$/m.exec(check.output)?.[0];
+  if (sandboxNote) return sandboxNote;
+  const output = check.output.trim();
+  if (!output) return `the check ${check.verdict}`;
+  return output.length <= 400 ? output : `${output.slice(0, 400)}...`;
 }
 
 function textResult(text: string, details: Record<string, unknown>): ToolResult {

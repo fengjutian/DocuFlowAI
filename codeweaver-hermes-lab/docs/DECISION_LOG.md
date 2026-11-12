@@ -1414,3 +1414,182 @@ approval for another command does not cover it, and an approval for that exact c
 Consequence: P0-012 is signed off. The rule it rests on: a command runs because a person approved
 that line, and no approval ever widens beyond the one operation it names.
 
+## D-076: The editor names the runtime it runs on, and it is told why
+Status: accepted
+Context: P0-004 asks for "编辑器通过 ACP 连上 Agent" — an editor reaching an agent over ACP. Both
+ends of that line were written: the endpoint in `src/acp/`, the editor's own client in
+`editor/crates/agent-acp`. Nothing had ever connected them, and the connection was not merely
+untested — three things in it were broken, and each of them made the "editor connection" a
+fiction.
+
+First: the endpoint named no runtime. `AcpBackend.startExecution()` started the task without a
+runtime id, so every editor task landed on whatever the server happened to default to — the
+reference runtime — while the product's primary runtime is Pi (D-042, D-060). The editor, the one
+client that is supposed to reach the product's main runtime, could not reach it at all.
+
+Second: tool calls arrived without their name. The Pi adapter emits `toolName`; the Hermes adapter
+emits `tool`. The ACP layer read only `tool`, so every tool call reached the editor labelled
+"tool". The call was real and its name was not — the first editor probe recorded exactly that
+("tools=1 (tool)").
+
+Third: a failed run said nothing. `execution.failed` carries the reason — a 429, an unreachable
+model, a tool that died — and the ACP layer dropped it, so the editor showed an empty transcript
+and a refusal. The person in front of the editor could not tell a run that died from a run that
+never started.
+
+Decision: three rules.
+
+1. The endpoint names the runtime. `CODEWEAVER_ACP_RUNTIME_ID` names one runtime exactly and
+   nothing else: the default is the product's primary runtime (`pi-local` when the server has Pi),
+   otherwise `auto`, which asks the scheduler for a healthy one. The editor is a client of
+   CodeWeaver, not a runtime of its own. A named runtime that is not registered is refused, not
+   replaced (D-047): the alternative is a silent substitution, and a run that happened somewhere
+   other than where it was asked to happen is not the run that was asked for.
+2. A tool call reaches the editor under the name the runtime gave it. `toolTitle` reads `toolName`
+   first and `tool` second, in one place — two implementations of "the tool's name" is how one of
+   them ends up wrong.
+3. A failure tells the editor why. `execution.failed` carries its reason across as a message
+   chunk. A failure with no reason forwards nothing, because "the run failed" is the one sentence
+   nobody can act on, and passing it on as if it were information would be worse than silence.
+
+Evidence: the probe is not a mock and not a script — it is the editor's own ACP client
+(`editor/crates/agent-acp`) driving the **real** endpoint (`dist/runners/acp-server.js`) against the
+**real** runtime with a **real** model. It creates a throwaway git workspace whose single file
+holds a nonce, names the runtime (`pi-local`), asks the model to read that file with `read_file`
+and reply with its exact content, and judges the turn on four counts that can each fail alone: a
+tool call happened, it was `read_file`, the turn ended with `EndTurn`, and the transcript carries
+the nonce. The judgement has 15 unit tests on the probe side, mostly the cases that have to fail
+(no tool call, the wrong tool, no nonce in the transcript, a turn that never finished, a refused
+turn, a control arm that ran anyway, a refusal that named nothing, a quota refusal counted as an
+environment refusal), and 7 on the lab side, of which three are about this decision (the tool name
+arrives as the runtime gave it, a failure arrives with its reason, a failure without a reason
+forwards nothing). The report's shape is tested too: a passing result carries no `notes` field at
+all, because the Phase 0 aggregator validates the shape and a `notes: null` is not the same thing
+as no note.
+
+The run that signed the item off: the editor's client opened a session on the real endpoint, the
+endpoint ran the task on the runtime that was named (`pi-local`), the model called `read_file` with
+`{"path":"nonce.txt"}`, and the turn ended with `EndTurn` carrying the nonce back
+(`NONCE-ACP-26472-1794462235621`, 11 events, session `sess_a42b411c-b7ab-49bf-b0c1-b2d9b8fde1c3`).
+The journal says the same thing from the other side: `execution.runtime` names `pi-local`, and the
+terminal entry is `execution.completed`.
+
+The probe has a **control arm** that costs no tokens: the same editor's client, pointed at the same
+real endpoint but naming a runtime that is not registered, must be refused by name ("Unknown
+runtime no-such-runtime"). Without that arm an endpoint that quietly ran the task on some other
+runtime would pass the main arm too — the control is what makes the main arm mean something. It
+also proves the client's reach: the refusal came back over the wire, in the client's own words.
+
+The probe also left a real negative case behind. The account's token plan ran out mid-session, the
+model answered 429, and the same judgement reported the run as failed — "the agent never called a
+tool … the turn ended with Refusal" — with the journal's own words next to it ("已达到 Token Plan
+用量上限"). A judge that only ever sees successes is a judge nobody has watched fail. That run is
+reported as `blocked`, not `failed`: a provider that refuses the call for lack of quota prevented
+the check, it did not contradict it (D-020) — and the refusal reached the editor as text, which is
+the third rule above working on the failure it was written for.
+
+Consequence: P0-004 is signed off. The rules it rests on: the editor names the runtime and is
+refused when the name is not registered; the editor is told what the tool was; and the editor is
+told why a run failed. The client base is recorded too (`client/PIN.json`, Zed 1.29.0, read through
+the UTF-8 BOM the provisioning script leaves) — the probe drives the editor's own ACP client, not a
+Zed GUI session, and saying so is part of the evidence rather than a footnote to it.
+
+
+## D-077: The sandbox limits are a kernel boundary, and the agent is told which one stopped it
+Status: accepted
+Context: P0-016 asks for a sandbox with memory, CPU and process limits. The checklist was written
+against Docker, and Docker is gone (doc/HERMES_NATIVE_PLAN.md) — but the limits were never a
+Docker feature. On Windows they are a job object, and the thing they limit is the acceptance
+check: a real process on the user's machine, started by CodeWeaver, on behalf of an agent. Nothing
+bounded it. A check could allocate the whole machine, start a thousand processes, or burn every
+core, and the only thing standing between a task and the user's machine was the hope that the
+command was sensible.
+
+D-075 did part of this job and said plainly what it was not: the command-line classifier reads
+the command line it is given, so a check that hides its work in a script file is beyond it. This
+decision covers that gap, and it covers it where the limit is real — in the kernel.
+
+Decision: four rules.
+
+1. **The limits are enforced by the kernel, not by the product's judgement.** A Windows job object
+   with `JOB_OBJECT_LIMIT_JOB_MEMORY`, `JOB_OBJECT_LIMIT_ACTIVE_PROCESS` and a CPU rate control.
+   Node cannot create one, so the helper is a PowerShell script with the job object API compiled
+   into it (`scripts/sandbox-run.ps1`); the arguments travel in an environment variable, because a
+   command line would have to quote them twice and that is where arguments get lost. The Evaluation
+   Engine's default runner is that helper, so every check runs inside the boundary whether anyone
+   asked for it or not.
+2. **A limit that cannot be established is not a limit.** If the helper is missing, the host is not
+   Windows, or the numbers are unusable, the check does **not** run unsandboxed: the exit code
+   stays unknown, the record says the sandbox was unavailable, and the check is blocked. The same
+   rule the worktree scope follows (D-074) — a boundary that could not be verified is not a
+   boundary with nothing behind it, and running anyway would be the one outcome nobody can detect
+   from the outside.
+3. **A limit that was hit is named.** "The check failed" and "the check was stopped by the memory
+   limit" are different facts, and only one of them tells the agent what to change. The name goes
+   in three places: the check's output (`[sandbox] the check exceeded the memory limit of 128 MB`),
+   the record (`limitHit: "memory"`), and the text the model actually reads.
+4. **The agent arm is part of the sign-off.** The checklist's security items need agent-level
+   evidence on top of the boundary evidence (D-008, D-020): a limit that stops a process but says
+   nothing is a limit the agent cannot act on, and an agent that was never asked proves nothing.
+
+Evidence: the probe (`npm run validate:sandbox-limits`) has five arms, and the first four go
+through the product's Evaluation Engine rather than through the helper, because the helper is the
+OS boundary and the engine is what the product does with it.
+
+- *control* — an ordinary check runs inside the job object and passes (`exitCode=0`,
+  `sandbox.established=true`, `memoryMb=1024`, `processLimit=64`, `cpuRatePercent=25`), and the
+  completion gate opens: "All 1 check(s) passed". A check that ran without limits looks the same
+  from the exit code alone, so the record is what says the limits were in force.
+- *memory* — the same check that allocates 512 MB passes under 1024 MB (`allocated 536870912`) and
+  is stopped under 128 MB: `exitCode=1`, `limitHit=memory`,
+  `RangeError: Array buffer allocation failed`, and the gate stays closed ("A check failed: failed:
+  a check that allocates half a gigabyte").
+- *processes* — the same check that starts twenty children at once passes without a limit
+  (`started=20 failures=0`) and is stopped under a four-process limit: `exitCode=1`,
+  `limitHit=processes`, `Error: spawn UNKNOWN` — errno -4094, which is
+  `ERROR_NOT_ENOUGH_QUOTA`, the answer Windows gives a spawn beyond the job's process limit.
+- *CPU* — a throttle does not fail a check, it slows it down, so the evidence is the check's own
+  clock: 521 ms uncapped against 1969 ms under a 1% cap on a 22-processor machine (about a quarter
+  of one core), the same work in both arms. The engine's own `durationMs` (2042 ms against 3472 ms)
+  is *not* the measure — it includes the helper's startup in both arms, which drowns the
+  difference. The cap is a share of all processors, not of one core, which is why it has to be
+  well below 100/22 percent to bite a single-threaded check.
+
+The fifth arm is the agent, and it found a defect. The task declares one check — `node
+allocate.mjs 512` — under a memory limit; the model is asked to run it with `evaluate_changes`; the
+product runs it inside the job object and has to tell the model what happened. The control arm is
+the same check under 1024 MB: the model ran it (`evaluate_changesCalls=1`), the tool answered
+"passed: 1/1 checks passed", the gate opened and the model said "All declared checks passed". The
+tight arm is the same check under 128 MB: the model ran it (`evaluate_changesCalls=1`), the tool
+answered
+
+    failed: failed: a check that allocates half a gigabyte
+    a check that allocates half a gigabyte: [sandbox] the check exceeded the memory limit of 128 MB
+
+the gate stayed shut ("A check failed: failed: a check that allocates half a gigabyte"), and the
+model's own answer named the limit — "exceeded the sandbox memory limit of 128 MB" — and said the
+check never completed.
+
+The defect the agent arm exposed: the limit reason was in the tool's `details`, and `details` is
+not what a model reads. The tool's *text* said only "failed: failed: a check that allocates half a
+gigabyte", so the agent was told that something failed and not what stopped it — the same defect
+D-075 fixed for refusals, in a new place. `explainCheck` now pulls the `[sandbox]` line out of the
+output and speaks it to the model, and a check that could not run at all explains itself the same
+way. The control experiment is recorded: replacing that line with a generic "the check did not
+pass" turns two unit tests red, so the gate that watches this behaviour has been watched failing.
+
+The judgements are pure functions with unit tests, and most of those tests are the cases that have
+to fail: an agent that never ran the check is `blocked` rather than `passed` (D-020), a limit that
+was not named to the model, a gate that opened anyway, an agent that reported the task as done
+although the check was stopped, a control arm that did not pass, a negated claim ("not all checks
+passed") read as a claim of success, and a claim of success hidden by a negation in an earlier
+sentence.
+
+Consequence: P0-016 is signed off, and the promise is kept narrow on purpose. The limits cover the
+processes **CodeWeaver starts** — the acceptance checks, which are the only processes the product
+runs on an agent's behalf. Putting the whole runtime behind an OS boundary (AppContainer, then
+Windows Sandbox or Hyper-V) is P0-017's job, and it is still blocked on that evidence
+(doc/HERMES_NATIVE_PLAN.md). Saying "sandboxed" without that sentence would be the kind of claim
+this log exists to prevent.
+
+

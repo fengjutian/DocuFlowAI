@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { SpawnCommandRunner, type CommandRunner } from "./command-runner.js";
+import type { CommandRunner } from "./command-runner.js";
 import { approvalCovers, classifyCommand, type CommandApproval } from "./command-policy.js";
+import { SandboxCommandRunner } from "./sandbox-runner.js";
+import type { SandboxLimits } from "./sandbox-limits.js";
 
 /**
  * Evaluation Engine (design 14.1 EVALUATION_FAILED / AT-204).
@@ -25,6 +27,14 @@ export interface EvaluationCheckSpec {
    * was given for, so it cannot be moved to another command.
    */
   approval?: CommandApproval;
+  /**
+   * The resource limits this check runs under.
+   *
+   * A check is a real process on the user's machine, so it runs inside a Windows job object with
+   * a memory, CPU and process limit. The task may ask for tighter or looser limits; the ones it
+   * does not name keep the default.
+   */
+  limits?: SandboxLimits;
 }
 
 export interface EvaluationCheckResult {
@@ -38,6 +48,21 @@ export interface EvaluationCheckResult {
   refusal?: { code: "dangerous_without_approval" | "approval_mismatch"; reasons: string[] };
   /** The approval that let the command run, when one did. */
   approval?: CommandApproval;
+  /** Which resource limit stopped the check, when one did. */
+  limitHit?: "memory" | "processes" | "cpu" | "timeout";
+  /**
+   * The sandbox the check ran under.
+   *
+   * A check that ran without limits and a check that ran inside them look the same from the exit
+   * code alone, so the record says which one it was.
+   */
+  sandbox?: {
+    established: boolean;
+    memoryMb: number;
+    cpuRatePercent: number;
+    processLimit: number;
+    peakJobMemoryBytes?: number;
+  };
 }
 
 export interface EvaluationResult {
@@ -62,7 +87,7 @@ export interface EvaluateOptions {
 export async function evaluateChecks(
   executionId: string,
   checks: readonly EvaluationCheckSpec[],
-  runner: CommandRunner = new SpawnCommandRunner(),
+  runner: CommandRunner = new SandboxCommandRunner(),
   options: EvaluateOptions = {}
 ): Promise<EvaluationResult> {
   const now = options.now ?? (() => new Date());
@@ -99,20 +124,44 @@ export async function evaluateChecks(
 
     const outcome = await runner.run(check.command, check.args, {
       ...(check.cwd ? { cwd: check.cwd } : {}),
-      ...(check.timeoutMs ? { timeoutMs: check.timeoutMs } : {})
+      ...(check.timeoutMs ? { timeoutMs: check.timeoutMs } : {}),
+      ...(check.limits ? { limits: check.limits } : {})
     });
     const verdict: EvaluationVerdict = outcome.timedOut || outcome.code === null
       ? "blocked"
       : outcome.code === expected
         ? "passed"
         : "failed";
+    // A check that was stopped by a resource limit failed, and the reason says which limit: a
+    // check that died because it ran out of memory is a different fact from a check that failed,
+    // and only one of them tells the agent what to change.
+    const limitHit = outcome.sandbox?.limitHit;
+    const limitNote = limitHit
+      ? `\n[sandbox] ${outcome.sandbox?.reason ?? "the check exceeded a resource limit"}`
+      : outcome.sandbox && !outcome.sandbox.established
+        ? `\n[sandbox] the check did not run inside a sandbox: ${outcome.sandbox.error ?? "the sandbox was unavailable"}`
+        : "";
     results.push({
       id: check.id,
       name: check.name,
       verdict,
       exitCode: outcome.code,
       durationMs: Date.now() - checkStarted,
-      output: truncate(`${outcome.stdout}\n${outcome.stderr}`),
+      output: truncate(`${outcome.stdout}\n${outcome.stderr}${limitNote}`),
+      ...(limitHit ? { limitHit } : {}),
+      ...(outcome.sandbox
+        ? {
+            sandbox: {
+              established: outcome.sandbox.established,
+              memoryMb: outcome.sandbox.limits.memoryMb,
+              cpuRatePercent: outcome.sandbox.limits.cpuRatePercent,
+              processLimit: outcome.sandbox.limits.processLimit,
+              ...(outcome.sandbox.peakJobMemoryBytes !== undefined
+                ? { peakJobMemoryBytes: outcome.sandbox.peakJobMemoryBytes }
+                : {})
+            }
+          }
+        : {}),
       ...(check.approval ? { approval: check.approval } : {})
     });
   }
