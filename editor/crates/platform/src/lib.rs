@@ -11,6 +11,7 @@ use codeweaver_editor_core::Editor;
 use codeweaver_render::{
     Color, FrameScene, Point, Rect, Renderer, RendererError, Size, TextFamily, TextStyle,
 };
+use codeweaver_syntax::{Language, Syntax};
 use codeweaver_text::TextOffset;
 use codeweaver_ui::TextMeasurer;
 use codeweaver_workspace::{Document, Workspace};
@@ -55,6 +56,8 @@ pub struct NativeApplication {
     cursor: Option<Point>,
     /// The find bar, when it is open.
     find: Option<FindBar>,
+    /// The syntax tree of the open document, and the highlights it gives.
+    syntax: Syntax,
 }
 
 impl NativeApplication {
@@ -72,6 +75,14 @@ impl NativeApplication {
             document = Some(opened);
         }
 
+        // The language of the file decides how the text is highlighted.
+        let mut syntax = Syntax::new();
+        syntax.set_language(
+            document
+                .as_ref()
+                .and_then(|document| Language::from_path(document.path())),
+        );
+
         Ok(NativeApplication {
             window: None,
             renderer: None,
@@ -87,6 +98,7 @@ impl NativeApplication {
             view: EditorView::new(),
             cursor: None,
             find: None,
+            syntax,
         })
     }
 
@@ -729,6 +741,7 @@ impl ApplicationHandler for NativeApplication {
                     &self.editor,
                     &self.input,
                     &mut self.view,
+                    &mut self.syntax,
                     Chrome {
                         agent: self.agent.as_ref(),
                         agent_error: self.agent_error.as_deref(),
@@ -775,6 +788,7 @@ fn build_scene(
     editor_state: &Editor,
     input: &TextInputState,
     view: &mut EditorView,
+    syntax: &mut Syntax,
     chrome: Chrome<'_>,
 ) -> FrameScene {
     let viewport = Rect::new(0.0, 0.0, size.width, size.height);
@@ -806,6 +820,13 @@ fn build_scene(
             body.size.height,
             &mut measurer,
         );
+
+        // The tree of the text is parsed again when the text changed, and
+        // the highlights are made for the text that is on screen.
+        let change = editor_state.last_change();
+        syntax.update(editor_state.buffer(), change);
+        let visible = view.visible_range();
+        let highlights = syntax.highlights(editor_state.buffer(), visible);
 
         scene.push_quad(
             Rect::new(0.0, 0.0, 40.0, size.height),
@@ -856,6 +877,7 @@ fn build_scene(
             input.preedit(),
             body,
             overlay,
+            highlights,
             &mut measurer,
         );
     }

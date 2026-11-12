@@ -1,0 +1,19 @@
+[package]
+name = "codeweaver-syntax"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Syntax highlighting for the CodeWeaver editor, with tree-sitter."
+
+[dependencies]
+codeweaver-text = { path = "../text" }
+tree-sitter = "0.25"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-json = "0.24"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-typescript = "0.23"

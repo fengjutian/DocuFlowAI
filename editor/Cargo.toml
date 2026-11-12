@@ -7,6 +7,7 @@ members = [
     "crates/editor-core",
     "crates/platform",
     "crates/render",
+    "crates/syntax",
     "crates/text",
     "crates/ui",
     "crates/workspace",
@@ -32,6 +33,37 @@ winit = "0.30.12"
 
 [profile.dev]
 debug = 1
+
+# The grammar crates compile C with a command line that is too long for the
+# MSVC debug record, so the compiler gives up with `D8050`. Without the debug
+# information the command line fits again. Cargo has no wildcards here, so
+# every grammar crate needs its own line.
+[profile.dev.package.tree-sitter]
+debug = false
+
+[profile.dev.package.tree-sitter-c]
+debug = false
+
+[profile.dev.package.tree-sitter-cpp]
+debug = false
+
+[profile.dev.package.tree-sitter-go]
+debug = false
+
+[profile.dev.package.tree-sitter-javascript]
+debug = false
+
+[profile.dev.package.tree-sitter-json]
+debug = false
+
+[profile.dev.package.tree-sitter-python]
+debug = false
+
+[profile.dev.package.tree-sitter-rust]
+debug = false
+
+[profile.dev.package.tree-sitter-typescript]
+debug = false
 
 [profile.release]
 lto = "thin"

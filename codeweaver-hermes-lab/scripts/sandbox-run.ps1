@@ -510,10 +510,13 @@ namespace CodeWeaver
 $argsList = @()
 # The arguments arrive as JSON in an environment variable: a command line would have to quote them
 # twice, once for the shell and once for PowerShell, and that is exactly where arguments get lost.
-$argsJson = $env:CW_SANDBOX_ARGS
-if (-not $argsJson) { $argsJson = $ArgsJson }
-if ($argsJson -and $argsJson.Trim() -ne "") {
-  $parsed = $argsJson | ConvertFrom-Json
+# The local is not called $argsJson: PowerShell variable names are case insensitive, so $argsJson
+# and the parameter $ArgsJson are one variable, and assigning the local would silently empty the
+# parameter before it could be used as the fallback.
+$argsJsonValue = $env:CW_SANDBOX_ARGS
+if (-not $argsJsonValue) { $argsJsonValue = $ArgsJson }
+if ($argsJsonValue -and $argsJsonValue.Trim() -ne "") {
+  $parsed = $argsJsonValue | ConvertFrom-Json
   if ($parsed) { $argsList = @($parsed) }
 }
 

@@ -11,6 +11,7 @@ codeweaver-agent-acp = { path = "../agent-acp" }
 codeweaver-agent-ui = { path = "../agent-ui" }
 codeweaver-editor-core = { path = "../editor-core" }
 codeweaver-render = { path = "../render" }
+codeweaver-syntax = { path = "../syntax" }
 codeweaver-text = { path = "../text" }
 codeweaver-ui = { path = "../ui" }
 codeweaver-workspace = { path = "../workspace" }

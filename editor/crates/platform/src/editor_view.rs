@@ -9,6 +9,7 @@ use std::ops::Range;
 
 use codeweaver_editor_core::Editor;
 use codeweaver_render::{Color, FrameScene, Rect, Renderer, TextFamily, TextShaper, TextStyle};
+use codeweaver_syntax::{Highlight, HighlightKind};
 use codeweaver_text::{Buffer, TextOffset};
 use codeweaver_ui::{
     LineMetrics, TextLayout, TextMeasurer, ViewState, VisualLine, caret_shape, selection_rects,
@@ -32,6 +33,40 @@ const MATCH_COLOR: Color = Color::rgb(0.34, 0.29, 0.10);
 /// The color of the match that the find bar is on.
 const CURRENT_MATCH_COLOR: Color = Color::rgb(0.58, 0.46, 0.11);
 
+/// The color that a kind of text is drawn in.
+///
+/// The colors are the ones of a dark theme: the text stays readable, and the
+/// kinds that are worth noticing are the ones that stand out.
+pub fn highlight_color(kind: HighlightKind) -> Color {
+    match kind {
+        HighlightKind::Keyword => Color::rgb(0.76, 0.36, 0.90),
+        HighlightKind::Function => Color::rgb(0.40, 0.72, 0.98),
+        HighlightKind::Type => Color::rgb(0.32, 0.80, 0.72),
+        HighlightKind::String => Color::rgb(0.68, 0.82, 0.42),
+        HighlightKind::Number => Color::rgb(0.92, 0.70, 0.38),
+        HighlightKind::Comment => Color::rgb(0.42, 0.47, 0.56),
+        HighlightKind::Operator => Color::rgb(0.74, 0.78, 0.86),
+        HighlightKind::Punctuation => Color::rgb(0.60, 0.65, 0.74),
+        HighlightKind::Constant => Color::rgb(0.92, 0.70, 0.38),
+        HighlightKind::Variable => TEXT_COLOR,
+        HighlightKind::Property => Color::rgb(0.52, 0.78, 0.86),
+        HighlightKind::Constructor => Color::rgb(0.40, 0.72, 0.98),
+        HighlightKind::Label => Color::rgb(0.52, 0.78, 0.86),
+        HighlightKind::Escape => Color::rgb(0.92, 0.70, 0.38),
+        HighlightKind::Attribute => Color::rgb(0.72, 0.62, 0.95),
+        HighlightKind::Module => Color::rgb(0.32, 0.80, 0.72),
+    }
+}
+
+/// A piece of a line, with the kind of text in it.
+struct Piece {
+    /// The byte range of the piece in the document.
+    start: usize,
+    end: usize,
+    /// What the highlighter said about the text, if it said anything.
+    kind: Option<HighlightKind>,
+}
+
 /// What the find bar leaves on the body of the editor.
 pub struct FindOverlay<'a> {
     /// The place of the find bar.
@@ -44,6 +79,14 @@ pub struct FindOverlay<'a> {
     pub matches: &'a [Range<TextOffset>],
     /// Which match is current, counted from the first one.
     pub current: Option<usize>,
+}
+
+/// Everything that is drawn on top of the text of the body.
+pub struct BodyOverlay<'a> {
+    /// What the find bar leaves on the body.
+    pub find: FindOverlay<'a>,
+    /// The highlights of the syntax, in the order of the text.
+    pub highlights: &'a [Highlight],
 }
 
 /// The presentation state of the editor body.
@@ -298,6 +341,17 @@ impl EditorView {
             .ensure_line_visible(line, visible_lines, total_lines);
     }
 
+    /// The byte range of the text that is on screen.
+    ///
+    /// The highlighter only looks at the text that is on screen, so this is
+    /// the range that it is asked about.
+    pub fn visible_range(&self) -> Range<usize> {
+        match (self.layout.lines.first(), self.layout.lines.last()) {
+            (Some(first), Some(last)) => first.range.start..last.range.end,
+            _ => 0..0,
+        }
+    }
+
     /// Draws the body: the selection, the text and the caret.
     ///
     /// The matches that the find bar found are drawn under the selection, so
@@ -308,13 +362,14 @@ impl EditorView {
         editor: &Editor,
         preedit: &str,
         body: Rect,
-        overlay: FindOverlay<'_>,
+        overlay: BodyOverlay<'_>,
         measurer: &mut dyn TextMeasurer,
     ) {
         let clip = body;
+        let find = overlay.find;
 
-        for (index, range) in overlay.matches.iter().enumerate() {
-            let color = if Some(index) == overlay.current {
+        for (index, range) in find.matches.iter().enumerate() {
+            let color = if Some(index) == find.current {
                 CURRENT_MATCH_COLOR
             } else {
                 MATCH_COLOR
@@ -353,7 +408,7 @@ impl EditorView {
         for line in &self.layout.lines {
             let y = body.origin.y + line.y;
             // A line that runs under the floating part stops at its edge.
-            let line_clip = match overlay.bar {
+            let line_clip = match find.bar {
                 Some(bar) if y + LINE_HEIGHT > bar.origin.y && y < bar.max_y() => Rect::new(
                     body.origin.x,
                     body.origin.y,
@@ -362,20 +417,17 @@ impl EditorView {
                 ),
                 _ => clip,
             };
-            match self.preedit_split(line, caret, preedit) {
-                Some(at) => {
-                    // The composition belongs between the text before the
-                    // caret and the text after it, so the line is drawn in
-                    // two parts.
-                    let before = &line.text[..at];
-                    let after = &line.text[at..];
-                    let combined = format!("{before}{preedit}");
-                    let width = measurer.measure(&combined, FONT_SIZE).width;
-                    self.push_line(scene, &combined, body.origin.x, y, body, line_clip);
-                    self.push_line(scene, after, body.origin.x + width, y, body, line_clip);
-                }
-                None => self.push_line(scene, &line.text, body.origin.x, y, body, line_clip),
-            }
+            self.push_line(
+                scene,
+                line,
+                overlay.highlights,
+                body,
+                y,
+                line_clip,
+                caret,
+                preedit,
+                measurer,
+            );
         }
 
         for selection in editor.selections() {
@@ -395,29 +447,51 @@ impl EditorView {
         }
     }
 
-    /// Draws one line of text.
+    /// Draws one line of text, in the pieces that the highlighter found.
+    #[allow(clippy::too_many_arguments)]
     fn push_line(
         &self,
         scene: &mut FrameScene,
-        text: &str,
-        x: f32,
-        y: f32,
+        line: &VisualLine,
+        highlights: &[Highlight],
         body: Rect,
+        y: f32,
         clip: Rect,
+        caret: usize,
+        preedit: &str,
+        measurer: &mut dyn TextMeasurer,
     ) {
-        // The run is wider than the body so the renderer does not wrap the
-        // text a second time: the body already wrapped it.
-        scene.push_text(
-            text,
-            Rect::new(x, y, body.size.width * 2.0, LINE_HEIGHT),
-            TextStyle {
+        // The composition belongs between the text before the caret and the
+        // text after it, so the line is split there.
+        let split = self
+            .preedit_split(line, caret, preedit)
+            .map(|at| line.range.start + at);
+        let pieces = pieces_of(line, highlights, split);
+        let width = match split {
+            Some(_) => measurer.measure(preedit, FONT_SIZE).width,
+            None => 0.0,
+        };
+        for (start, end, kind) in pieces {
+            let mut x = body.origin.x + line.offset_at(start);
+            // The text after the composition is pushed to the right by it.
+            if let Some(split) = split
+                && start >= split
+            {
+                x += width;
+            }
+            push_piece(scene, line, start, end, kind, x, y, body, clip);
+        }
+        if let Some(split) = split {
+            push_text(
+                scene,
+                preedit,
+                body.origin.x + line.offset_at(split),
+                y,
+                body,
                 clip,
-                color: TEXT_COLOR,
-                font_size: FONT_SIZE,
-                line_height: LINE_HEIGHT,
-                family: TextFamily::Monospace,
-            },
-        );
+                TEXT_COLOR,
+            );
+        }
     }
 
     /// Where the composition starts in a line, when the caret is on it.
@@ -429,6 +503,91 @@ impl EditorView {
         // The offset has to be a character boundary of the line's own text.
         line.text.is_char_boundary(at).then_some(at)
     }
+}
+
+/// The pieces of a line, with the kind of text in each.
+///
+/// The pieces cover the whole line: the text that the highlighter said
+/// nothing about is in pieces of its own. The line is also split at the
+/// position of the composition, so that the text after it can be pushed to
+/// the right.
+fn pieces_of(line: &VisualLine, highlights: &[Highlight], split: Option<usize>) -> Vec<Piece> {
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut cursor = line.range.start;
+    for highlight in highlights {
+        if highlight.range.end <= cursor {
+            continue;
+        }
+        if highlight.range.start >= line.range.end {
+            break;
+        }
+        let start = highlight.range.start.max(line.range.start);
+        let end = highlight.range.end.min(line.range.end);
+        if start > cursor {
+            pieces.push((cursor, start, None));
+        }
+        pieces.push((start, end, Some(highlight.kind)));
+        cursor = end;
+    }
+    if cursor < line.range.end {
+        pieces.push((cursor, line.range.end, None));
+    }
+
+    let Some(split) = split else {
+        return pieces;
+    };
+    let mut split_pieces: Vec<Piece> = Vec::with_capacity(pieces.len() + 1);
+    for (start, end, kind) in pieces {
+        if start < split && split < end {
+            split_pieces.push((start, split, kind));
+            split_pieces.push((split, end, kind));
+        } else {
+            split_pieces.push((start, end, kind));
+        }
+    }
+    split_pieces
+}
+
+/// Draws one piece of a line.
+fn push_piece(
+    scene: &mut FrameScene,
+    line: &VisualLine,
+    start: usize,
+    end: usize,
+    kind: Option<HighlightKind>,
+    x: f32,
+    y: f32,
+    body: Rect,
+    clip: Rect,
+) {
+    let text = &line.text[start - line.range.start..end - line.range.start];
+    let color = kind.map(highlight_color).unwrap_or(TEXT_COLOR);
+    push_text(scene, text, x, y, body, clip, color);
+}
+
+/// Draws a run of text.
+fn push_text(
+    scene: &mut FrameScene,
+    text: &str,
+    x: f32,
+    y: f32,
+    body: Rect,
+    clip: Rect,
+    color: Color,
+) {
+    // The run is wider than the body so the renderer does not wrap the
+    // text a second time: the body already wrapped it.
+    scene.push_text(
+        text,
+        Rect::new(x, y, body.size.width * 2.0, LINE_HEIGHT),
+        TextStyle {
+            clip,
+            color,
+            font_size: FONT_SIZE,
+            line_height: LINE_HEIGHT,
+            family: TextFamily::Monospace,
+        },
+    );
 }
 
 /// Measures text the way the renderer draws it.
@@ -484,6 +643,7 @@ impl TextMeasurer for ShaperMeasurer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codeweaver_syntax::{Language, Syntax};
     use codeweaver_ui::MonospaceMeasurer;
 
     fn view_of(text: &str) -> (EditorView, Editor) {
@@ -538,6 +698,7 @@ mod tests {
                 matches: &[],
                 current: None,
             },
+            &[],
             &mut measurer,
         );
 
@@ -568,6 +729,7 @@ mod tests {
                 matches: &[],
                 current: None,
             },
+            &[],
             &mut measurer,
         );
 
@@ -577,6 +739,70 @@ mod tests {
             .filter(|quad| quad.color == SELECTION_COLOR)
             .count();
         assert_eq!(selections, 2, "both selections must be drawn");
+    }
+
+    #[test]
+    fn the_highlights_are_drawn_in_their_own_color() {
+        let text = "fn main() {}\n";
+        let (view, editor) = view_of(text);
+        let mut syntax = Syntax::new();
+        syntax.set_language(Some(Language::Rust));
+        syntax.update(editor.buffer(), None);
+        let highlights = syntax.highlights(editor.buffer(), 0..editor.buffer().len().0);
+        assert!(!highlights.is_empty(), "the text should be highlighted");
+
+        let mut scene = FrameScene::default();
+        let mut measurer = MonospaceMeasurer::new(10.0);
+        view.draw(
+            &mut scene,
+            &editor,
+            "",
+            Rect::new(0.0, 0.0, 1000.0, 200.0),
+            FindOverlay {
+                bar: None,
+                matches: &[],
+                current: None,
+            },
+            highlights,
+            &mut measurer,
+        );
+
+        let keyword = highlight_color(HighlightKind::Keyword);
+        let keyword_runs = scene
+            .glyph_runs
+            .iter()
+            .filter(|run| run.color == keyword)
+            .count();
+        assert_eq!(keyword_runs, 1, "the keyword should be drawn on its own");
+        assert_eq!(
+            scene.glyph_runs[0].text, "fn",
+            "the keyword should be the first thing on the line"
+        );
+    }
+
+    #[test]
+    fn the_text_of_a_line_is_drawn_in_one_piece_when_there_is_no_highlight() {
+        let (view, editor) = view_of("abc\ndef\n");
+        let mut scene = FrameScene::default();
+        let mut measurer = MonospaceMeasurer::new(10.0);
+        view.draw(
+            &mut scene,
+            &editor,
+            "",
+            Rect::new(0.0, 0.0, 1000.0, 200.0),
+            FindOverlay {
+                bar: None,
+                matches: &[],
+                current: None,
+            },
+            &[],
+            &mut measurer,
+        );
+
+        // The document ends with a line break, so the last line is empty and
+        // nothing is drawn on it.
+        assert_eq!(scene.glyph_runs.len(), 2, "one run per line with text");
+        assert_eq!(scene.glyph_runs[0].text, "abc");
     }
 
     #[test]

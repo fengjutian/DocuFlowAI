@@ -101,6 +101,22 @@ pub struct AppliedTransaction {
     pub inverse: Transaction,
     /// The buffer version after the transaction was applied.
     pub version: BufferVersion,
+    /// What the transaction changed.
+    pub change: BufferChange,
+}
+
+/// A change that was applied to a buffer.
+///
+/// It holds the edits that were applied and the text that they replaced.
+/// The replaced text is what a parser needs to know how the text moved: a
+/// parser only ever sees the text that is there now, so without it there is
+/// no way to tell where the old text was.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BufferChange {
+    /// The edits that were applied, in the order they were applied.
+    pub edits: Vec<TextEdit>,
+    /// The text that each edit replaced, in the same order.
+    pub replaced: Vec<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -155,6 +171,26 @@ impl Buffer {
         self.rope
             .slice(self.char_index(range.start.0)..self.char_index(range.end.0))
             .to_string()
+    }
+
+    /// The text from `offset` to the end of the buffer.
+    ///
+    /// The text is handed out in the pieces the rope is made of, so a caller
+    /// that reads the whole document does not have to copy it into one
+    /// string. The piece starts at `offset`; the bytes of the rope that come
+    /// before it are not returned.
+    pub fn slice_from(&self, offset: usize) -> &[u8] {
+        let len = self.rope.len_bytes();
+        if offset >= len {
+            return &[];
+        }
+        let (chunk, chunk_start, _, _) = self.rope.chunk_at_byte(offset);
+        match chunk.get(offset - chunk_start..) {
+            Some(tail) => tail.as_bytes(),
+            // The offset is in the middle of a character. A parser never asks
+            // for such an offset, so this only keeps the slicing safe.
+            None => chunk.as_bytes(),
+        }
     }
 
     /// Total length in bytes.
@@ -328,6 +364,13 @@ impl Buffer {
             }
         }
 
+        // The inverse holds the text that each edit replaced, in the same
+        // order, so it is also what the change reports.
+        let replaced: Vec<String> = inverse_edits
+            .iter()
+            .map(|edit| edit.replacement.clone())
+            .collect();
+
         for state in self.anchors.values_mut() {
             for edit in transaction.edits.iter().rev() {
                 state.apply_edit(edit.range.start.0..edit.range.end.0, edit.replacement.len());
@@ -338,6 +381,10 @@ impl Buffer {
         Ok(AppliedTransaction {
             inverse: Transaction::new(self.version, inverse_edits),
             version: self.version,
+            change: BufferChange {
+                edits: transaction.edits,
+                replaced,
+            },
         })
     }
 

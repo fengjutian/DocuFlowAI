@@ -1,7 +1,8 @@
 use std::ops::Range;
 
 use codeweaver_text::{
-    Anchor, ApplyError, Bias, Buffer, BufferSnapshot, TextEdit, TextOffset, Transaction,
+    Anchor, ApplyError, Bias, Buffer, BufferChange, BufferSnapshot, TextEdit, TextOffset,
+    Transaction,
 };
 
 /// The current selection, expressed as two anchors.
@@ -64,8 +65,18 @@ pub struct Editor {
     /// There is always at least one. The first one is the primary selection;
     /// the others are the extra carets of a multi-cursor edit.
     selections: Vec<Selection>,
+    /// The undo stack holds the inverse of every edit, and the redo
+    /// stack holds the edits themselves. Because the history is only ever walked
+    /// in strict LIFO order, the byte offsets recorded here always belong to the
+    /// coordinate space the step is applied in.
     undo_stack: Vec<HistoryEntry>,
     redo_stack: Vec<HistoryEntry>,
+    /// What the last change to the buffer was.
+    ///
+    /// The syntax highlighter needs to know how the text moved to follow the
+    /// tree of the last parse, and the buffer only keeps the text that is
+    /// there now.
+    last_change: Option<BufferChange>,
 }
 
 impl Default for Editor {
@@ -81,6 +92,7 @@ impl Editor {
             selections: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            last_change: None,
         };
         editor.set_carets(&[TextOffset(0)]);
         editor
@@ -96,7 +108,17 @@ impl Editor {
         self.buffer = Buffer::new(text);
         self.undo_stack.clear();
         self.redo_stack.clear();
+        self.last_change = None;
         self.set_carets(&[TextOffset(0)]);
+    }
+
+    /// What the last change to the buffer was.
+    ///
+    /// The change holds the edits that were applied and the text that they
+    /// replaced. A parser that keeps a tree of the text needs both to follow
+    /// the text as it moves.
+    pub fn last_change(&self) -> Option<&BufferChange> {
+        self.last_change.as_ref()
     }
 
     pub fn buffer(&self) -> &Buffer {
@@ -435,6 +457,7 @@ impl Editor {
             return Ok(());
         };
         let applied = self.buffer.replay(entry.transaction.clone())?;
+        self.last_change = Some(applied.change.clone());
         self.set_carets(&entry.carets_to);
         self.redo_stack.push(HistoryEntry {
             transaction: applied.inverse,
@@ -449,6 +472,7 @@ impl Editor {
             return Ok(());
         };
         let applied = self.buffer.replay(entry.transaction.clone())?;
+        self.last_change = Some(applied.change.clone());
         self.set_carets(&entry.carets_to);
         self.undo_stack.push(HistoryEntry {
             transaction: applied.inverse,
@@ -488,6 +512,7 @@ impl Editor {
 
         let version = self.buffer.version();
         let applied = self.buffer.apply(Transaction::new(version, edits))?;
+        self.last_change = Some(applied.change.clone());
         // The undo step runs the edit backwards, so it starts at the carets
         // the edit produced and ends at the carets the edit started from.
         self.undo_stack.push(HistoryEntry {

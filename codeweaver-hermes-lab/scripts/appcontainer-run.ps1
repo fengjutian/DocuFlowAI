@@ -35,6 +35,7 @@ param(
   [string]$ProfileName = "CodeWeaver.Sandbox",
   [string]$Workspace = "",
   [string]$ReadPaths = "",
+  [switch]$GrantAncestors,
   [int]$TimeoutMs = 60000,
   [string]$WorkDir = ""
 )
@@ -187,7 +188,7 @@ namespace CodeWeaver
         [DllImport("advapi32.dll", SetLastError = true)]
         private static extern bool GetTokenInformation(IntPtr tokenHandle, int tokenClass, IntPtr information, int length, out int returnLength);
 
-        public static AppContainerResult Run(string command, string[] args, string profileName, string workspace, string[] readPaths, int timeoutMs, string workDir)
+        public static AppContainerResult Run(string command, string[] args, string profileName, string workspace, string[] readPaths, bool grantAncestors, int timeoutMs, string workDir)
         {
             var result = new AppContainerResult { ExitCode = -1, ExitCodeKnown = false, ProfileName = profileName };
             var granted = new List<string>();
@@ -205,22 +206,29 @@ namespace CodeWeaver
                 if (derived != 0 || sid == IntPtr.Zero)
                     throw new Win32Exception(derived, "DeriveAppContainerSidFromAppContainerName failed (" + derived + ")");
 
-                var identifier = new SecurityIdentifier(SidToBytes(sid));
+                // The IntPtr overload of the constructor is the one this compiler binds; the
+                // byte[] overload is not available to it.
+                var identifier = new SecurityIdentifier(sid);
                 result.AppContainerSid = identifier.Value;
 
                 // The workspace is the one place the child may write; the read paths are the places
                 // it may read. Nothing else is granted, and that is the whole point: the host's
                 // files stay out of reach because no ACE names the package SID.
+                //
+                // Inheritance is used on the workspace and nowhere else. An inheritable ACE on a
+                // directory is propagated by Windows to every file already below it, so granting
+                // one on a directory with thousands of files underneath - a Node installation, a
+                // repository - takes minutes of CPU and grants far more than was intended.
                 if (!string.IsNullOrEmpty(workspace))
                 {
-                    Grant(workspace, identifier, FileSystemRights.Modify | FileSystemRights.Synchronize, true, granted, ungrantable);
-                    GrantAncestors(workspace, identifier, granted, ungrantable);
+                    GrantDirectory(workspace, identifier, FileSystemRights.Modify | FileSystemRights.Synchronize, true, granted, ungrantable);
+                    if (grantAncestors) GrantAncestors(workspace, identifier, granted, ungrantable);
                 }
                 foreach (string path in readPaths ?? new string[0])
                 {
                     if (string.IsNullOrEmpty(path)) continue;
-                    Grant(path, identifier, FileSystemRights.ReadAndExecute | FileSystemRights.Synchronize, true, granted, ungrantable);
-                    GrantAncestors(path, identifier, granted, ungrantable);
+                    GrantPath(path, identifier, FileSystemRights.ReadAndExecute | FileSystemRights.Synchronize, granted, ungrantable);
+                    if (grantAncestors) GrantAncestors(path, identifier, granted, ungrantable);
                 }
                 if (ungrantable.Count > 0 && string.IsNullOrEmpty(workspace))
                     throw new InvalidOperationException("the boundary has nothing to grant: " + string.Join("; ", ungrantable.ToArray()));
@@ -233,9 +241,10 @@ namespace CodeWeaver
 
                 IntPtr size = IntPtr.Zero;
                 InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+                if (size == IntPtr.Zero) throw new InvalidOperationException("the attribute list has no size (" + Marshal.GetLastWin32Error() + ")");
                 attributeList = Marshal.AllocHGlobal(size);
                 if (!InitializeProcThreadAttributeList(attributeList, 1, 0, ref size))
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "InitializeProcThreadAttributeList failed");
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "InitializeProcThreadAttributeList failed (" + Marshal.GetLastWin32Error() + ")");
 
                 var caps = new SECURITY_CAPABILITIES
                 {
@@ -249,8 +258,11 @@ namespace CodeWeaver
                 };
                 capabilities = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SECURITY_CAPABILITIES)));
                 Marshal.StructureToPtr(caps, capabilities, false);
-                if (!UpdateProcThreadAttribute(attributeList, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, IntPtr.Zero, capabilities, (IntPtr)Marshal.SizeOf(typeof(SECURITY_CAPABILITIES)), IntPtr.Zero, IntPtr.Zero))
-                    throw new Win32Exception(Marshal.GetLastWin32Error(), "UpdateProcThreadAttribute(security capabilities) failed");
+                // UpdateProcThreadAttribute(lpAttributeList, dwFlags, lpAttribute, lpValue, cbSize, ...):
+                // dwFlags is 0 unless the attribute is the handle list, and the attribute *number*
+                // is the value of lpAttribute - it is not a pointer to a name and not a flag.
+                if (!UpdateProcThreadAttribute(attributeList, 0, (IntPtr)PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, capabilities, (IntPtr)Marshal.SizeOf(typeof(SECURITY_CAPABILITIES)), IntPtr.Zero, IntPtr.Zero))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "UpdateProcThreadAttribute(security capabilities) failed (" + Marshal.GetLastWin32Error() + "), attribute=" + PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES + " structSize=" + Marshal.SizeOf(typeof(SECURITY_CAPABILITIES)));
 
                 var startup = new STARTUPINFOEX();
                 startup.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
@@ -312,7 +324,11 @@ namespace CodeWeaver
                     DeleteProcThreadAttributeList(attributeList);
                     Marshal.FreeHGlobal(attributeList);
                 }
-                if (sid != IntPtr.Zero) FreeSid(sid);
+                if (sid != IntPtr.Zero)
+                {
+                    // Cleaning up must never lose the result: a failure here is reported, not thrown.
+                    try { FreeSid(sid); } catch { }
+                }
                 TryDelete(outPath);
                 TryDelete(errPath);
                 result.GrantedPaths = granted.ToArray();
@@ -340,7 +356,59 @@ namespace CodeWeaver
             finally { CloseHandle(token); }
         }
 
-        private static void Grant(string path, SecurityIdentifier sid, FileSystemRights rights, bool inherit, List<string> granted, List<string> failed)
+        /// <summary>
+        /// Grants access to a path that may be a file or a directory.
+        ///
+        /// The ACE is never inheritable here: a directory that holds an executable also holds
+        /// thousands of files, and an inheritable ACE would be propagated to all of them.
+        /// </summary>
+        private static void GrantPath(string path, SecurityIdentifier sid, FileSystemRights rights, List<string> granted, List<string> failed)
+        {
+            if (File.Exists(path))
+            {
+                GrantFile(path, sid, rights, granted, failed);
+                return;
+            }
+            if (Directory.Exists(path))
+            {
+                GrantDirectory(path, sid, rights, false, granted, failed);
+                // The files directly inside are granted one by one: an executable has to be able to
+                // read the DLLs and the sibling files it needs, and the directory's own ACE does
+                // not cover them.
+                try
+                {
+                    foreach (string child in Directory.GetFiles(path))
+                    {
+                        GrantFile(child, sid, rights, granted, failed);
+                    }
+                }
+                catch (Exception error)
+                {
+                    failed.Add(path + ": " + error.Message);
+                }
+                return;
+            }
+            failed.Add(path + ": the path does not exist");
+        }
+
+        private static void GrantFile(string path, SecurityIdentifier sid, FileSystemRights rights, List<string> granted, List<string> failed)
+        {
+            try
+            {
+                var info = new FileInfo(path);
+                var acl = info.GetAccessControl();
+                var rule = new FileSystemAccessRule(sid, rights, AccessControlType.Allow);
+                acl.AddAccessRule(rule);
+                info.SetAccessControl(acl);
+                granted.Add(path + " [file " + rights + "]");
+            }
+            catch (Exception error)
+            {
+                failed.Add(path + ": " + error.Message);
+            }
+        }
+
+        private static void GrantDirectory(string path, SecurityIdentifier sid, FileSystemRights rights, bool inherit, List<string> granted, List<string> failed)
         {
             try
             {
@@ -352,7 +420,7 @@ namespace CodeWeaver
                 var rule = new FileSystemAccessRule(sid, rights, inheritance, PropagationFlags.None, AccessControlType.Allow);
                 acl.AddAccessRule(rule);
                 info.SetAccessControl(acl);
-                granted.Add(path + " [" + rights + "]");
+                granted.Add(path + " [" + rights + (inherit ? " inherited" : "") + "]");
             }
             catch (Exception error)
             {
@@ -375,20 +443,12 @@ namespace CodeWeaver
             DirectoryInfo current = new DirectoryInfo(path).Parent;
             while (current != null)
             {
-                Grant(current.FullName, sid, FileSystemRights.Traverse | FileSystemRights.ReadAttributes | FileSystemRights.Synchronize, false, granted, failed);
+                GrantDirectory(current.FullName, sid, FileSystemRights.Traverse | FileSystemRights.ReadAttributes | FileSystemRights.Synchronize, false, granted, failed);
                 current = current.Parent;
             }
         }
 
-        private static byte[] SidToBytes(IntPtr sid)
-        {
-            int count = Marshal.ReadByte(sid, 1);
-            byte[] bytes = new byte[8 + count * 4];
-            Marshal.Copy(sid, bytes, 0, bytes.Length);
-            return bytes;
-        }
-
-        [DllImport("kernel32.dll", SetLastError = true)]
+        [DllImport("advapi32.dll", SetLastError = true)]
         private static extern IntPtr FreeSid(IntPtr sid);
 
         private static string ReadAll(string path)
@@ -486,19 +546,42 @@ try {
 }
 $commandArgs = @($commandArgs | ForEach-Object { [string]$_ })
 
-$readPaths = @()
+$readPathList = @()
 if (-not [string]::IsNullOrWhiteSpace($ReadPaths)) {
-  $readPaths = @($ReadPaths -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+  $readPathList = @($ReadPaths -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 }
+# The local above is not called $readPaths on purpose: PowerShell variable names are case
+# insensitive, so $readPaths and the parameter $ReadPaths are the same variable, and assigning
+# the local would overwrite the parameter with an empty one.
+[Console]::Error.WriteLine("[appcontainer-run] readPaths.count=" + $readPathList.Count + " [" + ($readPathList -join '|') + "]")
 
 $result = [CodeWeaver.AppContainerBoundary]::Run(
   $Command,
   [string[]]$commandArgs,
   $ProfileName,
   $Workspace,
-  [string[]]$readPaths,
+  [string[]]$readPathList,
+  $GrantAncestors.IsPresent,
   $TimeoutMs,
   $WorkDir
 )
 
-$result | ConvertTo-Json -Compress -Depth 5
+# The result is camelCase, because the caller is TypeScript and the keys have to mean the same
+# thing on both sides of the boundary.
+[ordered]@{
+  started = [bool]$result.Started
+  timedOut = [bool]$result.TimedOut
+  exitCode = [int]$result.ExitCode
+  exitCodeKnown = [bool]$result.ExitCodeKnown
+  sandboxEstablished = [bool]$result.SandboxEstablished
+  childIsAppContainer = [bool]$result.ChildIsAppContainer
+  appContainerSid = [string]$result.AppContainerSid
+  profileName = [string]$result.ProfileName
+  error = [string]$result.Error
+  stdout = [string]$result.Stdout
+  stderr = [string]$result.Stderr
+  stdoutBytes = [long]$result.StdoutBytes
+  stderrBytes = [long]$result.StderrBytes
+  grantedPaths = @($result.GrantedPaths)
+  ungrantablePaths = @($result.UngrantablePaths)
+} | ConvertTo-Json -Depth 4 -Compress
