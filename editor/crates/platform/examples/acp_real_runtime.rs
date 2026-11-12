@@ -135,12 +135,22 @@ fn make_workspace(root: &Path, nonce: &str) -> PathBuf {
 fn zed_version(root: &Path) -> String {
     let pin = root.join("client/PIN.json");
     match fs::read_to_string(&pin) {
-        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
-            .ok()
-            .and_then(|value| value.get("zedVersion").and_then(|v| v.as_str()).map(str::to_string))
-            .unwrap_or_else(|| "unknown".to_string()),
+        Ok(text) => parse_zed_version(&text),
         Err(_) => "unknown".to_string(),
     }
+}
+
+/// The version out of the pin text.
+///
+/// The pin file is written by a PowerShell script, so it carries a UTF-8 BOM. `serde_json` does
+/// not skip it, and a pin that reads as "unknown" is worse than no pin at all: it looks like a
+/// fact about the client and is not one.
+fn parse_zed_version(text: &str) -> String {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|value| value.get("zedVersion").and_then(|v| v.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn write_report(

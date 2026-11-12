@@ -145,7 +145,7 @@ export function createCodeWeaverAcpBackend(options: CodeWeaverAcpBackendOptions)
       const outcome = await ask({
         sessionId,
         toolCallId: String(event.payload["toolCallId"] ?? requestId),
-        title: String(event.payload["tool"] ?? event.payload["command"] ?? "permission requested"),
+        title: toolTitle(event, "permission requested"),
         options: [
           { optionId: "allow", name: "Allow", kind: "allow_once" },
           { optionId: "reject", name: "Reject", kind: "reject_once" }
@@ -266,7 +266,7 @@ export function toSessionUpdate(event: AgentRuntimeEvent): AcpSessionUpdate | un
       return {
         sessionUpdate: "tool_call",
         toolCallId: String(event.payload["toolCallId"] ?? event.payload["tool"] ?? event.eventId),
-        title: String(event.payload["tool"] ?? "tool"),
+        title: toolTitle(event),
         status: "in_progress"
       };
     case "tool.completed":
@@ -302,6 +302,18 @@ function payloadText(payload: Record<string, unknown>): string {
     if (typeof value === "string" && value) return value;
   }
   return "";
+}
+
+/**
+ * The tool's name, as the runtime reported it.
+ *
+ * The runtimes do not agree on the key: Pi carries `toolName`, Hermes carries `tool`. Reading only
+ * one of them makes the editor label every tool call "tool", which is exactly what the first
+ * editor probe saw — the call was real, its name was not.
+ */
+export function toolTitle(event: AgentRuntimeEvent, fallback = "tool"): string {
+  const value = event.payload["toolName"] ?? event.payload["tool"];
+  return typeof value === "string" && value !== "" ? value : fallback;
 }
 
 /** Hermes may carry the approval id at a few keys; the adapter uses the same order. */

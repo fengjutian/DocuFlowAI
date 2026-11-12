@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createCodeWeaverAcpBackend } from "../../acp/codeweaver-backend.js";
+import { createCodeWeaverAcpBackend, toSessionUpdate } from "../../acp/codeweaver-backend.js";
 import { CodeChangePipeline } from "../../code-engine/code-change-pipeline.js";
 import { SpawnGitRunner, gitOrThrow } from "../../code-engine/git-runner.js";
 import { WorktreeManager } from "../../code-engine/worktree-manager.js";
@@ -227,4 +227,41 @@ test("acp: a runtime that is not registered is refused, not silently replaced", 
     await rm(repo, { recursive: true, force: true });
     await rm(storeRoot, { recursive: true, force: true });
   }
+});
+
+/**
+ * A tool call the editor shows.
+ *
+ * The runtimes name the same thing differently — Pi carries `toolName`, Hermes carries `tool` —
+ * and the editor has only one label to draw. If the ACP layer reads only one of the keys, every
+ * tool call reaches the editor as "tool": the call was real, its name was not.
+ */
+function toolStarted(payload: Record<string, unknown>): AgentRuntimeEvent {
+  return {
+    eventId: "e-tool",
+    executionId: "exec-1",
+    projectId: "zed",
+    taskId: "acp-sess-1",
+    sequence: 2,
+    eventType: "tool.started",
+    timestamp: "2026-11-09T00:00:00.000Z",
+    payload
+  };
+}
+
+test("acp: a tool call carries the name the runtime gave it", () => {
+  const piUpdate = toSessionUpdate(toolStarted({ toolCallId: "call-1", toolName: "read_file" }));
+  assert.equal(piUpdate?.sessionUpdate, "tool_call");
+  assert.equal(piUpdate?.title, "read_file");
+  assert.equal(piUpdate?.toolCallId, "call-1");
+
+  // The same call from a runtime that names it the other way.
+  const hermesUpdate = toSessionUpdate(toolStarted({ toolCallId: "call-2", tool: "search_code" }));
+  assert.equal(hermesUpdate?.title, "search_code");
+});
+
+test("acp: a tool call without a name still reaches the editor", () => {
+  const update = toSessionUpdate(toolStarted({ toolCallId: "call-3" }));
+  assert.equal(update?.sessionUpdate, "tool_call");
+  assert.equal(update?.title, "tool");
 });
