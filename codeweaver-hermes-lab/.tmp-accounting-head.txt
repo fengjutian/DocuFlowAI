@@ -1,0 +1,635 @@
+import { spawnSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { createApiServer } from "../api/app.js";
+import { writeTestReport } from "../reporting/report-writer.js";
+import { createRuntime } from "../server/runtime.js";
+import { prepareGateway } from "./hermes-gateway.js";
+import type { TestResult } from "../types/hermes.js";
+
+/**
+ * P0-023: the cost statistics — token, model and execution time, associated.
+ *
+ * The checklist asks for "能关联 Token、模型和执行时间". The ledger that answers it already existed,
+ * and it was wrong in the way that matters: it read the counters out of a payload shape that only
+ * the *remote* runtime reports, so the primary runtime — the one the whole product runs on — was
+ * never accounted for at all. A cost page that shows nothing for the main runtime is not a cost
+ * page; it is a page about a runtime nobody uses.
+ *
+ * So the probe does not ask "is there a number somewhere". It asks whether the three facts are
+ * associated, and whether each of them is *the runtime's own*:
+ *
+ *  - recorded: the ledger holds a record for the execution at all. This is the link that failed
+ *    before the fix, and it is the one that has to hold for the primary runtime.
+ *  - tokens-agree: the ledger's numbers are the numbers the runtime reported, read straight out of
+ *    the recorded terminal payload — not a second opinion computed by the same code that wrote the
+ *    record. A checker that shares the code it checks proves nothing, so this probe reads the raw
+ *    payload keys itself, per runtime shape.
+ *  - model-named / model-unnamed: the model in the record is exactly what the runtime said. Pi names
+ *    its model, so the record must carry that name; the gateway does not name one, so the record
+ *    must say "unknown" rather than guess. A made-up model is worse than a missing one.
+ *  - timing-agree: the duration in the ledger is the journal's own start→terminal span. One number,
+ *    read once: the cost page and the audit timeline must not disagree about how long a run took.
+ *  - tokens-explain: the parts add up to the total. A total that cannot be explained by its parts
+ *    is a number nobody can trust.
+ *
+ * On top of that, the ledger as a whole has to hold up: the summary is the sum of the records, an
+ * execution that was never run is refused instead of answered with an empty record, and the record
+ * survives a restart — a cost page that forgets the run when the process restarts is not a record.
+ *
+ * Both runtimes are covered, because the ledger serves both: the primary one (Pi, in process) and
+ * the remote one (the pinned Hermes gateway). They report their counters differently, and the point
+ * of the shared extractor is that the ledger reads both without a second implementation.
+ */
+
+export interface AccountingUsageRecord {
+  id: string;
+  executionId: string;
+  model: string;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens?: number;
+  cacheWriteTokens?: number;
+  totalTokens: number;
+  durationMs: number;
+  startedAt?: string;
+  finishedAt?: string;
+}
+
+export interface AccountingSummary {
+  executions: number;
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  durationMs: number;
+  byModel: Array<{ model: string; executions: number; totalTokens: number }>;
+}
+
+export interface AccountingJournalEntry {
+  sequence: number;
+  kind: string;
+  category: string;
+  recordedAt: string;
+  payload?: Record<string, unknown>;
+}
+
+/** What the runtime itself reported, read straight out of the recorded terminal payload. */
+export interface ReportedUsage {
+  promptTokens: number;
+  completionTokens: number;
+  cachedTokens?: number;
+  cacheWriteTokens?: number;
+  totalTokens: number;
+  /** The model the runtime named, if it named one. */
+  model?: string;
+  /** How the numbers were read, for the evidence line. */
+  shape: string;
+}
+
+export interface AccountingClient {
+  /** Runs a task on the named runtime and returns the execution id. */
+  run(input: { runtimeId: string; taskId: string; prompt: string }): Promise<string>;
+  /** The execution's own state: the status, the recorded terminal event and the event count. */
+  execution(executionId: string): Promise<{
+    status: string;
+    terminalEventType?: string;
+    eventCount: number;
+  }>;
+  /** The usage record of one execution, with the status the endpoint answered. */
+  usage(executionId: string): Promise<{ status: number; record?: AccountingUsageRecord }>;
+  /** The whole ledger. */
+  ledger(): Promise<{ summary: AccountingSummary; records: AccountingUsageRecord[] }>;
+  /** The raw journal of one execution — the yardstick the record is measured against. */
+  logs(executionId: string): Promise<{ count: number; entries: AccountingJournalEntry[] }>;
+  /** Restarts the server over the same data directory, for the durability check. */
+  restart?(): Promise<AccountingClient>;
+}
+
+export interface AccountingOptions {
+  now?: () => Date;
+  runTimeoutMs?: number;
+  /** The runtimes to cover, in order. */
+  runtimes?: Array<{ runtimeId: string; label: string; shape: "pi" | "hermes" }>;
+}
+
+export interface AccountingLink {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface AccountingJudgement {
+  links: AccountingLink[];
+  ok: boolean;
+}
+
+const TERMINAL_CATEGORIES = new Set(["execution.completed", "execution.failed", "execution.cancelled"]);
+
+const DEFAULT_RUNTIMES: NonNullable<AccountingOptions["runtimes"]> = [
+  { runtimeId: "pi-local", label: "pi-local", shape: "pi" },
+  { runtimeId: "hermes-local", label: "hermes-local", shape: "hermes" }
+];
+
+/**
+ * Reads the counters the runtime reported, straight out of the recorded terminal payload.
+ *
+ * Deliberately literal, and deliberately *not* the product's extractor: the ledger's numbers are
+ * checked against the raw keys the runtime wrote, because a checker that reads the payload the same
+ * way the writer does cannot tell a faithful transcription from a shared mistake.
+ *
+ * The two shapes:
+ *
+ *  - Pi: one set of counters per assistant message, because every assistant message is one model
+ *    request. A run that asked the model five times spent the sum of five sets.
+ *  - The gateway: one set on the terminal event, `usage.{input_tokens,output_tokens,total_tokens}`.
+ */
+export function readReportedUsage(
+  payload: Record<string, unknown>,
+  shape: "pi" | "hermes"
+): ReportedUsage {
+  if (shape === "hermes") {
+    const usage = isRecord(payload["usage"]) ? payload["usage"] : {};
+    const runtime = isRecord(payload["runtime"]) ? payload["runtime"] : {};
+    const model = typeof runtime["model"] === "string" && runtime["model"] !== "" ? runtime["model"] : undefined;
+    return {
+      promptTokens: counter(usage["input_tokens"]),
+      completionTokens: counter(usage["output_tokens"]),
+      totalTokens: counter(usage["total_tokens"]),
+      ...(model ? { model } : {}),
+      shape: "gateway usage.{input_tokens,output_tokens,total_tokens}"
+    };
+  }
+
+  const messages = Array.isArray(payload["messages"]) ? payload["messages"] : [];
+  let promptTokens = 0;
+  let completionTokens = 0;
+  let cachedTokens = 0;
+  let cacheWriteTokens = 0;
+  let totalTokens = 0;
+  let counted = 0;
+  let cachedReported = false;
+  let writeReported = false;
+  let model: string | undefined;
+  for (const message of messages) {
+    if (!isRecord(message)) continue;
+    const usage = isRecord(message["usage"]) ? message["usage"] : undefined;
+    if (!usage) continue;
+    counted += 1;
+    promptTokens += counter(usage["input"]);
+    completionTokens += counter(usage["output"]);
+    if (typeof usage["cacheRead"] === "number") {
+      cachedReported = true;
+      cachedTokens += usage["cacheRead"];
+    }
+    if (typeof usage["cacheWrite"] === "number") {
+      writeReported = true;
+      cacheWriteTokens += usage["cacheWrite"];
+    }
+    totalTokens += counter(usage["totalTokens"]);
+    if (!model && typeof message["model"] === "string" && message["model"] !== "") model = message["model"];
+  }
+  return {
+    promptTokens,
+    completionTokens,
+    ...(cachedReported ? { cachedTokens } : {}),
+    ...(writeReported ? { cacheWriteTokens } : {}),
+    totalTokens,
+    ...(model ? { model } : {}),
+    shape: `pi messages[].usage (${counted} assistant message(s))`
+  };
+}
+
+/**
+ * Judges one runtime's arm: was the run accounted for, and are the three facts associated?
+ */
+export function judgeAccountingArm(input: {
+  runtimeId: string;
+  executionId: string;
+  usageStatus: number;
+  record?: AccountingUsageRecord;
+  reported?: ReportedUsage;
+  span: { startedAt?: string; finishedAt?: string; durationMs?: number };
+}): AccountingJudgement {
+  const links: AccountingLink[] = [];
+  const record = input.record;
+  const reported = input.reported;
+
+  // The ledger holds a record for this execution at all. Before the fix this was the link that
+  // failed for the primary runtime: the run happened, the model was paid for, and the ledger had
+  // nothing to show for it.
+  const recorded = input.usageStatus === 200 && record !== undefined && record.executionId === input.executionId;
+  links.push({
+    name: "recorded",
+    ok: recorded,
+    detail: recorded
+      ? `the ledger holds a record for ${input.executionId} (model ${record!.model}, ${record!.totalTokens} tokens)`
+      : `the ledger answered ${input.usageStatus} for ${input.executionId}${
+          record ? ` and returned a record for '${record.executionId}'` : " and returned no record"
+        }`
+  });
+
+  // The numbers are the runtime's own, read out of the recorded payload.
+  if (reported && record) {
+    const tokensAgree =
+      record.promptTokens === reported.promptTokens &&
+      record.completionTokens === reported.completionTokens &&
+      record.totalTokens === reported.totalTokens &&
+      (reported.cachedTokens === undefined
+        ? record.cachedTokens === undefined
+        : record.cachedTokens === reported.cachedTokens) &&
+      (reported.cacheWriteTokens === undefined
+        ? record.cacheWriteTokens === undefined
+        : record.cacheWriteTokens === reported.cacheWriteTokens);
+    links.push({
+      name: "tokens-agree",
+      ok: tokensAgree,
+      detail: tokensAgree
+        ? `prompt ${record.promptTokens} + completion ${record.completionTokens} + cached ${record.cachedTokens ?? 0} + written ${record.cacheWriteTokens ?? 0} = ${record.totalTokens}, as reported (${reported.shape})`
+        : `the ledger says prompt ${record.promptTokens} / completion ${record.completionTokens} / cached ${record.cachedTokens ?? "none"} / written ${record.cacheWriteTokens ?? "none"} / total ${record.totalTokens}, the runtime reported prompt ${reported.promptTokens} / completion ${reported.completionTokens} / cached ${reported.cachedTokens ?? "none"} / written ${reported.cacheWriteTokens ?? "none"} / total ${reported.totalTokens}`
+    });
+  } else {
+    links.push({
+      name: "tokens-agree",
+      ok: false,
+      detail: "there is no record and no reported usage to compare"
+    });
+  }
+
+  // The model is exactly what the runtime said. A runtime that names one must have it recorded; a
+  // runtime that names none must not have one invented for it.
+  if (reported?.model !== undefined) {
+    const named = record?.model === reported.model && record.model !== "unknown";
+    links.push({
+      name: "model-named",
+      ok: named,
+      detail: named
+        ? `the record names the model the runtime reported (${reported.model})`
+        : `the runtime reported the model '${reported.model}' but the record says '${record?.model ?? "nothing"}'`
+    });
+  } else {
+    const honest = record?.model === "unknown";
+    links.push({
+      name: "model-unnamed",
+      ok: honest,
+      detail: honest
+        ? "the runtime named no model, so the record says 'unknown' instead of guessing"
+        : `the runtime named no model, but the record says '${record?.model ?? "nothing"}'`
+    });
+  }
+
+  // The duration is the journal's own span, not a second measurement of the same run.
+  if (record) {
+    const span = input.span;
+    const timingAgree =
+      span.startedAt !== undefined &&
+      span.finishedAt !== undefined &&
+      span.durationMs !== undefined &&
+      span.durationMs > 0 &&
+      record.startedAt === span.startedAt &&
+      record.finishedAt === span.finishedAt &&
+      record.durationMs === span.durationMs;
+    links.push({
+      name: "timing-agree",
+      ok: timingAgree,
+      detail: timingAgree
+        ? `the record's ${record.durationMs}ms is the journal's ${span.startedAt} → ${span.finishedAt} span`
+        : `the record says ${record.durationMs}ms (${record.startedAt ?? "?"} → ${record.finishedAt ?? "?"}), the journal says ${span.durationMs ?? "?"}ms (${span.startedAt ?? "?"} → ${span.finishedAt ?? "?"})`
+    });
+  } else {
+    links.push({ name: "timing-agree", ok: false, detail: "there is no record to time" });
+  }
+
+  // The parts explain the total.
+  if (record) {
+    const sum =
+      record.promptTokens + record.completionTokens + (record.cachedTokens ?? 0) + (record.cacheWriteTokens ?? 0);
+    links.push({
+      name: "tokens-explain",
+      ok: sum === record.totalTokens,
+      detail:
+        sum === record.totalTokens
+          ? `the parts add up to the total (${sum})`
+          : `the parts add up to ${sum}, but the total says ${record.totalTokens}`
+    });
+  } else {
+    links.push({ name: "tokens-explain", ok: false, detail: "there is no record to explain" });
+  }
+
+  return { links, ok: links.every(link => link.ok) };
+}
+
+/**
+ * Judges the ledger as a whole: the summary, the refused id and the record that has to survive a
+ * restart.
+ */
+export function judgeAccountingLedger(input: {
+  summary: AccountingSummary;
+  records: AccountingUsageRecord[];
+  expected: Array<{ executionId: string; totalTokens: number; model: string }>;
+  missingUsageStatus?: number;
+  durable?: { status: number; record?: AccountingUsageRecord };
+}): AccountingJudgement {
+  const links: AccountingLink[] = [];
+  const summary = input.summary;
+  const records = input.records;
+
+  const totalTokens = records.reduce((sum, record) => sum + record.totalTokens, 0);
+  const promptTokens = records.reduce((sum, record) => sum + record.promptTokens, 0);
+  const completionTokens = records.reduce((sum, record) => sum + record.completionTokens, 0);
+  const cachedTokens = records.reduce((sum, record) => sum + (record.cachedTokens ?? 0), 0);
+  const cacheWriteTokens = records.reduce((sum, record) => sum + (record.cacheWriteTokens ?? 0), 0);
+  const durationMs = records.reduce((sum, record) => sum + record.durationMs, 0);
+
+  // Every execution the probe ran is in the ledger, with the tokens the runtime reported.
+  const missing = input.expected.filter(
+    expected => !records.some(record => record.executionId === expected.executionId && record.totalTokens === expected.totalTokens)
+  );
+  const summaryOk =
+    summary.executions === records.length &&
+    records.length === input.expected.length &&
+    missing.length === 0 &&
+    summary.totalTokens === totalTokens &&
+    summary.promptTokens === promptTokens &&
+    summary.completionTokens === completionTokens &&
+    summary.cachedTokens === cachedTokens &&
+    summary.cacheWriteTokens === cacheWriteTokens &&
+    summary.durationMs === durationMs;
+  links.push({
+    name: "summary-consistent",
+    ok: summaryOk,
+    detail: summaryOk
+      ? `the summary holds ${summary.executions} execution(s) and ${summary.totalTokens} tokens, which is the sum of the records`
+      : `the summary says ${summary.executions} execution(s) / ${summary.totalTokens} tokens, the records say ${records.length} / ${totalTokens}${
+          missing.length > 0
+            ? `; missing or wrong: ${missing.map(item => `${item.executionId} (${item.totalTokens} tokens)`).join(", ")}`
+            : ""
+        }`
+  });
+
+  // The summary groups by model, and the group holds the model's own executions.
+  const groupsOk = input.expected.every(expected => {
+    const group = summary.byModel.find(item => item.model === expected.model);
+    const held = records.filter(record => record.model === expected.model);
+    return (
+      group !== undefined &&
+      group.executions === held.length &&
+      group.totalTokens === held.reduce((sum, record) => sum + record.totalTokens, 0)
+    );
+  });
+  links.push({
+    name: "model-groups",
+    ok: groupsOk,
+    detail: groupsOk
+      ? `the summary groups ${summary.byModel.map(item => `${item.model}: ${item.executions}/${item.totalTokens}`).join(", ")}`
+      : `the summary groups ${summary.byModel.map(item => `${item.model}: ${item.executions}/${item.totalTokens}`).join(", ")}, which does not match the records`
+  });
+
+  // An id that was never an execution has to be refused: an empty record reads like a free run.
+  const missingStatus = input.missingUsageStatus;
+  links.push({
+    name: "not-found",
+    ok: missingStatus === 404,
+    detail:
+      missingStatus === 404
+        ? "an execution that was never run is refused"
+        : `an execution that was never run answered ${missingStatus ?? "?"} instead of 404`
+  });
+
+  // The record has to survive a restart, with the same numbers.
+  if (input.durable) {
+    const expected = input.expected[0];
+    const durable = input.durable;
+    const same =
+      durable.status === 200 &&
+      durable.record !== undefined &&
+      expected !== undefined &&
+      durable.record.executionId === expected.executionId &&
+      durable.record.totalTokens === expected.totalTokens &&
+      durable.record.model === expected.model &&
+      durable.record.durationMs === records.find(record => record.executionId === expected.executionId)?.durationMs;
+    links.push({
+      name: "durable",
+      ok: same,
+      detail: same
+        ? `after a restart the record is still there (${durable.record!.totalTokens} tokens, ${durable.record!.durationMs}ms)`
+        : `after a restart the usage endpoint answered ${durable.status} ${
+            durable.record ? `with ${durable.record.totalTokens} tokens for ${durable.record.executionId}` : "with no record"
+          }`
+    });
+  } else {
+    links.push({
+      name: "durable",
+      ok: false,
+      detail: "the server was not restarted, so the durability of the record was not measured"
+    });
+  }
+
+  return { links, ok: links.every(link => link.ok) };
+}
+
+/**
+ * P0-023: run on both runtimes, then read the cost back out of the ledger.
+ */
+export async function executeAccounting(
+  client: AccountingClient,
+  options: AccountingOptions = {}
+): Promise<TestResult> {
+  const now = options.now ?? (() => new Date());
+  const startedAt = now().toISOString();
+  const evidence: string[] = [];
+  const failures: string[] = [];
+  const runtimes = options.runtimes ?? DEFAULT_RUNTIMES;
+  const links: AccountingLink[] = [];
+  const expected: Array<{ executionId: string; totalTokens: number; model: string }> = [];
+
+  for (const runtime of runtimes) {
+    const taskId = `task-p0-023-${runtime.runtimeId}`;
+    const executionId = await client.run({
+      runtimeId: runtime.runtimeId,
+      taskId,
+      prompt: [
+        "Work in the repository you are given. Do exactly these two steps, using the tools:",
+        "1. Call read_file with path 'app.ts' and look at what it contains.",
+        "2. Call evaluate_changes to run the acceptance checks of this task."
+      ].join(" ")
+    });
+    evidence.push(`${runtime.label}/executionId=${executionId}`);
+    const terminal = await waitForTerminal(client, executionId, options.runTimeoutMs ?? 300_000);
+    evidence.push(`${runtime.label}/status=${terminal.status}`);
+    evidence.push(`${runtime.label}/terminalEvent=${terminal.terminalEventType ?? "none"}`);
+    evidence.push(`${runtime.label}/journalEvents=${terminal.eventCount}`);
+
+    const usage = await client.usage(executionId);
+    evidence.push(`${runtime.label}/usageStatus=${usage.status}`);
+    const logs = await client.logs(executionId);
+    const span = journalSpan(logs.entries);
+    const terminalEntry = span.terminal;
+    const reported = terminalEntry?.payload
+      ? readReportedUsage(terminalEntry.payload, runtime.shape)
+      : undefined;
+    if (reported) {
+      evidence.push(
+        `${runtime.label}/reported=prompt ${reported.promptTokens} + completion ${reported.completionTokens} + cached ${reported.cachedTokens ?? "none"} + written ${reported.cacheWriteTokens ?? "none"} = ${reported.totalTokens}, model ${reported.model ?? "none"} (${reported.shape})`
+      );
+    } else {
+      evidence.push(`${runtime.label}/reported=none (the journal holds no terminal payload)`);
+    }
+    if (usage.record) {
+      evidence.push(
+        `${runtime.label}/record=model ${usage.record.model}, prompt ${usage.record.promptTokens}, completion ${usage.record.completionTokens}, cached ${usage.record.cachedTokens ?? "none"}, written ${usage.record.cacheWriteTokens ?? "none"}, total ${usage.record.totalTokens}, ${usage.record.durationMs}ms`
+      );
+    }
+
+    const judgement = judgeAccountingArm({
+      runtimeId: runtime.runtimeId,
+      executionId,
+      usageStatus: usage.status,
+      ...(usage.record ? { record: usage.record } : {}),
+      ...(reported ? { reported } : {}),
+      span
+    });
+    for (const link of judgement.links) {
+      links.push({ ...link, name: `${runtime.label}/${link.name}` });
+    }
+    if (terminal.status !== "succeeded") {
+      failures.push(`the ${runtime.label} run ended as '${terminal.status}'`);
+    }
+    if (reported && usage.record) {
+      expected.push({
+        executionId,
+        totalTokens: reported.totalTokens,
+        model: usage.record.model
+      });
+    }
+  }
+
+  // The ledger as a whole.
+  const ledger = await client.ledger();
+  evidence.push(`ledgerRecords=${ledger.records.length}`);
+  evidence.push(`ledgerSummary=executions ${ledger.summary.executions}, total ${ledger.summary.totalTokens}, cached ${ledger.summary.cachedTokens}, written ${ledger.summary.cacheWriteTokens}, duration ${ledger.summary.durationMs}ms`);
+  for (const group of ledger.summary.byModel) {
+    evidence.push(`ledgerModel=${group.model} executions ${group.executions} tokens ${group.totalTokens}`);
+  }
+  const missingUsageStatus = await client.usage("exec-never-accounted-probe").then(result => result.status);
+
+  // The record has to survive a restart.
+  let durable: { status: number; record?: AccountingUsageRecord } | undefined;
+  if (client.restart) {
+    const restarted = await client.restart();
+    for (const item of expected) {
+      const answer = await restarted.usage(item.executionId);
+      if (item.executionId === expected[0]?.executionId) durable = answer;
+      evidence.push(
+        `restart/${item.executionId}=${answer.status}${
+          answer.record ? ` (${answer.record.totalTokens} tokens, ${answer.record.durationMs}ms)` : ""
+        }`
+      );
+    }
+  }
+
+  const ledgerJudgement = judgeAccountingLedger({
+    summary: ledger.summary,
+    records: ledger.records,
+    expected,
+    missingUsageStatus,
+    ...(durable ? { durable } : {})
+  });
+  for (const link of ledgerJudgement.links) links.push(link);
+
+  for (const link of links) {
+    evidence.push(`${link.name}:${link.ok ? "ok" : "missing"} ${link.detail}`);
+    if (!link.ok) failures.push(`the ${link.name} link does not hold: ${link.detail}`);
+  }
+
+  return {
+    id: "P0-023",
+    title: "执行成本统计：关联 Token、模型和执行时间",
+    status: failures.length === 0 ? "passed" : "failed",
+    startedAt,
+    finishedAt: now().toISOString(),
+    evidence,
+    ...(failures.length > 0 ? { notes: failures.join("; ") } : {})
+  };
+}
+
+/**
+ * Waits until the run is over *in the record*, not in the runtime's own claim.
+ *
+ * The runtime says "succeeded" before the journal has caught up, and the ledger is written from the
+ * terminal entry — so a probe that measured the moment the runtime reported success would measure a
+ * moving target, and would read the ledger before it was written. The probe waits for the recorded
+ * terminal event and for the event count to stop moving.
+ */
+async function waitForTerminal(
+  client: AccountingClient,
+  executionId: string,
+  timeoutMs: number
+): Promise<{ status: string; terminalEventType?: string; eventCount: number }> {
+  const deadline = Date.now() + timeoutMs;
+  let status = "unknown";
+  let terminalEventType: string | undefined;
+  let eventCount = -1;
+  let lastCount = -1;
+  let stableReads = 0;
+  while (Date.now() < deadline) {
+    const detail = await client.execution(executionId);
+    status = detail.status;
+    terminalEventType = detail.terminalEventType;
+    eventCount = detail.eventCount;
+    if (terminalEventType && eventCount === lastCount) {
+      stableReads += 1;
+      if (stableReads >= 2) break;
+    } else {
+      stableReads = 0;
+    }
+    lastCount = eventCount;
+    await sleep(300);
+  }
+  return { status, ...(terminalEventType ? { terminalEventType } : {}), eventCount };
+}
+
+/** The journal's own span: when the run started and when it ended. */
+function journalSpan(entries: AccountingJournalEntry[]): {
+  startedAt?: string;
+  finishedAt?: string;
+  durationMs?: number;
+  terminal?: AccountingJournalEntry;
+} {
+  const runtimeEvents = entries.filter(entry => entry.kind === "runtime.event");
+  const started = runtimeEvents.find(entry => entry.category === "execution.started");
+  const terminal = [...runtimeEvents].reverse().find(entry => TERMINAL_CATEGORIES.has(entry.category));
+  const startedAt = started?.recordedAt;
+  const finishedAt = terminal?.recordedAt;
+  const durationMs =
+    startedAt && finishedAt ? Math.max(0, Date.parse(finishedAt) - Date.parse(startedAt)) : undefined;
+  return {
+    ...(startedAt ? { startedAt } : {}),
+    ...(finishedAt ? { finishedAt } : {}),
+    ...(durationMs !== undefined ? { durationMs } : {}),
+    ...(terminal ? { terminal } : {})
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolveSleep => setTimeout(resolveSleep, ms));
+}
+
+function counter(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function git(args: string[], cwd: string): void {
+  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+  }
+}
+

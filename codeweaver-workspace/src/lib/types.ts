@@ -307,6 +307,10 @@ export interface UsageRecord {
   model: string;
   promptTokens: number;
   completionTokens: number;
+  /** Tokens served from the provider's cache, when the runtime reported them separately. */
+  cachedTokens?: number;
+  /** Tokens written into the provider's cache, when the runtime reported them separately. */
+  cacheWriteTokens?: number;
   totalTokens: number;
   durationMs: number;
   startedAt?: string;
@@ -317,6 +321,8 @@ export interface UsageSummary {
   executions: number;
   promptTokens: number;
   completionTokens: number;
+  cachedTokens: number;
+  cacheWriteTokens: number;
   totalTokens: number;
   durationMs: number;
   byModel: Array<{ model: string; executions: number; totalTokens: number }>;

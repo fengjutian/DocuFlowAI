@@ -1,0 +1,211 @@
+// --------------------------------------------------------------------------------- the real run
+
+/**
+ * The lab server, so the probe can restart it over the same data directory.
+ *
+ * The restart has to be a real one: the process forgets everything and reads it back from disk.
+ * A ledger that only survives as long as the process does is a cache, not a record.
+ */
+class LabServer {
+  private runtime: Runtime | undefined;
+  private server: ApiServer | undefined;
+
+  constructor(private readonly config: RuntimeConfig) {}
+
+  async start(): Promise<void> {
+    const runtime = createRuntime(this.config);
+    await runtime.ready();
+    const server = await createApiServer(runtime.deps).listen(0);
+    this.runtime = runtime;
+    this.server = server;
+  }
+
+  get url(): string {
+    if (!this.server) throw new Error("the server is not running");
+    return this.server.url;
+  }
+
+  async close(): Promise<void> {
+    const server = this.server;
+    const runtime = this.runtime;
+    this.server = undefined;
+    this.runtime = undefined;
+    if (server) await server.close();
+    if (runtime) await runtime.close();
+  }
+
+  async restart(): Promise<void> {
+    await this.close();
+    await this.start();
+  }
+}
+
+async function main(): Promise<void> {
+  const reportPath = resolve(
+    process.env.ACCOUNTING_REPORT_PATH ?? "reports/phase0-accounting.json"
+  );
+  const model = process.env.PI_PROBE_MODEL ?? "MiniMax-M3";
+  if (!process.env.MINIMAX_CN_API_KEY) {
+    throw new Error("MINIMAX_CN_API_KEY is not set; nothing to probe.");
+  }
+
+  // The remote runtime is the pinned gateway, started and stopped by this probe.
+  const gateway = await prepareGateway({ portEnvVar: "HERMES_GATEWAY_PORT" });
+
+  const repo = await mkdtemp(join(tmpdir(), "codeweaver-accounting-repo-"));
+  const dataDir = await mkdtemp(join(tmpdir(), "codeweaver-accounting-data-"));
+  await writeFile(join(repo, "app.ts"), "export const value = 1;\n", "utf8");
+  await writeFile(join(repo, "spec.md"), "# Spec\nThe value must stay 1.\n", "utf8");
+  await writeFile(
+    join(repo, "check.mjs"),
+    [
+      "import { readFileSync } from 'node:fs';",
+      "const content = readFileSync(new URL('./app.ts', import.meta.url), 'utf8');",
+      "if (!content.includes('value = 1')) {",
+      "  console.error('app.ts lost the value');",
+      "  process.exit(1);",
+      "}",
+      "console.log('app.ts holds value = 1');",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  git(["init", "-b", "main"], repo);
+  git(["config", "user.name", "CodeWeaver Probe"], repo);
+  git(["config", "user.email", "probe@codeweaver.local"], repo);
+  git(["add", "-A"], repo);
+  git(["commit", "-m", "initial"], repo);
+
+  const config: RuntimeConfig = {
+    host: "127.0.0.1",
+    port: 0,
+    dataDir,
+    worktreeRoot: join(dataDir, "worktrees"),
+    repository: repo,
+    hermesBaseUrl: `http://127.0.0.1:${gateway.port}`,
+    hermesApiKey: gateway.apiKey,
+    hermesTimeoutMs: 300_000,
+    pi: { provider: "minimax-cn", model }
+  };
+
+  const server = new LabServer(config);
+  await server.start();
+  const client = httpClient(server, repo);
+
+  let results: TestResult[];
+  try {
+    results = [await executeAccounting(client)];
+  } finally {
+    await server.close();
+    // The probe leaves the machine the way it found it.
+    await gateway.restore();
+    await rm(repo, { recursive: true, force: true });
+    await rm(dataDir, { recursive: true, force: true });
+  }
+
+  await writeTestReport(reportPath, results);
+  console.log(`Phase 0 accounting report: ${reportPath}`);
+  for (const item of results) {
+    console.log(`${item.id} ${item.status}: ${item.title}`);
+    for (const line of item.evidence) console.log(`  ${line}`);
+    if (item.notes) console.log(`  notes: ${item.notes}`);
+  }
+  if (results.some(item => item.status === "failed")) process.exitCode = 1;
+}
+
+/** The real client: everything goes over HTTP, the way the console drives it. */
+function httpClient(server: LabServer, workspace: string): AccountingClient {
+  return {
+    run: async input => {
+      const response = await fetch(`${server.url}/api/v1/tasks/${input.taskId}/executions`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: "probe-accounting",
+          prompt: input.prompt,
+          worktreePath: workspace,
+          documents: ["spec.md"],
+          selectedFiles: ["app.ts"],
+          architectureVersion: "1.0",
+          policy: {
+            snapshotId: "snap-accounting",
+            projectId: "probe-accounting",
+            taskId: input.taskId,
+            executionId: "",
+            worktreeId: "wt-accounting",
+            policyVersion: "1.0.0",
+            grantedCapabilities: ["*"],
+            allowedPaths: [workspace],
+            expiresAt: "2099-01-01T00:00:00.000Z"
+          },
+          template: { name: "coding-agent", version: "1.4.2", contentHash: "e".repeat(64) },
+          modelConfig: { model: process.env.PI_PROBE_MODEL ?? "MiniMax-M3" },
+          correlationId: input.taskId,
+          timeoutSeconds: 300,
+          allowedTools: ["read_file", "evaluate_changes"],
+          evaluationChecks: [
+            {
+              id: "check",
+              name: "the file still holds the value",
+              command: "node",
+              args: ["check.mjs"],
+              cwd: workspace
+            }
+          ],
+          runtimeId: input.runtimeId
+        })
+      });
+      if (response.status !== 201) {
+        throw new Error(`the task was refused: ${response.status} ${await response.text()}`);
+      }
+      const created = (await response.json()) as { execution: { executionId: string } };
+      return created.execution.executionId;
+    },
+    execution: async executionId => {
+      const response = await fetch(`${server.url}/api/v1/executions/${encodeURIComponent(executionId)}`);
+      const body = (await response.json()) as {
+        status?: string;
+        checkpoint?: { terminalEventType?: string; eventCount?: number };
+      };
+      return {
+        status: String(body.status ?? "unknown"),
+        ...(body.checkpoint?.terminalEventType
+          ? { terminalEventType: body.checkpoint.terminalEventType }
+          : {}),
+        eventCount: Number(body.checkpoint?.eventCount ?? -1)
+      };
+    },
+    usage: async executionId => {
+      const response = await fetch(`${server.url}/api/v1/executions/${encodeURIComponent(executionId)}/usage`);
+      if (response.status === 404) return { status: 404 };
+      if (response.status !== 200) {
+        throw new Error(`the usage endpoint refused: ${response.status} ${await response.text()}`);
+      }
+      const body = (await response.json()) as { usage: AccountingUsageRecord };
+      return { status: 200, record: body.usage };
+    },
+    ledger: async () => {
+      const response = await fetch(`${server.url}/api/v1/usage`);
+      if (response.status !== 200) {
+        throw new Error(`the ledger was refused: ${response.status} ${await response.text()}`);
+      }
+      return (await response.json()) as { summary: AccountingSummary; records: AccountingUsageRecord[] };
+    },
+    logs: async executionId => {
+      const response = await fetch(`${server.url}/api/v1/executions/${encodeURIComponent(executionId)}/logs`);
+      if (response.status !== 200) {
+        throw new Error(`the journal was refused: ${response.status} ${await response.text()}`);
+      }
+      return (await response.json()) as { count: number; entries: AccountingJournalEntry[] };
+    },
+    restart: async () => {
+      await server.restart();
+      return httpClient(server, workspace);
+    }
+  };
+}
+
+const invokedPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : undefined;
+if (invokedPath === import.meta.url) {
+  await main();
+}

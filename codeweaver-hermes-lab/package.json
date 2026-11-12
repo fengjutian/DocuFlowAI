@@ -24,6 +24,7 @@
     "validate:pi-client-disconnect": "npm run build && node dist/runners/pi-client-disconnect-phase0.js",
     "validate:runtime-crash": "npm run build && node dist/runners/runtime-crash-phase0.js",
     "validate:audit-timeline": "npm run build && node dist/runners/audit-timeline-phase0.js",
+    "validate:accounting": "npm run build && node dist/runners/accounting-phase0.js",
     "validate:multi-runtime-policy": "npm run build && node dist/runners/multi-runtime-policy-phase0.js",
     "report:phase0": "npm run build && node dist/runners/aggregate-phase0.js",
     "check:hermes": "npm run build && node dist/runners/check-hermes-version.js",

@@ -11,7 +11,9 @@ import { useApiData } from "@/hooks/useApiData";
  * Usage accounting.
  *
  * The ledger records one entry per execution, written only when the runtime reported token counts:
- * an execution without usage data produces no record rather than a fake zero.
+ * an execution without usage data produces no record rather than a fake zero. The cached tokens are
+ * shown apart from the prompt tokens, because the runtime counts them separately — a total that
+ * cannot be explained by its parts is a number nobody can check.
  */
 export function UsagePage() {
   const usage = useApiData(() => api.getUsage(), []);
@@ -30,7 +32,11 @@ export function UsagePage() {
         <StatCard
           label="总 Token"
           value={usage.data ? formatTokens(usage.data.summary.totalTokens) : "-"}
-          hint={usage.data ? `输入 ${formatTokens(usage.data.summary.promptTokens)}` : undefined}
+          hint={
+            usage.data
+              ? `输入 ${formatTokens(usage.data.summary.promptTokens)} · 缓存 ${formatTokens(usage.data.summary.cachedTokens)}`
+              : undefined
+          }
           icon={Coins}
           loading={usage.loading}
         />
@@ -96,6 +102,7 @@ export function UsagePage() {
                   <TableHead>模型</TableHead>
                   <TableHead>输入</TableHead>
                   <TableHead>输出</TableHead>
+                  <TableHead>缓存</TableHead>
                   <TableHead>合计</TableHead>
                   <TableHead>耗时</TableHead>
                   <TableHead>结束时间</TableHead>
@@ -108,6 +115,9 @@ export function UsagePage() {
                     <TableCell className="text-xs">{record.model}</TableCell>
                     <TableCell className="text-xs tabular-nums">{formatTokens(record.promptTokens)}</TableCell>
                     <TableCell className="text-xs tabular-nums">{formatTokens(record.completionTokens)}</TableCell>
+                    <TableCell className="text-xs tabular-nums">
+                      {record.cachedTokens === undefined ? "—" : formatTokens(record.cachedTokens)}
+                    </TableCell>
                     <TableCell className="text-xs tabular-nums">{formatTokens(record.totalTokens)}</TableCell>
                     <TableCell className="text-xs tabular-nums">{formatDuration(record.durationMs)}</TableCell>
                     <TableCell className="text-xs text-muted-foreground">

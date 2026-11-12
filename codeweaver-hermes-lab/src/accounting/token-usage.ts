@@ -22,6 +22,8 @@ export interface TokenUsage {
   completionTokens?: number;
   /** Tokens served from the provider's cache, when the runtime reports them separately. */
   cachedTokens?: number;
+  /** Tokens written into the provider's cache, when the runtime reports them separately. */
+  cacheWriteTokens?: number;
   /** What the runtime counted in total. */
   totalTokens?: number;
   /** The model the runtime says it used, when it says. */
@@ -43,6 +45,12 @@ const CACHED_KEYS = [
   "cachedTokens",
   "cacheRead"
 ] as const;
+const WRITE_KEYS = [
+  "cache_write_tokens",
+  "cache_creation_input_tokens",
+  "cacheWriteTokens",
+  "cacheWrite"
+] as const;
 const TOTAL_KEYS = ["total_tokens", "tokens_total", "totalTokens", "total"] as const;
 
 export function extractTokenUsage(payload: Record<string, unknown>): TokenUsage {
@@ -55,6 +63,7 @@ export function extractTokenUsage(payload: Record<string, unknown>): TokenUsage 
   let promptTokens = usage ? pickNumber(usage, PROMPT_KEYS) : undefined;
   let completionTokens = usage ? pickNumber(usage, COMPLETION_KEYS) : undefined;
   let cachedTokens = usage ? pickNumber(usage, CACHED_KEYS) : undefined;
+  let cacheWriteTokens = usage ? pickNumber(usage, WRITE_KEYS) : undefined;
   let totalTokens = usage ? pickNumber(usage, TOTAL_KEYS) : undefined;
   let model = typeof payload["model"] === "string" && payload["model"] !== ""
     ? payload["model"]
@@ -65,6 +74,7 @@ export function extractTokenUsage(payload: Record<string, unknown>): TokenUsage 
     promptTokens ??= pickNumber(payload, PROMPT_KEYS);
     completionTokens ??= pickNumber(payload, COMPLETION_KEYS);
     cachedTokens ??= pickNumber(payload, CACHED_KEYS);
+    cacheWriteTokens ??= pickNumber(payload, WRITE_KEYS);
     totalTokens = pickNumber(payload, TOTAL_KEYS);
   }
 
@@ -74,8 +84,11 @@ export function extractTokenUsage(payload: Record<string, unknown>): TokenUsage 
     let prompt = 0;
     let completion = 0;
     let cached = 0;
+    let cacheWrite = 0;
     let total = 0;
     let counted = 0;
+    let cachedReported = false;
+    let writeReported = false;
     for (const message of messages) {
       if (!isRecord(message)) continue;
       const messageUsage = isRecord(message["usage"]) ? message["usage"] : undefined;
@@ -83,12 +96,20 @@ export function extractTokenUsage(payload: Record<string, unknown>): TokenUsage 
       const messagePrompt = pickNumber(messageUsage, PROMPT_KEYS);
       const messageCompletion = pickNumber(messageUsage, COMPLETION_KEYS);
       const messageCached = pickNumber(messageUsage, CACHED_KEYS);
+      const messageWrite = pickNumber(messageUsage, WRITE_KEYS);
       const messageTotal = pickNumber(messageUsage, TOTAL_KEYS);
       if (messageTotal === undefined && messagePrompt === undefined && messageCompletion === undefined) continue;
       counted += 1;
       prompt += messagePrompt ?? 0;
       completion += messageCompletion ?? 0;
-      cached += messageCached ?? 0;
+      if (messageCached !== undefined) {
+        cachedReported = true;
+        cached += messageCached;
+      }
+      if (messageWrite !== undefined) {
+        writeReported = true;
+        cacheWrite += messageWrite;
+      }
       total += messageTotal ?? (messagePrompt ?? 0) + (messageCompletion ?? 0);
       model ??= typeof message["model"] === "string" && message["model"] !== ""
         ? message["model"]
@@ -97,7 +118,10 @@ export function extractTokenUsage(payload: Record<string, unknown>): TokenUsage 
     if (counted > 0) {
       promptTokens = prompt;
       completionTokens = completion;
-      cachedTokens = cached;
+      // A runtime that never mentions a cache did not report "zero cached tokens" — it reported
+      // nothing about caching. Saying zero would claim a fact the runtime never made.
+      if (cachedReported) cachedTokens = cached;
+      if (writeReported) cacheWriteTokens = cacheWrite;
       totalTokens = total;
     }
   }
@@ -109,13 +133,15 @@ export function extractTokenUsage(payload: Record<string, unknown>): TokenUsage 
   // A runtime that reports the parts but not the sum still accounted for the run. The cached tokens
   // are part of the total when the runtime counts them separately, so they are not left out.
   if (totalTokens === undefined && promptTokens !== undefined && completionTokens !== undefined) {
-    totalTokens = promptTokens + completionTokens + (cachedTokens ?? 0);
+    totalTokens =
+      promptTokens + completionTokens + (cachedTokens ?? 0) + (cacheWriteTokens ?? 0);
   }
 
   return {
     ...(promptTokens !== undefined ? { promptTokens } : {}),
     ...(completionTokens !== undefined ? { completionTokens } : {}),
     ...(cachedTokens !== undefined ? { cachedTokens } : {}),
+    ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
     ...(totalTokens !== undefined ? { totalTokens } : {}),
     ...(model !== undefined ? { model } : {})
   };

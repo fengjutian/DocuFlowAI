@@ -20,6 +20,8 @@ export interface UsageRecord {
   completionTokens: number;
   /** Tokens served from the provider's cache, when the runtime reports them separately. */
   cachedTokens?: number;
+  /** Tokens written into the provider's cache, when the runtime reports them separately. */
+  cacheWriteTokens?: number;
   totalTokens: number;
   durationMs: number;
   startedAt?: string;
@@ -31,6 +33,7 @@ export interface UsageSummary {
   promptTokens: number;
   completionTokens: number;
   cachedTokens: number;
+  cacheWriteTokens: number;
   totalTokens: number;
   durationMs: number;
   byModel: Array<{ model: string; executions: number; totalTokens: number }>;
@@ -92,6 +95,7 @@ export class UsageLedger {
       promptTokens: usage.promptTokens ?? 0,
       completionTokens: usage.completionTokens ?? 0,
       ...(usage.cachedTokens !== undefined ? { cachedTokens: usage.cachedTokens } : {}),
+      ...(usage.cacheWriteTokens !== undefined ? { cacheWriteTokens: usage.cacheWriteTokens } : {}),
       totalTokens: usage.totalTokens,
       durationMs: Math.max(0, timing.durationMs),
       ...(timing.startedAt ? { startedAt: timing.startedAt } : {}),
@@ -121,12 +125,14 @@ export class UsageLedger {
     let promptTokens = 0;
     let completionTokens = 0;
     let cachedTokens = 0;
+    let cacheWriteTokens = 0;
     let totalTokens = 0;
     let durationMs = 0;
     for (const record of records) {
       promptTokens += record.promptTokens;
       completionTokens += record.completionTokens;
       cachedTokens += record.cachedTokens ?? 0;
+      cacheWriteTokens += record.cacheWriteTokens ?? 0;
       totalTokens += record.totalTokens;
       durationMs += record.durationMs;
       const entry = byModel.get(record.model) ?? { executions: 0, totalTokens: 0 };
@@ -139,6 +145,7 @@ export class UsageLedger {
       promptTokens,
       completionTokens,
       cachedTokens,
+      cacheWriteTokens,
       totalTokens,
       durationMs,
       byModel: [...byModel.entries()]
