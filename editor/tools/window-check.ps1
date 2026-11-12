@@ -26,8 +26,11 @@ $exe = Join-Path $root 'target\debug\codeweaver-editor.exe'
 $logs = Join-Path $root '.dev-logs'
 $fixture = Join-Path $PSScriptRoot 'fixtures\sample.txt'
 $sample = Join-Path $logs 'sample.txt'
+$rustFixture = Join-Path $PSScriptRoot 'fixtures\sample.rs'
+$rustSample = Join-Path $logs 'sample.rs'
 $shot = Join-Path $logs 'window-check.png'
 $findShot = Join-Path $logs 'window-check-find.png'
+$syntaxShot = Join-Path $logs 'window-check-syntax.png'
 
 $sig = @'
 using System;
@@ -118,6 +121,10 @@ function To-Screen([double[]]$linear) {
 $SELECTION_RGB = To-Screen @(0.20, 0.33, 0.55)
 $ACCENT_RGB = To-Screen @(0.30, 0.58, 0.96)
 $MATCH_RGB = To-Screen @(0.58, 0.46, 0.11)
+# The colours of the syntax: the keyword of a language and the text of a
+# string.
+$KEYWORD_RGB = To-Screen @(0.76, 0.36, 0.90)
+$STRING_RGB = To-Screen @(0.68, 0.82, 0.42)
 
 if (-not (Test-Path $exe)) {
     throw "the editor is not built; run 'cargo build -p codeweaver-editor' first"
@@ -134,6 +141,7 @@ New-Item -ItemType Directory -Force -Path $logs | Out-Null
 # The fixture is read as UTF-8 on purpose: PowerShell reads a script without
 # a byte order mark as ANSI, so the text must not travel through the script.
 Copy-Item -Path $fixture -Destination $sample -Force
+Copy-Item -Path $rustFixture -Destination $rustSample -Force
 
 # The scale of the monitor the editor is on, and the way from the
 # coordinates of the script to the physical pixels of the screen.
@@ -248,10 +256,23 @@ function Start-Editor([string[]]$arguments) {
     # after the posted ones, and the editor would follow the real cursor
     # instead of the message. A check that depends on the order of two
     # things is a check that fails now and then.
+    #
+    # The cursor is put out of the way again here: whoever is using the
+    # machine may have moved it while the editor was starting.
     $window = New-Object Win32+RECT
     [Win32]::GetWindowRect($handle, [ref]$window) | Out-Null
-    $where = New-Object Win32+POINT
-    [Win32]::GetCursorPos([ref]$where) | Out-Null
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        [Win32]::SetCursorPos(10, 10) | Out-Null
+        Start-Sleep -Milliseconds 300
+        $where = New-Object Win32+POINT
+        [Win32]::GetCursorPos([ref]$where) | Out-Null
+        if ($where.X -ge $window.Left -and $where.X -lt $window.Right -and
+            $where.Y -ge $window.Top -and $where.Y -lt $window.Bottom) {
+            Write-Output "the cursor is still over the editor window ($($where.X),$($where.Y)), moving it again"
+            continue
+        }
+        break
+    }
     if ($where.X -ge $window.Left -and $where.X -lt $window.Right -and
         $where.Y -ge $window.Top -and $where.Y -lt $window.Bottom) {
         throw "the cursor is over the editor window ($($where.X),$($where.Y)), so the check would be a race"
@@ -378,6 +399,41 @@ try {
             throw 'a selection is drawn without a drag'
         }
         $findPicture.Dispose()
+    }
+    finally {
+        Stop-Process -Id $editor.Process.Id -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 400
+    }
+
+    # The third run: the editor on a file that has a language. The keywords
+    # and the strings of the file are drawn in their own colours.
+    $editor = Start-Editor @($rustSample)
+    $handle = $editor.Handle
+    try {
+        $syntax_result = Save-Window $handle $syntaxShot
+        Write-Output "print window: $($syntax_result.Ok)"
+        Write-Output "saved $syntaxShot"
+        $syntaxPicture = $syntax_result.Bitmap
+        $left = $syntax_result.Left
+        $top = $syntax_result.Top
+
+        # The keywords of the file are drawn in the colour of a keyword, and
+        # the text of a string in the colour of a string. Nothing else in the
+        # window is drawn in those colours.
+        $keywords = Count-Color $syntaxPicture $left $top $syntax_result.Width $syntax_result.Height $KEYWORD_RGB 22
+        Write-Output "keyword pixels: $keywords"
+        if ($keywords -lt 8) {
+            throw 'the keywords were not highlighted'
+        }
+        Write-Output 'the keywords are highlighted'
+
+        $strings = Count-Color $syntaxPicture $left $top $syntax_result.Width $syntax_result.Height $STRING_RGB 22
+        Write-Output "string pixels: $strings"
+        if ($strings -lt 8) {
+            throw 'the strings were not highlighted'
+        }
+        Write-Output 'the strings are highlighted'
+        $syntaxPicture.Dispose()
     }
     finally {
         Stop-Process -Id $editor.Process.Id -Force -ErrorAction SilentlyContinue
