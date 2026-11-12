@@ -7,11 +7,23 @@ import { isAbsolute, relative, resolve } from "node:path";
  * A boundary is only evidence if it is real. `backend: "none"` exists so a caller can state that
  * nothing was isolated, and validating such a spec always fails: the runner must not report
  * "restricted file denied" when there was nothing to deny it.
+ *
+ * The backends are the native ones, not Docker: the project decided not to depend on a Docker
+ * daemon (doc/HERMES_NATIVE_PLAN.md), and the SEC-B* evidence has to say which mechanism enforced
+ * it. Docker is kept as one backend among others because the probes themselves are backend
+ * independent - they ask the boundary to run a shell script and look at the answer.
  */
-export type BoundaryBackend = "docker" | "none";
+export type BoundaryBackend =
+  | "docker"
+  | "appcontainer"
+  | "wsl2"
+  | "windows-sandbox"
+  | "hyper-v"
+  | "none";
 
 export interface BoundarySpec {
   backend: BoundaryBackend;
+  /** The container image (docker) or the distribution name (wsl2). */
   image: string;
   workspaceDir: string;
   restrictedDir: string;
@@ -22,13 +34,21 @@ export interface BoundarySpec {
 }
 
 export const DEFAULT_SECURITY_IMAGE = "alpine:3.20";
+export const DEFAULT_WSL_DISTRO = "Ubuntu";
+
+/** The backends this lab can actually drive today. */
+export const SUPPORTED_BACKENDS: readonly BoundaryBackend[] = ["wsl2", "docker", "appcontainer"];
 
 /** Violations that make the spec unusable as evidence. An empty array means it can run. */
 export function validateBoundarySpec(spec: BoundarySpec): string[] {
   const violations: string[] = [];
-  if (spec.backend !== "docker") {
-    violations.push("backend must be 'docker': a process boundary cannot deny filesystem access on its own");
+  if (!SUPPORTED_BACKENDS.includes(spec.backend)) {
+    violations.push(
+      `backend must be one of ${SUPPORTED_BACKENDS.join(", ")}: a process boundary cannot deny filesystem access on its own`
+    );
   }
+  // The image is the container image for docker and the distribution for wsl2; both name what
+  // runs the probe. An empty name means nothing runs, which is not evidence.
   if (!spec.image.trim()) violations.push("image must not be empty");
 
   for (const [name, dir] of [
@@ -48,9 +68,7 @@ export function validateBoundarySpec(spec: BoundarySpec): string[] {
     violations.push("memoryLimitMb must be a positive number");
   }
   if (!Number.isFinite(spec.cpus) || spec.cpus <= 0) violations.push("cpus must be a positive number");
-  if (!Number.isInteger(spec.pidsLimit) || spec.pidsLimit <= 0) {
-    violations.push("pidsLimit must be a positive integer");
-  }
+  if (!Number.isInteger(spec.pidsLimit) || spec.pidsLimit <= 0) violations.push("pidsLimit must be a positive integer");
 
   if (violations.length === 0) {
     const dirs = [spec.workspaceDir, spec.restrictedDir, spec.outsideDir].map(dir => resolve(dir));
