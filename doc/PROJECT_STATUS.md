@@ -1,6 +1,6 @@
 # CodeWeaver 项目状态与剩余工作
 
-> 当前发布基线与开发拆分见 [PROJECT_PROGRESS_V0.2.0.md](./PROJECT_PROGRESS_V0.2.0.md)。文档号与产品版本统一为 `0.2.0`。
+> 当前发布基线与开发拆分见 [PROJECT_PROGRESS_V0.3.0.md](./PROJECT_PROGRESS_V0.3.0.md)。文档号与产品版本统一为 `0.3.0`。
 
 ## 1. 结论摘要
 
