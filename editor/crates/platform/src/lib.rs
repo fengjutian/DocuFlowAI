@@ -4,8 +4,10 @@ pub mod editor_view;
 pub mod find;
 mod input;
 mod lsp;
+mod pane;
+mod shell;
 
-use std::{ops::Range, path::PathBuf, sync::Arc, time::Duration};
+use std::{ops::Range, path::{Path, PathBuf}, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use codeweaver_agent_acp::ToolStatus;
@@ -14,16 +16,18 @@ use codeweaver_lsp::{Client as LspClient, LspEvent, ServerConfig};
 use codeweaver_render::{
     Color, FrameScene, Point, Rect, Renderer, RendererError, Size, TextFamily, TextStyle,
 };
-use codeweaver_syntax::{Language, Syntax};
+use codeweaver_syntax::{Highlight, Language};
 use codeweaver_text::TextOffset;
 use codeweaver_ui::TextMeasurer;
-use codeweaver_workspace::{Document, Workspace};
+use codeweaver_workspace::{ChangeDetector, Document, ExternalChange, FileTree, Workspace};
+use codeweaver_workbench::{close_decision, CloseDecision, TabBar, TabId};
 use completion::CompletionPopup;
 use editor_view::{
     BodyOverlay, EditorView, FindOverlay, LINE_HEIGHT, MarkSeverity, RendererMeasurer,
 };
 use find::{FindBar, FindField};
 use input::TextInputState;
+use pane::EditorPane;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -38,10 +42,29 @@ pub use agent::EndpointSettings;
 
 const WINDOW_TITLE: &str = "CodeWeaver";
 
+/// The question the window is asking the user.
+///
+/// The window asks a question when the answer is not the editor's to give:
+/// whether a file with unsaved changes may be closed, and what to do about a
+/// file that changed on disk while it was open.
+pub enum Prompt {
+    /// A tab with unsaved changes is about to be closed.
+    CloseDirty {
+        /// The tab that is about to be closed.
+        tab: codeweaver_workbench::TabId,
+    },
+    /// A file changed on disk while it was open.
+    ChangedOnDisk {
+        /// The tab whose file changed.
+        tab: codeweaver_workbench::TabId,
+        /// Whether the file is gone rather than changed.
+        removed: bool,
+    },
+}
+
 pub struct NativeApplication {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
-    editor: Editor,
     input: TextInputState,
     modifiers: ModifiersState,
     /// The agent session, started when the user asks for it.
@@ -50,35 +73,32 @@ pub struct NativeApplication {
     agent_error: Option<String>,
     /// The workspace services. The UI never touches the file system itself.
     workspace: Workspace,
-    /// The file that is open, if any.
-    document: Option<Document>,
     /// The last save or load error, shown in the status line.
     status: Option<String>,
     /// How to start the agent endpoint, when it is configured explicitly.
     endpoint: Option<EndpointSettings>,
-    /// The editor body: the scroll position and the layout of the text.
-    view: EditorView,
     /// Where the mouse is, in logical pixels.
     cursor: Option<Point>,
     /// The find bar, when it is open.
     find: Option<FindBar>,
-    /// The syntax tree of the open document, and the highlights it gives.
-    syntax: Syntax,
     /// The language server of the open document, if there is one.
     server: Option<LspClient>,
-    /// The URI of the open document, as the server knows it.
-    document_uri: Option<String>,
-    /// What the server has been told about the document.
-    server_version: Option<u64>,
     /// The version the server is told next.
     server_generation: i64,
-    /// The things the language server found wrong in the document.
-    marks: Vec<editor_view::Mark>,
-    /// How many of them are errors, and how many are warnings.
-    errors: usize,
-    warnings: usize,
     /// The completions the server offered, when the list is open.
     completion: Option<CompletionPopup>,
+    /// The tabs that are open.
+    tabs: TabBar,
+    /// The pane of every tab, in the order of the tabs.
+    panes: Vec<EditorPane>,
+    /// The tab that is on screen.
+    active: usize,
+    /// The files of the workspace, as a tree.
+    tree: Option<FileTree>,
+    /// The files that are watched for changes outside the editor.
+    detector: ChangeDetector,
+    /// The question the window is asking the user, if it is asking one.
+    prompt: Option<Prompt>,
 }
 
 impl NativeApplication {
@@ -99,73 +119,81 @@ impl NativeApplication {
     /// Creates the application, with the language server to use when it is
     /// given.
     fn build(path: Option<PathBuf>, server_config: Option<ServerConfig>) -> Result<Self> {
-        let mut editor = Editor::new("");
         let workspace = Workspace::detached();
-        let mut document = None;
-
-        if let Some(path) = path {
-            let opened = workspace
-                .open(&path)
-                .map_err(|error| anyhow::anyhow!("could not open {}: {error}", path.display()))?;
-            editor.load_text(opened.saved_text());
-            document = Some(opened);
-        }
-
-        // The language of the file decides how the text is highlighted.
-        let mut syntax = Syntax::new();
-        syntax.set_language(
-            document
-                .as_ref()
-                .and_then(|document| Language::from_path(document.path())),
-        );
-
-        // The language of the file also decides which language server runs.
+        let mut tabs = TabBar::new();
+        let mut panes: Vec<EditorPane> = Vec::new();
         let mut server = None;
-        let mut document_uri = None;
-        if let Some(document) = document.as_ref()
-            && let Some(language) = Language::from_path(document.path())
-            && let Some(config) = server_config.clone().or_else(|| lsp::server_for(language))
-        {
-            let root = lsp::workspace_root(document.path());
-            match LspClient::start(&config, &root) {
-                Ok(client) => {
-                    let uri = codeweaver_lsp::protocol::file_uri(document.path());
-                    let _ = client.did_open(&uri, lsp::language_id(language), 1, &editor.text());
-                    document_uri = Some(uri);
-                    server = Some(client);
+
+        match path {
+            Some(path) => {
+                let opened = workspace
+                    .open(&path)
+                    .map_err(|error| anyhow::anyhow!("could not open {}: {error}", path.display()))?;
+                // The language of the file decides how the text is highlighted.
+                let language = Language::from_path(opened.path());
+                let tab = tabs.open(path.clone(), shell::title_of(&path));
+                let mut pane = EditorPane::opened(tab, opened, language);
+                let text = pane.editor.text();
+
+                // The language of the file also decides which language server runs.
+                if let Some(language) = language
+                    && let Some(config) = server_config.clone().or_else(|| lsp::server_for(language))
+                {
+                    let root = lsp::workspace_root(&path);
+                    match LspClient::start(&config, &root) {
+                        Ok(client) => {
+                            let uri = codeweaver_lsp::protocol::file_uri(&path);
+                            let _ = client.did_open(&uri, lsp::language_id(language), 1, &text);
+                            pane.document_uri = Some(uri);
+                            server = Some(client);
+                        }
+                        Err(error) => eprintln!("could not start the language server: {error}"),
+                    }
                 }
-                Err(error) => eprintln!("could not start the language server: {error}"),
+                panes.push(pane);
+            }
+            None => {
+                // An empty editor still has a tab to draw and to click on.
+                let tab = tabs.open_scratch("untitled");
+                panes.push(EditorPane::scratch(tab, None));
             }
         }
 
         // The server has been told about the text that is there now.
-        let server_version = server.as_ref().map(|_| editor.version());
+        let server_version = server.as_ref().map(|_| panes[0].editor.version());
 
         Ok(NativeApplication {
             window: None,
             renderer: None,
-            editor,
             input: TextInputState::default(),
             modifiers: ModifiersState::default(),
             agent: None,
             agent_error: None,
             workspace,
-            document,
             status: None,
             endpoint: None,
-            view: EditorView::new(),
             cursor: None,
             find: None,
-            syntax,
             server,
-            document_uri,
-            server_version,
             server_generation: 1,
-            marks: Vec::new(),
-            errors: 0,
-            warnings: 0,
             completion: None,
+            tabs,
+            panes,
+            active: 0,
+            tree: None,
+            detector: ChangeDetector::new(),
+            prompt: None,
         })
+    }
+
+    /// The pane that is on screen.
+    fn pane(&self) -> &EditorPane {
+        &self.panes[self.active]
+    }
+
+    /// The pane that is on screen.
+    fn pane_mut(&mut self) -> &mut EditorPane {
+        &mut self.panes[self.active]
     }
 
     /// Sets how the agent endpoint is started.
@@ -186,17 +214,260 @@ impl NativeApplication {
 
     /// The editor's buffer.
     pub fn editor(&self) -> &Editor {
-        &self.editor
+        &self.panes[self.active].editor
     }
 
     /// The editor's buffer, for the callers that edit it.
     pub fn editor_mut(&mut self) -> &mut Editor {
-        &mut self.editor
+        &mut self.panes[self.active].editor
     }
 
     /// The file that is open, if any.
     pub fn document(&self) -> Option<&Document> {
-        self.document.as_ref()
+        self.panes[self.active].document.as_ref()
+    }
+
+    /// The file that is open, for the callers that change it.
+    pub fn document_mut(&mut self) -> Option<&mut Document> {
+        self.panes[self.active].document.as_mut()
+    }
+
+    /// Opens a file in a tab.
+    ///
+    /// A file that is already open is not opened twice: the tab that is
+    /// already there comes to the front instead.
+    fn open_file(&mut self, path: &Path) -> bool {
+        let before = self.tabs.len();
+        let tab = self.tabs.open(path.to_path_buf(), shell::title_of(path));
+        let index = self.tabs
+            .index_of(tab)
+            .expect("the tab was just opened, so it is in the list");
+        if self.tabs.len() == before {
+            // The file was already open.
+            self.activate_tab(index);
+            return true;
+        }
+
+        let opened = match self.workspace.open(path) {
+            Ok(document) => document,
+            Err(error) => {
+                self.status = Some(format!("打不开 {}：{error}", path.display()));
+                self.tabs.close(tab);
+                return false;
+            }
+        };
+        let language = Language::from_path(opened.path());
+        let pane = EditorPane::opened(tab, opened, language);
+        // The file is watched, so a change behind the editor's back is
+        // noticed instead of being overwritten.
+        if let Some(document) = pane.document.as_ref() {
+            self.detector.watch(document.path(), document.fingerprint());
+        }
+        self.panes.push(pane);
+        self.show_tree_of(path);
+        self.activate_tab(index);
+        true
+    }
+
+    /// Brings a tab to the front.
+    fn activate_tab(&mut self, index: usize) {
+        if index >= self.panes.len() || index == self.active {
+            return;
+        }
+        self.tabs.activate_index(index);
+        self.active = index;
+        // The language server is told about the document that is now on
+        // screen; it knows nothing about the ones that were closed.
+        self.tell_server_about_the_new_document();
+    }
+
+    /// Closes a tab.
+    fn close_tab(&mut self, index: usize) {
+        if index >= self.panes.len() {
+            return;
+        }
+        let tab = self.tabs.tabs()[index].id;
+        if let Some(document) = self.panes[index].document.as_ref() {
+            self.detector.forget(document.path());
+        }
+        self.panes.remove(index);
+        self.tabs.close(tab);
+
+        if self.panes.is_empty() {
+            // The last tab was closed: an empty editor takes its place, so
+            // there is always something to type into.
+            let tab = self.tabs.open_scratch("untitled");
+            self.panes.push(EditorPane::scratch(tab, None));
+            self.active = 0;
+            return;
+        }
+        // The workbench decides which tab comes to the front.
+        let active = self.tabs.active_index().unwrap_or(0);
+        self.active = active.min(self.panes.len() - 1);
+    }
+
+    /// Closes the tab with the given id, wherever it is.
+    fn close_tab_by_id(&mut self, tab: TabId) {
+        if let Some(index) = self.tabs.index_of(tab) {
+            self.close_tab(index);
+        }
+    }
+
+    /// Asks the user whether a tab with unsaved changes may be closed.
+    ///
+    /// A tab without unsaved changes is closed right away; one with them is
+    /// a question for the user, because throwing their work away is not the
+    /// editor's decision to make.
+    fn request_close(&mut self, index: usize) {
+        self.sync_dirty_flags();
+        let Some(tab) = self.tabs.tabs().get(index) else {
+            return;
+        };
+        match close_decision(tab) {
+            CloseDecision::Close => self.close_tab(index),
+            CloseDecision::Ask => {
+                self.prompt = Some(Prompt::CloseDirty { tab: tab.id });
+            }
+        }
+    }
+
+    /// Brings the dirty flags of the tabs up to date.
+    fn sync_dirty_flags(&mut self) {
+        for index in 0..self.panes.len() {
+            let Some(tab) = self.tabs.tabs().get(index) else {
+                continue;
+            };
+            let id = tab.id;
+            let dirty = self.panes[index].is_dirty();
+            if tab.dirty != dirty {
+                self.tabs.mark_dirty(id, dirty);
+            }
+        }
+    }
+
+    /// Writes the buffer of a tab back to its file.
+    fn save_tab(&mut self, tab: TabId) {
+        let Some(index) = self.tabs.index_of(tab) else {
+            return;
+        };
+        let Some(mut document) = self.panes[index].document.take() else {
+            self.status = Some("这个标签还没有文件".to_owned());
+            return;
+        };
+        let text = self.panes[index].editor.text();
+        match self.workspace.save(&mut document, &text) {
+            Ok(()) => {
+                self.status = Some(format!("已保存 {}", document.display_path()));
+                // The file is watched from its new state.
+                self.detector.watch(document.path(), document.fingerprint());
+            }
+            Err(error) => {
+                self.status = Some(format!("保存失败：{error}"));
+                eprintln!("could not save the document: {error}");
+                // The file changed behind the editor's back: the user is
+                // asked what to do with it.
+                if let codeweaver_workspace::WorkspaceError::ChangedOnDisk { path } = &error {
+                    self.prompt = Some(Prompt::ChangedOnDisk {
+                        tab,
+                        removed: false,
+                    });
+                    let _ = path;
+                }
+            }
+        }
+        self.panes[index].document = Some(document);
+    }
+
+    /// Tells the language server about the document that is on screen.
+    fn tell_server_about_the_new_document(&mut self) {
+        let Some(server) = self.server.as_ref() else {
+            return;
+        };
+        let pane = &mut self.panes[self.active];
+        let Some(path) = pane.document.as_ref().map(|document| document.path().to_path_buf())
+        else {
+            pane.document_uri = None;
+            pane.server_version = None;
+            return;
+        };
+        let Some(language) = Language::from_path(&path) else {
+            return;
+        };
+        let uri = codeweaver_lsp::protocol::file_uri(&path);
+        let version = pane.editor.version();
+        let text = pane.editor.text();
+        pane.document_uri = Some(uri.clone());
+        pane.server_version = Some(version);
+        self.server_generation += 1;
+        let generation = self.server_generation;
+        let _ = server.did_open(&uri, lsp::language_id(language), generation, &text);
+    }
+
+    /// Collects the answer of the highlighter.
+    ///
+    /// The highlighter runs on a thread of its own, so the window keeps
+    /// drawing while the answer is being made. The answer belongs to a
+    /// version of the text: an answer that arrives after the text changed
+    /// again is about a text that is gone, and is dropped.
+    fn pump_syntax(&mut self) -> bool {
+        let pane = &mut self.panes[self.active];
+        let version = pane.editor.version();
+        let visible = pane.view.visible_range();
+        if pane.asked.as_ref() != Some(&(version, visible.clone())) {
+            let text = pane.editor.text();
+            let lines = pane.editor.buffer().line_count();
+            pane.syntax.request(version, text, visible.clone(), lines);
+            pane.asked = Some((version, visible));
+        }
+        let Some(outcome) = pane.syntax.poll() else {
+            return false;
+        };
+        if outcome.version != pane.editor.version() {
+            // The text changed while the highlighter was working.
+            return false;
+        }
+        let changed = outcome.highlights != pane.highlights || outcome.degraded != pane.degraded;
+        pane.highlights = outcome.highlights;
+        pane.degraded = outcome.degraded;
+        changed
+    }
+
+    /// Looks at the files that are open and notices the ones that changed.
+    ///
+    /// The change is not applied: the user is asked what to do with it. A
+    /// file that is overwritten without asking is a file somebody's work is
+    /// lost in.
+    fn poll_disk(&mut self) -> bool {
+        let changes = self.detector.poll();
+        if changes.is_empty() {
+            return false;
+        }
+        for change in changes {
+            let (path, removed) = match change {
+                ExternalChange::Modified { path } => (path, false),
+                ExternalChange::Removed { path } => (path, true),
+            };
+            let Some(index) = self
+                .panes
+                .iter()
+                .position(|pane| pane.document.as_ref().is_some_and(|d| d.path() == path))
+            else {
+                continue;
+            };
+            let tab = self.panes[index].tab;
+            self.prompt = Some(Prompt::ChangedOnDisk { tab, removed });
+        }
+        true
+    }
+
+    /// Makes the file tree show the directory of a file.
+    fn show_tree_of(&mut self, path: &Path) {
+        let Some(root) = path.parent() else {
+            return;
+        };
+        if self.tree.is_none() {
+            self.tree = Some(FileTree::new(root.to_path_buf()));
+        }
     }
 
     /// The agent's transcript so far.
@@ -240,8 +511,9 @@ impl NativeApplication {
         let size = renderer.logical_size(scale_factor);
         let body = editor_body_rect(size);
         let mut measurer = RendererMeasurer::new(renderer, TextFamily::Monospace);
-        self.view.layout(
-            self.editor.buffer(),
+        let pane = &mut self.panes[self.active];
+        pane.view.layout(
+            pane.editor.buffer(),
             body.size.width,
             body.size.height,
             &mut measurer,
@@ -268,26 +540,26 @@ impl NativeApplication {
                 LspEvent::Diagnostics { uri, diagnostics } => {
                     // The server may talk about other documents; only the one
                     // on screen is drawn.
-                    if Some(uri.as_str()) != self.document_uri.as_deref() {
+                    if Some(uri.as_str()) != self.panes[self.active].document_uri.as_deref() {
                         continue;
                     }
-                    let marks = lsp::marks_for(self.editor.buffer(), &diagnostics);
-                    self.errors = marks
+                    let marks = lsp::marks_for(self.panes[self.active].editor.buffer(), &diagnostics);
+                    self.panes[self.active].errors = marks
                         .iter()
                         .filter(|mark| mark.severity == MarkSeverity::Error)
                         .count();
-                    self.warnings = marks
+                    self.panes[self.active].warnings = marks
                         .iter()
                         .filter(|mark| mark.severity == MarkSeverity::Warning)
                         .count();
-                    self.marks = marks;
+                    self.panes[self.active].marks = marks;
                     changed = true;
                 }
                 LspEvent::Disconnected { reason } => {
                     eprintln!("the language server went away: {reason}");
                     self.status = Some(format!("语言服务器断开了：{reason}"));
                     self.server = None;
-                    self.marks.clear();
+                    self.panes[self.active].marks.clear();
                     changed = true;
                 }
                 LspEvent::Message { text } => {
@@ -300,10 +572,10 @@ impl NativeApplication {
         // The completions the server offered, with the ones that do not
         // match the word in front of the caret left out.
         for list in lists {
-            let caret = self.editor.caret().0;
-            let prefix = completion::word_before(self.editor.buffer(), caret);
+            let caret = self.panes[self.active].editor.caret().0;
+            let prefix = completion::word_before(self.panes[self.active].editor.buffer(), caret);
             let items = completion::matching(list.items, &prefix);
-            let start = completion::word_start(self.editor.buffer(), caret);
+            let start = completion::word_start(self.panes[self.active].editor.buffer(), caret);
             if let Some(popup) = CompletionPopup::new(items, start) {
                 self.completion = Some(popup);
                 changed = true;
@@ -317,20 +589,20 @@ impl NativeApplication {
     /// The server is told about every edit, so its answers are about the text
     /// that is on screen and not about the text as the file was opened.
     fn tell_server_about_the_change(&mut self) {
-        let Some(uri) = self.document_uri.clone() else {
+        let Some(uri) = self.panes[self.active].document_uri.clone() else {
             return;
         };
-        let Some(change) = self.editor.last_change() else {
+        let Some(change) = self.panes[self.active].editor.last_change() else {
             return;
         };
-        let version = self.editor.buffer().version();
-        if self.server_version == Some(version) {
+        let version = self.panes[self.active].editor.buffer().version();
+        if self.panes[self.active].server_version == Some(version) {
             // The server already knows about this text.
             return;
         }
-        let changes = lsp::changes_for(self.editor.buffer(), change);
-        let text = self.editor.text();
-        self.server_version = Some(version);
+        let changes = lsp::changes_for(self.panes[self.active].editor.buffer(), change);
+        let text = self.panes[self.active].editor.text();
+        self.panes[self.active].server_version = Some(version);
         self.server_generation += 1;
         let generation = self.server_generation;
         if let Some(server) = self.server.as_ref()
@@ -342,11 +614,13 @@ impl NativeApplication {
 
     /// Scrolls the body so that the caret is on screen.
     fn keep_caret_visible(&mut self, scale_factor: f64) {
-        let total_lines = self.editor.buffer().line_count();
+        let pane = &self.panes[self.active];
+        let total_lines = pane.editor.buffer().line_count();
         let visible = self.visible_lines(scale_factor);
-        let caret = self.editor.caret().0;
-        self.view
-            .ensure_caret_visible(self.editor.buffer(), caret, total_lines, visible);
+        let caret = pane.editor.caret().0;
+        let pane = &mut self.panes[self.active];
+        pane.view
+            .ensure_caret_visible(pane.editor.buffer(), caret, total_lines, visible);
     }
 
     /// Handles a mouse press in the editor body.
@@ -361,8 +635,9 @@ impl NativeApplication {
             return;
         }
         let add = self.modifiers.control_key();
-        self.view.press(
-            &mut self.editor,
+        let pane = &mut self.panes[self.active];
+        pane.view.press(
+            &mut pane.editor,
             cursor.x - body.origin.x,
             cursor.y - body.origin.y,
             add,
@@ -372,15 +647,16 @@ impl NativeApplication {
 
     /// Handles the mouse moving while a drag is in progress.
     fn drag_body(&mut self, scale_factor: f64) {
-        if !self.view.is_dragging() {
+        if !self.panes[self.active].view.is_dragging() {
             return;
         }
         let Some(cursor) = self.cursor else {
             return;
         };
         let body = editor_body_rect(self.window_size(scale_factor));
-        self.view.drag(
-            &mut self.editor,
+        let pane = &mut self.panes[self.active];
+        pane.view.drag(
+            &mut pane.editor,
             cursor.x - body.origin.x,
             cursor.y - body.origin.y,
         );
@@ -391,19 +667,23 @@ impl NativeApplication {
     /// When the caret is on the edge of the screen, the body scrolls first,
     /// so the caret can keep moving.
     fn move_caret_vertically(&mut self, scale_factor: f64, delta: isize) {
-        if self.view.move_vertical(&mut self.editor, delta) {
-            return;
+        {
+            let pane = &mut self.panes[self.active];
+            if pane.view.move_vertical(&mut pane.editor, delta) {
+                return;
+            }
         }
-        let total_lines = self.editor.buffer().line_count();
-        self.view.scroll(delta, total_lines);
+        let total_lines = self.panes[self.active].editor.buffer().line_count();
+        self.panes[self.active].view.scroll(delta, total_lines);
         self.rebuild_layout(scale_factor);
-        self.view.move_vertical(&mut self.editor, delta);
+        let pane = &mut self.panes[self.active];
+        pane.view.move_vertical(&mut pane.editor, delta);
     }
 
     /// Scrolls the body by a number of lines.
     fn scroll_body(&mut self, lines: isize) {
-        let total_lines = self.editor.buffer().line_count();
-        self.view.scroll(lines, total_lines);
+        let total_lines = self.panes[self.active].editor.buffer().line_count();
+        self.panes[self.active].view.scroll(lines, total_lines);
     }
 
     /// Scrolls the body the way the wheel was turned.
@@ -500,7 +780,7 @@ impl NativeApplication {
                     return true;
                 }
                 Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
-                    if let Err(error) = completion.apply(&mut self.editor) {
+                    if let Err(error) = completion.apply(&mut self.panes[self.active].editor) {
                         eprintln!("could not put the completion in: {error}");
                     }
                     return true;
@@ -522,11 +802,11 @@ impl NativeApplication {
 
     /// Asks the server what could come next at the caret.
     fn request_completion(&mut self) {
-        let Some(uri) = self.document_uri.clone() else {
+        let Some(uri) = self.panes[self.active].document_uri.clone() else {
             return;
         };
-        let caret = self.editor.caret().0;
-        let position = lsp::position_of(self.editor.buffer(), caret);
+        let caret = self.panes[self.active].editor.caret().0;
+        let position = lsp::position_of(self.panes[self.active].editor.buffer(), caret);
         let outcome = self
             .server
             .as_ref()
@@ -588,10 +868,10 @@ impl NativeApplication {
             }
             Key::Named(NamedKey::Enter) => {
                 if self.modifiers.control_key() && self.modifiers.alt_key() {
-                    let count = find.replace_all(&mut self.editor);
+                    let count = find.replace_all(&mut self.panes[self.active].editor);
                     self.status = Some(format!("替换了 {count} 处"));
                 } else if self.modifiers.alt_key() {
-                    let count = find.select_all_matches(&mut self.editor);
+                    let count = find.select_all_matches(&mut self.panes[self.active].editor);
                     self.status = Some(format!("选中了 {count} 处"));
                 } else if self.modifiers.shift_key() {
                     find.previous_match();
@@ -600,20 +880,20 @@ impl NativeApplication {
                 }
             }
             Key::Named(NamedKey::Tab) => find.toggle_field(),
-            Key::Named(NamedKey::Backspace) => find.backspace(&self.editor),
-            Key::Named(NamedKey::Space) => find.type_text(&self.editor, " "),
+            Key::Named(NamedKey::Backspace) => find.backspace(&self.panes[self.active].editor),
+            Key::Named(NamedKey::Space) => find.type_text(&self.panes[self.active].editor, " "),
             Key::Character(character) if !self.modifiers.control_key() => {
                 let character = character.as_ref();
                 if character.chars().any(char::is_control) {
                     // The key did not produce text of its own; the text of
                     // the event is what the user typed.
                     if let Some(typed) = text.filter(|typed| !typed.chars().any(char::is_control)) {
-                        find.type_text(&self.editor, typed);
+                        find.type_text(&self.panes[self.active].editor, typed);
                     } else {
                         handled = false;
                     }
                 } else {
-                    find.type_text(&self.editor, character);
+                    find.type_text(&self.panes[self.active].editor, character);
                 }
             }
             _ => {
@@ -629,7 +909,7 @@ impl NativeApplication {
     /// Opens the find bar and searches for what the editor has selected.
     fn open_find(&mut self, replacing: bool) {
         let mut find = self.find.take().unwrap_or_default();
-        find.open(&mut self.editor, replacing);
+        find.open(&mut self.panes[self.active].editor, replacing);
         self.find = Some(find);
     }
 
@@ -639,8 +919,8 @@ impl NativeApplication {
     /// find bar can be looked at without a keyboard.
     pub fn open_find_with(&mut self, query: &str) {
         let mut find = self.find.take().unwrap_or_default();
-        find.open(&mut self.editor, false);
-        find.type_text(&self.editor, query);
+        find.open(&mut self.panes[self.active].editor, false);
+        find.type_text(&self.panes[self.active].editor, query);
         self.find = Some(find);
     }
 
@@ -655,9 +935,9 @@ impl NativeApplication {
     /// The status line: the open file, whether it changed, and the last
     /// message.
     fn status_line(&self) -> String {
-        let mut status = match self.document.as_ref() {
+        let mut status = match self.panes[self.active].document.as_ref() {
             Some(document) => {
-                let dirty = if document.is_dirty(&self.editor.text()) {
+                let dirty = if document.is_dirty(&self.panes[self.active].editor.text()) {
                     " ●"
                 } else {
                     ""
@@ -668,8 +948,8 @@ impl NativeApplication {
         };
         // What the language server found wrong is counted, so that the user
         // knows there is something to look at.
-        if self.errors > 0 || self.warnings > 0 {
-            status.push_str(&format!("  ·  ✕ {}  ⚠ {}", self.errors, self.warnings));
+        if self.panes[self.active].errors > 0 || self.panes[self.active].warnings > 0 {
+            status.push_str(&format!("  ·  ✕ {}  ⚠ {}", self.panes[self.active].errors, self.panes[self.active].warnings));
         }
         if let Some(message) = self.status.as_ref() {
             status.push_str(&format!("  ·  {message}"));
@@ -679,12 +959,12 @@ impl NativeApplication {
 
     /// Writes the buffer back to the open file.
     fn save_document(&mut self) {
-        let Some(mut document) = self.document.take() else {
+        let Some(mut document) = self.panes[self.active].document.take() else {
             self.status = Some("没有打开的文件".to_owned());
             return;
         };
 
-        let text = self.editor.text();
+        let text = self.panes[self.active].editor.text();
         match self.workspace.save(&mut document, &text) {
             Ok(()) => {
                 self.status = Some(format!("已保存 {}", document.display_path()));
@@ -694,12 +974,12 @@ impl NativeApplication {
                 eprintln!("could not save the document: {error}");
             }
         }
-        self.document = Some(document);
+        self.panes[self.active].document = Some(document);
     }
 
     /// Starts an agent turn with the editor's current text as the prompt.
     pub fn start_agent_turn(&mut self) {
-        let prompt = self.editor.text();
+        let prompt = self.panes[self.active].editor.text();
         if prompt.trim().is_empty() {
             self.agent_error =
                 Some("the buffer is empty, so there is nothing to ask about".to_owned());
@@ -717,7 +997,7 @@ impl NativeApplication {
             };
             // The agent works in the directory of the open file, so its
             // context is the file the user is actually looking at.
-            if let Some(document) = self.document.as_ref()
+            if let Some(document) = self.panes[self.active].document.as_ref()
                 && let Some(directory) = document.path().parent()
             {
                 settings.cwd = directory.to_path_buf();
@@ -822,8 +1102,8 @@ impl ApplicationHandler for NativeApplication {
                         // While the find bar is open, the composed text goes
                         // into the bar instead of the document.
                         if let Some(find) = self.find.as_mut() {
-                            find.type_text(&self.editor, &text);
-                        } else if let Err(error) = self.editor.insert(&text) {
+                            find.type_text(&self.panes[self.active].editor, &text);
+                        } else if let Err(error) = self.panes[self.active].editor.insert(&text) {
                             eprintln!("failed to commit IME text: {error}");
                         }
                         self.input.finish_commit();
@@ -846,7 +1126,7 @@ impl ApplicationHandler for NativeApplication {
                     let scale_factor = window.scale_factor();
                     match state {
                         ElementState::Pressed => self.press_body(scale_factor),
-                        ElementState::Released => self.view.release(),
+                        ElementState::Released => self.panes[self.active].view.release(),
                     }
                     window.request_redraw();
                 }
@@ -889,46 +1169,52 @@ impl ApplicationHandler for NativeApplication {
                 // to be current before the caret is moved.
                 self.rebuild_layout(scale_factor);
                 let result = match event.logical_key.as_ref() {
-                    Key::Named(NamedKey::Backspace) => self.editor.backspace(),
-                    Key::Named(NamedKey::Delete) => self.editor.delete_forward(),
+                    Key::Named(NamedKey::Backspace) => self.panes[self.active].editor.backspace(),
+                    Key::Named(NamedKey::Delete) => self.panes[self.active].editor.delete_forward(),
                     Key::Named(NamedKey::ArrowLeft) if self.modifiers.shift_key() => {
-                        self.editor.extend_left();
+                        self.panes[self.active].editor.extend_left();
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowRight) if self.modifiers.shift_key() => {
-                        self.editor.extend_right();
+                        self.panes[self.active].editor.extend_right();
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowUp) if self.modifiers.shift_key() => {
-                        self.view.extend_vertical(&mut self.editor, -1);
+                        let pane = &mut self.panes[self.active];
+                        pane.view.extend_vertical(&mut pane.editor, -1);
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowDown) if self.modifiers.shift_key() => {
-                        self.view.extend_vertical(&mut self.editor, 1);
+                        let pane = &mut self.panes[self.active];
+                        pane.view.extend_vertical(&mut pane.editor, 1);
                         Ok(())
                     }
                     Key::Named(NamedKey::Home) if self.modifiers.shift_key() => {
-                        self.view.extend_to_line_edge(&mut self.editor, false);
+                        let pane = &mut self.panes[self.active];
+                        pane.view.extend_to_line_edge(&mut pane.editor, false);
                         Ok(())
                     }
                     Key::Named(NamedKey::End) if self.modifiers.shift_key() => {
-                        self.view.extend_to_line_edge(&mut self.editor, true);
+                        let pane = &mut self.panes[self.active];
+                        pane.view.extend_to_line_edge(&mut pane.editor, true);
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowLeft) => {
-                        self.editor.move_left();
+                        self.panes[self.active].editor.move_left();
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowRight) => {
-                        self.editor.move_right();
+                        self.panes[self.active].editor.move_right();
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowUp) if self.modifiers.alt_key() => {
-                        self.view.add_cursor_vertically(&mut self.editor, -1);
+                        let pane = &mut self.panes[self.active];
+                        pane.view.add_cursor_vertically(&mut pane.editor, -1);
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowDown) if self.modifiers.alt_key() => {
-                        self.view.add_cursor_vertically(&mut self.editor, 1);
+                        let pane = &mut self.panes[self.active];
+                        pane.view.add_cursor_vertically(&mut pane.editor, 1);
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowUp) => {
@@ -940,34 +1226,36 @@ impl ApplicationHandler for NativeApplication {
                         Ok(())
                     }
                     Key::Named(NamedKey::Escape) => {
-                        self.editor.collapse_to_primary();
+                        self.panes[self.active].editor.collapse_to_primary();
                         Ok(())
                     }
                     Key::Named(NamedKey::Home) => {
-                        self.view.move_to_line_edge(&mut self.editor, false);
+                        let pane = &mut self.panes[self.active];
+                        pane.view.move_to_line_edge(&mut pane.editor, false);
                         Ok(())
                     }
                     Key::Named(NamedKey::End) => {
-                        self.view.move_to_line_edge(&mut self.editor, true);
+                        let pane = &mut self.panes[self.active];
+                        pane.view.move_to_line_edge(&mut pane.editor, true);
                         Ok(())
                     }
-                    Key::Named(NamedKey::Enter) => self.editor.insert("\n"),
+                    Key::Named(NamedKey::Enter) => self.panes[self.active].editor.insert("\n"),
                     Key::Character(character)
                         if self.modifiers.control_key() && character.eq_ignore_ascii_case("z") =>
                     {
-                        self.editor.undo()
+                        self.panes[self.active].editor.undo()
                     }
                     Key::Character(character)
                         if self.modifiers.control_key() && character.eq_ignore_ascii_case("y") =>
                     {
-                        self.editor.redo()
+                        self.panes[self.active].editor.redo()
                     }
                     _ if self.input.preedit().is_empty()
                         && !self.modifiers.control_key()
                         && let Some(text) = event.text
                         && !text.chars().any(char::is_control) =>
                     {
-                        self.editor.insert(&text)
+                        self.panes[self.active].editor.insert(&text)
                     }
                     _ => Ok(()),
                 };
@@ -999,25 +1287,37 @@ impl ApplicationHandler for NativeApplication {
                 if self.pump_lsp() {
                     window.request_redraw();
                 }
+                // The highlighter answers on its own thread as well. The
+                // answer belongs to a version of the text: an answer that
+                // arrives after the text changed again is dropped.
+                if self.pump_syntax() {
+                    window.request_redraw();
+                }
+                // The files on disk are looked at now and then, so a file
+                // that changed behind the editor's back is noticed.
+                if self.poll_disk() {
+                    window.request_redraw();
+                }
                 // The status line is read before the renderer is borrowed.
                 let status_line = self.status_line();
                 let scale_factor = window.scale_factor();
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
                 };
+                let pane = &mut self.panes[self.active];
                 let scene = build_scene(
                     renderer,
                     renderer.logical_size(scale_factor),
-                    &self.editor,
+                    &pane.editor,
                     &self.input,
-                    &mut self.view,
-                    &mut self.syntax,
+                    &mut pane.view,
+                    &pane.highlights,
                     Chrome {
                         agent: self.agent.as_ref(),
                         agent_error: self.agent_error.as_deref(),
                         status_line,
                         find: self.find.as_ref(),
-                        marks: &self.marks,
+                        marks: &pane.marks,
                         completion: self.completion.as_ref(),
                     },
                 );
@@ -1076,7 +1376,7 @@ fn build_scene(
     editor_state: &Editor,
     input: &TextInputState,
     view: &mut EditorView,
-    syntax: &mut Syntax,
+    highlights: &[Highlight],
     chrome: Chrome<'_>,
 ) -> FrameScene {
     let viewport = Rect::new(0.0, 0.0, size.width, size.height);
@@ -1109,12 +1409,10 @@ fn build_scene(
             &mut measurer,
         );
 
-        // The tree of the text is parsed again when the text changed, and
-        // the highlights are made for the text that is on screen.
-        let change = editor_state.last_change();
-        syntax.update(editor_state.buffer(), change);
+        // The highlights were made on the highlighter's own thread; they are
+        // the ones that belong to the text that is on screen.
         let visible = view.visible_range();
-        let highlights = syntax.highlights(editor_state.buffer(), visible);
+        let highlights = highlights;
 
         scene.push_quad(
             Rect::new(0.0, 0.0, 40.0, size.height),

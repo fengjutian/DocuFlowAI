@@ -313,6 +313,7 @@ dependencies = [
  "codeweaver-syntax",
  "codeweaver-text",
  "codeweaver-ui",
+ "codeweaver-workbench",
  "codeweaver-workspace",
  "pollster",
  "serde_json",
@@ -361,6 +362,10 @@ version = "0.3.0"
 dependencies = [
  "codeweaver-text",
 ]
+
+[[package]]
+name = "codeweaver-workbench"
+version = "0.3.0"
 
 [[package]]
 name = "codeweaver-workspace"

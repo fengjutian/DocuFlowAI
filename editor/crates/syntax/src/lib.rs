@@ -15,6 +15,8 @@
 
 pub mod highlight;
 pub mod language;
+pub mod policy;
+pub mod worker;
 
 use std::ops::Range;
 
@@ -23,6 +25,8 @@ use tree_sitter::{InputEdit, Node, Parser, Point, Query, QueryCursor, StreamingI
 
 pub use highlight::{Highlight, HighlightKind};
 pub use language::Language;
+pub use policy::HighlightPolicy;
+pub use worker::{Outcome, SyntaxWorker};
 
 /// The syntax tree of a document, and the highlights it gives.
 pub struct Syntax {
@@ -36,6 +40,10 @@ pub struct Syntax {
     highlights: Vec<Highlight>,
     /// The range that the highlights cover.
     computed: Option<Range<usize>>,
+    /// The sizes at which the highlighter gives up.
+    policy: HighlightPolicy,
+    /// Whether the document is too big to be highlighted.
+    degraded: bool,
 }
 
 impl Default for Syntax {
@@ -54,12 +62,47 @@ impl Syntax {
             version: None,
             highlights: Vec::new(),
             computed: None,
+            policy: HighlightPolicy::default(),
+            degraded: false,
         }
     }
 
     /// The language that is highlighted, if any.
     pub fn language(&self) -> Option<Language> {
         self.language
+    }
+
+    /// The sizes at which the highlighter gives up.
+    pub fn policy(&self) -> &HighlightPolicy {
+        &self.policy
+    }
+
+    /// Sets the sizes at which the highlighter gives up.
+    ///
+    /// A document that is already degraded is looked at again with the new
+    /// policy, so lowering the limit takes effect without reopening the file.
+    pub fn set_policy(&mut self, policy: HighlightPolicy) {
+        self.policy = policy;
+    }
+
+    /// Whether the document is too big to be highlighted.
+    ///
+    /// A degraded document is still perfectly editable — it is only the
+    /// colours that are missing.
+    pub fn is_degraded(&self) -> bool {
+        self.degraded
+    }
+
+    /// Gives up on the document: the tree and the highlights are dropped.
+    ///
+    /// The highlighter is not in a broken state afterwards; it simply has
+    /// nothing to say about this text.
+    pub fn degrade(&mut self) {
+        self.tree = None;
+        self.version = None;
+        self.highlights.clear();
+        self.computed = None;
+        self.degraded = true;
     }
 
     /// Sets the language that is highlighted.
@@ -117,6 +160,14 @@ impl Syntax {
             self.computed = None;
             return false;
         }
+        // A document that is too big is not parsed at all. The parse is linear
+        // in the size of the text, and a file that big costs more than a frame
+        // is allowed to take.
+        if !self.policy.allows(buffer.len().0, buffer.line_count()) {
+            self.degrade();
+            return false;
+        }
+        self.degraded = false;
         if self.version == Some(buffer.version()) {
             return false;
         }
@@ -156,13 +207,52 @@ impl Syntax {
     /// has to be parsed first with [`Syntax::update`].
     pub fn highlights(&mut self, buffer: &Buffer, range: Range<usize>) -> &[Highlight] {
         if self.computed.as_ref() != Some(&range) {
-            self.compute(buffer, range);
+            self.compute(NodeText { buffer }, range);
+        }
+        &self.highlights
+    }
+
+    /// Parses a plain text and keeps the tree.
+    ///
+    /// This is the way the background highlighter works: it is given the text
+    /// of the document rather than the buffer, because the buffer lives on the
+    /// thread that draws the picture.
+    ///
+    /// Returns `true` when the document was parsed again. A text that has the
+    /// same version as the last parse is not parsed again — that is the case
+    /// of a scroll, where only the range that is asked for changes.
+    pub fn parse_text(&mut self, text: &str, version: BufferVersion, lines: usize) -> bool {
+        if !self.policy.allows(text.len(), lines) {
+            self.degrade();
+            return false;
+        }
+        self.degraded = false;
+        if self.version == Some(version) {
+            return false;
+        }
+        let tree = self.parser.parse(text.as_bytes(), None);
+        self.tree = tree;
+        self.version = Some(version);
+        self.highlights.clear();
+        self.computed = None;
+        true
+    }
+
+    /// The highlights of the byte range of a plain text.
+    ///
+    /// The text has to be parsed first with [`Syntax::parse_text`].
+    pub fn highlights_of_text(&mut self, text: &str, range: Range<usize>) -> &[Highlight] {
+        if self.computed.as_ref() != Some(&range) {
+            self.compute(NodeTextStr { text }, range);
         }
         &self.highlights
     }
 
     /// Makes the highlights of the byte range.
-    fn compute(&mut self, buffer: &Buffer, range: Range<usize>) {
+    fn compute<'a, T>(&mut self, provider: T, range: Range<usize>)
+    where
+        T: tree_sitter::TextProvider<&'a [u8]>,
+    {
         self.highlights.clear();
         self.computed = Some(range.clone());
         let Some(query) = self.query.as_ref() else {
@@ -174,7 +264,7 @@ impl Syntax {
 
         let mut cursor = QueryCursor::new();
         cursor.set_byte_range(range);
-        let mut captures = cursor.captures(query, tree.root_node(), NodeText { buffer });
+        let mut captures = cursor.captures(query, tree.root_node(), provider);
 
         let mut found: Vec<Candidate> = Vec::new();
         while let Some((matched, index)) = captures.next() {
@@ -320,6 +410,29 @@ impl<'a> tree_sitter::TextProvider<&'a [u8]> for NodeText<'a> {
             let take = piece.len().min(end - offset);
             pieces.push(&piece[..take]);
             offset += take;
+        }
+        pieces.into_iter()
+    }
+}
+
+/// Hands the text of a node to a query, when the text is a plain string.
+///
+/// The background highlighter is given the text of the document rather than
+/// the buffer, so it needs a text provider of its own.
+struct NodeTextStr<'a> {
+    text: &'a str,
+}
+
+impl<'a> tree_sitter::TextProvider<&'a [u8]> for NodeTextStr<'a> {
+    type I = std::vec::IntoIter<&'a [u8]>;
+
+    fn text(&mut self, node: Node) -> Self::I {
+        let bytes = self.text.as_bytes();
+        let start = node.start_byte().min(bytes.len());
+        let end = node.end_byte().min(bytes.len());
+        let mut pieces = Vec::new();
+        if start < end {
+            pieces.push(&bytes[start..end]);
         }
         pieces.into_iter()
     }
@@ -489,5 +602,80 @@ mod tests {
         let text = buffer.text();
         let kinds = kinds_of(&mut syntax, &text);
         assert!(kinds.iter().any(|(word, _)| word == "let"));
+    }
+
+    #[test]
+    fn the_policy_limits_the_size_and_the_number_of_lines() {
+        let policy = HighlightPolicy {
+            max_bytes: 100,
+            max_lines: 10,
+        };
+        assert!(policy.allows(100, 10));
+        assert!(!policy.allows(101, 10), "the size limit has to hold");
+        assert!(!policy.allows(100, 11), "the line limit has to hold");
+        assert!(HighlightPolicy::unlimited().allows(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn a_document_that_is_too_big_is_not_parsed() {
+        let mut syntax = syntax_of(Language::Rust);
+        syntax.set_policy(HighlightPolicy {
+            max_bytes: 10,
+            max_lines: 1_000,
+        });
+        let text = "fn main() { let x = 1; }\n";
+        let buffer = Buffer::new(text);
+
+        assert!(!syntax.update(&buffer, None), "a big document is not parsed");
+        assert!(syntax.is_degraded());
+        assert!(
+            syntax.highlights(&buffer, 0..buffer.len().0).is_empty(),
+            "a degraded document has no highlights to draw"
+        );
+    }
+
+    #[test]
+    fn a_degraded_document_is_highlighted_again_when_the_policy_allows_it() {
+        let mut syntax = syntax_of(Language::Rust);
+        syntax.set_policy(HighlightPolicy {
+            max_bytes: 1,
+            max_lines: 1,
+        });
+        let buffer = Buffer::new("fn main() {}\n");
+        syntax.update(&buffer, None);
+        assert!(syntax.is_degraded());
+
+        syntax.set_policy(HighlightPolicy::unlimited());
+        syntax.update(&buffer, None);
+        assert!(!syntax.is_degraded());
+        assert!(!syntax.highlights(&buffer, 0..buffer.len().0).is_empty());
+    }
+
+    #[test]
+    fn parsing_a_plain_text_gives_the_same_highlights_as_the_buffer() {
+        let text = "fn main() { let x = 1; }\n";
+
+        let mut from_buffer = syntax_of(Language::Rust);
+        let expected = kinds_of(&mut from_buffer, text);
+
+        let mut from_text = syntax_of(Language::Rust);
+        from_text.parse_text(text, 1, 1);
+        let actual: Vec<(String, HighlightKind)> = from_text
+            .highlights_of_text(text, 0..text.len())
+            .iter()
+            .map(|highlight| (text[highlight.range.clone()].to_owned(), highlight.kind))
+            .collect();
+
+        assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn a_text_that_has_not_changed_is_not_parsed_again() {
+        let mut syntax = syntax_of(Language::Rust);
+        let text = "fn main() {}\n";
+        assert!(syntax.parse_text(text, 7, 1));
+        // The same version is a scroll, not an edit.
+        assert!(!syntax.parse_text(text, 7, 1));
+        assert!(syntax.parse_text(text, 8, 1));
     }
 }

@@ -8,6 +8,16 @@
 //! the text it was loaded with, and a fingerprint of the file as it was on
 //! disk. The fingerprint is what stops the editor from silently overwriting a
 //! file that something else changed in the meantime.
+//!
+//! Two models sit next to it: [`FileTree`], the tree of the workspace that
+//! the file panel draws, and [`ChangeDetector`], which reports the files that
+//! changed on disk while they were open.
+
+pub mod tree;
+pub mod watch;
+
+pub use tree::{FileTree, NodeKind, TreeNode};
+pub use watch::{ChangeDetector, ExternalChange};
 
 use std::{
     fs,

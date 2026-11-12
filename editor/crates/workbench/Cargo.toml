@@ -1,0 +1,9 @@
+[package]
+name = "codeweaver-workbench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The tab strip and session model of the CodeWeaver editor."
+
+[dependencies]

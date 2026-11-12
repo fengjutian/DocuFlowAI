@@ -15,6 +15,7 @@ codeweaver-render = { path = "../render" }
 codeweaver-syntax = { path = "../syntax" }
 codeweaver-text = { path = "../text" }
 codeweaver-ui = { path = "../ui" }
+codeweaver-workbench = { path = "../workbench" }
 codeweaver-workspace = { path = "../workspace" }
 pollster.workspace = true
 wgpu.workspace = true
