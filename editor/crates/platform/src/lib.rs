@@ -456,12 +456,10 @@ impl ApplicationHandler for NativeApplication {
                     x: position.x as f32 / scale_factor as f32,
                     y: position.y as f32 / scale_factor as f32,
                 });
-                eprintln!("cursor moved to {:?}", self.cursor);
                 self.drag_body(scale_factor);
                 window.request_redraw();
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                eprintln!("mouse input {button:?} {state:?}");
                 if button == MouseButton::Left {
                     let scale_factor = window.scale_factor();
                     match state {
