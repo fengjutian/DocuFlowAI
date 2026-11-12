@@ -18,6 +18,15 @@ export interface AcpBackendDefaults {
   policySnapshotId: string;
   allowedTools?: string[];
   timeoutSeconds?: number;
+  /**
+   * The runtime an editor session runs on.
+   *
+   * The editor is a client of CodeWeaver, not a runtime of its own: without a name, the task would
+   * land on whatever the server happens to default to, and the product's primary runtime (D-060)
+   * would be unreachable from the editor. "auto" asks the scheduler for a healthy one; any other
+   * id names one exactly.
+   */
+  runtimeId?: string;
 }
 
 export interface AcpPermissionOption {
@@ -103,7 +112,8 @@ export function createCodeWeaverAcpBackend(options: CodeWeaverAcpBackendOptions)
         modelConfig: {},
         correlationId: taskInput.correlationId,
         timeoutSeconds: timeout,
-        allowedTools: taskInput.allowedTools
+        allowedTools: taskInput.allowedTools,
+        ...(options.defaults.runtimeId ? { runtimeId: options.defaults.runtimeId } : {})
       });
       return result.execution;
     } catch (error) {

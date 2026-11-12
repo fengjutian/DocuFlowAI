@@ -57,7 +57,11 @@ function adapter(): AgentRuntimeAdapter {
   };
 }
 
-async function harness(repo: string, storeRoot: string) {
+async function harness(
+  repo: string,
+  storeRoot: string,
+  overrides: { runtimeId?: string; resolveRuntime?: (id: string) => AgentRuntimeAdapter | undefined } = {}
+) {
   const git = new SpawnGitRunner();
   const stores = {
     contextSnapshots: new ImmutableRecordStore<ContextSnapshotRecord>(storeRoot, "contexts", assertContextSnapshot),
@@ -74,13 +78,20 @@ async function harness(repo: string, storeRoot: string) {
     coordinator,
     changes: new CodeChangePipeline(git, worktrees),
     stores,
-    traceability: new TraceabilityQuery(stores, journal)
+    traceability: new TraceabilityQuery(stores, journal),
+    ...(overrides.resolveRuntime ? { resolveRuntime: overrides.resolveRuntime } : {})
   });
 
   const warnings: string[] = [];
   const backend = createCodeWeaverAcpBackend({
     coordinator,
-    defaults: { projectId: "zed", contextSnapshotId: "ctx", policySnapshotId: "pol", timeoutSeconds: 5 },
+    defaults: {
+      projectId: "zed",
+      contextSnapshotId: "ctx",
+      policySnapshotId: "pol",
+      timeoutSeconds: 5,
+      ...(overrides.runtimeId ? { runtimeId: overrides.runtimeId } : {})
+    },
     idFactory: () => "sess-1",
     runIdFactory: () => "run-acp-1",
     onWarning: message => warnings.push(message),
@@ -146,8 +157,7 @@ test("acp snapshots: a prompt creates context, policy and prompt records plus au
   }
 });
 
-test("acp snapshots: a non-git cwd degrades to a journaled skip instead of a fake snapshot", async () => {
-  const plain = await mkdtemp(join(tmpdir(), "codeweaver-acp-plain-"));
+test("acp snapshots: a non-git cwd degrades to a journaled skip instead of a fake snapshot", async () => {  const plain = await mkdtemp(join(tmpdir(), "codeweaver-acp-plain-"));
   const storeRoot = await mkdtemp(join(tmpdir(), "codeweaver-acp-plain-store-"));
   try {
     const { stores, journal, backend, warnings } = await harness(plain, storeRoot);
@@ -167,6 +177,47 @@ test("acp snapshots: a non-git cwd degrades to a journaled skip instead of a fak
     assert.match(String(skipped?.payload["reason"]), /not a git repository/i);
   } finally {
     await rm(plain, { recursive: true, force: true });
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("acp: the editor session runs on the runtime it names", async () => {
+  const repo = await gitRepo();
+  const storeRoot = await mkdtemp(join(tmpdir(), "codeweaver-acp-runtime-store-"));
+  try {
+    const { journal, backend } = await harness(repo, storeRoot, {
+      runtimeId: "pi-local",
+      resolveRuntime: id => (id === "pi-local" ? adapter() : undefined)
+    });
+    const session = await backend.createSession({ cwd: repo });
+    const stopReason = await backend.prompt(session.sessionId, "do the thing", () => undefined);
+    assert.equal(stopReason, "end_turn");
+
+    // The runtime that ran is on the timeline: an editor run that lands somewhere else is a bug
+    // nobody can see.
+    const runtimeFact = (await journal.read("exec-1")).find(entry => entry.category === "execution.runtime");
+    assert.equal(runtimeFact?.payload["runtimeId"], "pi-local");
+  } finally {
+    await rm(repo, { recursive: true, force: true });
+    await rm(storeRoot, { recursive: true, force: true });
+  }
+});
+
+test("acp: a runtime that is not registered is refused, not silently replaced", async () => {
+  const repo = await gitRepo();
+  const storeRoot = await mkdtemp(join(tmpdir(), "codeweaver-acp-missing-store-"));
+  try {
+    const { backend } = await harness(repo, storeRoot, {
+      runtimeId: "no-such-runtime",
+      resolveRuntime: () => undefined
+    });
+    const session = await backend.createSession({ cwd: repo });
+    await assert.rejects(
+      () => backend.prompt(session.sessionId, "do the thing", () => undefined),
+      /no-such-runtime|Unknown runtime/
+    );
+  } finally {
+    await rm(repo, { recursive: true, force: true });
     await rm(storeRoot, { recursive: true, force: true });
   }
 });

@@ -28,6 +28,11 @@ async function main(): Promise<void> {
 
   const projectId = process.env["CODEWEAVER_ACP_PROJECT_ID"] ?? "zed";
   const timeoutSeconds = Number(process.env["CODEWEAVER_ACP_TIMEOUT_SECONDS"] ?? 300);
+  // Which runtime an editor session runs on. The product's primary runtime is Pi (D-060), so an
+  // endpoint that has one talks to that one; "auto" asks the scheduler for a healthy runtime, and
+  // any other id names one exactly (D-047). The editor is a client of CodeWeaver, not a runtime.
+  const runtimeId =
+    process.env["CODEWEAVER_ACP_RUNTIME_ID"] ?? (config.pi ? "pi-local" : "auto");
 
   const policyFor = ({ cwd, taskId }: { cwd: string; taskId: string }): PolicySnapshot => ({
     snapshotId: `pol_acp_${taskId}`,
@@ -49,7 +54,8 @@ async function main(): Promise<void> {
       contextSnapshotId: "acp-context",
       policySnapshotId: "acp-policy",
       allowedTools: ["read_file", "search_code", "generate_diff"],
-      timeoutSeconds
+      timeoutSeconds,
+      runtimeId
     },
     snapshots: { taskService: runtime.deps.taskService, policyFor },
     onWarning: message => process.stderr.write(`[acp] ${message}\n`),
