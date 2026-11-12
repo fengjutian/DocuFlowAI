@@ -1,4 +1,4 @@
-import test from "node:test";
+﻿import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -115,7 +115,8 @@ test("a task naming a disabled runtime is refused with a reason that says it is 
     assert.match(body, /disabled/);
     assert.doesNotMatch(body, /Unknown runtime/);
   } finally {
-    await app.close();
+    await app.stop();
+    await app.cleanup();
   }
 });
 
@@ -135,7 +136,8 @@ test("the configuration survives a restart of the server", async () => {
     });
     assert.equal(patched.status, 200);
   } finally {
-    await app.close();
+    // The data directory stays: the restart below runs over it.
+    await app.stop();
   }
 
   // A new process over the same data directory: this is what a restart looks like.
@@ -168,8 +170,7 @@ test("the configuration survives a restart of the server", async () => {
   } finally {
     await server.close();
     await runtime.close();
-    await rm(app.repo, { recursive: true, force: true });
-    await rm(app.dataDir, { recursive: true, force: true });
+    await app.cleanup();
   }
 });
 
@@ -237,7 +238,8 @@ test("the configuration endpoint reports the configuration and the operation rec
     const historyBody = await history.json() as { history: Array<{ action: string }> };
     assert.ok(historyBody.history.some(entry => entry.action === "default"));
   } finally {
-    await app.close();
+    await app.stop();
+    await app.cleanup();
   }
 });
 
@@ -251,7 +253,8 @@ test("a configuration change that names no field is refused", async () => {
     });
     assert.equal(response.status, 400);
   } finally {
-    await app.close();
+    await app.stop();
+    await app.cleanup();
   }
 });
 
@@ -265,6 +268,7 @@ test("a wrongly typed priority is refused", async () => {
     });
     assert.equal(response.status, 400);
   } finally {
-    await app.close();
+    await app.stop();
+    await app.cleanup();
   }
 });

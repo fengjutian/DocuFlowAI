@@ -222,7 +222,7 @@ test("disables and re-enables a registered runtime", async () => {
 
     const enabled = await fetch(`${app.url}/api/v1/runtimes/hermes-local/enable`, { method: "POST" });
     assert.equal(enabled.status, 200);
-    assert.deepEqual(await enabled.json(), { id: "hermes-local", enabled: true });
+    assert.deepEqual(await enabled.json(), { id: "hermes-local", enabled: true, runningExecutions: [] });
   } finally {
     await app.close();
   }

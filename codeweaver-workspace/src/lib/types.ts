@@ -10,7 +10,39 @@ export interface RuntimeEntry {
   runtimeType: string;
   version: string | null;
   enabled: boolean;
+  /** Scheduling tier. Only the highest tier among the candidates is eligible. */
+  priority: number;
+  /** The labels the operator attached to this runtime. */
+  tags: string[];
+  /** Whether this runtime is the one unnamed work goes to. */
+  isDefault: boolean;
   metadata: Record<string, unknown>;
+}
+
+/** The persisted configuration of the runtimes, as the server reports it. */
+export interface RuntimeConfig {
+  version: number;
+  defaultRuntimeId: string | null;
+  runtimes: Array<{
+    id: string;
+    enabled: boolean;
+    priority: number;
+    tags: string[];
+    isDefault: boolean;
+  }>;
+}
+
+/** One recorded configuration change (the operation record). */
+export interface RuntimeConfigAuditEntry {
+  id: string;
+  recordedAt: string;
+  /** Who made the change: `console`, `api` or `system`. */
+  actor: string;
+  /** What was done: `enable`, `disable`, `update`, `default` or `restore`. */
+  action: string;
+  runtimeId: string;
+  changes: Array<{ field: string; from: unknown; to: unknown }>;
+  note?: string;
 }
 
 export interface RuntimeHealth {

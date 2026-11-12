@@ -1,8 +1,9 @@
-import { Fragment, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { HeartPulse, Loader2, Server, Trophy } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { EmptyState, ErrorNotice } from "@/components/common/EmptyState";
@@ -10,7 +11,7 @@ import { StatusBadge } from "@/components/common/StatusBadge";
 import { api } from "@/lib/api";
 import { formatTime, shortId } from "@/lib/format";
 import { useApiData } from "@/hooks/useApiData";
-import type { RuntimeHealth, RuntimeScore } from "@/lib/types";
+import type { RuntimeConfigAuditEntry, RuntimeHealth, RuntimeScore } from "@/lib/types";
 
 /**
  * Runtime registry view.
@@ -22,15 +23,45 @@ import type { RuntimeHealth, RuntimeScore } from "@/lib/types";
  * The score table below is the same discipline applied to quality: the server scores the runtimes
  * from what the journal recorded, and the UI shows that verdict — including the dimensions nobody
  * could measure, which are shown as unmeasured rather than as zero.
+ *
+ * The configuration is the server's as well: the priority, the tags and the default runtime are
+ * written through the API and read back from it, and every change is on the server's operation
+ * record. The console keeps no copy of what it thinks the configuration is.
  */
+
+interface Draft {
+  priority: string;
+  tags: string;
+}
+
 export function RuntimesPage() {
   const runtimes = useApiData(() => api.listRuntimes(), []);
   const scores = useApiData(() => api.runtimeScores(), []);
+  const config = useApiData(() => api.runtimeConfig(), []);
+  const history = useApiData(() => api.runtimeConfigHistory(), []);
   const scoreReport = scores.data;
   const [health, setHealth] = useState<Record<string, RuntimeHealth>>({});
   const [checking, setChecking] = useState<string | undefined>(undefined);
   const [expanded, setExpanded] = useState<string | undefined>(undefined);
   const [updating, setUpdating] = useState<string | undefined>(undefined);
+  const [drafts, setDrafts] = useState<Record<string, Draft>>({});
+
+  // The drafts follow the server's configuration until the operator edits them: a form that keeps
+  // showing values the server no longer holds is a form that lies.
+  useEffect(() => {
+    const entries = config.data?.runtimes;
+    if (!entries) return;
+    setDrafts(current => {
+      const next: Record<string, Draft> = {};
+      for (const entry of entries) {
+        next[entry.id] = current[entry.id] ?? {
+          priority: String(entry.priority),
+          tags: entry.tags.join(", ")
+        };
+      }
+      return next;
+    });
+  }, [config.data]);
 
   const check = async (runtimeId: string) => {
     setChecking(runtimeId);
@@ -50,9 +81,59 @@ export function RuntimesPage() {
   const setEnabled = async (runtimeId: string, enabled: boolean) => {
     setUpdating(runtimeId);
     try {
-      await api.setRuntimeEnabled(runtimeId, enabled);
+      const result = await api.setRuntimeEnabled(runtimeId, enabled);
       await runtimes.refresh();
-      toast.success(`${runtimeId} 已${enabled ? "启用" : "禁用"}`);
+      await config.refresh();
+      await history.refresh();
+      const running = result.runningExecutions.length;
+      toast.success(
+        enabled
+          ? `${runtimeId} 已启用`
+          : running > 0
+            ? `${runtimeId} 已禁用，不再接新任务；${running} 个存量会话仍在运行`
+            : `${runtimeId} 已禁用，不再接新任务`
+      );
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      setUpdating(undefined);
+    }
+  };
+
+  const setDefault = async (runtimeId: string) => {
+    setUpdating(runtimeId);
+    try {
+      await api.setDefaultRuntime(runtimeId);
+      await runtimes.refresh();
+      await config.refresh();
+      await history.refresh();
+      toast.success(`未点名运行时的任务将落在 ${runtimeId}`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    } finally {
+      setUpdating(undefined);
+    }
+  };
+
+  const saveDraft = async (runtimeId: string) => {
+    const draft = drafts[runtimeId];
+    if (!draft) return;
+    const priority = Number(draft.priority);
+    if (!Number.isFinite(priority)) {
+      toast.error("优先级必须是数字");
+      return;
+    }
+    const tags = draft.tags
+      .split(",")
+      .map(tag => tag.trim())
+      .filter(tag => tag !== "");
+    setUpdating(runtimeId);
+    try {
+      await api.updateRuntime(runtimeId, { priority, tags });
+      await runtimes.refresh();
+      await config.refresh();
+      await history.refresh();
+      toast.success(`${runtimeId} 的配置已保存`);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
     } finally {
@@ -66,7 +147,8 @@ export function RuntimesPage() {
         <CardHeader>
           <CardTitle className="text-base">Runtime Registry</CardTitle>
           <CardDescription>
-            运行时由后端注册与探活；前端只发起检查并展示服务端结论。
+            运行时由后端注册与探活；前端只发起检查并展示服务端结论。禁用只停止接新任务，
+            已经在跑的会话仍然保留。
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -86,6 +168,9 @@ export function RuntimesPage() {
                   <TableHead>类型</TableHead>
                   <TableHead>版本</TableHead>
                   <TableHead>状态</TableHead>
+                  <TableHead>优先级</TableHead>
+                  <TableHead>标签</TableHead>
+                  <TableHead>默认</TableHead>
                   <TableHead>健康</TableHead>
                   <TableHead>探活时间</TableHead>
                   <TableHead className="text-right">操作</TableHead>
@@ -103,6 +188,13 @@ export function RuntimesPage() {
                       </TableCell>
                       <TableCell>
                         <StatusBadge status={runtime.enabled ? "healthy" : "disabled"} />
+                      </TableCell>
+                      <TableCell className="text-xs tabular-nums">{runtime.priority}</TableCell>
+                      <TableCell className="text-xs text-muted-foreground">
+                        {runtime.tags.length > 0 ? runtime.tags.join(", ") : "-"}
+                      </TableCell>
+                      <TableCell className="text-xs">
+                        {runtime.isDefault ? <StatusBadge status="default" /> : "-"}
                       </TableCell>
                       <TableCell>
                         {report ? (
@@ -137,6 +229,15 @@ export function RuntimesPage() {
                           <Button
                             size="sm"
                             variant="ghost"
+                            disabled={updating === runtime.id || runtime.isDefault}
+                            title={runtime.isDefault ? "已经是默认运行时" : "设为默认运行时"}
+                            onClick={() => void setDefault(runtime.id)}
+                          >
+                            设为默认
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
                             disabled={updating === runtime.id}
                             onClick={() => void setEnabled(runtime.id, !runtime.enabled)}
                           >
@@ -144,6 +245,90 @@ export function RuntimesPage() {
                             {runtime.enabled ? "禁用" : "启用"}
                           </Button>
                         </div>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          ) : null}
+        </CardContent>
+      </Card>
+
+      <Card className="border-border/70 bg-card/60">
+        <CardHeader>
+          <CardTitle className="text-base">运行时配置</CardTitle>
+          <CardDescription>
+            配置写在服务端磁盘上，重启后自动恢复。优先级分层：只有最高层参与调度；未配置默认运行时时按策略均衡。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {config.error ? <ErrorNotice error={config.error} onRetry={config.refresh} /> : null}
+          {config.loading ? <p className="text-sm text-muted-foreground">读取中…</p> : null}
+
+          {config.data && config.data.runtimes.length === 0 ? (
+            <EmptyState icon={Server} title="没有可配置的运行时" />
+          ) : null}
+
+          {config.data && config.data.runtimes.length > 0 ? (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>运行时</TableHead>
+                  <TableHead className="w-32">优先级</TableHead>
+                  <TableHead>标签</TableHead>
+                  <TableHead className="text-right">操作</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {config.data.runtimes.map(entry => {
+                  const draft = drafts[entry.id] ?? { priority: String(entry.priority), tags: entry.tags.join(", ") };
+                  return (
+                    <TableRow key={entry.id}>
+                      <TableCell className="font-mono text-xs">
+                        {entry.id}
+                        {entry.isDefault ? (
+                          <span className="ml-2 text-muted-foreground">默认</span>
+                        ) : null}
+                        {!entry.enabled ? (
+                          <span className="ml-2 text-muted-foreground">已禁用</span>
+                        ) : null}
+                      </TableCell>
+                      <TableCell>
+                        <Input
+                          className="h-8 text-xs"
+                          value={draft.priority}
+                          onChange={event =>
+                            setDrafts(current => ({
+                              ...current,
+                              [entry.id]: { ...draft, priority: event.target.value }
+                            }))
+                          }
+                        />
+                      </TableCell>
+                      <TableCell>
+                        <Input
+                          className="h-8 text-xs"
+                          placeholder="逗号分隔"
+                          value={draft.tags}
+                          onChange={event =>
+                            setDrafts(current => ({
+                              ...current,
+                              [entry.id]: { ...draft, tags: event.target.value }
+                            }))
+                          }
+                        />
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={updating === entry.id}
+                          onClick={() => void saveDraft(entry.id)}
+                        >
+                          {updating === entry.id ? <Loader2 className="size-4 animate-spin" /> : null}
+                          保存
+                        </Button>
                       </TableCell>
                     </TableRow>
                   );
@@ -264,6 +449,52 @@ export function RuntimesPage() {
 
       <Card className="border-border/70 bg-card/60">
         <CardHeader>
+          <CardTitle className="text-base">配置操作记录</CardTitle>
+          <CardDescription>
+            每次配置变更都记在服务端的追加式日志里：谁改的、哪个运行时、改了什么。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {history.error ? <ErrorNotice error={history.error} onRetry={history.refresh} /> : null}
+          {history.loading ? <p className="text-sm text-muted-foreground">读取中…</p> : null}
+
+          {history.data && history.data.history.length === 0 ? (
+            <EmptyState icon={Server} title="还没有配置变更记录" />
+          ) : null}
+
+          {history.data && history.data.history.length > 0 ? (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>时间</TableHead>
+                  <TableHead>操作者</TableHead>
+                  <TableHead>动作</TableHead>
+                  <TableHead>运行时</TableHead>
+                  <TableHead>变更</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {history.data.history.map(entry => (
+                  <TableRow key={entry.id}>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {formatTime(entry.recordedAt)}
+                    </TableCell>
+                    <TableCell className="text-xs">{entry.actor}</TableCell>
+                    <TableCell className="text-xs">{describeAction(entry.action)}</TableCell>
+                    <TableCell className="font-mono text-xs">{entry.runtimeId}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {describeChanges(entry)}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          ) : null}
+        </CardContent>
+      </Card>
+
+      <Card className="border-border/70 bg-card/60">
+        <CardHeader>
           <CardTitle className="text-base">Runtime 元数据</CardTitle>
           <CardDescription>注册时携带的原始元数据，用于排查适配器配置问题。</CardDescription>
         </CardHeader>
@@ -340,4 +571,35 @@ function ScoreDetail({ score }: { score: RuntimeScore }) {
 function formatRate(value: number | null): string {
   if (value === null) return "未测量";
   return `${(value * 100).toFixed(0)}%`;
+}
+
+function describeAction(action: string): string {
+  switch (action) {
+    case "enable":
+      return "启用";
+    case "disable":
+      return "禁用";
+    case "update":
+      return "修改配置";
+    case "default":
+      return "设置默认运行时";
+    case "restore":
+      return "启动恢复";
+    default:
+      return action;
+  }
+}
+
+/** The before/after values of one change, in a form an operator can read at a glance. */
+function describeChanges(entry: RuntimeConfigAuditEntry): string {
+  if (entry.changes.length === 0) return entry.note ?? "-";
+  return entry.changes
+    .map(change => `${change.field}: ${formatValue(change.from)} → ${formatValue(change.to)}`)
+    .join("; ");
+}
+
+function formatValue(value: unknown): string {
+  if (value === null || value === undefined) return "无";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
 }

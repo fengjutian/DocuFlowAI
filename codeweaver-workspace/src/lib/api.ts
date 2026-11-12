@@ -12,6 +12,8 @@ import type {
   ResumeResponse,
   RetryResponse,
   RuntimeEntry,
+  RuntimeConfig,
+  RuntimeConfigAuditEntry,
   RuntimeHealth,
   RuntimePermissionRequest,
   RuntimeScoreReport,
@@ -105,10 +107,39 @@ export const api = {
     }),
 
   setRuntimeEnabled: (runtimeId: string, enabled: boolean) =>
-    request<{ id: string; enabled: boolean }>(
+    request<{ id: string; enabled: boolean; runningExecutions: string[] }>(
       `/api/v1/runtimes/${encodeURIComponent(runtimeId)}/${enabled ? "enable" : "disable"}`,
-      { method: "POST" }
+      { method: "POST", body: { actor: "console" } }
     ),
+
+  /**
+   * The persisted runtime configuration.
+   *
+   * The console shows what the server has stored; it never keeps its own copy of what it thinks the
+   * configuration is.
+   */
+  runtimeConfig: () => request<RuntimeConfig>("/api/v1/runtimes/config"),
+
+  /** The recorded configuration changes, newest first. */
+  runtimeConfigHistory: (limit = 50) =>
+    request<{ history: RuntimeConfigAuditEntry[] }>(`/api/v1/runtimes/config/history?limit=${limit}`),
+
+  /** Changes the priority, the tags or the enabled switch of one runtime. */
+  updateRuntime: (
+    runtimeId: string,
+    patch: { enabled?: boolean; priority?: number; tags?: string[] }
+  ) =>
+    request<{ id: string; enabled: boolean; priority: number; tags: string[] }>(
+      `/api/v1/runtimes/${encodeURIComponent(runtimeId)}`,
+      { method: "PATCH", body: { ...patch, actor: "console" } }
+    ),
+
+  /** Names the runtime that unnamed work goes to; `null` clears it. */
+  setDefaultRuntime: (runtimeId: string | null) =>
+    request<{ defaultRuntimeId: string | null }>("/api/v1/runtimes/default", {
+      method: "POST",
+      body: { runtimeId, actor: "console" }
+    }),
 
   startTask: (taskId: string, input: StartTaskInput) =>
     request<StartTaskResponse>(`/api/v1/tasks/${encodeURIComponent(taskId)}/executions`, {
