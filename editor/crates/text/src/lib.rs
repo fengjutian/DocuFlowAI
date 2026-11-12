@@ -206,6 +206,20 @@ impl Buffer {
         self.rope.char_to_line(char_index)
     }
 
+    /// The byte ranges of every occurrence of `query` in the text.
+    ///
+    /// The search runs over the rope's chunks, so the text is never copied
+    /// whole — a hundred megabyte document is searched the same way a small
+    /// one is. A match that reaches over the border between two chunks is
+    /// still found.
+    ///
+    /// The search is case insensitive unless `case_sensitive` says otherwise,
+    /// and the case folding only looks at ASCII letters, so a match is always
+    /// as long as the text that was searched for.
+    pub fn find_all(&self, query: &str, case_sensitive: bool) -> Vec<Range<TextOffset>> {
+        find_all_in_chunks(self.rope.chunks().map(str::as_bytes), query, case_sensitive)
+    }
+
     pub fn version(&self) -> BufferVersion {
         self.version
     }
@@ -397,6 +411,94 @@ impl Buffer {
     }
 }
 
+/// Folds the case of ASCII letters, so a search can ignore it.
+///
+/// Only ASCII letters are folded: folding the case of other letters can
+/// change how many bytes they take, and then a match would not be the length
+/// of the text that was searched for.
+fn fold(bytes: &[u8], case_sensitive: bool) -> Vec<u8> {
+    if case_sensitive {
+        bytes.to_vec()
+    } else {
+        bytes.iter().map(|byte| byte.to_ascii_lowercase()).collect()
+    }
+}
+
+/// The byte ranges of every occurrence of `query` in a sequence of chunks.
+///
+/// The chunks are the pieces the text is stored in, and they are searched
+/// without ever holding the whole text in memory. A match that reaches over
+/// the border between two chunks is still found, because the window keeps the
+/// tail of the previous chunk.
+///
+/// Matches do not overlap: the next match starts where the last one ended.
+/// A replacement that was computed from overlapping matches would write the
+/// same text twice.
+fn find_all_in_chunks<'a>(
+    chunks: impl Iterator<Item = &'a [u8]>,
+    query: &str,
+    case_sensitive: bool,
+) -> Vec<Range<TextOffset>> {
+    let needle = fold(query.as_bytes(), case_sensitive);
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    // The window holds the bytes that are searched: the tail of the previous
+    // chunk plus the chunk that is being scanned.
+    let mut window: Vec<u8> = Vec::new();
+    // The document offset of the first byte in the window.
+    let mut window_start = 0usize;
+    // The offset the next match may start at, so matches do not overlap.
+    let mut search_from = 0usize;
+    for chunk in chunks {
+        // The chunk starts where the window ends.
+        let chunk_start = window_start + window.len();
+        if case_sensitive {
+            window.extend_from_slice(chunk);
+        } else {
+            window.extend(chunk.iter().map(|byte| byte.to_ascii_lowercase()));
+        }
+        let chunk_end = chunk_start + chunk.len();
+
+        let mut from = 0usize;
+        while let Some(at) = find_bytes(&window[from..], &needle) {
+            let start = from + at;
+            let end = start + needle.len();
+            let match_start = window_start + start;
+            let match_end = match_start + needle.len();
+            if match_end > chunk_end {
+                // The match reaches into the next chunk: it is found there.
+                break;
+            }
+            if match_start >= search_from {
+                matches.push(TextOffset(match_start)..TextOffset(match_end));
+                search_from = match_end;
+            }
+            from = end;
+        }
+
+        // Keep the tail of the window for the next chunk.
+        let keep = needle.len() - 1;
+        if window.len() > keep {
+            let drop = window.len() - keep;
+            window.drain(..drop);
+            window_start += drop;
+        }
+    }
+    matches
+}
+
+/// Where `needle` is in `haystack`.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,5 +681,101 @@ mod tests {
         assert_eq!(buffer.line_of_offset(12), 1);
         // The end of the text is the empty line after the last break.
         assert_eq!(buffer.line_of_offset(13), 2);
+    }
+
+    #[test]
+    fn a_search_finds_every_occurrence() {
+        let buffer = Buffer::new("one two one two one");
+        let matches = buffer.find_all("one", true);
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[0], TextOffset(0)..TextOffset(3));
+        assert_eq!(matches[1], TextOffset(8)..TextOffset(11));
+        assert_eq!(matches[2], TextOffset(16)..TextOffset(19));
+    }
+
+    #[test]
+    fn a_search_ignores_the_case_by_default() {
+        let buffer = Buffer::new("One ONE one");
+        let matches = buffer.find_all("one", false);
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[0], TextOffset(0)..TextOffset(3));
+        assert_eq!(matches[1], TextOffset(4)..TextOffset(7));
+        assert_eq!(matches[2], TextOffset(8)..TextOffset(11));
+    }
+
+    #[test]
+    fn a_case_sensitive_search_only_finds_the_same_case() {
+        let buffer = Buffer::new("One ONE one");
+        let matches = buffer.find_all("one", true);
+        assert_eq!(matches, vec![TextOffset(8)..TextOffset(11)]);
+    }
+
+    #[test]
+    fn an_empty_query_matches_nothing() {
+        let buffer = Buffer::new("anything");
+        assert!(buffer.find_all("", false).is_empty());
+        assert!(buffer.find_all("", true).is_empty());
+    }
+
+    #[test]
+    fn a_search_that_finds_nothing_returns_no_matches() {
+        let buffer = Buffer::new("first\nsecond");
+        assert!(buffer.find_all("zzz", true).is_empty());
+    }
+
+    #[test]
+    fn a_match_that_reaches_over_a_line_break_is_found() {
+        let buffer = Buffer::new("first\nsecond");
+        let matches = buffer.find_all("\nse", true);
+        assert_eq!(matches, vec![TextOffset(5)..TextOffset(8)]);
+    }
+
+    #[test]
+    fn matches_do_not_overlap() {
+        // A replacement computed from overlapping matches would write the
+        // same text twice, so the next match starts where the last one ended.
+        let buffer = Buffer::new("aaaa");
+        let matches = buffer.find_all("aa", true);
+        assert_eq!(
+            matches,
+            vec![TextOffset(0)..TextOffset(2), TextOffset(2)..TextOffset(4)]
+        );
+    }
+
+    #[test]
+    fn a_match_that_reaches_over_a_chunk_border_is_found() {
+        // The chunks are the pieces the text is stored in.
+        let chunks: Vec<&[u8]> = vec![b"one tw", b"o one"];
+        let matches = find_all_in_chunks(chunks.into_iter(), "two", true);
+        assert_eq!(matches, vec![TextOffset(4)..TextOffset(7)]);
+    }
+
+    #[test]
+    fn a_match_that_starts_in_the_tail_of_a_chunk_is_found() {
+        let chunks: Vec<&[u8]> = vec![b"xxa", b"bc"];
+        let matches = find_all_in_chunks(chunks.into_iter(), "ab", true);
+        assert_eq!(matches, vec![TextOffset(2)..TextOffset(4)]);
+    }
+
+    #[test]
+    fn a_case_insensitive_search_reaches_over_a_chunk_border() {
+        let chunks: Vec<&[u8]> = vec![b"xxA", b"bc"];
+        let matches = find_all_in_chunks(chunks.into_iter(), "ab", false);
+        assert_eq!(matches, vec![TextOffset(2)..TextOffset(4)]);
+    }
+
+    #[test]
+    fn a_search_over_many_chunks_finds_every_occurrence() {
+        let chunks: Vec<&[u8]> = vec![b"ab", b"ab", b"ab", b"ab"];
+        let matches = find_all_in_chunks(chunks.into_iter(), "ab", true);
+        assert_eq!(
+            matches,
+            vec![
+                TextOffset(0)..TextOffset(2),
+                TextOffset(2)..TextOffset(4),
+                TextOffset(4)..TextOffset(6),
+                TextOffset(6)..TextOffset(8),
+            ]
+        );
     }
 }

@@ -1,8 +1,9 @@
 mod agent;
 pub mod editor_view;
+pub mod find;
 mod input;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use codeweaver_agent_acp::ToolStatus;
@@ -10,8 +11,11 @@ use codeweaver_editor_core::Editor;
 use codeweaver_render::{
     Color, FrameScene, Point, Rect, Renderer, RendererError, Size, TextFamily, TextStyle,
 };
+use codeweaver_text::TextOffset;
+use codeweaver_ui::TextMeasurer;
 use codeweaver_workspace::{Document, Workspace};
-use editor_view::{EditorView, LINE_HEIGHT, RendererMeasurer};
+use editor_view::{EditorView, FindOverlay, LINE_HEIGHT, RendererMeasurer};
+use find::{FindBar, FindField};
 use input::TextInputState;
 use winit::{
     application::ApplicationHandler,
@@ -49,6 +53,8 @@ pub struct NativeApplication {
     view: EditorView,
     /// Where the mouse is, in logical pixels.
     cursor: Option<Point>,
+    /// The find bar, when it is open.
+    find: Option<FindBar>,
 }
 
 impl NativeApplication {
@@ -80,6 +86,7 @@ impl NativeApplication {
             endpoint: None,
             view: EditorView::new(),
             cursor: None,
+            find: None,
         })
     }
 
@@ -300,6 +307,109 @@ impl NativeApplication {
         }
     }
 
+    /// Opens the find bar when the user asks for it.
+    ///
+    /// Ctrl+F finds, Ctrl+H finds and replaces.
+    fn handle_find_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
+        if !self.modifiers.control_key() {
+            return false;
+        }
+        let Key::Character(character) = key else {
+            return false;
+        };
+        let letter = character
+            .as_ref()
+            .chars()
+            .next()
+            .map(|letter| letter.to_ascii_lowercase());
+        match letter {
+            Some('f') => {
+                self.open_find(false);
+                true
+            }
+            Some('h') => {
+                self.open_find(true);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Gives a key to the find bar while it is open.
+    ///
+    /// Returns `true` when the key belonged to the find bar. The bar is taken
+    /// out of the application while it is handled, so that it can be closed.
+    fn handle_find_bar_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
+        let Some(mut find) = self.find.take() else {
+            return false;
+        };
+
+        let mut handled = true;
+        // Whether the bar stays open.
+        let mut keep = true;
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                // The bar closes and the editor takes the keyboard back.
+                keep = false;
+            }
+            Key::Named(NamedKey::Enter) => {
+                if self.modifiers.control_key() && self.modifiers.alt_key() {
+                    let count = find.replace_all(&mut self.editor);
+                    self.status = Some(format!("替换了 {count} 处"));
+                } else if self.modifiers.alt_key() {
+                    let count = find.select_all_matches(&mut self.editor);
+                    self.status = Some(format!("选中了 {count} 处"));
+                } else if self.modifiers.shift_key() {
+                    find.previous_match();
+                } else {
+                    find.next_match();
+                }
+            }
+            Key::Named(NamedKey::Tab) => find.toggle_field(),
+            Key::Named(NamedKey::Backspace) => find.backspace(&self.editor),
+            Key::Named(NamedKey::Space) => find.type_text(&self.editor, " "),
+            Key::Character(character) if !self.modifiers.control_key() => {
+                let character = character.as_ref();
+                if character.chars().any(char::is_control) {
+                    // The key did not produce text of its own; the text of
+                    // the event is what the user typed.
+                    if let Some(typed) = text.filter(|typed| !typed.chars().any(char::is_control)) {
+                        find.type_text(&self.editor, typed);
+                    } else {
+                        handled = false;
+                    }
+                } else {
+                    find.type_text(&self.editor, character);
+                }
+            }
+            _ => {
+                handled = false;
+            }
+        }
+        if keep {
+            self.find = Some(find);
+        }
+        handled
+    }
+
+    /// Opens the find bar and searches for what the editor has selected.
+    fn open_find(&mut self, replacing: bool) {
+        let mut find = self.find.take().unwrap_or_default();
+        find.open(&mut self.editor, replacing);
+        self.find = Some(find);
+    }
+
+    /// Opens the find bar and searches for the given text.
+    ///
+    /// This is what the editor does when it is started with a search, so the
+    /// find bar can be looked at without a keyboard.
+    pub fn open_find_with(&mut self, query: &str) {
+        let mut find = self.find.take().unwrap_or_default();
+        find.open(&mut self.editor, false);
+        find.type_text(&self.editor, query);
+        self.find = Some(find);
+    }
+
     /// The status line: the open file, whether it changed, and the last
     /// message.
     fn status_line(&self) -> String {
@@ -445,7 +555,11 @@ impl ApplicationHandler for NativeApplication {
                     Ime::Disabled => self.input.enable_ime(false),
                     Ime::Preedit(text, selection) => self.input.set_preedit(text, selection),
                     Ime::Commit(text) => {
-                        if let Err(error) = self.editor.insert(&text) {
+                        // While the find bar is open, the composed text goes
+                        // into the bar instead of the document.
+                        if let Some(find) = self.find.as_mut() {
+                            find.type_text(&self.editor, &text);
+                        } else if let Err(error) = self.editor.insert(&text) {
                             eprintln!("failed to commit IME text: {error}");
                         }
                         self.input.finish_commit();
@@ -487,6 +601,15 @@ impl ApplicationHandler for NativeApplication {
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if self.handle_agent_key(&event.logical_key.as_ref()) {
+                    window.request_redraw();
+                    return;
+                }
+                if self.handle_find_key(&event.logical_key.as_ref()) {
+                    window.request_redraw();
+                    return;
+                }
+                // While the find bar is open, the keys go to the bar.
+                if self.handle_find_bar_key(&event.logical_key.as_ref(), event.text.as_deref()) {
                     window.request_redraw();
                     return;
                 }
@@ -610,6 +733,7 @@ impl ApplicationHandler for NativeApplication {
                         agent: self.agent.as_ref(),
                         agent_error: self.agent_error.as_deref(),
                         status_line,
+                        find: self.find.as_ref(),
                     },
                 );
                 match renderer.render(&scene, scale_factor) {
@@ -638,7 +762,12 @@ struct Chrome<'a> {
     agent: Option<&'a AgentSession>,
     agent_error: Option<&'a str>,
     status_line: String,
+    /// The find bar, when it is open.
+    find: Option<&'a FindBar>,
 }
+
+/// The matches of a search that was not run.
+const NO_MATCHES: &[Range<TextOffset>] = &[];
 
 fn build_scene(
     renderer: &mut Renderer,
@@ -652,68 +781,91 @@ fn build_scene(
     let body = editor_body_rect(size);
     let mut scene = FrameScene::default();
 
-    // Only the renderer knows how the text is shaped, so the layout is
-    // measured through it.
-    let mut measurer = RendererMeasurer::new(renderer, TextFamily::Monospace);
-    view.layout(
-        editor_state.buffer(),
-        body.size.width,
-        body.size.height,
-        &mut measurer,
-    );
+    // The matches the find bar found, and the one it is on.
+    let (matches, current_match) = match chrome.find {
+        Some(find) => (find.matches(), Some(find.current_index())),
+        None => (NO_MATCHES, None),
+    };
+    let overlay = FindOverlay {
+        // The find bar floats over the body, so the text under it is left
+        // out.
+        bar: chrome
+            .find
+            .map(|find| find_bar_rect(body, find.replacing())),
+        matches,
+        current: current_match,
+    };
 
-    scene.push_quad(
-        Rect::new(0.0, 0.0, 40.0, size.height),
-        Color::rgb(0.075, 0.086, 0.11),
-        viewport,
-    );
-    scene.push_quad(body, Color::rgb(0.075, 0.086, 0.11), viewport);
-    scene.push_quad(
-        Rect::new(body.origin.x, body.origin.y, 3.0, body.size.height),
-        Color::rgb(0.30, 0.58, 0.96),
-        viewport,
-    );
-    let heading = format!(
-        "CodeWeaver · Buffer v{} · IME {} · Undo {} · Redo {} · 光标 {}",
-        editor_state.version(),
-        if input.ime_enabled() { "ON" } else { "READY" },
-        editor_state.can_undo(),
-        editor_state.can_redo(),
-        editor_state.cursor_count(),
-    );
-    scene.push_text(
-        heading,
-        Rect::new(56.0, 16.0, size.width - 72.0, 28.0),
-        TextStyle {
-            clip: viewport,
-            color: Color::rgb(0.78, 0.82, 0.90),
-            font_size: 15.0,
-            line_height: 22.0,
-            family: TextFamily::SansSerif,
-        },
-    );
-    // The status line sits under the heading.
-    scene.push_text(
-        chrome.status_line,
-        Rect::new(56.0, 38.0, size.width - 72.0, 22.0),
-        TextStyle {
-            clip: viewport,
-            color: Color::rgb(0.55, 0.60, 0.70),
-            font_size: 13.0,
-            line_height: 18.0,
-            family: TextFamily::SansSerif,
-        },
-    );
+    {
+        // Only the renderer knows how the text is shaped, so the layout is
+        // measured through it.
+        let mut measurer = RendererMeasurer::new(renderer, TextFamily::Monospace);
+        view.layout(
+            editor_state.buffer(),
+            body.size.width,
+            body.size.height,
+            &mut measurer,
+        );
 
-    view.draw(
-        &mut scene,
-        editor_state,
-        input.preedit(),
-        body,
-        &mut measurer,
-    );
+        scene.push_quad(
+            Rect::new(0.0, 0.0, 40.0, size.height),
+            Color::rgb(0.075, 0.086, 0.11),
+            viewport,
+        );
+        scene.push_quad(body, Color::rgb(0.075, 0.086, 0.11), viewport);
+        scene.push_quad(
+            Rect::new(body.origin.x, body.origin.y, 3.0, body.size.height),
+            Color::rgb(0.30, 0.58, 0.96),
+            viewport,
+        );
+        let heading = format!(
+            "CodeWeaver · Buffer v{} · IME {} · Undo {} · Redo {} · 光标 {}",
+            editor_state.version(),
+            if input.ime_enabled() { "ON" } else { "READY" },
+            editor_state.can_undo(),
+            editor_state.can_redo(),
+            editor_state.cursor_count(),
+        );
+        scene.push_text(
+            heading,
+            Rect::new(56.0, 16.0, size.width - 72.0, 28.0),
+            TextStyle {
+                clip: viewport,
+                color: Color::rgb(0.78, 0.82, 0.90),
+                font_size: 15.0,
+                line_height: 22.0,
+                family: TextFamily::SansSerif,
+            },
+        );
+        // The status line sits under the heading.
+        scene.push_text(
+            chrome.status_line,
+            Rect::new(56.0, 38.0, size.width - 72.0, 22.0),
+            TextStyle {
+                clip: viewport,
+                color: Color::rgb(0.55, 0.60, 0.70),
+                font_size: 13.0,
+                line_height: 18.0,
+                family: TextFamily::SansSerif,
+            },
+        );
+
+        view.draw(
+            &mut scene,
+            editor_state,
+            input.preedit(),
+            body,
+            overlay,
+            &mut measurer,
+        );
+    }
 
     push_agent_panel(&mut scene, size, chrome.agent, chrome.agent_error);
+
+    // The find bar is drawn in the sans-serif face, so it gets a measurer of
+    // its own.
+    let mut ui_measurer = RendererMeasurer::new(renderer, TextFamily::SansSerif);
+    push_find_bar(&mut scene, size, body, chrome.find, &mut ui_measurer);
     scene
 }
 
@@ -734,6 +886,164 @@ fn editor_body_rect(size: Size) -> Rect {
         (right - left).max(1.0),
         (size.height - 84.0).max(1.0),
     )
+}
+
+/// The place of the find bar in the corner of the editor body.
+///
+/// The bar is flush with the right edge of the body, so that the text it
+/// covers is exactly the text under it.
+fn find_bar_rect(body: Rect, replacing: bool) -> Rect {
+    let width = 420.0f32.min(body.size.width.max(1.0));
+    let height = if replacing { 86.0 } else { 60.0 };
+    Rect::new(
+        body.origin.x + body.size.width - width,
+        body.origin.y + 8.0,
+        width,
+        height,
+    )
+}
+
+/// Draws the find bar in the corner of the editor body.
+fn push_find_bar(
+    scene: &mut FrameScene,
+    size: Size,
+    body: Rect,
+    find: Option<&FindBar>,
+    measurer: &mut dyn TextMeasurer,
+) {
+    let Some(find) = find else {
+        return;
+    };
+    let viewport = Rect::new(0.0, 0.0, size.width, size.height);
+    let bar = find_bar_rect(body, find.replacing());
+    let width = bar.size.width;
+    let height = bar.size.height;
+
+    scene.push_quad(bar, Color::rgb(0.10, 0.12, 0.16), viewport);
+    scene.push_quad(
+        Rect::new(bar.origin.x, bar.origin.y, bar.size.width, 1.0),
+        Color::rgb(0.22, 0.25, 0.31),
+        viewport,
+    );
+
+    let field_width = (bar.size.width - 104.0).max(1.0);
+    let query_field = Rect::new(bar.origin.x + 12.0, bar.origin.y + 10.0, field_width, 24.0);
+    push_find_field(
+        scene,
+        viewport,
+        query_field,
+        find.query(),
+        find.field() == FindField::Query,
+        "查找",
+        measurer,
+    );
+    if find.replacing() {
+        let replacement_field =
+            Rect::new(bar.origin.x + 12.0, bar.origin.y + 40.0, field_width, 24.0);
+        push_find_field(
+            scene,
+            viewport,
+            replacement_field,
+            find.replacement(),
+            find.field() == FindField::Replacement,
+            "替换为",
+            measurer,
+        );
+    }
+
+    // How many matches were found.
+    let status = Rect::new(
+        bar.origin.x + 12.0 + field_width + 8.0,
+        bar.origin.y + 12.0,
+        (width - field_width - 32.0).max(1.0),
+        20.0,
+    );
+    scene.push_text(
+        find.status(),
+        status,
+        TextStyle {
+            clip: viewport,
+            color: Color::rgb(0.72, 0.76, 0.84),
+            font_size: 13.0,
+            line_height: 18.0,
+            family: TextFamily::SansSerif,
+        },
+    );
+    let hints = Rect::new(
+        bar.origin.x + 12.0,
+        bar.origin.y + height - 22.0,
+        (width - 24.0).max(1.0),
+        18.0,
+    );
+    scene.push_text(
+        "Enter 下一个 · Shift+Enter 上一个 · Tab 切换 · Alt+Enter 全选匹配",
+        hints,
+        TextStyle {
+            clip: viewport,
+            color: Color::rgb(0.45, 0.50, 0.58),
+            font_size: 12.0,
+            line_height: 16.0,
+            family: TextFamily::SansSerif,
+        },
+    );
+}
+
+/// Draws one field of the find bar.
+fn push_find_field(
+    scene: &mut FrameScene,
+    viewport: Rect,
+    field: Rect,
+    text: &str,
+    active: bool,
+    placeholder: &str,
+    measurer: &mut dyn TextMeasurer,
+) {
+    scene.push_quad(field, Color::rgb(0.06, 0.07, 0.09), viewport);
+    scene.push_quad(
+        Rect::new(field.origin.x, field.origin.y, field.size.width, 1.0),
+        if active {
+            Color::rgb(0.30, 0.58, 0.96)
+        } else {
+            Color::rgb(0.18, 0.20, 0.25)
+        },
+        viewport,
+    );
+    let empty = text.is_empty();
+    let shown = if empty { placeholder } else { text };
+    let width = measurer.measure(shown, 14.0).width;
+    scene.push_text(
+        shown.to_owned(),
+        Rect::new(
+            field.origin.x + 6.0,
+            field.origin.y + 2.0,
+            (field.size.width - 12.0).max(1.0),
+            (field.size.height - 4.0).max(1.0),
+        ),
+        TextStyle {
+            clip: field,
+            color: if empty {
+                Color::rgb(0.38, 0.42, 0.50)
+            } else {
+                Color::rgb(0.86, 0.89, 0.94)
+            },
+            font_size: 14.0,
+            line_height: 20.0,
+            family: TextFamily::SansSerif,
+        },
+    );
+    if active {
+        // The caret stands after the text that was typed.
+        scene.push_quad(
+            Rect::new(
+                field.origin.x + 6.0 + width + 1.0,
+                field.origin.y + 4.0,
+                1.5,
+                (field.size.height - 8.0).max(1.0),
+            ),
+            Color::rgb(0.30, 0.58, 0.96),
+            field,
+        );
+    }
 }
 
 /// Draws the agent panel on the right of the window.
@@ -1001,5 +1311,74 @@ mod tests {
             app.editor.selection().range(app.editor.buffer()),
             TextOffset(1)..TextOffset(5)
         );
+    }
+
+    /// An application with the find bar open.
+    fn app_with_find(text: &str) -> NativeApplication {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.editor.load_text(text);
+        app.modifiers = ModifiersState::CONTROL;
+        app.handle_find_key(&character("f"));
+        app.modifiers = ModifiersState::default();
+        app
+    }
+
+    /// A key that carries a character.
+    fn character(text: &str) -> Key<&'_ str> {
+        Key::Character(text)
+    }
+
+    /// A key that has a name, like Enter or Escape.
+    fn named(key: NamedKey) -> Key<&'static str> {
+        Key::Named(key)
+    }
+
+    #[test]
+    fn the_find_key_opens_the_find_bar() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL;
+        assert!(app.handle_find_key(&character("f")));
+        assert!(app.find.is_some());
+        // Ctrl+H replaces as well as finds.
+        assert!(app.handle_find_key(&character("h")));
+        assert!(app.find.as_ref().expect("the find bar is open").replacing());
+    }
+
+    #[test]
+    fn the_find_bar_takes_the_keys_while_it_is_open() {
+        let mut app = app_with_find("one two one");
+        app.handle_find_bar_key(&character("o"), Some("o"));
+        // The text goes into the query, not into the document.
+        assert_eq!(app.editor.text(), "one two one");
+        let find = app.find.as_ref().expect("the find bar is open");
+        assert_eq!(find.query(), "o");
+        assert_eq!(find.match_count(), 3);
+    }
+
+    #[test]
+    fn escape_closes_the_find_bar() {
+        let mut app = app_with_find("one two one");
+        assert!(app.handle_find_bar_key(&named(NamedKey::Escape), None));
+        assert!(app.find.is_none());
+    }
+
+    #[test]
+    fn selecting_every_match_gives_every_match_a_caret() {
+        let mut app = app_with_find("one two one");
+        app.handle_find_bar_key(&character("o"), Some("o"));
+        app.modifiers = ModifiersState::ALT;
+        app.handle_find_bar_key(&named(NamedKey::Enter), None);
+        assert_eq!(app.editor.cursor_count(), 3);
+    }
+
+    #[test]
+    fn the_next_match_walks_through_the_matches() {
+        let mut app = app_with_find("one two one");
+        app.handle_find_bar_key(&character("o"), Some("o"));
+        let find = app.find.as_ref().expect("the find bar is open");
+        assert_eq!(find.current_index(), 0);
+        app.handle_find_bar_key(&named(NamedKey::Enter), None);
+        let find = app.find.as_ref().expect("the find bar is open");
+        assert_eq!(find.current_index(), 1);
     }
 }

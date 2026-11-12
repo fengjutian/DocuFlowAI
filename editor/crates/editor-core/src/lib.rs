@@ -399,6 +399,37 @@ impl Editor {
         self.selections = selections;
     }
 
+    /// The ranges of every selection, in the order of the text.
+    pub fn selection_ranges(&self) -> Vec<Range<TextOffset>> {
+        self.selections
+            .iter()
+            .map(|selection| selection.range(&self.buffer))
+            .collect()
+    }
+
+    /// Selects every range, dropping the other selections.
+    ///
+    /// The ranges that cover the same text are merged, so two carets in the
+    /// same place are one caret. This is what "select all the matches" does:
+    /// every match becomes a selection, and editing then reaches all of them
+    /// at once.
+    pub fn set_selection_ranges(&mut self, ranges: &[Range<TextOffset>]) {
+        self.release_selections();
+        let ranges = merge_ranges(ranges.to_vec());
+        let mut selections = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let anchor = self.buffer.anchor(range.start, Bias::Left);
+            let head = self.buffer.anchor(range.end, Bias::Right);
+            selections.push(Selection { anchor, head });
+        }
+        if selections.is_empty() {
+            let anchor = self.buffer.anchor(TextOffset(0), Bias::Right);
+            let head = self.buffer.anchor(TextOffset(0), Bias::Right);
+            selections.push(Selection { anchor, head });
+        }
+        self.selections = selections;
+    }
+
     pub fn undo(&mut self) -> Result<(), ApplyError> {
         let Some(entry) = self.undo_stack.pop() else {
             return Ok(());
@@ -432,7 +463,7 @@ impl Editor {
     ///
     /// The ranges are replaced in one transaction, so the text changes in one
     /// step and the undo history has one entry for all of them.
-    fn replace_ranges(
+    pub fn replace_ranges(
         &mut self,
         ranges: Vec<Range<TextOffset>>,
         replacement: &str,

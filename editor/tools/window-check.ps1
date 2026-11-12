@@ -2,6 +2,22 @@
 # takes the cursor away from whoever is using the machine. winit reads the
 # position out of the message, so the editor sees the click where it was
 # sent.
+#
+# Two things fight that:
+#
+# - The real mouse. If it is over the editor, its own messages arrive after
+#   the posted ones and the editor follows the real cursor instead of the
+#   message. So the cursor is moved out of the way first, and put back
+#   afterwards.
+# - The scale. The editor works in logical pixels and the screen has
+#   physical ones, and a script that is not aware of the scale gets
+#   coordinates in a third space. So the script asks the system how aware
+#   it is, and turns every measurement into physical pixels.
+#
+# The find bar is checked in a second run of the editor, started with the
+# search already open: the editor reads the modifier keys from the real
+# keyboard state, and neither a posted key message nor a key that was
+# injected at the system level can be relied on to open the bar.
 
 $ErrorActionPreference = 'Stop'
 
@@ -11,6 +27,7 @@ $logs = Join-Path $root '.dev-logs'
 $fixture = Join-Path $PSScriptRoot 'fixtures\sample.txt'
 $sample = Join-Path $logs 'sample.txt'
 $shot = Join-Path $logs 'window-check.png'
+$findShot = Join-Path $logs 'window-check-find.png'
 
 $sig = @'
 using System;
@@ -22,12 +39,19 @@ public class Win32 {
   [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder text, int max);
   [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr h, ref POINT p);
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
   [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int command);
+  [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+  [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
+  [DllImport("user32.dll")] public static extern IntPtr GetThreadDpiAwarenessContext();
+
   public delegate bool EnumProc(IntPtr h, IntPtr extra);
   public struct RECT { public int Left, Top, Right, Bottom; }
   public struct POINT { public int X, Y; }
@@ -56,6 +80,14 @@ public class Win32 {
 Add-Type -TypeDefinition $sig
 Add-Type -AssemblyName System.Drawing
 
+# The editor is aware of the scale; the script tries to be as well. When it
+# is not, the system hands out coordinates in the space of the system scale,
+# and every measurement has to be turned into physical pixels.
+[Win32]::SetProcessDpiAwarenessContext([IntPtr](-4)) | Out-Null
+$awareness = [Win32]::GetThreadDpiAwarenessContext()
+$scriptIsAware = ($awareness -eq [IntPtr](-4)) -or ($awareness -eq [IntPtr](-3))
+Write-Output "the script is scale aware: $scriptIsAware"
+
 $TOPMOST = [IntPtr](-1)
 $SWP_SHOWWINDOW = 0x0040
 
@@ -68,6 +100,24 @@ $MK_LBUTTON = 0x0001
 $BODY_X = 56
 $BODY_Y = 52
 $LINE_HEIGHT = 22
+
+# The colours the editor draws its parts in, as the code writes them.
+#
+# The renderer draws in linear values and the surface turns them into sRGB,
+# so the colour that shows up on the screen is the sRGB version of the one
+# in the code. The check looks for those colours and not for "something
+# blue", because the grey text of the status line is blue enough to pass
+# such a test.
+function To-Srgb([double]$value) {
+    if ($value -le 0.0031308) { return $value * 12.92 }
+    return 1.055 * [Math]::Pow($value, 1.0 / 2.4) - 0.055
+}
+function To-Screen([double[]]$linear) {
+    return @($linear | ForEach-Object { [int][Math]::Round((To-Srgb $_) * 255) })
+}
+$SELECTION_RGB = To-Screen @(0.20, 0.33, 0.55)
+$ACCENT_RGB = To-Screen @(0.30, 0.58, 0.96)
+$MATCH_RGB = To-Screen @(0.58, 0.46, 0.11)
 
 if (-not (Test-Path $exe)) {
     throw "the editor is not built; run 'cargo build -p codeweaver-editor' first"
@@ -85,6 +135,14 @@ New-Item -ItemType Directory -Force -Path $logs | Out-Null
 # a byte order mark as ANSI, so the text must not travel through the script.
 Copy-Item -Path $fixture -Destination $sample -Force
 
+# The scale of the monitor the editor is on, and the way from the
+# coordinates of the script to the physical pixels of the screen.
+$script:Factor = 1.0
+function To-Physical([double]$value) {
+    if ($scriptIsAware) { return $value }
+    return $value * $script:Factor
+}
+
 function Send-Mouse([IntPtr]$handle, [uint32]$message, [int]$x, [int]$y, [int]$extra) {
     $packed = [int64](($y -band 0xFFFF) -shl 16) -bor ($x -band 0xFFFF) -bor $extra
     [Win32]::PostMessage($handle, $message, [IntPtr]0, [IntPtr]$packed) | Out-Null
@@ -98,19 +156,29 @@ function Save-Window([IntPtr]$handle, [string]$path) {
     # Something else on the machine now and then minimises the window a
     # moment after it appears, so the restore is retried: a check that fails
     # because the window was not on screen says nothing about the editor.
-    $rect = New-Object Win32+RECT
+    $client = New-Object Win32+RECT
     for ($attempt = 0; $attempt -lt 5; $attempt++) {
         [Win32]::ShowWindow($handle, 9) | Out-Null
-        [Win32]::SetWindowPos($handle, $TOPMOST, 40, 40, 1281, 801, $SWP_SHOWWINDOW) | Out-Null
+        [Win32]::SetWindowPos($handle, $TOPMOST, 40, 40, 1201, 751, $SWP_SHOWWINDOW) | Out-Null
         Start-Sleep -Seconds 2
-        [Win32]::GetClientRect($handle, [ref]$rect) | Out-Null
-        if ($rect.Right -gt 0 -and $rect.Bottom -gt 0) { break }
+        [Win32]::GetClientRect($handle, [ref]$client) | Out-Null
+        if ($client.Right -gt 0 -and $client.Bottom -gt 0) { break }
         Write-Output "the window has no client area (attempt $($attempt + 1)), restoring it again"
     }
-    if ($rect.Right -le 0 -or $rect.Bottom -le 0) {
+    if ($client.Right -le 0 -or $client.Bottom -le 0) {
         throw 'the editor window has no client area to capture'
     }
-    $bitmap = New-Object System.Drawing.Bitmap $rect.Right, $rect.Bottom
+
+    # The picture holds the whole window, title bar and all, so the client
+    # area starts a little way inside it. The check needs to know where.
+    $window = New-Object Win32+RECT
+    [Win32]::GetWindowRect($handle, [ref]$window) | Out-Null
+    $origin = New-Object Win32+POINT
+    [Win32]::ClientToScreen($handle, [ref]$origin) | Out-Null
+
+    $width = [int](To-Physical ($window.Right - $window.Left))
+    $height = [int](To-Physical ($window.Bottom - $window.Top))
+    $bitmap = New-Object System.Drawing.Bitmap $width, $height
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     $hdc = $graphics.GetHdc()
     # PW_RENDERFULLCONTENT makes the window manager draw the window even
@@ -119,82 +187,208 @@ function Save-Window([IntPtr]$handle, [string]$path) {
     $graphics.ReleaseHdc($hdc)
     $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
     $graphics.Dispose()
-    return @{ Bitmap = $bitmap; Ok = $ok }
+    return @{
+        Bitmap = $bitmap
+        Ok = $ok
+        # Where the client area starts inside the picture.
+        Left = [int](To-Physical ($origin.X - $window.Left))
+        Top = [int](To-Physical ($origin.Y - $window.Top))
+        Width = [int](To-Physical $client.Right)
+        Height = [int](To-Physical $client.Bottom)
+    }
 }
 
-Get-Process -Name codeweaver-editor -ErrorAction SilentlyContinue | Stop-Process -Force
-Start-Sleep -Milliseconds 500
+# Counts the pixels of one colour in a rectangle of the picture.
+function Count-Color($picture, [int]$left, [int]$top, [int]$width, [int]$height, [int[]]$rgb, [int]$tolerance) {
+    $count = 0
+    for ($y = $top; $y -lt $top + $height; $y++) {
+        if ($y -lt 0 -or $y -ge $picture.Height) { continue }
+        for ($x = $left; $x -lt $left + $width; $x++) {
+            if ($x -lt 0 -or $x -ge $picture.Width) { continue }
+            $pixel = $picture.GetPixel($x, $y)
+            if ([Math]::Abs($pixel.R - $rgb[0]) -le $tolerance -and
+                [Math]::Abs($pixel.G - $rgb[1]) -le $tolerance -and
+                [Math]::Abs($pixel.B - $rgb[2]) -le $tolerance) {
+                $count++
+            }
+        }
+    }
+    return $count
+}
 
-$editor = Start-Process -FilePath $exe -ArgumentList $sample `
-    -RedirectStandardOutput (Join-Path $logs 'app-out.log') `
-    -RedirectStandardError (Join-Path $logs 'app-err.log') -PassThru
-try {
+# Starts the editor and waits for its window.
+function Start-Editor([string[]]$arguments) {
+    Get-Process -Name codeweaver-editor -ErrorAction SilentlyContinue | Stop-Process -Force
+    Start-Sleep -Milliseconds 500
+    $process = Start-Process -FilePath $exe -ArgumentList $arguments `
+        -RedirectStandardOutput (Join-Path $logs 'app-out.log') `
+        -RedirectStandardError (Join-Path $logs 'app-err.log') -PassThru
     $handle = [IntPtr]::Zero
     for ($i = 0; $i -lt 60; $i++) {
         Start-Sleep -Milliseconds 250
-        $editor.Refresh()
-        if (-not $editor.HasExited) {
-            $handle = [Win32]::Find([uint32]$editor.Id)
+        $process.Refresh()
+        if (-not $process.HasExited) {
+            $handle = [Win32]::Find([uint32]$process.Id)
             if ($handle -ne [IntPtr]::Zero) { break }
         }
     }
     if ($handle -eq [IntPtr]::Zero) { throw 'the editor window never appeared' }
     # The first frame needs the GPU.
     Start-Sleep -Seconds 3
-
+    $script:Factor = [Win32]::GetDpiForWindow($handle) / 96.0
     # Windows restores the window to wherever it was the last time, which
     # can be a monitor that is not connected any more. An off-screen window
     # has no client area to capture, and the real cursor would land on it
     # and fight with the posted messages, so put it on the primary screen
     # first.
-    [Win32]::SetWindowPos($handle, $TOPMOST, 40, 40, 1280, 800, $SWP_SHOWWINDOW) | Out-Null
+    [Win32]::SetWindowPos($handle, $TOPMOST, 40, 40, 1200, 750, $SWP_SHOWWINDOW) | Out-Null
     Start-Sleep -Seconds 2
 
-    # The window's messages carry physical pixels, the editor works in
-    # logical ones, and the two are only related by the scale factor of the
-    # monitor the window is on.
-    $factor = [Win32]::GetDpiForWindow($handle) / 96.0
-    Write-Output "editor window: $handle, scale $factor"
-
-    # Drag over the last line of the document: the selection should show up.
-    $x = [int]($BODY_X * $factor)
-    $y = [int](($BODY_Y + $LINE_HEIGHT * 6) * $factor)
-    Send-Mouse $handle $WM_MOUSEMOVE $x $y 0
-    Start-Sleep -Milliseconds 200
-    Send-Mouse $handle $WM_LBUTTONDOWN $x $y 0
-    Start-Sleep -Milliseconds 200
-    foreach ($dx in 40, 90, 140, 200) {
-        Send-Mouse $handle $WM_MOUSEMOVE ([int](($BODY_X + $dx) * $factor)) $y $MK_LBUTTON
-        Start-Sleep -Milliseconds 150
+    # The real cursor must not be over the editor: its own messages arrive
+    # after the posted ones, and the editor would follow the real cursor
+    # instead of the message. A check that depends on the order of two
+    # things is a check that fails now and then.
+    $window = New-Object Win32+RECT
+    [Win32]::GetWindowRect($handle, [ref]$window) | Out-Null
+    $where = New-Object Win32+POINT
+    [Win32]::GetCursorPos([ref]$where) | Out-Null
+    if ($where.X -ge $window.Left -and $where.X -lt $window.Right -and
+        $where.Y -ge $window.Top -and $where.Y -lt $window.Bottom) {
+        throw "the cursor is over the editor window ($($where.X),$($where.Y)), so the check would be a race"
     }
-    Send-Mouse $handle $WM_LBUTTONUP ([int](($BODY_X + 200) * $factor)) $y 0
-    Start-Sleep -Milliseconds 800
+    return @{ Process = $process; Handle = $handle }
+}
 
-    $shot_result = Save-Window $handle $shot
-    Write-Output "print window: $($shot_result.Ok)"
-    Write-Output "saved $shot"
+try {
+    # The real cursor is moved out of the way, so that its own messages do
+    # not fight with the posted ones. It goes back where it was afterwards.
+    $cursor = New-Object Win32+POINT
+    [Win32]::GetCursorPos([ref]$cursor) | Out-Null
+    [Win32]::SetCursorPos(10, 10) | Out-Null
+    Start-Sleep -Milliseconds 300
+    $moved = New-Object Win32+POINT
+    [Win32]::GetCursorPos([ref]$moved) | Out-Null
+    Write-Output "the cursor was moved to $($moved.X),$($moved.Y)"
 
-    # The selected text is drawn behind the glyphs, so the check looks for
-    # the blue of the selection along the line the drag covered.
-    $picture = $shot_result.Bitmap
-    $lineTop = [int]($BODY_Y + $LINE_HEIGHT * 6)
-    $blue = 0
-    for ($y = $lineTop; $y -lt $lineTop + $LINE_HEIGHT - 2; $y++) {
-        for ($x = [int]$BODY_X; $x -lt [int]($BODY_X + 200); $x++) {
-            $pixel = $picture.GetPixel($x, $y)
-            if (($pixel.B - $pixel.R) -gt 30) { $blue++ }
+    # The first run: the editor on its own.
+    $editor = Start-Editor @($sample)
+    $handle = $editor.Handle
+    try {
+        Write-Output "editor window: $handle, scale $($script:Factor)"
+
+        # Drag over the third line of the document: the selection should show
+        # up. The line is far enough from the find bar, which sits in the
+        # top right corner, so the two do not cover each other.
+        #
+        # The real cursor is put out of the way first: it must not be over
+        # the editor while the drag runs, or its own messages would arrive
+        # after the posted ones.
+        [Win32]::SetCursorPos(10, 10) | Out-Null
+        Start-Sleep -Milliseconds 300
+        $dragLine = 2
+        $x = [int](To-Physical $BODY_X)
+        $y = [int](To-Physical ($BODY_Y + $LINE_HEIGHT * $dragLine))
+        Send-Mouse $handle $WM_MOUSEMOVE $x $y 0
+        Start-Sleep -Milliseconds 200
+        Send-Mouse $handle $WM_LBUTTONDOWN $x $y 0
+        Start-Sleep -Milliseconds 200
+        foreach ($dx in 40, 90, 140, 200) {
+            Send-Mouse $handle $WM_MOUSEMOVE ([int](To-Physical ($BODY_X + $dx))) $y $MK_LBUTTON
+            Start-Sleep -Milliseconds 150
         }
+        Send-Mouse $handle $WM_LBUTTONUP ([int](To-Physical ($BODY_X + 200))) $y 0
+        Start-Sleep -Milliseconds 800
+
+        $shot_result = Save-Window $handle $shot
+        Write-Output "print window: $($shot_result.Ok)"
+        Write-Output "saved $shot"
+        $picture = $shot_result.Bitmap
+        $left = $shot_result.Left
+        $top = $shot_result.Top
+
+        # The selection is drawn in the colour of the selection, and nowhere
+        # else in the editor, so the whole client area is scanned.
+        $selected = Count-Color $picture $left $top $shot_result.Width $shot_result.Height $SELECTION_RGB 14
+        Write-Output "selected pixels: $selected"
+        if ($selected -lt 25) {
+            throw 'the selection was not drawn'
+        }
+        Write-Output 'the selection is drawn'
+
+        # The find bar sits in the top right corner of the body. Without it
+        # open, that corner holds nothing but text.
+        $findLeft = $left + [int](0.25 * $shot_result.Width)
+        $findTop = $top + [int](To-Physical $BODY_Y)
+        $findWidth = [int](0.65 * $shot_result.Width)
+        $findHeight = [int](To-Physical 60)
+        $accentBefore = Count-Color $picture $findLeft $findTop $findWidth $findHeight $ACCENT_RGB 14
+        Write-Output "accent pixels where the find bar will be: $accentBefore"
+        if ($accentBefore -gt 5) {
+            throw 'the find bar region is not empty before the find bar is opened'
+        }
+
+        # Without a search, no match is highlighted.
+        $matchedBefore = Count-Color $picture $left $top $shot_result.Width $shot_result.Height $MATCH_RGB 16
+        Write-Output "highlighted match pixels: $matchedBefore"
+        if ($matchedBefore -gt 5) {
+            throw 'the body shows matches before the search was made'
+        }
+        $picture.Dispose()
     }
-    Write-Output "blue pixels on the selected line: $blue"
-    if ($blue -lt 25) {
-        throw 'the selection was not drawn'
+    finally {
+        Stop-Process -Id $editor.Process.Id -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 400
     }
-    Write-Output 'the selection is drawn'
-    $picture.Dispose()
+
+    # The second run: the editor with a search already open.
+    $editor = Start-Editor @($sample, '--find', 'fox')
+    $handle = $editor.Handle
+    try {
+        $find_result = Save-Window $handle $findShot
+        Write-Output "print window: $($find_result.Ok)"
+        Write-Output "saved $findShot"
+        $findPicture = $find_result.Bitmap
+        $left = $find_result.Left
+        $top = $find_result.Top
+
+        $findLeft = $left + [int](0.25 * $find_result.Width)
+        $findTop = $top + [int](To-Physical $BODY_Y)
+        $findWidth = [int](0.65 * $find_result.Width)
+        $findHeight = [int](To-Physical 60)
+        $accent = Count-Color $findPicture $findLeft $findTop $findWidth $findHeight $ACCENT_RGB 14
+        Write-Output "accent pixels in the find bar: $accent"
+        if ($accent -lt 40) {
+            throw 'the find bar was not drawn'
+        }
+        Write-Output 'the find bar is drawn'
+
+        # The match "fox" is on the first line of the document.
+        $matched = Count-Color $findPicture $left $top $find_result.Width $find_result.Height $MATCH_RGB 16
+        Write-Output "highlighted match pixels: $matched"
+        if ($matched -lt 20) {
+            throw 'the match was not highlighted'
+        }
+        Write-Output 'the match is highlighted'
+
+        # Without a drag, no selection is drawn: the colour of the selection
+        # belongs to the drag of the first run only.
+        $selected = Count-Color $findPicture $left $top $find_result.Width $find_result.Height $SELECTION_RGB 14
+        Write-Output "selected pixels: $selected"
+        if ($selected -gt 5) {
+            throw 'a selection is drawn without a drag'
+        }
+        $findPicture.Dispose()
+    }
+    finally {
+        Stop-Process -Id $editor.Process.Id -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 400
+    }
 }
 finally {
-    Stop-Process -Id $editor.Id -Force -ErrorAction SilentlyContinue
+    Get-Process -Name codeweaver-editor -ErrorAction SilentlyContinue | Stop-Process -Force
     Start-Sleep -Milliseconds 400
+    # The cursor goes back where it was.
+    [Win32]::SetCursorPos($cursor.X, $cursor.Y) | Out-Null
     $errors = Get-Content (Join-Path $logs 'app-err.log') -Raw -ErrorAction SilentlyContinue
     if ($errors) { Write-Output '--- app stderr ---'; Write-Output $errors }
 }

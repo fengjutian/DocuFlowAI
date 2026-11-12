@@ -5,6 +5,8 @@
 //! the selection stay in the editor's core: the body only knows where they
 //! are on screen.
 
+use std::ops::Range;
+
 use codeweaver_editor_core::Editor;
 use codeweaver_render::{Color, FrameScene, Rect, Renderer, TextFamily, TextShaper, TextStyle};
 use codeweaver_text::{Buffer, TextOffset};
@@ -25,6 +27,24 @@ const TEXT_COLOR: Color = Color::rgb(0.88, 0.90, 0.94);
 const SELECTION_COLOR: Color = Color::rgb(0.20, 0.33, 0.55);
 /// The color of the caret.
 const CARET_COLOR: Color = Color::rgb(0.30, 0.58, 0.96);
+/// The color of a match that the find bar found.
+const MATCH_COLOR: Color = Color::rgb(0.34, 0.29, 0.10);
+/// The color of the match that the find bar is on.
+const CURRENT_MATCH_COLOR: Color = Color::rgb(0.58, 0.46, 0.11);
+
+/// What the find bar leaves on the body of the editor.
+pub struct FindOverlay<'a> {
+    /// The place of the find bar.
+    ///
+    /// The find bar floats over the body, and the renderer draws all the
+    /// text after all the blocks of colour, so the text of the body is left
+    /// out where the bar is.
+    pub bar: Option<Rect>,
+    /// The matches, in the order of the text.
+    pub matches: &'a [Range<TextOffset>],
+    /// Which match is current, counted from the first one.
+    pub current: Option<usize>,
+}
 
 /// The presentation state of the editor body.
 pub struct EditorView {
@@ -279,15 +299,39 @@ impl EditorView {
     }
 
     /// Draws the body: the selection, the text and the caret.
+    ///
+    /// The matches that the find bar found are drawn under the selection, so
+    /// the selection of the user still shows on top of them.
     pub fn draw(
         &self,
         scene: &mut FrameScene,
         editor: &Editor,
         preedit: &str,
         body: Rect,
+        overlay: FindOverlay<'_>,
         measurer: &mut dyn TextMeasurer,
     ) {
         let clip = body;
+
+        for (index, range) in overlay.matches.iter().enumerate() {
+            let color = if Some(index) == overlay.current {
+                CURRENT_MATCH_COLOR
+            } else {
+                MATCH_COLOR
+            };
+            for rect in selection_rects(&self.layout, range.start.0..range.end.0) {
+                scene.push_quad(
+                    Rect::new(
+                        body.origin.x + rect.x,
+                        body.origin.y + rect.y,
+                        rect.width,
+                        rect.height,
+                    ),
+                    color,
+                    clip,
+                );
+            }
+        }
 
         for selection in editor.selections() {
             let range = selection.range(editor.buffer());
@@ -308,6 +352,16 @@ impl EditorView {
         let caret = editor.caret().0;
         for line in &self.layout.lines {
             let y = body.origin.y + line.y;
+            // A line that runs under the floating part stops at its edge.
+            let line_clip = match overlay.bar {
+                Some(bar) if y + LINE_HEIGHT > bar.origin.y && y < bar.max_y() => Rect::new(
+                    body.origin.x,
+                    body.origin.y,
+                    (bar.origin.x - body.origin.x).max(1.0),
+                    body.size.height,
+                ),
+                _ => clip,
+            };
             match self.preedit_split(line, caret, preedit) {
                 Some(at) => {
                     // The composition belongs between the text before the
@@ -317,10 +371,10 @@ impl EditorView {
                     let after = &line.text[at..];
                     let combined = format!("{before}{preedit}");
                     let width = measurer.measure(&combined, FONT_SIZE).width;
-                    self.push_line(scene, &combined, body.origin.x, y, body, clip);
-                    self.push_line(scene, after, body.origin.x + width, y, body, clip);
+                    self.push_line(scene, &combined, body.origin.x, y, body, line_clip);
+                    self.push_line(scene, after, body.origin.x + width, y, body, line_clip);
                 }
-                None => self.push_line(scene, &line.text, body.origin.x, y, body, clip),
+                None => self.push_line(scene, &line.text, body.origin.x, y, body, line_clip),
             }
         }
 
@@ -479,6 +533,11 @@ mod tests {
             &editor,
             "",
             Rect::new(0.0, 0.0, 1000.0, 200.0),
+            FindOverlay {
+                bar: None,
+                matches: &[],
+                current: None,
+            },
             &mut measurer,
         );
 
@@ -504,6 +563,11 @@ mod tests {
             &editor,
             "",
             Rect::new(0.0, 0.0, 1000.0, 200.0),
+            FindOverlay {
+                bar: None,
+                matches: &[],
+                current: None,
+            },
             &mut measurer,
         );
 
