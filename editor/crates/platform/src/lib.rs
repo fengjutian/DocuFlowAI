@@ -496,31 +496,38 @@ impl ApplicationHandler for NativeApplication {
     }
 }
 
-fn build_demo_scene(
-    size: codeweaver_render::Size,
+fn build_scene(
+    renderer: &mut Renderer,
+    size: Size,
     editor_state: &Editor,
     input: &TextInputState,
+    view: &mut EditorView,
     agent: Option<&AgentSession>,
     agent_error: Option<&str>,
     status_line: String,
 ) -> FrameScene {
     let viewport = Rect::new(0.0, 0.0, size.width, size.height);
-    let editor = Rect::new(56.0, 52.0, (size.width - 80.0).max(1.0), 180.0);
-    let content_clip = Rect::new(
-        editor.origin.x + 16.0,
-        editor.origin.y + 16.0,
-        (editor.size.width - 32.0).max(1.0),
-        (editor.size.height - 32.0).max(1.0),
-    );
+    let body = editor_body_rect(size);
     let mut scene = FrameScene::default();
+
+    // Only the renderer knows how the text is shaped, so the layout is
+    // measured through it.
+    let mut measurer = RendererMeasurer::new(renderer, TextFamily::Monospace);
+    view.layout(
+        editor_state.buffer(),
+        body.size.width,
+        body.size.height,
+        &mut measurer,
+    );
+
     scene.push_quad(
         Rect::new(0.0, 0.0, 40.0, size.height),
         Color::rgb(0.075, 0.086, 0.11),
         viewport,
     );
-    scene.push_quad(editor, Color::rgb(0.075, 0.086, 0.11), viewport);
+    scene.push_quad(body, Color::rgb(0.075, 0.086, 0.11), viewport);
     scene.push_quad(
-        Rect::new(editor.origin.x, editor.origin.y, 3.0, editor.size.height),
+        Rect::new(body.origin.x, body.origin.y, 3.0, body.size.height),
         Color::rgb(0.30, 0.58, 0.96),
         viewport,
     );
@@ -539,6 +546,7 @@ fn build_demo_scene(
             color: Color::rgb(0.78, 0.82, 0.90),
             font_size: 15.0,
             line_height: 22.0,
+            family: TextFamily::SansSerif,
         },
     );
     // The status line sits under the heading.
@@ -550,52 +558,44 @@ fn build_demo_scene(
             color: Color::rgb(0.55, 0.60, 0.70),
             font_size: 13.0,
             line_height: 18.0,
+            family: TextFamily::SansSerif,
         },
     );
-    let mut text = String::with_capacity(editor_state.text().len() + input.preedit().len());
-    text.push_str(&editor_state.text_before_caret());
-    text.push_str(input.preedit());
-    text.push_str(&editor_state.text_after_caret());
-    if text.is_empty() {
-        text = "点击窗口输入；支持中文 IME，Ctrl+Z 撤销，Ctrl+Y 重做".to_owned();
-    }
-    scene.push_text(
-        text,
-        content_clip,
-        TextStyle {
-            clip: content_clip,
-            color: Color::rgb(0.88, 0.90, 0.94),
-            font_size: 18.0,
-            line_height: 28.0,
-        },
-    );
-    if !input.preedit().is_empty() {
-        scene.push_quad(
-            Rect::new(
-                content_clip.origin.x,
-                content_clip.origin.y + 27.0,
-                180.0,
-                2.0,
-            ),
-            Color::rgb(0.96, 0.72, 0.30),
-            content_clip,
-        );
-    }
+
+    view.draw(&mut scene, editor_state, input.preedit(), body, &mut measurer);
 
     push_agent_panel(&mut scene, size, agent, agent_error);
     scene
 }
 
+/// The area the agent panel is drawn in.
+fn agent_panel_rect(size: Size) -> Rect {
+    let width = (size.width * 0.34).clamp(280.0, 520.0);
+    Rect::new(size.width - width, 0.0, width, size.height)
+}
+
+/// The area the text body is drawn in.
+fn editor_body_rect(size: Size) -> Rect {
+    let panel = agent_panel_rect(size);
+    let left = 56.0;
+    let right = panel.origin.x - 16.0;
+    Rect::new(
+        left,
+        52.0,
+        (right - left).max(1.0),
+        (size.height - 84.0).max(1.0),
+    )
+}
+
 /// Draws the agent panel on the right of the window.
 fn push_agent_panel(
     scene: &mut FrameScene,
-    size: codeweaver_render::Size,
+    size: Size,
     agent: Option<&AgentSession>,
     agent_error: Option<&str>,
 ) {
     let viewport = Rect::new(0.0, 0.0, size.width, size.height);
-    let panel_width = (size.width * 0.34).clamp(280.0, 520.0);
-    let panel = Rect::new(size.width - panel_width, 0.0, panel_width, size.height);
+    let panel = agent_panel_rect(size);
     let content = Rect::new(
         panel.origin.x + 16.0,
         56.0,
@@ -629,6 +629,7 @@ fn push_agent_panel(
             color: Color::rgb(0.72, 0.78, 0.88),
             font_size: 14.0,
             line_height: 20.0,
+            family: TextFamily::SansSerif,
         },
     );
 
@@ -673,6 +674,7 @@ fn push_agent_panel(
             color: Color::rgb(0.84, 0.87, 0.92),
             font_size: 14.0,
             line_height: 20.0,
+            family: TextFamily::SansSerif,
         },
     );
 }

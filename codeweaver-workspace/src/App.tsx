@@ -15,6 +15,7 @@ import { SkillsPage } from "@/pages/SkillsPage";
 import { SubagentsPage } from "@/pages/SubagentsPage";
 import { UsagePage } from "@/pages/UsagePage";
 import { TracePage } from "@/pages/TracePage";
+import { AuditTimelinePage } from "@/pages/AuditTimelinePage";
 
 export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -37,6 +38,7 @@ export default function App() {
             <Route path="/subagents" element={<SubagentsPage />} />
             <Route path="/usage" element={<UsagePage />} />
             <Route path="/trace" element={<TracePage />} />
+            <Route path="/audit-timeline" element={<AuditTimelinePage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </AppShell>
