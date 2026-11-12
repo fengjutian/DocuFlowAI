@@ -196,6 +196,16 @@ impl Buffer {
         self.slice(range)
     }
 
+    /// The index of the line that contains `offset`.
+    ///
+    /// An offset that points at a line break belongs to the line the break
+    /// ends, not to the empty line that follows it.
+    pub fn line_of_offset(&self, offset: usize) -> usize {
+        let offset = offset.min(self.rope.len_bytes());
+        let char_index = self.char_index(offset);
+        self.rope.char_to_line(char_index)
+    }
+
     pub fn version(&self) -> BufferVersion {
         self.version
     }
@@ -555,5 +565,19 @@ mod tests {
         assert_eq!(buffer.line_count(), 3);
         assert_eq!(buffer.line_text(0), "中文");
         assert_eq!(buffer.line_range(0), TextOffset(0)..TextOffset(6));
+    }
+
+    #[test]
+    fn an_offset_finds_the_line_it_is_on() {
+        let buffer = Buffer::new("first\n中文\n");
+        assert_eq!(buffer.line_of_offset(0), 0);
+        assert_eq!(buffer.line_of_offset(4), 0);
+        // The line break belongs to the line it ends.
+        assert_eq!(buffer.line_of_offset(5), 0);
+        assert_eq!(buffer.line_of_offset(6), 1);
+        assert_eq!(buffer.line_of_offset(11), 1);
+        assert_eq!(buffer.line_of_offset(12), 1);
+        // The end of the text is the empty line after the last break.
+        assert_eq!(buffer.line_of_offset(13), 2);
     }
 }

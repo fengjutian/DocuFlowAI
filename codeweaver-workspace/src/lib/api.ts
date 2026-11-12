@@ -1,6 +1,7 @@
 import { useConnection, normalizeBaseUrl } from "./settings";
 import type {
   AgentExecution,
+  AuditTimeline,
   CommitTrace,
   CompletionGate,
   CodeWeaverEvent,
@@ -198,7 +199,22 @@ export const api = {
     request<TaskTrace>(`/api/v1/tasks/${encodeURIComponent(taskId)}/trace`),
 
   traceCommit: (sha: string) =>
-    request<CommitTrace>(`/api/v1/trace/commits/${encodeURIComponent(sha)}`)
+    request<CommitTrace>(`/api/v1/trace/commits/${encodeURIComponent(sha)}`),
+
+  /**
+   * The audit timeline: the recorded events of every execution, correlated and ordered.
+   *
+   * It is read from the server's journal — the same append-only record the live stream replays —
+   * so the console never rebuilds the history from what its own socket happened to receive.
+   */
+  auditTimeline: (query: { taskId?: string; executionId?: string; category?: string } = {}) => {
+    const params = new URLSearchParams();
+    if (query.taskId) params.set("taskId", query.taskId);
+    if (query.executionId) params.set("executionId", query.executionId);
+    if (query.category) params.set("category", query.category);
+    const suffix = params.toString();
+    return request<AuditTimeline>(`/api/v1/audit/timeline${suffix ? `?${suffix}` : ""}`);
+  }
 };
 
 export type { AgentExecution, CompletionGate, ExecutionCheckpoint };

@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { InMemoryJournalStore, type JournalEntry } from "../../journal/journal.js";
+import { recordAudit, recordRuntimeEvent } from "../../journal/event-journal.js";
 import {
   AuditTimelineService,
   buildAuditTimeline,
@@ -181,4 +182,65 @@ test("a timeline that was never recorded is not answered with an empty timeline"
   // The service has no executions to answer with; the API layer is what refuses the id.
   assert.equal(timeline.items.length, 0);
   assert.equal(timeline.executions.length, 0);
+});
+
+/**
+ * The P0-022 probe found this on a real run: the runtime's first event is emitted *before* the
+ * facts that precede it in the journal are written, so a journal that stored the emit time put an
+ * event before the facts recorded before it — and its own timestamps contradicted its own order.
+ */
+test("the journal records the time it was written, not the time the runtime emitted the event", async () => {
+  const store = new InMemoryJournalStore();
+  await recordRuntimeEvent(
+    store,
+    {
+      executionId: "exec-1",
+      projectId: "proj-1",
+      taskId: "task-1",
+      sequence: 1,
+      eventId: "evt-1",
+      eventType: "execution.started",
+      timestamp: "2026-11-12T00:00:00.000Z",
+      payload: {}
+    },
+    2,
+    "2026-11-12T00:00:05.000Z"
+  );
+  const entries = await store.read("exec-1");
+  assert.equal(entries[0]!.recordedAt, "2026-11-12T00:00:05.000Z");
+  // The runtime's own time is not lost: it is kept where it belongs, in the payload.
+  assert.equal(entries[0]!.payload["eventTimestamp"], "2026-11-12T00:00:00.000Z");
+});
+
+test("a timeline stays ordered when the runtime emitted an event before the facts before it", async () => {
+  const store = new InMemoryJournalStore();
+  await recordAudit(store, {
+    executionId: "exec-1",
+    sequence: 1,
+    category: "execution.input",
+    payload: { taskId: "task-1" },
+    recordedAt: "2026-11-12T00:00:05.000Z"
+  });
+  // Emitted at 00:00:00, recorded after the fact above.
+  await recordRuntimeEvent(
+    store,
+    {
+      executionId: "exec-1",
+      projectId: "proj-1",
+      taskId: "task-1",
+      sequence: 1,
+      eventId: "evt-1",
+      eventType: "execution.started",
+      timestamp: "2026-11-12T00:00:00.000Z",
+      payload: {}
+    },
+    2,
+    "2026-11-12T00:00:06.000Z"
+  );
+  const timeline = buildAuditTimeline(await store.read("exec-1"));
+  assert.deepEqual(timeline.items.map(item => item.recordedAt), [
+    "2026-11-12T00:00:05.000Z",
+    "2026-11-12T00:00:06.000Z"
+  ]);
+  assert.equal(timeline.executions[0]!.timestampsMonotonic, true);
 });

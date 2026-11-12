@@ -24,13 +24,14 @@ function item(
   recordedAt: string,
   payload: Record<string, unknown> = {}
 ): AuditTimelineItemView {
+  const taskId = category === "execution.input" ? "task-1" : undefined;
   return {
     executionId,
     sequence,
     kind: category.startsWith("execution.") ? "runtime.event" : "audit",
     category,
     recordedAt,
-    taskId: category === "execution.input" ? taskId : undefined,
+    ...(taskId ? { taskId } : {}),
     payload
   };
 }

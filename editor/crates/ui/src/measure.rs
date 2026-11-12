@@ -54,13 +54,17 @@ impl MonospaceMeasurer {
 impl TextMeasurer for MonospaceMeasurer {
     fn measure(&mut self, text: &str, _font_size: f32) -> LineMetrics {
         let mut boundaries = Vec::with_capacity(text.len() + 1);
-        for index in 0..=text.len() {
-            boundaries.push(index as f32 * self.advance);
+        let mut width = 0.0;
+        for character in text.chars() {
+            // The bytes inside one character have no glyph of their own, so
+            // they share the character's start offset.
+            for _ in 0..character.len_utf8() {
+                boundaries.push(width);
+            }
+            width += self.advance;
         }
-        LineMetrics {
-            width: text.chars().count() as f32 * self.advance,
-            boundaries,
-        }
+        boundaries.push(width);
+        LineMetrics { width, boundaries }
     }
 }
 

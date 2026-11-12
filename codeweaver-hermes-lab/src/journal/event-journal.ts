@@ -15,7 +15,8 @@ import type { JournalEntry, JournalStore } from "./journal.js";
 export async function recordRuntimeEvent(
   store: JournalStore,
   event: AgentRuntimeEvent,
-  journalSequence: number
+  journalSequence: number,
+  recordedAt?: string
 ): Promise<JournalEntry> {
   const entry: JournalEntry = {
     executionId: event.executionId,
@@ -23,10 +24,16 @@ export async function recordRuntimeEvent(
     eventSequence: event.sequence,
     kind: "runtime.event",
     category: event.eventType,
-    recordedAt: event.timestamp,
+    // The recorded time is the time the entry was written, not the time the runtime emitted the
+    // event. The two disagree: the runtime's first event is emitted before the facts that precede
+    // it in the journal are written, so an emit time would put an event *before* the facts that
+    // were recorded before it — and a journal whose timestamps contradict its own order cannot be
+    // put in a timeline. The runtime's own time is kept in the payload, where it belongs.
+    recordedAt: recordedAt ?? new Date().toISOString(),
     payload: {
       ...event.payload,
       eventId: event.eventId,
+      eventTimestamp: event.timestamp,
       // The envelope needs to know which execution and task the event belongs to, and the replayed
       // frames are built from the payload alone. The runtime event carries both outside its payload.
       projectId: event.projectId,

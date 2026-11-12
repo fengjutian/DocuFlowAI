@@ -39,7 +39,12 @@ impl VisualLine {
     /// The byte offsets of the line's characters, in order.
     fn char_boundaries(&self) -> Vec<usize> {
         let mut offsets = vec![self.range.start];
-        offsets.extend(self.range.start + self.text.char_indices().map(|(index, _)| index).skip(1));
+        offsets.extend(
+            self.text
+                .char_indices()
+                .skip(1)
+                .map(|(index, _)| self.range.start + index),
+        );
         offsets.push(self.range.end);
         offsets
     }
@@ -118,6 +123,13 @@ impl TextLayout {
             .find(|line| offset >= line.range.start && offset <= line.range.end)
     }
 
+    /// The index of the visual line that contains a byte offset.
+    pub fn line_index_of(&self, offset: usize) -> Option<usize> {
+        self.lines
+            .iter()
+            .position(|line| offset >= line.range.start && offset <= line.range.end)
+    }
+
     /// The point of a byte offset, relative to the layout's top left corner.
     ///
     /// Returns `None` when the offset is outside the layout — for example
@@ -146,7 +158,9 @@ impl TextLayout {
         let mut best_distance = f32::INFINITY;
         for offset in boundaries {
             let distance = (line.offset_at(offset) - x).abs();
-            if distance < best_distance {
+            // A click exactly between two characters goes to the later one,
+            // so the caret never ends up on the wrong side of a glyph.
+            if distance <= best_distance {
                 best_distance = distance;
                 best = offset;
             }
@@ -158,12 +172,8 @@ impl TextLayout {
 /// Splits a logical line into the pieces that fit the width.
 ///
 /// Returns the byte ranges of the pieces, together with the x offsets of
-/// their byte boundaries.
-fn wrap(
-    text: &str,
-    metrics: &LineMetrics,
-    width: f32,
-) -> Vec<(Range<usize>, Vec<f32>)> {
+/// their byte boundaries relative to the piece's own start.
+fn wrap(text: &str, metrics: &LineMetrics, width: f32) -> Vec<(Range<usize>, Vec<f32>)> {
     if text.is_empty() {
         return vec![(0..0, vec![0.0])];
     }
@@ -173,23 +183,35 @@ fn wrap(
 
     let mut pieces = Vec::new();
     let mut segment_start = 0usize;
-    let mut last_fitting = 0usize;
 
     // Walk the characters, cutting whenever the next one would not fit.
     for (index, character) in text.char_indices() {
         let end = index + character.len_utf8();
-        if metrics.offset_at(end) > width && index > segment_start {
-            pieces.push((segment_start..last_fitting, &metrics.boundaries[segment_start..=last_fitting]));
-            segment_start = last_fitting;
-            last_fitting = segment_start;
+        // The width is measured from the start of the piece, not from the
+        // start of the line: a piece always begins at the left edge.
+        let used = metrics.offset_at(end) - metrics.offset_at(segment_start);
+        if used > width && index > segment_start {
+            pieces.push((
+                segment_start..index,
+                relative(&metrics.boundaries, segment_start, index),
+            ));
+            segment_start = index;
         }
-        last_fitting = end;
     }
-    pieces.push((segment_start..text.len(), &metrics.boundaries[segment_start..]));
+    pieces.push((
+        segment_start..text.len(),
+        relative(&metrics.boundaries, segment_start, text.len()),
+    ));
 
     pieces
-        .into_iter()
-        .map(|(range, bounds)| (range, bounds.to_vec()))
+}
+
+/// The x offsets of the byte boundaries `start..=end`, relative to `start`.
+fn relative(boundaries: &[f32], start: usize, end: usize) -> Vec<f32> {
+    let base = boundaries.get(start).copied().unwrap_or(0.0);
+    boundaries[start..=end]
+        .iter()
+        .map(|offset| offset - base)
         .collect()
 }
 

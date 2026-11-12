@@ -135,7 +135,12 @@ export class ExecutionCoordinator {
 
     session.unsubscribe = await selected.subscribe(execution.executionId, event => {
       this.enqueue(session, async () => {
-        const entry = await recordRuntimeEvent(this.options.journal, event, session.nextJournalSequence);
+        const entry = await recordRuntimeEvent(
+          this.options.journal,
+          event,
+          session.nextJournalSequence,
+          this.now().toISOString()
+        );
         session.nextJournalSequence += 1;
         // Published after the write, not before it. An event that is announced before it is recorded
         // can be lost by a client that reconnects in between: it is in neither the replay nor the
@@ -252,7 +257,9 @@ export class ExecutionCoordinator {
           executionId,
           sequence: session.nextJournalSequence,
           category,
-          payload
+          payload,
+          // The same clock the runtime events are recorded with, so one journal carries one time.
+          recordedAt: this.now().toISOString()
         });
         session.nextJournalSequence += 1;
         // A CodeWeaver fact is on the timeline too, so the live stream carries it like any other
@@ -378,7 +385,7 @@ export class ExecutionCoordinator {
     let compensated = 0;
     for (const event of [...events].sort((a, b) => a.sequence - b.sequence)) {
       if (seen.has(event.sequence)) continue;
-      await recordRuntimeEvent(this.options.journal, event, sequence);
+      await recordRuntimeEvent(this.options.journal, event, sequence, this.now().toISOString());
       sequence += 1;
       compensated += 1;
     }

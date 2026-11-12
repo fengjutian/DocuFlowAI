@@ -80,21 +80,44 @@ pub fn caret_shape(layout: &TextLayout, offset: usize) -> Option<CaretShape> {
     })
 }
 
-/// The selection's rectangle on screen, when the selection is on one line.
+/// The selection's rectangle on one visual line.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SelectionRect {
+    /// The left edge of the selection.
+    pub x: f32,
+    /// The top edge of the selection.
+    pub y: f32,
+    /// The width of the selection.
+    pub width: f32,
+    /// The height of the selection.
+    pub height: f32,
+}
+
+/// The selection's rectangles on screen, one per visual line it covers.
 ///
 /// A selection that spans several lines has no single rectangle; the caller
 /// draws it line by line.
-pub fn selection_line(
-    layout: &TextLayout,
-    range: std::ops::Range<usize>,
-) -> Option<(f32, f32, f32)> {
-    let line = layout.line_of(range.start)?;
-    let start = line.offset_at(range.start);
-    let end = line.offset_at(range.end.min(line.range.end));
-    if end < start {
-        return None;
+pub fn selection_rects(layout: &TextLayout, range: std::ops::Range<usize>) -> Vec<SelectionRect> {
+    let mut rects = Vec::new();
+    for line in &layout.lines {
+        let start = range.start.max(line.range.start);
+        let end = range.end.min(line.range.end);
+        if end <= start {
+            continue;
+        }
+        let x = line.offset_at(start);
+        let width = line.offset_at(end) - x;
+        if width <= 0.0 {
+            continue;
+        }
+        rects.push(SelectionRect {
+            x,
+            y: line.y,
+            width,
+            height: layout.line_height,
+        });
     }
-    Some((start, line.y, end - start))
+    rects
 }
 
 #[cfg(test)]
@@ -133,5 +156,49 @@ mod tests {
         let mut view = ViewState::new();
         view.ensure_line_visible(3, 5, 100);
         assert_eq!(view.first_line, 0);
+    }
+
+    fn layout_of(text: &str) -> TextLayout {
+        use crate::measure::MonospaceMeasurer;
+        use codeweaver_text::Buffer;
+        let buffer = Buffer::new(text);
+        let mut measurer = MonospaceMeasurer::new(10.0);
+        TextLayout::build(&buffer, 0, 10, 1000.0, 16.0, 20.0, &mut measurer)
+    }
+
+    #[test]
+    fn a_selection_on_one_line_is_one_rectangle() {
+        let layout = layout_of("abc\ndef\n");
+        let rects = selection_rects(&layout, 1..3);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].x, 10.0);
+        assert_eq!(rects[0].width, 20.0);
+        assert_eq!(rects[0].y, 0.0);
+        assert_eq!(rects[0].height, 20.0);
+    }
+
+    #[test]
+    fn a_selection_over_several_lines_is_one_rectangle_per_line() {
+        let layout = layout_of("abc\ndef\n");
+        let rects = selection_rects(&layout, 1..5);
+        assert_eq!(rects.len(), 2);
+        assert_eq!((rects[0].x, rects[0].width), (10.0, 20.0));
+        assert_eq!((rects[1].x, rects[1].width), (0.0, 10.0));
+        assert_eq!(rects[1].y, 20.0);
+    }
+
+    #[test]
+    fn an_empty_selection_has_no_rectangle() {
+        let layout = layout_of("abc\ndef\n");
+        assert!(selection_rects(&layout, 1..1).is_empty());
+    }
+
+    #[test]
+    fn the_caret_sits_on_the_line_of_its_offset() {
+        let layout = layout_of("abc\ndef\n");
+        let caret = caret_shape(&layout, 5).expect("the caret is on screen");
+        assert_eq!(caret.x, 10.0);
+        assert_eq!(caret.y, 20.0);
+        assert_eq!(caret.height, 20.0);
     }
 }

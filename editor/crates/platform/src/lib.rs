@@ -1,4 +1,5 @@
 mod agent;
+mod editor_view;
 mod input;
 
 use std::{path::PathBuf, sync::Arc};
@@ -6,13 +7,14 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::{Context, Result};
 use codeweaver_agent_acp::ToolStatus;
 use codeweaver_editor_core::Editor;
-use codeweaver_render::{Color, FrameScene, Rect, Renderer, RendererError, TextStyle};
+use codeweaver_render::{Color, FrameScene, Point, Rect, Renderer, RendererError, Size, TextFamily, TextStyle};
 use codeweaver_workspace::{Document, Workspace};
+use editor_view::{EditorView, LINE_HEIGHT, RendererMeasurer};
 use input::TextInputState;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, Ime, WindowEvent},
+    event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{Key, ModifiersState, NamedKey},
     window::{ImePurpose, Window, WindowAttributes, WindowId},
@@ -41,6 +43,10 @@ pub struct NativeApplication {
     status: Option<String>,
     /// How to start the agent endpoint, when it is configured explicitly.
     endpoint: Option<EndpointSettings>,
+    /// The editor body: the scroll position and the layout of the text.
+    view: EditorView,
+    /// Where the mouse is, in logical pixels.
+    cursor: Option<Point>,
 }
 
 impl NativeApplication {
@@ -70,6 +76,8 @@ impl NativeApplication {
             document,
             status: None,
             endpoint: None,
+            view: EditorView::new(),
+            cursor: None,
         })
     }
 
@@ -118,6 +126,75 @@ impl NativeApplication {
             Some(session) => session.pump(),
             None => false,
         }
+    }
+
+    /// The size of the window, in logical pixels.
+    fn window_size(&self, scale_factor: f64) -> Size {
+        match self.renderer.as_ref() {
+            Some(renderer) => renderer.logical_size(scale_factor),
+            None => Size::new(0.0, 0.0),
+        }
+    }
+
+    /// How many lines of the body fit on screen.
+    fn visible_lines(&self, scale_factor: f64) -> usize {
+        let body = editor_body_rect(self.window_size(scale_factor));
+        ((body.size.height / LINE_HEIGHT).floor() as usize).max(1)
+    }
+
+    /// Rebuilds the layout of the text on screen.
+    ///
+    /// The layout is only rebuilt when something it depends on changed, so
+    /// a mouse move does not pay for measuring the text again.
+    fn rebuild_layout(&mut self, scale_factor: f64) {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return;
+        };
+        let size = renderer.logical_size(scale_factor);
+        let body = editor_body_rect(size);
+        let mut measurer = RendererMeasurer::new(renderer, TextFamily::Monospace);
+        self.view.layout(
+            self.editor.buffer(),
+            body.size.width,
+            body.size.height,
+            &mut measurer,
+        );
+    }
+
+    /// Scrolls the body so that the caret is on screen.
+    fn keep_caret_visible(&mut self, scale_factor: f64) {
+        let total_lines = self.editor.buffer().line_count();
+        let visible = self.visible_lines(scale_factor);
+        let caret = self.editor.caret().0;
+        self.view
+            .ensure_caret_visible(self.editor.buffer(), caret, total_lines, visible);
+    }
+
+    /// Handles a mouse press in the editor body.
+    fn press_body(&mut self, scale_factor: f64) {
+        let Some(cursor) = self.cursor else {
+            return;
+        };
+        let body = editor_body_rect(self.window_size(scale_factor));
+        if !body.contains(cursor) {
+            return;
+        }
+        self.view
+            .press(&mut self.editor, cursor.x - body.origin.x, cursor.y - body.origin.y);
+        self.keep_caret_visible(scale_factor);
+    }
+
+    /// Handles the mouse moving while a drag is in progress.
+    fn drag_body(&mut self, scale_factor: f64) {
+        if !self.view.is_dragging() {
+            return;
+        }
+        let Some(cursor) = self.cursor else {
+            return;
+        };
+        let body = editor_body_rect(self.window_size(scale_factor));
+        self.view
+            .drag(&mut self.editor, cursor.x - body.origin.x, cursor.y - body.origin.y);
     }
 
     /// Handles the keys that drive the agent.

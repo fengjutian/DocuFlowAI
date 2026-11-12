@@ -474,3 +474,54 @@ export interface TaskTrace {
   taskId: string;
   executions: ExecutionTrace[];
 }
+
+/**
+ * One recorded audit event on the timeline.
+ *
+ * The timeline is read from the server's journal, so an item here is exactly one recorded line:
+ * the same thing the live stream replays.
+ */
+export interface AuditTimelineItem {
+  executionId: string;
+  sequence: number;
+  kind: "runtime.event" | "audit";
+  category: string;
+  recordedAt: string;
+  taskId?: string;
+  parentExecutionId?: string;
+  payload: Record<string, unknown>;
+}
+
+/** One execution's place in the timeline: what it was, and which stages it went through. */
+export interface AuditTimelineExecution {
+  executionId: string;
+  taskIds: string[];
+  parentExecutionId?: string;
+  childExecutionIds: string[];
+  runtimeId?: string;
+  eventCount: number;
+  firstRecordedAt: string;
+  lastRecordedAt: string;
+  /** Journal positions missing from this execution's recorded range. */
+  gaps: number[];
+  /** The stages the recorded events reconstruct, in the order they happened. */
+  phases: string[];
+  /** False when the recorded timestamps disagree with the recorded order (two different clocks). */
+  timestampsMonotonic: boolean;
+}
+
+/**
+ * The audit timeline: the recorded events of every execution, correlated and ordered.
+ *
+ * This is what design 15 asks for — "从审计事件还原完整执行过程" — and it is a different thing from
+ * the trace: a trace is the set of records that belong together, a timeline is the sequence they
+ * happened in.
+ */
+export interface AuditTimeline {
+  items: AuditTimelineItem[];
+  executions: AuditTimelineExecution[];
+  taskIds: string[];
+  categories: Record<string, number>;
+  gaps: Array<{ executionId: string; sequences: number[] }>;
+  truncated: boolean;
+}

@@ -151,8 +151,14 @@ export function judgeAuditTimeline(input: {
 
   // The global order is the recorded time; inside an execution the journal order is never broken.
   let timeOrdered = true;
+  let firstBreak: { previous: AuditTimelineItemView; current: AuditTimelineItemView } | undefined;
   for (let index = 1; index < timeline.items.length; index += 1) {
-    if (timeline.items[index]!.recordedAt < timeline.items[index - 1]!.recordedAt) timeOrdered = false;
+    if (timeline.items[index]!.recordedAt < timeline.items[index - 1]!.recordedAt) {
+      timeOrdered = false;
+      if (!firstBreak) {
+        firstBreak = { previous: timeline.items[index - 1]!, current: timeline.items[index]! };
+      }
+    }
   }
   let sequenceOrdered = true;
   for (const execution of timeline.executions) {
@@ -163,13 +169,20 @@ export function judgeAuditTimeline(input: {
       if (sequences[index]! <= sequences[index - 1]!) sequenceOrdered = false;
     }
   }
+  const skews = timeline.executions
+    .filter(execution => !execution.timestampsMonotonic)
+    .map(execution => execution.executionId);
   links.push({
     name: "ordered",
     ok: timeOrdered && sequenceOrdered,
     detail:
       timeOrdered && sequenceOrdered
         ? "the timeline is ordered by time, and every execution keeps its own journal order"
-        : `the recorded order is broken (time ordered: ${timeOrdered}, journal order kept: ${sequenceOrdered})`
+        : `the recorded order is broken (time ordered: ${timeOrdered}, journal order kept: ${sequenceOrdered}${
+            firstBreak
+              ? `; first break: ${firstBreak.previous.executionId}#${firstBreak.previous.sequence} ${firstBreak.previous.category} at ${firstBreak.previous.recordedAt} then ${firstBreak.current.executionId}#${firstBreak.current.sequence} ${firstBreak.current.category} at ${firstBreak.current.recordedAt}`
+              : ""
+          }${skews.length > 0 ? `; executions whose own timestamps disagree with their order: ${skews.join(",")}` : ""})`
   });
 
   // Correlation: the executions of one task are on one timeline and carry the task.
@@ -219,7 +232,7 @@ export function judgeAuditTimeline(input: {
   });
 
   // The task scope: asking for the task returns the whole tree.
-  const taskExecutionIds = taskTimeline.executions.map(item => item.executionId);
+  const taskExecutionIds = input.taskTimeline.executions.map(item => item.executionId);
   const taskScopeOk =
     taskExecutionIds.includes(input.firstExecutionId) &&
     taskExecutionIds.includes(input.secondExecutionId);
@@ -307,6 +320,11 @@ export async function executeAuditTimeline(
   evidence.push(`taskTimelineExecutions=${taskTimeline.executions.map(item => item.executionId).join(",") || "none"}`);
   evidence.push(`journalCounts=${Object.entries(journalCounts).map(([id, count]) => `${id}=${count}`).join(",")}`);
   evidence.push(`missingTimelineStatus=${missingTimelineStatus}`);
+  for (const execution of timeline.executions) {
+    evidence.push(
+      `execution=${execution.executionId} events=${execution.eventCount} phases=${execution.phases.join(">") || "none"} timestampsMonotonic=${execution.timestampsMonotonic} gaps=${execution.gaps.join(",") || "none"}`
+    );
+  }
 
   const judgement = judgeAuditTimeline({
     taskId,

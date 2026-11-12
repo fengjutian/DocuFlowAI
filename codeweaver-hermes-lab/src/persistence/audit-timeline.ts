@@ -218,7 +218,7 @@ export function buildAuditTimeline(entries: readonly JournalEntry[]): AuditTimel
       executionId,
       taskIds: [...ownTaskIds],
       ...(parentExecutionId ? { parentExecutionId } : {}),
-      ...(childExecutionIds.length > 0 ? { childExecutionIds } : {}),
+      childExecutionIds,
       ...(runtimeId ? { runtimeId } : {}),
       eventCount: sorted.length,
       firstRecordedAt: sorted[0]!.recordedAt,
