@@ -1588,8 +1588,93 @@ sentence.
 Consequence: P0-016 is signed off, and the promise is kept narrow on purpose. The limits cover the
 processes **CodeWeaver starts** — the acceptance checks, which are the only processes the product
 runs on an agent's behalf. Putting the whole runtime behind an OS boundary (AppContainer, then
-Windows Sandbox or Hyper-V) is P0-017's job, and it is still blocked on that evidence
-(doc/HERMES_NATIVE_PLAN.md). Saying "sandboxed" without that sentence would be the kind of claim
-this log exists to prevent.
+Windows Sandbox or Hyper-V) is P0-017's job; D-078 is that evidence. Saying "sandboxed" without
+the sentence about which processes are behind the boundary would be the kind of claim this log
+exists to prevent.
+
+## D-078: The host path boundary is a virtual machine, and the agent is told when it stops it
+Status: accepted
+
+The checklist item is 「宿主机目录保护｜Agent 无法访问未授权宿主机目录」, and its acceptance hint asks
+two questions: can the agent reach the host's `/root`, and can it reach a host service over the
+network. Both are answered by a boundary, and the boundary has to be a real one — a boundary the
+product maintains itself is a filter, not an isolation.
+
+**The mechanism.** The plan (doc/HERMES_NATIVE_PLAN.md) allows a Hyper-V virtual machine as the
+fallback when AppContainer cannot be used. On this machine AppContainer cannot be used: the
+account is not an administrator, so the package SID cannot be granted traverse on the drive roots,
+and every image inside the container fails with `CreateProcess failed (2)`. WSL2 is that virtual
+machine — a real guest kernel, not a container — and it needs no administrator rights. The
+mechanism is named in the evidence (`backend=wsl2`), and the backend type still has room for
+AppContainer, Windows Sandbox and Docker, so the probes do not change when the mechanism does:
+the SEC-B* scripts ask the boundary to run a shell script and look at the answer.
+
+The AppContainer path is not gone, it is unproven: `scripts/appcontainer-run.ps1` derives a package
+SID, grants it the right ACEs, starts the child with `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`
+and then checks from the parent's side that the child's token really is an AppContainer token
+(`TokenIsAppContainer`) — a run that only looks isolated is reported as not isolated. It carries
+no evidence yet, because this machine cannot exercise it: granting a package SID traverse on
+`C:\` and `D:\` needs administrator rights. So it is not in `SUPPORTED_BACKENDS`, and a spec that
+names it is blocked rather than run.
+
+**The shape of the boundary.** Inside a private mount namespace the host drives are unmounted,
+only the workspace is mounted back, and it is mounted with `noexec`. The network namespace has no
+interface at all. The work runs as an unprivileged user (`uid=1002 user=cwlab`), because a root
+process inside the guest can mount a host drive again and read the host's raw disks — the guest
+kernel exposes them as `/dev/sd*`, and only root may read them. The `noexec` mount is load-bearing
+rather than tidiness: WSL2 hands Windows binaries to the host through a kernel handler
+(`/proc/sys/fs/binfmt_misc/WSLInterop`, interpreter `/init`) that cannot be removed from inside
+the guest — a fresh `binfmt_misc` mount shows the same global table, and masking `/init` changes
+nothing, because the handler is implemented in the WSL kernel driver. So the boundary's protection
+is that no Windows executable is reachable: the drives are unmounted, and the one directory that
+is mounted back cannot execute anything. The probe proves both halves: the drives are gone
+(`no host drive mounted and no host content visible`) and a file with a Windows header inside the
+workspace is refused (`Permission denied`).
+
+**What the boundary proves.** Ten probes, one per property, all run inside it: the workspace is
+readable and writable, the restricted and outside directories are absent, a path traversal out of
+the workspace is refused, the network has no route (`links=lo:, routes=0`, and `wget` itself
+exists and fails with a name resolution error), the work is unprivileged, the host drives are not
+mounted, a Windows executable is not runnable, and the host's raw disks are not readable.
+
+**The control.** Every "it was refused" needs a "it was reachable otherwise", or the two arms do
+not show that the boundary made the difference. The same script reads the same host directory —
+the user's own profile, `C:\Users\Charles.feng` — in the same guest, as the same user, without
+the namespaces: `HOST_DIR_REACHABLE entries=172`. Inside the boundary the same script answers
+`HOST_DIR_UNREACHABLE`. The script prints a count and never a name: an evidence line is not the
+place for the contents of someone's home directory.
+
+**The agent.** The checklist item is about the agent, so the boundary evidence supports it rather
+than replacing it (D-008/D-020). A real model, on the real Pi runtime, over the real HTTP
+surface, is asked to run the acceptance check that reads the host directory. The control arm runs
+the same check without the boundary: the model called `evaluate_changes` once, the tool answered
+"passed: 1/1 checks passed", the check's own output said `HOST_DIR_REACHABLE entries=172`, the
+completion gate opened and the model reported the task as done. The tight arm runs the same check
+inside the boundary: the model called the tool once, the tool answered
+
+    failed: failed: a check that reads a host directory outside the workspace
+    a check that reads a host directory outside the workspace: target=/mnt/c/Users/Charles.feng
+    HOST_DIR_UNREACHABLE: /mnt/c/Users/Charles.feng is not reachable from here
+
+the gate stayed shut ("A check failed: failed: a check that reads a host directory outside the
+workspace"), and the model named the refusal and said the check could not read the directory —
+it did not report the task as done.
+
+**A detail the agent arm corrected.** The control arm first failed, and the reason was worth
+keeping: the tool's text carries the verdict, and spells out the reason only for the checks that
+did **not** pass, because that is where an agent needs it. A passing check's output lives in the
+tool's `details`, not in its text. The judgement was reading the tool's text for the word
+"passed", which also matches "0/1 checks passed" — a failed verdict. The verdict is now read off
+the front of the text (`toolVerdict`), and the check's own output is read from the details, which
+is also what lets the evidence show that the agent's check really did read the host directory.
+
+Consequence: P0-017 is signed off, and the promise is kept narrow on purpose, in the same way
+P0-016's was. What is behind the boundary are the processes **CodeWeaver starts** — the
+acceptance checks, which are the only processes the product runs on an agent's behalf. The agent
+runtime itself still runs on the host: moving it into the guest would mean a Node runtime and a
+model API route inside the virtual machine, and the network namespace that forbids egress would
+have to allow exactly one endpoint. That is the next layer, and until it exists the sentence
+"the agent cannot reach unauthorized host directories" means the agent's work cannot, not that
+the agent process itself is invisible.
 
 

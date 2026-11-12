@@ -1,15 +1,16 @@
 mod agent;
+mod completion;
 pub mod editor_view;
 pub mod find;
 mod input;
 mod lsp;
 
-use std::{ops::Range, path::PathBuf, sync::Arc};
+use std::{ops::Range, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use codeweaver_agent_acp::ToolStatus;
 use codeweaver_editor_core::Editor;
-use codeweaver_lsp::{Client as LspClient, LspEvent, protocol::Diagnostic};
+use codeweaver_lsp::{Client as LspClient, LspEvent};
 use codeweaver_render::{
     Color, FrameScene, Point, Rect, Renderer, RendererError, Size, TextFamily, TextStyle,
 };
@@ -17,14 +18,17 @@ use codeweaver_syntax::{Language, Syntax};
 use codeweaver_text::TextOffset;
 use codeweaver_ui::TextMeasurer;
 use codeweaver_workspace::{Document, Workspace};
-use editor_view::{BodyOverlay, EditorView, FindOverlay, LINE_HEIGHT, RendererMeasurer};
+use completion::CompletionPopup;
+use editor_view::{
+    BodyOverlay, EditorView, FindOverlay, LINE_HEIGHT, MarkSeverity, RendererMeasurer,
+};
 use find::{FindBar, FindField};
 use input::TextInputState;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
     event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ActiveEventLoop, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, ModifiersState, NamedKey},
     window::{ImePurpose, Window, WindowAttributes, WindowId},
 };
@@ -68,8 +72,13 @@ pub struct NativeApplication {
     server_version: Option<u64>,
     /// The version the server is told next.
     server_generation: i64,
-    /// The things the server found wrong in the document.
-    diagnostics: Vec<Diagnostic>,
+    /// The things the language server found wrong in the document.
+    marks: Vec<editor_view::Mark>,
+    /// How many of them are errors, and how many are warnings.
+    errors: usize,
+    warnings: usize,
+    /// The completions the server offered, when the list is open.
+    completion: Option<CompletionPopup>,
 }
 
 impl NativeApplication {
@@ -114,6 +123,9 @@ impl NativeApplication {
             }
         }
 
+        // The server has been told about the text that is there now.
+        let server_version = server.as_ref().map(|_| editor.version());
+
         Ok(NativeApplication {
             window: None,
             renderer: None,
@@ -132,9 +144,12 @@ impl NativeApplication {
             syntax,
             server,
             document_uri,
-            server_version: None,
+            server_version,
             server_generation: 1,
-            diagnostics: Vec::new(),
+            marks: Vec::new(),
+            errors: 0,
+            warnings: 0,
+            completion: None,
         })
     }
 
@@ -216,6 +231,98 @@ impl NativeApplication {
             body.size.height,
             &mut measurer,
         );
+    }
+
+    /// Collects what the language server has said.
+    ///
+    /// The server talks on its own thread, so its answers are collected once
+    /// per frame - the same way the agent's output is. Returns whether
+    /// something the user can see changed.
+    fn pump_lsp(&mut self) -> bool {
+        let events = match self.server.as_ref() {
+            Some(server) => server.drain_events(),
+            None => return false,
+        };
+        let lists = match self.server.as_ref() {
+            Some(server) => server.drain_completions(),
+            None => Vec::new(),
+        };
+        let mut changed = false;
+        for event in events {
+            match event {
+                LspEvent::Diagnostics { uri, diagnostics } => {
+                    // The server may talk about other documents; only the one
+                    // on screen is drawn.
+                    if Some(uri.as_str()) != self.document_uri.as_deref() {
+                        continue;
+                    }
+                    let marks = lsp::marks_for(self.editor.buffer(), &diagnostics);
+                    self.errors = marks
+                        .iter()
+                        .filter(|mark| mark.severity == MarkSeverity::Error)
+                        .count();
+                    self.warnings = marks
+                        .iter()
+                        .filter(|mark| mark.severity == MarkSeverity::Warning)
+                        .count();
+                    self.marks = marks;
+                    changed = true;
+                }
+                LspEvent::Disconnected { reason } => {
+                    eprintln!("the language server went away: {reason}");
+                    self.status = Some(format!("语言服务器断开了：{reason}"));
+                    self.server = None;
+                    self.marks.clear();
+                    changed = true;
+                }
+                LspEvent::Message { text } => {
+                    self.status = Some(text);
+                    changed = true;
+                }
+            }
+        }
+
+        // The completions the server offered, with the ones that do not
+        // match the word in front of the caret left out.
+        for list in lists {
+            let caret = self.editor.caret().0;
+            let prefix = completion::word_before(self.editor.buffer(), caret);
+            let items = completion::matching(list.items, &prefix);
+            let start = completion::word_start(self.editor.buffer(), caret);
+            if let Some(popup) = CompletionPopup::new(items, start) {
+                self.completion = Some(popup);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Tells the language server what the text looks like now.
+    ///
+    /// The server is told about every edit, so its answers are about the text
+    /// that is on screen and not about the text as the file was opened.
+    fn tell_server_about_the_change(&mut self) {
+        let Some(uri) = self.document_uri.clone() else {
+            return;
+        };
+        let Some(change) = self.editor.last_change() else {
+            return;
+        };
+        let version = self.editor.buffer().version();
+        if self.server_version == Some(version) {
+            // The server already knows about this text.
+            return;
+        }
+        let changes = lsp::changes_for(self.editor.buffer(), change);
+        let text = self.editor.text();
+        self.server_version = Some(version);
+        self.server_generation += 1;
+        let generation = self.server_generation;
+        if let Some(server) = self.server.as_ref()
+            && let Err(error) = server.did_change(&uri, generation, &text, &changes)
+        {
+            eprintln!("could not tell the language server about the change: {error}");
+        }
     }
 
     /// Scrolls the body so that the caret is on screen.
@@ -355,6 +462,73 @@ impl NativeApplication {
         }
     }
 
+    /// Handles the keys that the language server takes.
+    ///
+    /// The list of completions takes the keys that move inside it, and
+    /// Ctrl+Space asks the server what could come next.
+    fn handle_lsp_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
+        if self.completion.is_some() {
+            let mut completion = self.completion.take().expect("the list is open");
+            match key {
+                Key::Named(NamedKey::Escape) => {
+                    // The list closes and the editor takes the keyboard back.
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    completion.select_next();
+                    self.completion = Some(completion);
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    completion.select_previous();
+                    self.completion = Some(completion);
+                    return true;
+                }
+                Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
+                    if let Err(error) = completion.apply(&mut self.editor) {
+                        eprintln!("could not put the completion in: {error}");
+                    }
+                    return true;
+                }
+                _ => {
+                    // The key was not one of the list: the list closes and
+                    // the key goes on to the editor.
+                }
+            }
+        }
+
+        // Ctrl+Space asks the server what could come next.
+        if self.modifiers.control_key()
+            && let Key::Character(character) = key
+            && character.as_ref() == " "
+        {
+            self.request_completion();
+            return true;
+        }
+        false
+    }
+
+    /// Asks the server what could come next at the caret.
+    fn request_completion(&mut self) {
+        let Some(uri) = self.document_uri.clone() else {
+            return;
+        };
+        let caret = self.editor.caret().0;
+        let position = lsp::position_of(self.editor.buffer(), caret);
+        let outcome = self
+            .server
+            .as_ref()
+            .map(|server| server.request_completion(&uri, position));
+        match outcome {
+            Some(Ok(())) => {}
+            Some(Err(error)) => {
+                eprintln!("could not ask the server for completions: {error}");
+                self.status = Some(format!("补全请求失败：{error}"));
+            }
+            None => self.status = Some("没有语言服务器".to_owned()),
+        }
+    }
+
     /// Opens the find bar when the user asks for it.
     ///
     /// Ctrl+F finds, Ctrl+H finds and replaces.
@@ -472,6 +646,11 @@ impl NativeApplication {
             }
             None => "untitled".to_owned(),
         };
+        // What the language server found wrong is counted, so that the user
+        // knows there is something to look at.
+        if self.errors > 0 || self.warnings > 0 {
+            status.push_str(&format!("  ·  ✕ {}  ⚠ {}", self.errors, self.warnings));
+        }
         if let Some(message) = self.status.as_ref() {
             status.push_str(&format!("  ·  {message}"));
         }
@@ -574,6 +753,23 @@ impl ApplicationHandler for NativeApplication {
         }
     }
 
+    /// Called when the event loop is about to wait.
+    ///
+    /// The language server answers on its own thread, so the window has to
+    /// wake up from time to time to hear what it said. Without this, the
+    /// diagnostics of a file that was opened would only show up when the
+    /// user typed something.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.pump_lsp()
+            && let Some(window) = self.window.as_ref()
+        {
+            window.request_redraw();
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            std::time::Instant::now() + Duration::from_millis(100),
+        ));
+    }
+
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
@@ -658,6 +854,13 @@ impl ApplicationHandler for NativeApplication {
                 }
                 // While the find bar is open, the keys go to the bar.
                 if self.handle_find_bar_key(&event.logical_key.as_ref(), event.text.as_deref()) {
+                    window.request_redraw();
+                    return;
+                }
+                // The list of completions and the request for one belong to
+                // the language server.
+                if self.handle_lsp_key(&event.logical_key.as_ref()) {
+                    self.tell_server_about_the_change();
                     window.request_redraw();
                     return;
                 }
@@ -755,6 +958,7 @@ impl ApplicationHandler for NativeApplication {
                 // and the caret is brought back on screen.
                 self.rebuild_layout(scale_factor);
                 self.keep_caret_visible(scale_factor);
+                self.tell_server_about_the_change();
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
@@ -763,6 +967,16 @@ impl ApplicationHandler for NativeApplication {
                 if let Some(session) = self.agent.as_mut()
                     && session.pump()
                 {
+                    window.request_redraw();
+                }
+                // The language server answers on its own thread, so its
+                // answers are collected the same way.
+                if self.pump_lsp() {
+                    window.request_redraw();
+                }
+                // The language server answers on its own thread, so its
+                // findings are collected here too.
+                if self.pump_lsp() {
                     window.request_redraw();
                 }
                 // The status line is read before the renderer is borrowed.
@@ -783,6 +997,8 @@ impl ApplicationHandler for NativeApplication {
                         agent_error: self.agent_error.as_deref(),
                         status_line,
                         find: self.find.as_ref(),
+                        marks: &self.marks,
+                        completion: self.completion.as_ref(),
                     },
                 );
                 match renderer.render(&scene, scale_factor) {
@@ -813,6 +1029,10 @@ struct Chrome<'a> {
     status_line: String,
     /// The find bar, when it is open.
     find: Option<&'a FindBar>,
+    /// The things the language server found wrong in the document.
+    marks: &'a [editor_view::Mark],
+    /// The list of completions, when it is open.
+    completion: Option<&'a CompletionPopup>,
 }
 
 /// The matches of a search that was not run.
@@ -915,6 +1135,7 @@ fn build_scene(
             BodyOverlay {
                 find: overlay,
                 highlights,
+                marks: chrome.marks,
             },
             &mut measurer,
         );
@@ -926,6 +1147,20 @@ fn build_scene(
     // its own.
     let mut ui_measurer = RendererMeasurer::new(renderer, TextFamily::SansSerif);
     push_find_bar(&mut scene, size, body, chrome.find, &mut ui_measurer);
+
+    // The list of completions floats under the caret.
+    if let Some(popup) = chrome.completion
+        && let Some(point) = view.point_of(editor_state.caret().0)
+    {
+        completion::draw(
+            &mut scene,
+            Rect::new(0.0, 0.0, size.width, size.height),
+            body,
+            popup,
+            point,
+            &mut ui_measurer,
+        );
+    }
     scene
 }
 

@@ -7,12 +7,13 @@
 use std::path::{Path, PathBuf};
 
 use codeweaver_lsp::{
-    ServerConfig,
-    positions,
-    protocol::{Position, Range, TextChange},
+    ServerConfig, positions,
+    protocol::{Diagnostic, DiagnosticSeverity, Position, Range, TextChange},
 };
 use codeweaver_syntax::Language;
 use codeweaver_text::{Buffer, BufferChange};
+
+use crate::editor_view::{Mark, MarkSeverity};
 
 /// The language server of a language, if the machine has one.
 pub fn server_for(language: Language) -> Option<ServerConfig> {
@@ -75,18 +76,45 @@ pub fn changes_for(buffer: &Buffer, change: &BufferChange) -> Vec<TextChange> {
         let replaced = &change.replaced[0];
         let start = positions::position_at(buffer, edit.range.start.0);
         let end = positions::advance(start, replaced);
-        return vec![TextChange {
-            range: Range { start, end },
-            text: edit.replacement.clone(),
-        }];
+        return vec![TextChange::in_range(
+            Range { start, end },
+            edit.replacement.clone(),
+        )];
     }
-    vec![TextChange {
-        range: Range {
-            start: Position::new(0, 0),
-            end: positions::position_at(buffer, buffer.len().0),
-        },
-        text: buffer.text(),
-    }]
+    vec![TextChange::whole(buffer.text())]
+}
+
+/// The things the server found wrong, in the editor's own words.
+///
+/// The places the server gives are in its own units, so they are worked out
+/// against the text that is there now.
+pub fn marks_for(buffer: &Buffer, diagnostics: &[Diagnostic]) -> Vec<Mark> {
+    diagnostics
+        .iter()
+        .filter_map(|diagnostic| {
+            let start = positions::offset_at(buffer, diagnostic.range.start)?;
+            let end = positions::offset_at(buffer, diagnostic.range.end)?;
+            Some(Mark {
+                range: start..end,
+                severity: severity_of(diagnostic.severity),
+            })
+        })
+        .collect()
+}
+
+/// How bad a thing is, in the editor's own words.
+fn severity_of(severity: Option<DiagnosticSeverity>) -> MarkSeverity {
+    match severity {
+        Some(DiagnosticSeverity::Error) => MarkSeverity::Error,
+        Some(DiagnosticSeverity::Warning) => MarkSeverity::Warning,
+        Some(DiagnosticSeverity::Information) => MarkSeverity::Information,
+        _ => MarkSeverity::Hint,
+    }
+}
+
+/// The place of the caret, in the protocol's own words.
+pub fn position_of(buffer: &Buffer, offset: usize) -> Position {
+    positions::position_at(buffer, offset)
 }
 
 #[cfg(test)]
@@ -96,8 +124,21 @@ mod tests {
 
     #[test]
     fn the_root_of_a_workspace_is_the_folder_with_the_manifest() {
-        let root = workspace_root(Path::new("C:/code/project/src/main.rs"));
-        assert_eq!(root, PathBuf::from("C:/code/project"));
+        // The manifest has to be there for the walk to find it.
+        let mut fixture = std::env::current_exe().expect("the test binary has a path");
+        fixture.pop();
+        if fixture.ends_with("deps") {
+            fixture.pop();
+        }
+        let project = fixture.join("workspace-fixture").join("project");
+        std::fs::create_dir_all(project.join("src")).expect("the fixture is made");
+        std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"fixture\"\n")
+            .expect("the manifest is written");
+
+        let root = workspace_root(&project.join("src").join("main.rs"));
+        assert_eq!(root, project);
+
+        let _ = std::fs::remove_dir_all(fixture.join("workspace-fixture"));
     }
 
     #[test]
@@ -111,9 +152,10 @@ mod tests {
             .unwrap();
         let changes = changes_for(&buffer, &applied.change);
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].range.start, Position::new(1, 0));
+        let range = changes[0].range.expect("the change has a range");
+        assert_eq!(range.start, Position::new(1, 0));
         // The old text was "let", three characters on the second line.
-        assert_eq!(changes[0].range.end, Position::new(1, 3));
+        assert_eq!(range.end, Position::new(1, 3));
         assert_eq!(changes[0].text, "let");
     }
 
@@ -132,6 +174,25 @@ mod tests {
         let changes = changes_for(&buffer, &applied.change);
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].text, buffer.text());
-        assert_eq!(changes[0].range.start, Position::new(0, 0));
+        // Without a range, the whole document is replaced.
+        assert_eq!(changes[0].range, None);
+    }
+
+    #[test]
+    fn a_diagnostic_becomes_a_mark_on_the_text() {
+        let buffer = Buffer::new("fn main() {\n    let x = 1;\n}\n");
+        let diagnostic = Diagnostic {
+            range: Range {
+                start: Position::new(1, 4),
+                end: Position::new(1, 5),
+            },
+            severity: Some(DiagnosticSeverity::Error),
+            message: "cannot find value `x`".to_owned(),
+            source: Some("rustc".to_owned()),
+        };
+        let marks = marks_for(&buffer, &[diagnostic]);
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].range, 16..17);
+        assert_eq!(marks[0].severity, MarkSeverity::Error);
     }
 }

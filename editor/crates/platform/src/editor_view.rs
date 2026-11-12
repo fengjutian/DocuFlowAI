@@ -382,6 +382,13 @@ impl EditorView {
         }
     }
 
+    /// The place of a byte offset on screen, in the coordinates of the body.
+    ///
+    /// Returns nothing when the offset is not on screen.
+    pub fn point_of(&self, offset: usize) -> Option<(f32, f32)> {
+        self.layout.offset_point(offset)
+    }
+
     /// Draws the body: the selection, the text and the caret.
     ///
     /// The matches that the find bar found are drawn under the selection, so
@@ -744,6 +751,7 @@ mod tests {
                 current: None,
             },
             highlights,
+            marks: &[],
         }
     }
 

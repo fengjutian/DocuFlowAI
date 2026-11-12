@@ -113,7 +113,10 @@ mod tests {
         let mut chunk = b"Content-Length: 7\r\n\r\n{\"a\":1}".to_vec();
         chunk.extend_from_slice(b"Content-Length: 7\r\n\r\n{\"b\":2}");
         let frames = reader.push(&chunk);
-        assert_eq!(frames, vec!["{\"a\":1}".to_string(), "{\"b\":2}".to_string()]);
+        assert_eq!(
+            frames,
+            vec!["{\"a\":1}".to_string(), "{\"b\":2}".to_string()]
+        );
     }
 
     #[test]

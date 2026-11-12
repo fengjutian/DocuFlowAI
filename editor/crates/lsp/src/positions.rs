@@ -11,6 +11,7 @@ use crate::protocol::Position;
 
 /// The place of a byte offset in the document.
 pub fn position_at(buffer: &Buffer, offset: usize) -> Position {
+    let offset = offset.min(buffer.len().0);
     let line = buffer.line_of_offset(offset);
     let start = buffer.line_range(line).start.0;
     let text = buffer.slice(TextOffset(start)..TextOffset(offset));
@@ -21,18 +22,24 @@ pub fn position_at(buffer: &Buffer, offset: usize) -> Position {
 /// The byte offset of a place in the document.
 ///
 /// A column past the end of the line lands at the end of the line: the
-/// server sometimes asks about a place that is not there.
+/// server sometimes asks about a place that is not there. A column that
+/// points into the middle of a character lands at the start of it.
 pub fn offset_at(buffer: &Buffer, position: Position) -> Option<usize> {
     let line = position.line as usize;
     let text = buffer.line_text(line);
+    let start = buffer.line_range(line).start.0;
     let mut units = 0u32;
     for (index, character) in text.char_indices() {
-        if units >= position.character {
-            return Some(buffer.line_range(line).start.0 + index);
+        let width = character.len_utf16() as u32;
+        // A column that points into the middle of a character lands at the
+        // start of it: the server counts in code units, but a place in the
+        // text is between characters.
+        if units >= position.character || units + width > position.character {
+            return Some(start + index);
         }
-        units += character.len_utf16() as u32;
+        units += width;
     }
-    Some(buffer.line_range(line).start.0 + text.len())
+    Some(start + text.len())
 }
 
 /// The place that comes after `text`, when the text starts at `place`.
@@ -75,9 +82,13 @@ mod tests {
     #[test]
     fn a_character_outside_the_basic_plane_counts_as_two() {
         let buffer = Buffer::new("let x = \"😀\";\n");
-        // The emoji is four bytes and two UTF-16 code units.
-        assert_eq!(position_at(&buffer, 12), Position::new(0, 12));
-        assert_eq!(offset_at(&buffer, Position::new(0, 12)), Some(12));
+        // The emoji is four bytes and two UTF-16 code units, and it starts
+        // after nine characters.
+        assert_eq!(position_at(&buffer, 13), Position::new(0, 11));
+        assert_eq!(offset_at(&buffer, Position::new(0, 11)), Some(13));
+        // A column that points into the middle of the emoji lands at the
+        // start of it.
+        assert_eq!(offset_at(&buffer, Position::new(0, 10)), Some(9));
     }
 
     #[test]

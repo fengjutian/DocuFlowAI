@@ -101,14 +101,14 @@ export class Wsl2BoundaryProvider implements CheckPlanningProvider {
    * command line would be re-parsed by the shell on the way in.
    */
   async planCheck(
-    spec: BoundarySpec,
+    workspaceDir: string,
     script: string,
     options: { mode: "inside" | "outside" }
   ): Promise<{ command: string; args: string[] }> {
     await this.stage(script);
     const inner =
       options.mode === "inside"
-        ? this.boundaryCommand(spec)
+        ? this.boundaryCommand(workspaceDir)
         : ["cd /", `exec su -s /bin/sh ${this.user} -c 'sh ${this.scriptPath}'`].join("; ");
     return {
       command: this.wsl,
@@ -137,13 +137,13 @@ export class Wsl2BoundaryProvider implements CheckPlanningProvider {
   }
 
   /** The command that runs the staged script inside the boundary. */
-  private boundaryCommand(spec: BoundarySpec): string {
-    return `unshare -m --propagation private --net bash -c "${this.boundarySetup(spec)}"`;
+  private boundaryCommand(workspaceDir: string): string {
+    return `unshare -m --propagation private --net bash -c "${this.boundarySetup(workspaceDir)}"`;
   }
 
   /** What the boundary does, in the order it has to happen. */
-  private boundarySetup(spec: BoundarySpec): string {
-    const workspace = spec.workspaceDir.replace(/'/g, "'\\''");
+  private boundarySetup(workspaceDir: string): string {
+    const workspace = workspaceDir.replace(/'/g, "'\\''");
     return [
       "umount -l /mnt/c /mnt/d /mnt/wsl /mnt/wslg 2>/dev/null || true",
       "mkdir -p /workspace",

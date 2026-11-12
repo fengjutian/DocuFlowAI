@@ -10,6 +10,7 @@ anyhow.workspace = true
 codeweaver-agent-acp = { path = "../agent-acp" }
 codeweaver-agent-ui = { path = "../agent-ui" }
 codeweaver-editor-core = { path = "../editor-core" }
+codeweaver-lsp = { path = "../lsp" }
 codeweaver-render = { path = "../render" }
 codeweaver-syntax = { path = "../syntax" }
 codeweaver-text = { path = "../text" }

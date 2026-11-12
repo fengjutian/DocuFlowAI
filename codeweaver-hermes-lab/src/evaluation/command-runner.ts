@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import type { SandboxOutcome } from "./sandbox-runner.js";
 import type { SandboxLimits } from "./sandbox-limits.js";
+import type { BoundaryOutcome } from "./boundary-runner.js";
 
 export interface CommandOutcome {
   code: number | null;
@@ -9,6 +10,8 @@ export interface CommandOutcome {
   timedOut: boolean;
   /** What the sandbox did with the command, when it ran inside one. */
   sandbox?: SandboxOutcome;
+  /** What the host path boundary did with the command, when it ran inside one. */
+  boundary?: BoundaryOutcome;
 }
 
 /** How a command is run. */

@@ -99,10 +99,45 @@ pub struct TextDocumentItem {
 }
 
 /// A change to a document: the text of a range was replaced.
+///
+/// The range is optional. Without it, the whole document is replaced by the
+/// text, which is what the protocol calls *full* synchronisation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextChange {
-    pub range: Range,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<Range>,
     pub text: String,
+}
+
+impl TextChange {
+    /// The text of a range was replaced by other text.
+    pub fn in_range(range: Range, text: impl Into<String>) -> Self {
+        TextChange {
+            range: Some(range),
+            text: text.into(),
+        }
+    }
+
+    /// The whole document was replaced by other text.
+    pub fn whole(text: impl Into<String>) -> Self {
+        TextChange {
+            range: None,
+            text: text.into(),
+        }
+    }
+}
+
+/// How the server wants to be told about changes to a document.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextDocumentSyncKind {
+    /// The server does not want to be told about changes at all.
+    #[default]
+    None,
+    /// The client sends the whole document after every change.
+    Full,
+    /// The client sends the range that changed.
+    Incremental,
 }
 
 /// One entry of a completion list.
@@ -151,6 +186,9 @@ pub struct ServerCapabilities {
     /// Whether the server can complete code.
     #[serde(default)]
     pub completion_provider: Option<serde_json::Value>,
+    /// How the server wants to be told about changes to a document.
+    #[serde(default, deserialize_with = "read_sync_kind")]
+    pub text_document_sync: TextDocumentSyncKind,
 }
 
 /// The answer to the `initialize` request.
@@ -158,6 +196,29 @@ pub struct ServerCapabilities {
 pub struct InitializeResult {
     #[serde(default)]
     pub capabilities: ServerCapabilities,
+}
+
+/// Reads how the server wants to be told about changes.
+///
+/// The capability is either the kind itself or an object that holds it
+/// together with the other things the server wants to be told.
+fn read_sync_kind<'de, D>(deserializer: D) -> Result<TextDocumentSyncKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let kind = match &value {
+        serde_json::Value::Number(number) => number.as_i64(),
+        serde_json::Value::Object(fields) => {
+            fields.get("change").and_then(|change| change.as_i64())
+        }
+        _ => None,
+    };
+    Ok(match kind {
+        Some(1) => TextDocumentSyncKind::Full,
+        Some(2) => TextDocumentSyncKind::Incremental,
+        _ => TextDocumentSyncKind::None,
+    })
 }
 
 /// The path of a file, as the protocol writes it.
@@ -182,12 +243,15 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     // The host is empty for a local file; a host that is not empty is a
     // remote file, which the editor does not open.
-    let rest = match rest.find('/') {
-        Some(0) => rest,
-        _ => return None,
+    let rest = rest.strip_prefix('/')?;
+    // A Windows path begins with a drive letter, which the URI writes after
+    // a slash: `file:///C:/code`. The slash is not part of the path.
+    let rest = match rest.strip_prefix('/') {
+        Some(rest) if is_drive_letter(rest) => rest,
+        _ => rest,
     };
-    let mut bytes = Vec::new();
-    let mut raw = Vec::new();
+
+    let mut bytes: Vec<u8> = Vec::with_capacity(rest.len());
     let mut chars = rest.chars().peekable();
     while let Some(character) = chars.next() {
         if character == '%' {
@@ -196,14 +260,22 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
                 bytes.push(byte);
                 continue;
             }
+            // Not an escape after all: the percent sign belongs to the path.
+            bytes.push(b'%');
+            bytes.extend(hex.as_bytes());
+            continue;
         }
-        raw.extend(character.to_string().bytes());
+        let mut encoded = [0u8; 4];
+        bytes.extend(character.encode_utf8(&mut encoded).as_bytes());
     }
-    if !bytes.is_empty() {
-        raw.extend(bytes);
-    }
-    let text = String::from_utf8(raw).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
     Some(PathBuf::from(text))
+}
+
+/// Whether the text begins with a drive letter, like `C:`.
+fn is_drive_letter(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 /// Writes the characters that a URI does not allow as `%XX`.
@@ -211,7 +283,9 @@ fn encode_uri(text: &str) -> String {
     let mut encoded = String::with_capacity(text.len());
     for byte in text.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+            // A colon is allowed in a path: it is what a Windows drive
+            // letter is made of.
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
                 encoded.push(byte as char);
             }
             _ => encoded.push_str(&format!("%{byte:02X}")),

@@ -307,6 +307,7 @@ dependencies = [
  "codeweaver-agent-acp",
  "codeweaver-agent-ui",
  "codeweaver-editor-core",
+ "codeweaver-lsp",
  "codeweaver-render",
  "codeweaver-syntax",
  "codeweaver-text",

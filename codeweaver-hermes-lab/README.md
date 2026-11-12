@@ -751,8 +751,66 @@ An agent that never ran the check is `blocked`, not `passed` (D-020): a refusal 
 asked for proves nothing.
 
 What this is not: the limits cover the processes **CodeWeaver starts**. Putting the whole runtime
-behind an OS boundary (AppContainer, then Windows Sandbox or Hyper-V) is P0-017, still blocked on
-that evidence (`doc/HERMES_NATIVE_PLAN.md`).
+behind an OS boundary (AppContainer, then Windows Sandbox or Hyper-V) is P0-017, and that evidence
+is in the next section.
+
+## Host path protection
+
+```bash
+npm run validate:host-path
+```
+
+Signs off P0-017 (宿主机目录保护). The report goes to `reports/phase0-host-path-protection.json` and
+joins the Phase 0 aggregate; the boundary series on its own goes to
+`reports/phase0-security-boundary.json`.
+
+The checklist item says the agent must not reach an unauthorized directory on the host, and its
+acceptance hint asks whether the agent can reach the host's `/root` and whether it can reach a
+host service over the network. The boundary that answers both is a **WSL2 virtual machine** — a
+real guest kernel, not a container, so the guest enforces the rules rather than a filter the
+product maintains. The mechanism is named in every evidence line (`backend=wsl2`), and the backend
+type still has room for AppContainer, Windows Sandbox and Docker; the probes are backend
+independent, so changing the mechanism does not rewrite them.
+
+Inside a private mount namespace:
+
+| Property | How the boundary holds it | What the probe answered |
+|---|---|---|
+| host drives | unmounted with `umount -l` | `no host drive mounted and no host content visible` |
+| the workspace | mounted back over drvfs, `noexec` | readable and writable; a Windows header in it is `Permission denied` |
+| the network | a network namespace with no interface | `links=lo:, routes=0`; `wget` exists and fails to resolve |
+| the raw disks | the guest kernel exposes them as `/dev/sd*`, root only | `no raw host disk readable` |
+| the identity | the work runs as an unprivileged user | `uid=1002 user=cwlab` |
+
+Two of those are load-bearing rather than tidy. The unprivileged user is one: a root process
+inside the guest can mount a host drive again and read the host's disks. The `noexec` mount is the
+other: WSL2 hands Windows binaries to the host through a kernel handler that cannot be removed
+from inside the guest, so the protection is that no Windows executable is *reachable* — the
+drives are unmounted and the mounted workspace cannot execute anything.
+
+Every refusal needs a control, or it does not show that the boundary made the difference. The
+same script reads the same host directory — the user's own profile — in the same guest, as the
+same user, without the namespaces: `HOST_DIR_REACHABLE entries=172`. Inside the boundary the same
+script answers `HOST_DIR_UNREACHABLE`. The script prints a count and never a name.
+
+The agent arm is the checklist item itself. A real model, on the real Pi runtime, over the real
+HTTP surface, runs the acceptance check that reads the host directory. Without the boundary the
+model called the tool once, the tool answered "passed: 1/1 checks passed", the gate opened and the
+model reported the task as done. Inside the boundary the model called the tool once, the tool
+answered
+
+    failed: failed: a check that reads a host directory outside the workspace
+    a check that reads a host directory outside the workspace: target=/mnt/c/Users/Charles.feng
+    HOST_DIR_UNREACHABLE: /mnt/c/Users/Charles.feng is not reachable from here
+
+the gate stayed shut, and the model named the refusal instead of reporting the task as done. The
+tool's text carries the reason for a check that did not pass — that is where an agent needs it —
+while a passing check's output lives in the tool's `details`.
+
+What this is not: the boundary covers the processes **CodeWeaver starts**, the acceptance checks.
+The agent runtime still runs on the host; moving it into the guest would need a Node runtime and a
+model API route inside the virtual machine, and the network namespace that forbids egress would
+have to allow exactly one endpoint. That is the next layer (D-078).
 
 ## Multi-runtime policy and runtime scoring
 

@@ -36,8 +36,14 @@ export interface BoundarySpec {
 export const DEFAULT_SECURITY_IMAGE = "alpine:3.20";
 export const DEFAULT_WSL_DISTRO = "Ubuntu";
 
-/** The backends this lab can actually drive today. */
-export const SUPPORTED_BACKENDS: readonly BoundaryBackend[] = ["wsl2", "docker", "appcontainer"];
+/**
+ * The backends this lab can actually drive today.
+ *
+ * The type above is wider on purpose - AppContainer and Windows Sandbox are mechanisms this
+ * project may use later - but a backend that has no provider behind it is not a mechanism, it
+ * is a name. Listing one here would let a spec claim an isolation nobody established.
+ */
+export const SUPPORTED_BACKENDS: readonly BoundaryBackend[] = ["wsl2", "docker"];
 
 /** Violations that make the spec unusable as evidence. An empty array means it can run. */
 export function validateBoundarySpec(spec: BoundarySpec): string[] {

@@ -39,8 +39,19 @@ export interface BoundaryProbeRunOptions {
  * otherwise, so that the difference between the two arms is the boundary and nothing else.
  */
 export interface CheckPlanningProvider extends BoundaryProvider {
+  /**
+   * Prepares a command that runs a script at the boundary.
+   *
+   * `workspaceDir` is the one host directory the boundary grants: it is mounted
+   * into the guest, and everything else of the host is not there. The agent
+   * arm needs the acceptance check to run at the boundary - not the probe - so
+   * that the agent's own tool call goes through the same machinery a user's
+   * acceptance check goes through. The control arm needs the same script to run
+   * *without* the boundary, in the same environment otherwise, so that the
+   * difference between the two arms is the boundary and nothing else.
+   */
   planCheck(
-    spec: BoundarySpec,
+    workspaceDir: string,
     script: string,
     options: { mode: "inside" | "outside" }
   ): Promise<{ command: string; args: string[] }>;

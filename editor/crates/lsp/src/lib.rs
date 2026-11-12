@@ -37,7 +37,7 @@ use crate::{
     framing::{FrameReader, serialize},
     protocol::{
         CompletionList, Diagnostic, Position, TextChange, TextDocumentIdentifier, TextDocumentItem,
-        VersionedTextDocumentIdentifier,
+        TextDocumentSyncKind, VersionedTextDocumentIdentifier,
     },
 };
 
@@ -92,12 +92,23 @@ impl ServerConfig {
 }
 
 /// A request that is waiting for its answer.
-struct Pending {
-    /// Where the answer of a request goes.
-    sender: Option<Sender<Result<Value, LspError>>>,
-    /// Where the answer of a completion goes: the list is not a JSON-RPC
-    /// result but a list of items, so it has its own way in.
-    completion: Option<Sender<CompletionList>>,
+enum Pending {
+    /// The answer goes back to the caller that asked for it.
+    Answer(Sender<Result<Value, LspError>>),
+    /// A completion is not a JSON-RPC result but a list of items, so it has
+    /// its own way in.
+    Completion(Sender<CompletionList>),
+}
+
+/// The document that was opened before the handshake was done.
+///
+/// The server has not seen the document yet, so the text that is kept here
+/// is the text it gets when the handshake ends.
+struct Waiting {
+    uri: String,
+    language_id: String,
+    version: i64,
+    text: String,
 }
 
 /// A connection to a language server.
@@ -109,11 +120,16 @@ pub struct Client {
     completions: Receiver<CompletionList>,
     /// Where the answer of a completion goes.
     completion_sender: Sender<CompletionList>,
+    responses: Receiver<Result<Value, LspError>>,
+    /// Where the answer of an ordinary request goes.
+    response_sender: Sender<Result<Value, LspError>>,
     running: Arc<AtomicBool>,
     /// Whether the handshake is done.
     ready: Arc<AtomicBool>,
+    /// How the server wants to be told about changes.
+    sync_kind: Arc<Mutex<TextDocumentSyncKind>>,
     /// The document that was opened before the handshake was done.
-    waiting: Arc<Mutex<Option<(String, String, i64, String)>>>,
+    waiting: Arc<Mutex<Option<Waiting>>>,
     reader: Option<JoinHandle<()>>,
     child: Option<Child>,
 }
@@ -133,19 +149,23 @@ impl Client {
             .stderr(Stdio::piped());
 
         let mut child = command.spawn().map_err(LspError::Spawn)?;
-        let stdin = Arc::new(Mutex::new(Some(child.stdin.take().expect("stdin was piped"))));
+        let stdin = Arc::new(Mutex::new(Some(
+            child.stdin.take().expect("stdin was piped"),
+        )));
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
 
         let (event_sender, events) = channel();
         let (completion_sender, completions) = channel();
+        let (response_sender, responses) = channel();
         let client_completions = completion_sender.clone();
+        let client_responses = response_sender.clone();
         let pending: Arc<Mutex<HashMap<i64, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_id = Arc::new(Mutex::new(1));
         let running = Arc::new(AtomicBool::new(true));
         let ready = Arc::new(AtomicBool::new(false));
-        let waiting: Arc<Mutex<Option<(String, String, i64, String)>>> =
-            Arc::new(Mutex::new(None));
+        let sync_kind = Arc::new(Mutex::new(TextDocumentSyncKind::Full));
+        let waiting: Arc<Mutex<Option<Waiting>>> = Arc::new(Mutex::new(None));
 
         // The server writes what it thinks about the program to its error
         // output. Nobody is watching it, but when the server dies that text
@@ -173,9 +193,14 @@ impl Client {
             let pending = Arc::clone(&pending);
             let next_id = Arc::clone(&next_id);
             let ready = Arc::clone(&ready);
+            let sync_kind = Arc::clone(&sync_kind);
             let waiting = Arc::clone(&waiting);
             let root = root.to_path_buf();
-            move || handshake(&stdin, &pending, &next_id, &ready, &waiting, &root)
+            move || {
+                handshake(
+                    &stdin, &pending, &next_id, &ready, &sync_kind, &waiting, &root,
+                )
+            }
         });
 
         Ok(Client {
@@ -185,8 +210,11 @@ impl Client {
             events,
             completions,
             completion_sender: client_completions,
+            responses,
+            response_sender: client_responses,
             running,
             ready,
+            sync_kind,
             waiting,
             reader: Some(reader),
             child: Some(child),
@@ -203,6 +231,14 @@ impl Client {
         self.running.load(Ordering::SeqCst)
     }
 
+    /// How the server wants to be told about changes.
+    pub fn sync_kind(&self) -> TextDocumentSyncKind {
+        *self
+            .sync_kind
+            .lock()
+            .expect("the sync kind lock is not poisoned")
+    }
+
     /// Tells the server that a document was opened.
     pub fn did_open(
         &self,
@@ -213,14 +249,17 @@ impl Client {
     ) -> Result<(), LspError> {
         if !self.is_ready() {
             // The handshake is not done yet; the document goes as soon as it
-            // is.
-            let mut waiting = self.waiting.lock().expect("the waiting lock is not poisoned");
-            *waiting = Some((
-                uri.to_owned(),
-                language_id.to_owned(),
+            // is, with the text it has then.
+            let mut waiting = self
+                .waiting
+                .lock()
+                .expect("the waiting lock is not poisoned");
+            *waiting = Some(Waiting {
+                uri: uri.to_owned(),
+                language_id: language_id.to_owned(),
                 version,
-                text.to_owned(),
-            ));
+                text: text.to_owned(),
+            });
             return Ok(());
         }
         self.notify(
@@ -237,12 +276,37 @@ impl Client {
     }
 
     /// Tells the server that a document changed.
+    ///
+    /// `text` is the whole text of the document, and `changes` says what
+    /// changed in it. A server that wants the whole document after every
+    /// change gets `text`; a server that wants the range gets `changes`.
     pub fn did_change(
         &self,
         uri: &str,
         version: i64,
+        text: &str,
         changes: &[TextChange],
     ) -> Result<(), LspError> {
+        if !self.is_ready() {
+            // The server has not seen the document yet, so it gets the whole
+            // text when the handshake ends. The ranges of the changes are of
+            // no use here: there is no text to put them in.
+            let mut waiting = self
+                .waiting
+                .lock()
+                .expect("the waiting lock is not poisoned");
+            if let Some(document) = waiting.as_mut() {
+                document.version = version;
+                document.text = text.to_owned();
+            }
+            return Ok(());
+        }
+
+        let changes = if self.sync_kind() == TextDocumentSyncKind::Full {
+            vec![TextChange::whole(text)]
+        } else {
+            changes.to_vec()
+        };
         self.notify(
             "textDocument/didChange",
             json!({
@@ -273,13 +337,7 @@ impl Client {
         self.pending
             .lock()
             .expect("the pending lock is not poisoned")
-            .insert(
-                id,
-                Pending {
-                    sender: None,
-                    completion: Some(self.completion_sender.clone()),
-                },
-            );
+            .insert(id, Pending::Completion(self.completion_sender.clone()));
 
         let message = json!({
             "jsonrpc": "2.0",
@@ -289,6 +347,25 @@ impl Client {
                 "textDocument": TextDocumentIdentifier { uri: uri.to_owned() },
                 "position": position,
             },
+        });
+        self.write(&message)
+    }
+
+    /// Asks the server something else.
+    ///
+    /// The answer arrives later: it is in [`Client::drain_responses`].
+    pub fn request(&self, method: &str, params: Value) -> Result<(), LspError> {
+        let id = self.next_id();
+        self.pending
+            .lock()
+            .expect("the pending lock is not poisoned")
+            .insert(id, Pending::Answer(self.response_sender.clone()));
+
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
         });
         self.write(&message)
     }
@@ -303,9 +380,24 @@ impl Client {
         self.completions.try_iter().collect()
     }
 
+    /// Returns the answers of the ordinary requests that arrived since the
+    /// last call.
+    ///
+    /// The answers that came back as an error are left out: the caller asked
+    /// for something, and there is nothing to show.
+    pub fn drain_responses(&self) -> Vec<Value> {
+        self.responses
+            .try_iter()
+            .filter_map(|answer| answer.ok())
+            .collect()
+    }
+
     /// The next id of a request.
     fn next_id(&self) -> i64 {
-        let mut next = self.next_id.lock().expect("the request id lock is not poisoned");
+        let mut next = self
+            .next_id
+            .lock()
+            .expect("the request id lock is not poisoned");
         let id = *next;
         *next += 1;
         id
@@ -349,7 +441,8 @@ fn handshake(
     pending: &Arc<Mutex<HashMap<i64, Pending>>>,
     next_id: &Arc<Mutex<i64>>,
     ready: &Arc<AtomicBool>,
-    waiting: &Arc<Mutex<Option<(String, String, i64, String)>>>,
+    sync_kind: &Arc<Mutex<TextDocumentSyncKind>>,
+    waiting: &Arc<Mutex<Option<Waiting>>>,
     root: &Path,
 ) {
     let id = {
@@ -362,13 +455,7 @@ fn handshake(
     pending
         .lock()
         .expect("the pending lock is not poisoned")
-        .insert(
-            id,
-            Pending {
-                sender: Some(sender),
-                completion: None,
-            },
-        );
+        .insert(id, Pending::Answer(sender));
 
     let root_uri = crate::protocol::file_uri(root);
     let message = json!({
@@ -394,8 +481,15 @@ fn handshake(
 
     // The answer comes back through the reader thread, which resolves the
     // request.
-    if !matches!(receiver.recv(), Ok(Ok(_))) {
+    let Ok(Ok(answer)) = receiver.recv() else {
         return;
+    };
+
+    // The server says how it wants to be told about changes.
+    if let Ok(result) = serde_json::from_value::<crate::protocol::InitializeResult>(answer) {
+        *sync_kind
+            .lock()
+            .expect("the sync kind lock is not poisoned") = result.capabilities.text_document_sync;
     }
 
     let _ = write_frame(
@@ -415,9 +509,13 @@ fn handshake(
     );
     ready.store(true, Ordering::SeqCst);
 
-    // A document that was opened before the handshake was done goes now.
-    let document = waiting.lock().expect("the waiting lock is not poisoned").take();
-    if let Some((uri, language_id, version, text)) = document {
+    // A document that was opened before the handshake was done goes now, with
+    // the text it has then: the server has not seen any text before.
+    let document = waiting
+        .lock()
+        .expect("the waiting lock is not poisoned")
+        .take();
+    if let Some(document) = document {
         let _ = write_frame(
             stdin,
             &json!({
@@ -425,10 +523,10 @@ fn handshake(
                 "method": "textDocument/didOpen",
                 "params": {
                     "textDocument": TextDocumentItem {
-                        uri,
-                        language_id,
-                        version,
-                        text,
+                        uri: document.uri,
+                        language_id: document.language_id,
+                        version: document.version,
+                        text: document.text,
                     },
                 },
             }),
@@ -464,7 +562,7 @@ fn read_loop(
     // Fail every request that is still waiting, so callers do not hang.
     let mut pending = pending.lock().expect("the pending lock is not poisoned");
     for (_, entry) in pending.drain() {
-        if let Some(sender) = entry.sender {
+        if let Pending::Answer(sender) = entry {
             let _ = sender.send(Err(LspError::Closed));
         }
     }
@@ -521,7 +619,10 @@ fn dispatch(
             };
             let outcome = if let Some(error) = message.get("error") {
                 Err(LspError::Remote {
-                    code: error.get("code").and_then(|code| code.as_i64()).unwrap_or(0),
+                    code: error
+                        .get("code")
+                        .and_then(|code| code.as_i64())
+                        .unwrap_or(0),
                     message: error
                         .get("message")
                         .and_then(|message| message.as_str())
@@ -533,14 +634,15 @@ fn dispatch(
             };
             // A completion is not a JSON-RPC result but a list of items, so
             // it goes into its own way in.
-            if let Some(completion) = entry.completion {
-                if let Ok(value) = outcome {
-                    let _ = completion.send(completion_list(value));
+            match entry {
+                Pending::Completion(completion) => {
+                    if let Ok(value) = outcome {
+                        let _ = completion.send(completion_list(value));
+                    }
                 }
-                return;
-            }
-            if let Some(sender) = entry.sender {
-                let _ = sender.send(outcome);
+                Pending::Answer(sender) => {
+                    let _ = sender.send(outcome);
+                }
             }
         }
         // A request from the server. It gets an empty answer, so that the
@@ -576,7 +678,9 @@ fn dispatch(
                     .and_then(|params| params.get("message"))
                     .and_then(|message| message.as_str())
                     .unwrap_or_default();
-                let _ = events.send(LspEvent::Message { text: text.to_owned() });
+                let _ = events.send(LspEvent::Message {
+                    text: text.to_owned(),
+                });
             }
         }
         (None, None) => {}
@@ -584,12 +688,9 @@ fn dispatch(
 }
 
 /// Writes a frame to the server.
-fn write_frame(
-    stdin: &Arc<Mutex<Option<ChildStdin>>>,
-    message: &Value,
-) -> Result<(), LspError> {
-    let text = serde_json::to_string(message)
-        .map_err(|error| LspError::Protocol(error.to_string()))?;
+fn write_frame(stdin: &Arc<Mutex<Option<ChildStdin>>>, message: &Value) -> Result<(), LspError> {
+    let text =
+        serde_json::to_string(message).map_err(|error| LspError::Protocol(error.to_string()))?;
     let mut guard = stdin.lock().expect("the stdin lock is not poisoned");
     let stdin = guard.as_mut().ok_or(LspError::Closed)?;
     stdin
