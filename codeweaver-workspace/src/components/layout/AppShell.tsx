@@ -4,6 +4,7 @@ import {
   Gauge,
   GitBranch,
   GitCommitHorizontal,
+  History,
   LayoutDashboard,
   Puzzle,
   Server,
@@ -25,7 +26,8 @@ const NAV_ITEMS = [
   { to: "/subagents", label: "子代理委派", icon: GitBranch, end: false },
   { to: "/skills", label: "技能管理", icon: Puzzle, end: false },
   { to: "/usage", label: "用量统计", icon: Gauge, end: false },
-  { to: "/trace", label: "提交追溯", icon: GitCommitHorizontal, end: false }
+  { to: "/trace", label: "提交追溯", icon: GitCommitHorizontal, end: false },
+  { to: "/audit-timeline", label: "审计时间线", icon: History, end: false }
 ];
 
 const STREAM_LABEL: Record<string, string> = {

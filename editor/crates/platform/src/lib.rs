@@ -197,6 +197,20 @@ impl NativeApplication {
             .drag(&mut self.editor, cursor.x - body.origin.x, cursor.y - body.origin.y);
     }
 
+    /// Moves the caret one visual line up or down.
+    ///
+    /// When the caret is on the edge of the screen, the body scrolls first,
+    /// so the caret can keep moving.
+    fn move_caret_vertically(&mut self, scale_factor: f64, delta: isize) {
+        if self.view.move_vertical(&mut self.editor, delta) {
+            return;
+        }
+        let total_lines = self.editor.buffer().line_count();
+        self.view.scroll(delta, total_lines);
+        self.rebuild_layout(scale_factor);
+        self.view.move_vertical(&mut self.editor, delta);
+    }
+
     /// Handles the keys that drive the agent.
     ///
     /// Returns `true` when the key belonged to the agent, so the caller does
@@ -414,11 +428,47 @@ impl ApplicationHandler for NativeApplication {
                 window.request_redraw();
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                let scale_factor = window.scale_factor();
+                self.cursor = Some(Point {
+                    x: position.x as f32 / scale_factor as f32,
+                    y: position.y as f32 / scale_factor as f32,
+                });
+                self.drag_body(scale_factor);
+                window.request_redraw();
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left {
+                    let scale_factor = window.scale_factor();
+                    match state {
+                        ElementState::Pressed => self.press_body(scale_factor),
+                        ElementState::Released => self.view.release(),
+                    }
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(lines) => lines as isize,
+                    MouseScrollDelta::PixelDelta(pixels) => (pixels / LINE_HEIGHT as f64) as isize,
+                };
+                if lines != 0 {
+                    // A positive delta means the wheel was turned away from
+                    // the user, which shows the text above.
+                    let total_lines = self.editor.buffer().line_count();
+                    self.view.scroll(-lines, total_lines);
+                    window.request_redraw();
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if self.handle_agent_key(&event.logical_key.as_ref()) {
                     window.request_redraw();
                     return;
                 }
+                let scale_factor = window.scale_factor();
+                // The layout is measured from the text on screen, so it has
+                // to be current before the caret is moved.
+                self.rebuild_layout(scale_factor);
                 let result = match event.logical_key.as_ref() {
                     Key::Named(NamedKey::Backspace) => self.editor.backspace(),
                     Key::Named(NamedKey::ArrowLeft) => {
@@ -427,6 +477,22 @@ impl ApplicationHandler for NativeApplication {
                     }
                     Key::Named(NamedKey::ArrowRight) => {
                         self.editor.move_right();
+                        Ok(())
+                    }
+                    Key::Named(NamedKey::ArrowUp) => {
+                        self.move_caret_vertically(scale_factor, -1);
+                        Ok(())
+                    }
+                    Key::Named(NamedKey::ArrowDown) => {
+                        self.move_caret_vertically(scale_factor, 1);
+                        Ok(())
+                    }
+                    Key::Named(NamedKey::Home) => {
+                        self.view.move_to_line_edge(&mut self.editor, false);
+                        Ok(())
+                    }
+                    Key::Named(NamedKey::End) => {
+                        self.view.move_to_line_edge(&mut self.editor, true);
                         Ok(())
                     }
                     Key::Named(NamedKey::Enter) => self.editor.insert("\n"),
@@ -452,6 +518,10 @@ impl ApplicationHandler for NativeApplication {
                 if let Err(error) = result {
                     eprintln!("editor input transaction failed: {error}");
                 }
+                // The text may have changed, so the layout is measured again
+                // and the caret is brought back on screen.
+                self.rebuild_layout(scale_factor);
+                self.keep_caret_visible(scale_factor);
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
@@ -464,18 +534,21 @@ impl ApplicationHandler for NativeApplication {
                 }
                 // The status line is read before the renderer is borrowed.
                 let status_line = self.status_line();
+                let scale_factor = window.scale_factor();
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
                 };
-                let scene = build_demo_scene(
-                    renderer.logical_size(window.scale_factor()),
+                let scene = build_scene(
+                    renderer,
+                    renderer.logical_size(scale_factor),
                     &self.editor,
                     &self.input,
+                    &mut self.view,
                     self.agent.as_ref(),
                     self.agent_error.as_deref(),
                     status_line,
                 );
-                match renderer.render(&scene, window.scale_factor()) {
+                match renderer.render(&scene, scale_factor) {
                     Ok(()) => {}
                     Err(RendererError::Surface(wgpu::SurfaceError::Lost)) => {
                         renderer.resize(window.inner_size());
