@@ -103,6 +103,14 @@ export interface EvaluateOptions {
   commitSha?: string;
   now?: () => Date;
   idFactory?: () => string;
+  /**
+   * The runner that puts a check behind the host path boundary.
+   *
+   * A check that declares `boundary: true` runs here. When there is no such
+   * runner the check is blocked: it does not run on the host instead, because
+   * a check that ran somewhere else is not the check that was asked for.
+   */
+  boundaryRunner?: CommandRunner;
 }
 
 export async function evaluateChecks(
@@ -143,7 +151,34 @@ export async function evaluateChecks(
       continue;
     }
 
-    const outcome = await runner.run(check.command, check.args, {
+    // A check that asks for the host path boundary runs there, and only there.
+    // When no boundary is configured the check is blocked rather than run on the
+    // host: a check that ran somewhere else is not the check that was asked for.
+    let checkRunner = runner;
+    if (check.boundary === true) {
+      const boundaryRunner = options.boundaryRunner;
+      if (!boundaryRunner) {
+        results.push({
+          id: check.id,
+          name: check.name,
+          verdict: "blocked",
+          exitCode: null,
+          durationMs: Date.now() - checkStarted,
+          output:
+            `blocked: the check asked to run inside the host path boundary, but no boundary is configured. ` +
+            `The command was not run.`,
+          boundary: {
+            established: false,
+            description: "no boundary",
+            error: "no boundary is configured"
+          }
+        });
+        continue;
+      }
+      checkRunner = boundaryRunner;
+    }
+
+    const outcome = await checkRunner.run(check.command, check.args, {
       ...(check.cwd ? { cwd: check.cwd } : {}),
       ...(check.timeoutMs ? { timeoutMs: check.timeoutMs } : {}),
       ...(check.limits ? { limits: check.limits } : {})
