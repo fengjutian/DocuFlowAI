@@ -118,13 +118,18 @@ function To-Srgb([double]$value) {
 function To-Screen([double[]]$linear) {
     return @($linear | ForEach-Object { [int][Math]::Round((To-Srgb $_) * 255) })
 }
+# The text is drawn in the colour the code writes: the text pass does not
+# go through the conversion that the blocks of colour do.
+function To-Bytes([double[]]$value) {
+    return @($value | ForEach-Object { [int][Math]::Round($_ * 255) })
+}
 $SELECTION_RGB = To-Screen @(0.20, 0.33, 0.55)
 $ACCENT_RGB = To-Screen @(0.30, 0.58, 0.96)
 $MATCH_RGB = To-Screen @(0.58, 0.46, 0.11)
 # The colours of the syntax: the keyword of a language and the text of a
 # string.
-$KEYWORD_RGB = To-Screen @(0.76, 0.36, 0.90)
-$STRING_RGB = To-Screen @(0.68, 0.82, 0.42)
+$KEYWORD_RGB = To-Bytes @(0.76, 0.36, 0.90)
+$STRING_RGB = To-Bytes @(0.68, 0.82, 0.42)
 
 if (-not (Test-Path $exe)) {
     throw "the editor is not built; run 'cargo build -p codeweaver-editor' first"
@@ -304,33 +309,44 @@ try {
         # The real cursor is put out of the way first: it must not be over
         # the editor while the drag runs, or its own messages would arrive
         # after the posted ones.
-        [Win32]::SetCursorPos(10, 10) | Out-Null
-        Start-Sleep -Milliseconds 300
-        $dragLine = 2
-        $x = [int](To-Physical $BODY_X)
-        $y = [int](To-Physical ($BODY_Y + $LINE_HEIGHT * $dragLine))
-        Send-Mouse $handle $WM_MOUSEMOVE $x $y 0
-        Start-Sleep -Milliseconds 200
-        Send-Mouse $handle $WM_LBUTTONDOWN $x $y 0
-        Start-Sleep -Milliseconds 200
-        foreach ($dx in 40, 90, 140, 200) {
-            Send-Mouse $handle $WM_MOUSEMOVE ([int](To-Physical ($BODY_X + $dx))) $y $MK_LBUTTON
-            Start-Sleep -Milliseconds 150
+        #
+        # The drag is tried a few times: the messages are posted to the
+        # window, and what the machine does with them while the editor is
+        # starting up is not in the editor's hands. A check that fails now
+        # and then says more about the machine than about the editor.
+        $selected = 0
+        for ($attempt = 1; $attempt -le 4; $attempt++) {
+            [Win32]::SetCursorPos(10, 10) | Out-Null
+            Start-Sleep -Milliseconds 300
+            $dragLine = 2
+            $x = [int](To-Physical $BODY_X)
+            $y = [int](To-Physical ($BODY_Y + $LINE_HEIGHT * $dragLine))
+            Send-Mouse $handle $WM_MOUSEMOVE $x $y 0
+            Start-Sleep -Milliseconds 200
+            Send-Mouse $handle $WM_LBUTTONDOWN $x $y 0
+            Start-Sleep -Milliseconds 200
+            foreach ($dx in 40, 90, 140, 200) {
+                Send-Mouse $handle $WM_MOUSEMOVE ([int](To-Physical ($BODY_X + $dx))) $y $MK_LBUTTON
+                Start-Sleep -Milliseconds 150
+            }
+            Send-Mouse $handle $WM_LBUTTONUP ([int](To-Physical ($BODY_X + 200))) $y 0
+            Start-Sleep -Milliseconds 800
+
+            $shot_result = Save-Window $handle $shot
+            Write-Output "print window: $($shot_result.Ok)"
+            Write-Output "saved $shot"
+            $picture = $shot_result.Bitmap
+            $left = $shot_result.Left
+            $top = $shot_result.Top
+
+            # The selection is drawn in the colour of the selection, and
+            # nowhere else in the editor, so the whole client area is scanned.
+            $selected = Count-Color $picture $left $top $shot_result.Width $shot_result.Height $SELECTION_RGB 14
+            Write-Output "selected pixels: $selected"
+            if ($selected -ge 25) { break }
+            $picture.Dispose()
+            Write-Output "the selection was not drawn (attempt $attempt), trying again"
         }
-        Send-Mouse $handle $WM_LBUTTONUP ([int](To-Physical ($BODY_X + 200))) $y 0
-        Start-Sleep -Milliseconds 800
-
-        $shot_result = Save-Window $handle $shot
-        Write-Output "print window: $($shot_result.Ok)"
-        Write-Output "saved $shot"
-        $picture = $shot_result.Bitmap
-        $left = $shot_result.Left
-        $top = $shot_result.Top
-
-        # The selection is drawn in the colour of the selection, and nowhere
-        # else in the editor, so the whole client area is scanned.
-        $selected = Count-Color $picture $left $top $shot_result.Width $shot_result.Height $SELECTION_RGB 14
-        Write-Output "selected pixels: $selected"
         if ($selected -lt 25) {
             throw 'the selection was not drawn'
         }

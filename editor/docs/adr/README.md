@@ -21,6 +21,7 @@
 | [ADR-0006](0006-shape-cache-and-perf-baseline.md) | 整形结果按文本缓存，性能基线进 CI | 已接受 |
 | [ADR-0007](0007-multiple-selections.md) | 选区是列表，编辑一次应用全部光标 | 已接受 |
 | [ADR-0008](0008-find-and-replace.md) | 查找替换建在多光标地基上，搜索是分块的 | 已接受 |
+| [ADR-0009](0009-syntax-highlighting.md) | 语法高亮用 tree-sitter，查询自带，解析增量 | 已接受 |
 
 ## 待补
 

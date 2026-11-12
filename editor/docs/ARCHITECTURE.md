@@ -27,6 +27,7 @@ agent-acp -> editor-core transaction（待建）
 ```text
 platform -> agent-ui -> agent-acp
 platform -> editor-core -> text
+platform -> syntax -> text
 platform -> workspace
 platform -> render
 platform -> ui -> text
@@ -43,6 +44,11 @@ platform -> ui -> text
 知道字符落在哪，但字体与整形只有渲染器知道，于是 `ui` 声明 `TextMeasurer`
 trait，由 `platform` 用 `Renderer::measure_text` 实现并注入。换行只由 `ui` 做
 一次，渲染器不再二次折行。详见 [ADR-0005](adr/0005-ui-layer.md)。
+
+`syntax` 是语法高亮：把缓冲区变成"哪些字节是什么种类"的列表。它只依赖
+`text`（要字节偏移和改动记录），**不依赖 `editor-core`（不需要选区模型），
+也不依赖 `render`（颜色是 platform 的事）**。详见
+[ADR-0009](adr/0009-syntax-highlighting.md)。
 
 禁止事项：
 
