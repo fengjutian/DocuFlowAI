@@ -367,4 +367,16 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         assert_eq!(civil_from_days(19_723), (2024, 1, 1));
     }
+
+    #[test]
+    fn the_pin_version_is_read_through_a_utf8_bom() {
+        assert_eq!(parse_zed_version("\u{feff}{\"zedVersion\":\"1.29.0\"}"), "1.29.0");
+        assert_eq!(parse_zed_version("{\"zedVersion\":\"1.29.0\"}"), "1.29.0");
+    }
+
+    #[test]
+    fn a_pin_that_names_no_version_is_unknown() {
+        assert_eq!(parse_zed_version("{}"), "unknown");
+        assert_eq!(parse_zed_version("not json"), "unknown");
+    }
 }
