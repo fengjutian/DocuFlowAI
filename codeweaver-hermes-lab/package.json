@@ -29,6 +29,7 @@
     "validate:worktree-isolation": "npm run build && node dist/runners/worktree-isolation-phase0.js",
     "validate:command-approval": "npm run build && node dist/runners/command-approval-phase0.js",
     "validate:sandbox-limits": "npm run build && node dist/runners/sandbox-limits-phase0.js",
+    "validate:host-path": "npm run build && node dist/runners/host-path-protection-phase0.js",
     "validate:multi-runtime-policy": "npm run build && node dist/runners/multi-runtime-policy-phase0.js",
     "report:phase0": "npm run build && node dist/runners/aggregate-phase0.js",
     "check:hermes": "npm run build && node dist/runners/check-hermes-version.js",

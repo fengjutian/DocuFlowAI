@@ -290,6 +290,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "codeweaver-lsp"
+version = "0.1.0"
+dependencies = [
+ "codeweaver-text",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "codeweaver-platform"
 version = "0.1.0"
 dependencies = [

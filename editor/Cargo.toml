@@ -5,6 +5,7 @@ members = [
     "crates/agent-ui",
     "crates/app",
     "crates/editor-core",
+    "crates/lsp",
     "crates/platform",
     "crates/render",
     "crates/syntax",

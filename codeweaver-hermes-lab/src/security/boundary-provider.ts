@@ -19,6 +19,8 @@ export interface BoundaryProvider {
   readonly backend: BoundaryBackend;
   /** Whether the boundary can be established on this machine, and why not when it cannot. */
   available(): Promise<{ ok: boolean; reason: string }>;
+  /** Describes the boundary for the evidence line, e.g. "Ubuntu (WSL2 2.7.3.0)". */
+  describe(): Promise<string>;
   /** Runs one probe script inside the boundary. */
   run(spec: BoundarySpec, script: string, timeoutMs: number): Promise<ProbeOutcome>;
 }
@@ -26,8 +28,22 @@ export interface BoundaryProvider {
 export interface BoundaryProbeRunOptions {
   spec: BoundarySpec;
   timeoutMs?: number;
-  /** Describes the boundary for the evidence line, e.g. "Ubuntu (WSL2 2.7.3.0)". */
-  describe: () => Promise<string>;
+}
+
+/**
+ * A provider that can hand the *product* a command which runs at the boundary.
+ *
+ * The agent arm needs the acceptance check to run at the boundary - not the probe - so that the
+ * agent's own tool call goes through the same machinery a user's acceptance check goes through.
+ * The control arm needs the same script to run *without* the boundary, in the same environment
+ * otherwise, so that the difference between the two arms is the boundary and nothing else.
+ */
+export interface CheckPlanningProvider extends BoundaryProvider {
+  planCheck(
+    spec: BoundarySpec,
+    script: string,
+    options: { mode: "inside" | "outside" }
+  ): Promise<{ command: string; args: string[] }>;
 }
 
 /**
@@ -53,7 +69,7 @@ export async function executeBoundaryProbes(
 
   let described: string;
   try {
-    described = await options.describe();
+    described = await provider.describe();
   } catch (error) {
     return blockedAll(`Boundary runtime unavailable: ${errorMessage(error)}`);
   }
@@ -107,8 +123,8 @@ export function spawnCapture(
   options: { input?: string; cwd?: string } = {}
 ): Promise<ProbeOutcome> {
   return new Promise(resolveOutcome => {
-    let stdout = "";
-    let stderr = "";
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     let settled = false;
     let timedOut = false;
     const child = spawn(command, args, {
@@ -127,12 +143,8 @@ export function spawnCapture(
       child.stdin?.end();
     }
 
-    child.stdout.on("data", chunk => {
-      stdout += String(chunk);
-    });
-    child.stderr.on("data", chunk => {
-      stderr += String(chunk);
-    });
+    child.stdout.on("data", chunk => stdoutChunks.push(Buffer.from(chunk)));
+    child.stderr.on("data", chunk => stderrChunks.push(Buffer.from(chunk)));
     child.on("error", error => {
       finish(null, errorMessage(error));
     });
@@ -144,10 +156,34 @@ export function spawnCapture(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      let stderr = decodeOutput(Buffer.concat(stderrChunks));
       if (error) stderr += stderr ? ` ${error}` : error;
-      resolveOutcome({ exitCode, stdout, stderr, timedOut });
+      resolveOutcome({
+        exitCode,
+        stdout: decodeOutput(Buffer.concat(stdoutChunks)),
+        stderr,
+        timedOut
+      });
     }
   });
+}
+
+/**
+ * Decodes a captured stream.
+ *
+ * The Windows build of `wsl` writes UTF-16LE, so reading its output as UTF-8 produces text with
+ * NUL bytes between the characters - "W S L   H r,g:". An evidence line that reads like that is
+ * unreadable, and an unreadable boundary description is not evidence.
+ */
+export function decodeOutput(buffer: Buffer): string {
+  if (buffer.length === 0) return "";
+  let nuls = 0;
+  for (const byte of buffer) if (byte === 0) nuls += 1;
+  // A UTF-16LE stream is mostly NUL bytes; a UTF-8 text stream never is.
+  if (nuls > 0 && nuls * 10 >= buffer.length) {
+    return buffer.toString("utf16le").replace(/\u0000/g, "");
+  }
+  return buffer.toString("utf8").replace(/\u0000/g, "");
 }
 
 export function errorMessage(error: unknown): string {

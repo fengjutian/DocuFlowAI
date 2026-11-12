@@ -20,6 +20,14 @@ export interface ToolResult {
   text: string;
   denied: boolean;
   reason?: string;
+  /**
+   * What the checks themselves printed.
+   *
+   * A check that passes says nothing in the tool's text - the text carries the verdict, and the
+   * reason only for a check that failed. The output of a passing check is the only place where
+   * "the check really did read that directory" is visible, so it is read from the details.
+   */
+  checkOutputs?: string[];
 }
 
 export interface ToolFacts {
@@ -48,13 +56,20 @@ export function collectToolFacts(entries: readonly ToolJournalEntry[]): ToolFact
     }
     if (entry.category === "tool.completed" || entry.category === "tool.failed") {
       const result = payload["result"] as
-        | { content?: Array<{ text?: string }>; details?: { denied?: boolean; reason?: string } }
+        | {
+            content?: Array<{ text?: string }>;
+            details?: { denied?: boolean; reason?: string; checks?: Array<{ output?: string }> };
+          }
         | undefined;
+      const checkOutputs = (result?.details?.checks ?? [])
+        .map(check => check.output ?? "")
+        .filter(output => output.trim().length > 0);
       results.push({
         tool: String(payload["toolName"] ?? "unknown"),
         text: (result?.content ?? []).map(part => part.text ?? "").join("\n"),
         denied: result?.details?.denied === true,
-        ...(result?.details?.reason ? { reason: result.details.reason } : {})
+        ...(result?.details?.reason ? { reason: result.details.reason } : {}),
+        ...(checkOutputs.length > 0 ? { checkOutputs } : {})
       });
       continue;
     }

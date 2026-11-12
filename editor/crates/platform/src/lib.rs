@@ -2,12 +2,14 @@ mod agent;
 pub mod editor_view;
 pub mod find;
 mod input;
+mod lsp;
 
 use std::{ops::Range, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use codeweaver_agent_acp::ToolStatus;
 use codeweaver_editor_core::Editor;
+use codeweaver_lsp::{Client as LspClient, LspEvent, protocol::Diagnostic};
 use codeweaver_render::{
     Color, FrameScene, Point, Rect, Renderer, RendererError, Size, TextFamily, TextStyle,
 };
@@ -58,6 +60,16 @@ pub struct NativeApplication {
     find: Option<FindBar>,
     /// The syntax tree of the open document, and the highlights it gives.
     syntax: Syntax,
+    /// The language server of the open document, if there is one.
+    server: Option<LspClient>,
+    /// The URI of the open document, as the server knows it.
+    document_uri: Option<String>,
+    /// What the server has been told about the document.
+    server_version: Option<u64>,
+    /// The version the server is told next.
+    server_generation: i64,
+    /// The things the server found wrong in the document.
+    diagnostics: Vec<Diagnostic>,
 }
 
 impl NativeApplication {
@@ -83,6 +95,25 @@ impl NativeApplication {
                 .and_then(|document| Language::from_path(document.path())),
         );
 
+        // The language of the file also decides which language server runs.
+        let mut server = None;
+        let mut document_uri = None;
+        if let Some(document) = document.as_ref()
+            && let Some(language) = Language::from_path(document.path())
+            && let Some(config) = lsp::server_for(language)
+        {
+            let root = lsp::workspace_root(document.path());
+            match LspClient::start(&config, &root) {
+                Ok(client) => {
+                    let uri = codeweaver_lsp::protocol::file_uri(document.path());
+                    let _ = client.did_open(&uri, lsp::language_id(language), 1, &editor.text());
+                    document_uri = Some(uri);
+                    server = Some(client);
+                }
+                Err(error) => eprintln!("could not start the language server: {error}"),
+            }
+        }
+
         Ok(NativeApplication {
             window: None,
             renderer: None,
@@ -99,6 +130,11 @@ impl NativeApplication {
             cursor: None,
             find: None,
             syntax,
+            server,
+            document_uri,
+            server_version: None,
+            server_generation: 1,
+            diagnostics: Vec::new(),
         })
     }
 

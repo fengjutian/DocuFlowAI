@@ -26,10 +26,15 @@ test("accepts a docker boundary over the fixture directories", () => {
   assert.deepEqual(validateBoundarySpec(spec()), []);
 });
 
-test("rejects a spec that claims isolation without a container backend", () => {
+test("accepts the wsl2 boundary as a real isolation backend", () => {
+  assert.deepEqual(validateBoundarySpec(spec({ backend: "wsl2", image: "Ubuntu" })), []);
+});
+
+test("rejects a spec that claims isolation without a real backend", () => {
   const violations = validateBoundarySpec(spec({ backend: "none" }));
 
-  assert.ok(violations.some(item => /backend must be 'docker'/.test(item)));
+  assert.ok(violations.some(item => /backend must be one of/.test(item)));
+  assert.ok(violations.some(item => /wsl2/.test(item)));
 });
 
 test("rejects overlapping or missing fixture directories", () => {

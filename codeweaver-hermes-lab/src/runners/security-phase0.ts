@@ -29,8 +29,7 @@ export async function executeSecurityPhase0(options: {
 }): Promise<TestResult[]> {
   return executeBoundaryProbes(options.provider, {
     spec: options.spec,
-    timeoutMs: options.timeoutMs ?? 120_000,
-    describe: () => options.provider.describe()
+    timeoutMs: options.timeoutMs ?? 120_000
   });
 }
 

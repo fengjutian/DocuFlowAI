@@ -32,7 +32,10 @@ const defaultInputs = [
   "reports/phase0-acp-editor.json",
   // The sandbox limits: the acceptance checks run inside a Windows job object with memory, CPU
   // and process limits, and the probe shows the limits biting.
-  "reports/phase0-sandbox-limits.json"
+  "reports/phase0-sandbox-limits.json",
+  // The host path protection: the acceptance check runs inside a WSL2 boundary where the host
+  // drives are not mounted, and the probe shows the agent being told why.
+  "reports/phase0-host-path-protection.json"
 ];
 
 async function main(): Promise<void> {

@@ -1,5 +1,5 @@
 import { spawnCapture } from "./boundary-provider.js";
-import type { BoundaryProvider } from "./boundary-provider.js";
+import type { CheckPlanningProvider } from "./boundary-provider.js";
 import type { ProbeOutcome } from "./boundary-probes.js";
 import { DEFAULT_WSL_DISTRO, type BoundarySpec } from "./boundary-spec.js";
 
@@ -36,7 +36,7 @@ export interface Wsl2BoundaryOptions {
 
 const DEFAULT_SANDBOX_USER = "cwlab";
 
-export class Wsl2BoundaryProvider implements BoundaryProvider {
+export class Wsl2BoundaryProvider implements CheckPlanningProvider {
   readonly backend = "wsl2" as const;
 
   constructor(private readonly options: Wsl2BoundaryOptions = {}) {}
@@ -88,6 +88,36 @@ export class Wsl2BoundaryProvider implements BoundaryProvider {
   }
 
   async run(spec: BoundarySpec, script: string, timeoutMs: number): Promise<ProbeOutcome> {
+    await this.stage(script);
+    const outcome = await this.guest(["--", "bash", "-c", this.boundaryCommand(spec)], timeoutMs);
+    return outcome;
+  }
+
+  /**
+   * Prepares a command the product can spawn, which runs a script at the boundary.
+   *
+   * The script is staged in the guest first, because the command line is not a place to put a
+   * script: the product spawns it as one argv entry, and a script that travelled inside the
+   * command line would be re-parsed by the shell on the way in.
+   */
+  async planCheck(
+    spec: BoundarySpec,
+    script: string,
+    options: { mode: "inside" | "outside" }
+  ): Promise<{ command: string; args: string[] }> {
+    await this.stage(script);
+    const inner =
+      options.mode === "inside"
+        ? this.boundaryCommand(spec)
+        : ["cd /", `exec su -s /bin/sh ${this.user} -c 'sh ${this.scriptPath}'`].join("; ");
+    return {
+      command: this.wsl,
+      args: ["-d", this.distro, "--user", "root", "--", "bash", "-c", inner]
+    };
+  }
+
+  /** Writes the probe script into the guest. */
+  private async stage(script: string): Promise<void> {
     const prepare = await this.guest(
       [
         "--",
@@ -96,29 +126,36 @@ export class Wsl2BoundaryProvider implements BoundaryProvider {
         `mkdir -p "$(dirname ${this.scriptPath})" && cat > ${this.scriptPath} && chmod 755 ${this.scriptPath} && ` +
           `(id -u ${this.user} >/dev/null 2>&1 || useradd -m -s /bin/sh ${this.user})`
       ],
-      timeoutMs,
+      60_000,
       script
     );
     if (prepare.exitCode !== 0) {
-      return {
-        exitCode: prepare.exitCode,
-        stdout: prepare.stdout,
-        stderr: prepare.stderr || "the probe script could not be placed in the guest",
-        timedOut: prepare.timedOut
-      };
+      throw new Error(
+        `the probe script could not be placed in the guest: ${prepare.stderr.trim() || `exit ${prepare.exitCode}`}`
+      );
     }
+  }
 
+  /** The command that runs the staged script inside the boundary. */
+  private boundaryCommand(spec: BoundarySpec): string {
+    return `unshare -m --propagation private --net bash -c "${this.boundarySetup(spec)}"`;
+  }
+
+  /** What the boundary does, in the order it has to happen. */
+  private boundarySetup(spec: BoundarySpec): string {
     const workspace = spec.workspaceDir.replace(/'/g, "'\\''");
-    const setup = [
+    return [
       "umount -l /mnt/c /mnt/d /mnt/wsl /mnt/wslg 2>/dev/null || true",
       "mkdir -p /workspace",
-      `mount -t drvfs '${workspace}' /workspace || exit 70`,
+      // noexec is load-bearing. WSL2 runs Windows binaries through a kernel handler that cannot
+      // be removed from inside the guest, so the boundary's protection is that no Windows
+      // executable is reachable: the host drives are unmounted, and the one directory that is
+      // mounted back is mounted without the execute bit, so a Windows binary inside the
+      // workspace cannot be launched either.
+      `mount -t drvfs -o noexec '${workspace}' /workspace || exit 70`,
       "cd /workspace",
       `exec su -s /bin/sh ${this.user} -c 'sh ${this.scriptPath}'`
     ].join("; ");
-
-    const outcome = await this.guest(["--", "bash", "-c", `unshare -m --propagation private --net bash -c "${setup}"`], timeoutMs);
-    return outcome;
   }
 
   /** Runs a command inside the guest as root. */

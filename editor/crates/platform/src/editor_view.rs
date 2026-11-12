@@ -67,6 +67,34 @@ struct Piece {
     kind: Option<HighlightKind>,
 }
 
+/// How bad a thing the language server found is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarkSeverity {
+    Error,
+    Warning,
+    Information,
+    Hint,
+}
+
+/// A thing the language server found wrong in the document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mark {
+    /// The byte range of the text the mark is under.
+    pub range: Range<usize>,
+    /// How bad it is.
+    pub severity: MarkSeverity,
+}
+
+/// The color of the line under a thing the server found wrong.
+fn mark_color(severity: MarkSeverity) -> Color {
+    match severity {
+        MarkSeverity::Error => Color::rgb(0.75, 0.10, 0.10),
+        MarkSeverity::Warning => Color::rgb(0.85, 0.55, 0.10),
+        MarkSeverity::Information => Color::rgb(0.20, 0.60, 0.85),
+        MarkSeverity::Hint => Color::rgb(0.45, 0.70, 0.45),
+    }
+}
+
 /// What the find bar leaves on the body of the editor.
 pub struct FindOverlay<'a> {
     /// The place of the find bar.
@@ -87,6 +115,8 @@ pub struct BodyOverlay<'a> {
     pub find: FindOverlay<'a>,
     /// The highlights of the syntax, in the order of the text.
     pub highlights: &'a [Highlight],
+    /// The things the language server found wrong.
+    pub marks: &'a [Mark],
 }
 
 /// The presentation state of the editor body.
@@ -399,6 +429,41 @@ impl EditorView {
                         rect.height,
                     ),
                     SELECTION_COLOR,
+                    clip,
+                );
+            }
+        }
+
+        // The things the server found wrong are drawn under the text, so the
+        // text stays readable.
+        for mark in overlay.marks {
+            let rects = selection_rects(&self.layout, mark.range.start..mark.range.end);
+            if rects.is_empty() {
+                // A mark with no text under it (a missing semicolon, say)
+                // still has to be seen: it gets a bar of its own.
+                if let Some(point) = self.layout.offset_point(mark.range.start) {
+                    scene.push_quad(
+                        Rect::new(
+                            body.origin.x + point.0,
+                            body.origin.y + point.1 + LINE_HEIGHT - 2.0,
+                            4.0,
+                            2.0,
+                        ),
+                        mark_color(mark.severity),
+                        clip,
+                    );
+                }
+                continue;
+            }
+            for rect in rects {
+                scene.push_quad(
+                    Rect::new(
+                        body.origin.x + rect.x,
+                        body.origin.y + rect.y + rect.height - 2.0,
+                        rect.width,
+                        2.0,
+                    ),
+                    mark_color(mark.severity),
                     clip,
                 );
             }
