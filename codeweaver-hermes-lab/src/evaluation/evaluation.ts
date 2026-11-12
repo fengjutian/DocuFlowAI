@@ -35,6 +35,16 @@ export interface EvaluationCheckSpec {
    * does not name keep the default.
    */
   limits?: SandboxLimits;
+  /**
+   * Whether this check runs inside the host path boundary.
+   *
+   * The boundary is a virtual machine where the host's directories are not
+   * mounted and the network has no route. A check that declares it is asking
+   * to run there; when no boundary is configured the check does not run on the
+   * host instead - it is blocked, because a check that ran somewhere else is
+   * not the check that was asked for.
+   */
+  boundary?: boolean;
 }
 
 export interface EvaluationCheckResult {
@@ -62,6 +72,17 @@ export interface EvaluationCheckResult {
     cpuRatePercent: number;
     processLimit: number;
     peakJobMemoryBytes?: number;
+  };
+  /**
+   * The host path boundary the check ran in.
+   *
+   * A check that ran behind the boundary and a check that ran on the host look
+   * the same from the exit code alone, so the record says which one it was.
+   */
+  boundary?: {
+    established: boolean;
+    description: string;
+    error?: string;
   };
 }
 
