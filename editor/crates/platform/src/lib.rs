@@ -173,6 +173,8 @@ impl NativeApplication {
     }
 
     /// Handles a mouse press in the editor body.
+    ///
+    /// Ctrl+click adds a caret instead of moving the one that is there.
     fn press_body(&mut self, scale_factor: f64) {
         let Some(cursor) = self.cursor else {
             return;
@@ -181,10 +183,12 @@ impl NativeApplication {
         if !body.contains(cursor) {
             return;
         }
+        let add = self.modifiers.control_key();
         self.view.press(
             &mut self.editor,
             cursor.x - body.origin.x,
             cursor.y - body.origin.y,
+            add,
         );
         self.keep_caret_visible(scale_factor);
     }
@@ -492,6 +496,31 @@ impl ApplicationHandler for NativeApplication {
                 self.rebuild_layout(scale_factor);
                 let result = match event.logical_key.as_ref() {
                     Key::Named(NamedKey::Backspace) => self.editor.backspace(),
+                    Key::Named(NamedKey::Delete) => self.editor.delete_forward(),
+                    Key::Named(NamedKey::ArrowLeft) if self.modifiers.shift_key() => {
+                        self.editor.extend_left();
+                        Ok(())
+                    }
+                    Key::Named(NamedKey::ArrowRight) if self.modifiers.shift_key() => {
+                        self.editor.extend_right();
+                        Ok(())
+                    }
+                    Key::Named(NamedKey::ArrowUp) if self.modifiers.shift_key() => {
+                        self.view.extend_vertical(&mut self.editor, -1);
+                        Ok(())
+                    }
+                    Key::Named(NamedKey::ArrowDown) if self.modifiers.shift_key() => {
+                        self.view.extend_vertical(&mut self.editor, 1);
+                        Ok(())
+                    }
+                    Key::Named(NamedKey::Home) if self.modifiers.shift_key() => {
+                        self.view.extend_to_line_edge(&mut self.editor, false);
+                        Ok(())
+                    }
+                    Key::Named(NamedKey::End) if self.modifiers.shift_key() => {
+                        self.view.extend_to_line_edge(&mut self.editor, true);
+                        Ok(())
+                    }
                     Key::Named(NamedKey::ArrowLeft) => {
                         self.editor.move_left();
                         Ok(())
@@ -500,12 +529,24 @@ impl ApplicationHandler for NativeApplication {
                         self.editor.move_right();
                         Ok(())
                     }
+                    Key::Named(NamedKey::ArrowUp) if self.modifiers.alt_key() => {
+                        self.view.add_cursor_vertically(&mut self.editor, -1);
+                        Ok(())
+                    }
+                    Key::Named(NamedKey::ArrowDown) if self.modifiers.alt_key() => {
+                        self.view.add_cursor_vertically(&mut self.editor, 1);
+                        Ok(())
+                    }
                     Key::Named(NamedKey::ArrowUp) => {
                         self.move_caret_vertically(scale_factor, -1);
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowDown) => {
                         self.move_caret_vertically(scale_factor, 1);
+                        Ok(())
+                    }
+                    Key::Named(NamedKey::Escape) => {
+                        self.editor.collapse_to_primary();
                         Ok(())
                     }
                     Key::Named(NamedKey::Home) => {
@@ -633,11 +674,12 @@ fn build_scene(
         viewport,
     );
     let heading = format!(
-        "CodeWeaver · Buffer v{} · IME {} · Undo {} · Redo {}",
+        "CodeWeaver · Buffer v{} · IME {} · Undo {} · Redo {} · 光标 {}",
         editor_state.version(),
         if input.ime_enabled() { "ON" } else { "READY" },
         editor_state.can_undo(),
         editor_state.can_redo(),
+        editor_state.cursor_count(),
     );
     scene.push_text(
         heading,
@@ -918,6 +960,46 @@ mod tests {
         assert!(
             app.view.view.first_line > 0,
             "the view must follow the caret"
+        );
+    }
+
+    #[test]
+    fn adding_a_caret_below_gives_every_caret_a_neighbour() {
+        let mut app = app_with_body("one\ntwo\nthree\n");
+        app.editor.select_range(TextOffset(1), TextOffset(1));
+        assert!(app.view.add_cursor_vertically(&mut app.editor, 1));
+        assert_eq!(app.editor.cursor_count(), 2);
+        // The new caret keeps the column: the second character of the line
+        // below.
+        assert_eq!(app.editor.carets(), vec![TextOffset(1), TextOffset(5)]);
+    }
+
+    #[test]
+    fn adding_a_caret_at_the_edge_of_the_document_does_nothing() {
+        let mut app = app_with_body("one\ntwo\n");
+        // The last line of the document has no line below it.
+        app.editor.select_range(TextOffset(8), TextOffset(8));
+        assert!(!app.view.add_cursor_vertically(&mut app.editor, 1));
+        assert_eq!(app.editor.cursor_count(), 1);
+    }
+
+    #[test]
+    fn typing_writes_at_every_caret() {
+        let mut app = app_with_body("one\ntwo\n");
+        app.editor.select_range(TextOffset(1), TextOffset(1));
+        app.view.add_cursor_vertically(&mut app.editor, 1);
+        app.editor.insert("X").unwrap();
+        assert_eq!(app.editor.text(), "oXne\ntXwo\n");
+    }
+
+    #[test]
+    fn holding_shift_extends_the_selection_to_the_line_below() {
+        let mut app = app_with_body("one\ntwo\n");
+        app.editor.select_range(TextOffset(1), TextOffset(1));
+        assert!(app.view.extend_vertical(&mut app.editor, 1));
+        assert_eq!(
+            app.editor.selection().range(app.editor.buffer()),
+            TextOffset(1)..TextOffset(5)
         );
     }
 }

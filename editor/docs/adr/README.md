@@ -19,6 +19,7 @@
 | [ADR-0004](0004-file-open-and-save.md) | 文件读写放在 workspace 服务层，打开文件即一次新的编辑会话 | 已接受 |
 | [ADR-0005](0005-ui-layer.md) | UI 层独立成 crate，字体测量由渲染层注入 | 已接受 |
 | [ADR-0006](0006-shape-cache-and-perf-baseline.md) | 整形结果按文本缓存，性能基线进 CI | 已接受 |
+| [ADR-0007](0007-multiple-selections.md) | 选区是列表，编辑一次应用全部光标 | 已接受 |
 
 ## 待补
 

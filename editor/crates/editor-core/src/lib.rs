@@ -41,8 +41,8 @@ impl Selection {
 ///
 /// - `transaction` transforms the state before the step into the state after
 ///   it;
-/// - `caret_before` is the caret in the state before the step;
-/// - `caret_after` is the caret in the state after the step.
+/// - `carets_from` are the carets of the state before the step;
+/// - `carets_to` are the carets of the state after the step.
 ///
 /// The undo stack therefore holds the inverse of every edit, and the redo
 /// stack holds the edits themselves. Because the history is only ever walked
@@ -51,15 +51,19 @@ impl Selection {
 #[derive(Clone, Debug)]
 struct HistoryEntry {
     transaction: Transaction,
-    caret_before: TextOffset,
-    caret_after: TextOffset,
+    carets_from: Vec<TextOffset>,
+    carets_to: Vec<TextOffset>,
 }
 
 /// The editing state of one document.
 #[derive(Clone, Debug)]
 pub struct Editor {
     buffer: Buffer,
-    selection: Option<Selection>,
+    /// The selections, in the order of the text.
+    ///
+    /// There is always at least one. The first one is the primary selection;
+    /// the others are the extra carets of a multi-cursor edit.
+    selections: Vec<Selection>,
     undo_stack: Vec<HistoryEntry>,
     redo_stack: Vec<HistoryEntry>,
 }
@@ -74,11 +78,11 @@ impl Editor {
     pub fn new(text: impl Into<String>) -> Self {
         let mut editor = Editor {
             buffer: Buffer::new(text),
-            selection: None,
+            selections: Vec::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
         };
-        editor.reset_selection(TextOffset(0));
+        editor.set_carets(&[TextOffset(0)]);
         editor
     }
 
@@ -92,7 +96,7 @@ impl Editor {
         self.buffer = Buffer::new(text);
         self.undo_stack.clear();
         self.redo_stack.clear();
-        self.reset_selection(TextOffset(0));
+        self.set_carets(&[TextOffset(0)]);
     }
 
     pub fn buffer(&self) -> &Buffer {
@@ -131,14 +135,32 @@ impl Editor {
         self.buffer.slice(caret..self.buffer.len())
     }
 
-    pub fn selection(&self) -> Selection {
-        self.selection
-            .expect("the selection is initialised in Editor::new")
+    /// Every selection, in the order of the text.
+    pub fn selections(&self) -> &[Selection] {
+        &self.selections
     }
 
-    /// The caret position, in bytes.
+    /// The primary selection: the topmost one.
+    pub fn selection(&self) -> &Selection {
+        &self.selections[0]
+    }
+
+    /// The caret position of the primary selection, in bytes.
     pub fn caret(&self) -> TextOffset {
         self.selection().head(&self.buffer)
+    }
+
+    /// The position of every caret, in bytes.
+    pub fn carets(&self) -> Vec<TextOffset> {
+        self.selections
+            .iter()
+            .map(|selection| selection.head(&self.buffer))
+            .collect()
+    }
+
+    /// How many carets there are.
+    pub fn cursor_count(&self) -> usize {
+        self.selections.len()
     }
 
     pub fn can_undo(&self) -> bool {
@@ -149,56 +171,232 @@ impl Editor {
         !self.redo_stack.is_empty()
     }
 
-    /// Inserts `text` at the caret, replacing the selection when there is one.
+    /// Inserts `text` at every caret, replacing the selections when there are
+    /// any.
     pub fn insert(&mut self, text: &str) -> Result<(), ApplyError> {
-        let range = self.selection().range(&self.buffer);
-        let caret = TextOffset(range.start.0 + text.len());
-        self.commit_edit(range, text, caret)
+        let ranges = self
+            .selections
+            .iter()
+            .map(|selection| selection.range(&self.buffer))
+            .collect();
+        self.replace_ranges(ranges, text)
     }
 
-    /// Deletes the selection, or the character before the caret.
+    /// Deletes the selection, or the character before the caret, at every
+    /// caret.
     pub fn backspace(&mut self) -> Result<(), ApplyError> {
-        let selection = self.selection();
-        let range = if selection.is_empty(&self.buffer) {
-            let caret = selection.head(&self.buffer);
-            if caret.0 == 0 {
-                return Ok(());
-            }
-            let previous = self.buffer.prev_char_boundary(caret);
-            previous..caret
-        } else {
-            selection.range(&self.buffer)
-        };
-        let caret = range.start;
-        self.commit_edit(range, "", caret)
+        let ranges = self
+            .selections
+            .iter()
+            .map(|selection| {
+                let range = selection.range(&self.buffer);
+                if !range.is_empty() {
+                    return range;
+                }
+                let caret = selection.head(&self.buffer);
+                if caret.0 == 0 {
+                    return TextOffset(0)..TextOffset(0);
+                }
+                let previous = self.buffer.prev_char_boundary(caret);
+                previous..caret
+            })
+            .collect();
+        self.replace_ranges(ranges, "")
+    }
+
+    /// Deletes the character after every caret.
+    pub fn delete_forward(&mut self) -> Result<(), ApplyError> {
+        let ranges = self
+            .selections
+            .iter()
+            .map(|selection| {
+                let range = selection.range(&self.buffer);
+                if !range.is_empty() {
+                    return range;
+                }
+                let caret = selection.head(&self.buffer);
+                if caret.0 >= self.buffer.len().0 {
+                    return caret..caret;
+                }
+                let next = self.buffer.next_char_boundary(caret);
+                caret..next
+            })
+            .collect();
+        self.replace_ranges(ranges, "")
+    }
+
+    /// Extends every selection one character to the left.
+    ///
+    /// The anchor of a selection stays where it is and its head moves, which
+    /// is what holding Shift does.
+    pub fn extend_left(&mut self) {
+        let heads: Vec<TextOffset> = self
+            .selections
+            .iter()
+            .map(|selection| self.buffer.prev_char_boundary(selection.head(&self.buffer)))
+            .collect();
+        self.set_selection_heads(&heads);
+    }
+
+    /// Extends every selection one character to the right.
+    pub fn extend_right(&mut self) {
+        let heads: Vec<TextOffset> = self
+            .selections
+            .iter()
+            .map(|selection| self.buffer.next_char_boundary(selection.head(&self.buffer)))
+            .collect();
+        self.set_selection_heads(&heads);
+    }
+
+    /// Moves the head of every selection, keeping the anchors.
+    pub fn set_selection_heads(&mut self, heads: &[TextOffset]) {
+        for (selection, head) in self.selections.iter_mut().zip(heads) {
+            self.buffer.release_anchor(&selection.head);
+            selection.head = self.buffer.anchor(*head, Bias::Right);
+        }
     }
 
     pub fn move_left(&mut self) {
-        let range = self.selection().range(&self.buffer);
-        let caret = if range.is_empty() {
-            self.buffer.prev_char_boundary(range.start)
-        } else {
-            range.start
-        };
-        self.reset_selection(caret);
+        let carets: Vec<TextOffset> = self
+            .selections
+            .iter()
+            .map(|selection| {
+                let range = selection.range(&self.buffer);
+                if range.is_empty() {
+                    self.buffer.prev_char_boundary(range.start)
+                } else {
+                    range.start
+                }
+            })
+            .collect();
+        self.set_carets(&carets);
     }
 
     pub fn move_right(&mut self) {
-        let range = self.selection().range(&self.buffer);
-        let caret = if range.is_empty() {
-            self.buffer.next_char_boundary(range.start)
-        } else {
-            range.end
-        };
-        self.reset_selection(caret);
+        let carets: Vec<TextOffset> = self
+            .selections
+            .iter()
+            .map(|selection| {
+                let range = selection.range(&self.buffer);
+                if range.is_empty() {
+                    self.buffer.next_char_boundary(range.start)
+                } else {
+                    range.end
+                }
+            })
+            .collect();
+        self.set_carets(&carets);
     }
 
-    /// Selects the range `start..end`.
+    /// Selects the range `start..end`, dropping the other carets.
     pub fn select_range(&mut self, start: TextOffset, end: TextOffset) {
-        self.release_selection();
+        self.release_selections();
         let anchor = self.buffer.anchor(start, Bias::Left);
         let head = self.buffer.anchor(end, Bias::Right);
-        self.selection = Some(Selection { anchor, head });
+        self.selections = vec![Selection { anchor, head }];
+    }
+
+    /// Selects the range `start..end` in the selection at `index`.
+    ///
+    /// The other selections are left alone, which is what a drag does: it
+    /// moves the head of the selection it started on.
+    pub fn select_range_at(&mut self, index: usize, start: TextOffset, end: TextOffset) {
+        let Some(selection) = self.selections.get(index).copied() else {
+            return;
+        };
+        self.buffer.release_anchor(&selection.anchor);
+        self.buffer.release_anchor(&selection.head);
+        let anchor = self.buffer.anchor(start, Bias::Left);
+        let head = self.buffer.anchor(end, Bias::Right);
+        self.selections[index] = Selection { anchor, head };
+    }
+
+    /// Adds a caret at `offset`, keeping the other selections.
+    ///
+    /// Returns where the caret ended up: the index of the new selection, or
+    /// the index of the caret that was already there.
+    pub fn add_cursor(&mut self, offset: TextOffset) -> usize {
+        if let Some(index) = self
+            .selections
+            .iter()
+            .position(|selection| selection.head(&self.buffer) == offset)
+        {
+            return index;
+        }
+        let anchor = self.buffer.anchor(offset, Bias::Right);
+        let head = self.buffer.anchor(offset, Bias::Right);
+        let selection = Selection { anchor, head };
+        let mut position = self.selections.len();
+        for (index, existing) in self.selections.iter().enumerate() {
+            if existing.head(&self.buffer) > offset {
+                position = index;
+                break;
+            }
+        }
+        self.selections.insert(position, selection);
+        position
+    }
+
+    /// Adds a caret at every offset, keeping the other selections.
+    ///
+    /// The selections are kept in the order of the text, so the first one is
+    /// always the topmost caret. An offset that already has a caret on it is
+    /// skipped: two carets in the same place are one caret.
+    pub fn add_cursors(&mut self, offsets: &[TextOffset]) {
+        for offset in offsets {
+            if self
+                .selections
+                .iter()
+                .any(|selection| selection.head(&self.buffer) == *offset)
+            {
+                continue;
+            }
+            let anchor = self.buffer.anchor(*offset, Bias::Right);
+            let selection = Selection {
+                anchor,
+                head: anchor,
+            };
+            let mut position = self.selections.len();
+            for (index, existing) in self.selections.iter().enumerate() {
+                if existing.head(&self.buffer) > *offset {
+                    position = index;
+                    break;
+                }
+            }
+            self.selections.insert(position, selection);
+        }
+    }
+
+    /// Drops every caret but the primary one.
+    pub fn collapse_to_primary(&mut self) {
+        if self.selections.len() <= 1 {
+            return;
+        }
+        for selection in &self.selections[1..] {
+            self.buffer.release_anchor(&selection.anchor);
+            self.buffer.release_anchor(&selection.head);
+        }
+        self.selections.truncate(1);
+    }
+
+    /// Points the selections at `carets`, dropping the selections
+    /// themselves.
+    pub fn set_carets(&mut self, carets: &[TextOffset]) {
+        self.release_selections();
+        let mut selections = Vec::with_capacity(carets.len());
+        for caret in carets {
+            // The anchor and the head are two anchors, not one: they are
+            // released one by one, and they may end up in different places.
+            let anchor = self.buffer.anchor(*caret, Bias::Right);
+            let head = self.buffer.anchor(*caret, Bias::Right);
+            selections.push(Selection { anchor, head });
+        }
+        if selections.is_empty() {
+            let anchor = self.buffer.anchor(TextOffset(0), Bias::Right);
+            let head = self.buffer.anchor(TextOffset(0), Bias::Right);
+            selections.push(Selection { anchor, head });
+        }
+        self.selections = selections;
     }
 
     pub fn undo(&mut self) -> Result<(), ApplyError> {
@@ -206,11 +404,11 @@ impl Editor {
             return Ok(());
         };
         let applied = self.buffer.replay(entry.transaction.clone())?;
-        self.reset_selection(entry.caret_after);
+        self.set_carets(&entry.carets_to);
         self.redo_stack.push(HistoryEntry {
             transaction: applied.inverse,
-            caret_before: entry.caret_after,
-            caret_after: entry.caret_before,
+            carets_from: entry.carets_to,
+            carets_to: entry.carets_from,
         });
         Ok(())
     }
@@ -220,55 +418,101 @@ impl Editor {
             return Ok(());
         };
         let applied = self.buffer.replay(entry.transaction.clone())?;
-        self.reset_selection(entry.caret_after);
+        self.set_carets(&entry.carets_to);
         self.undo_stack.push(HistoryEntry {
             transaction: applied.inverse,
-            caret_before: entry.caret_after,
-            caret_after: entry.caret_before,
+            carets_from: entry.carets_to,
+            carets_to: entry.carets_from,
         });
         Ok(())
     }
 
-    /// Applies an edit and records it in the undo history.
-    fn commit_edit(
+    /// Replaces the given ranges with `replacement` and puts a caret after
+    /// the text that replaced each of them.
+    ///
+    /// The ranges are replaced in one transaction, so the text changes in one
+    /// step and the undo history has one entry for all of them.
+    fn replace_ranges(
         &mut self,
-        range: Range<TextOffset>,
+        ranges: Vec<Range<TextOffset>>,
         replacement: &str,
-        caret: TextOffset,
     ) -> Result<(), ApplyError> {
-        let caret_before = self.caret();
+        let ranges = merge_ranges(ranges);
+        if ranges.is_empty() {
+            return Ok(());
+        }
+        let carets_from = self.carets();
+
+        // The ranges are sorted, so every range before a caret shifts it by
+        // the size of the change that came before it.
+        let mut shift = 0isize;
+        let mut edits = Vec::with_capacity(ranges.len());
+        let mut carets_to = Vec::with_capacity(ranges.len());
+        for range in &ranges {
+            edits.push(TextEdit::new(range.clone(), replacement));
+            let caret = range.start.0 as isize + shift + replacement.len() as isize;
+            carets_to.push(TextOffset(caret as usize));
+            shift += replacement.len() as isize - (range.end.0 - range.start.0) as isize;
+        }
+
         let version = self.buffer.version();
-        let applied = self.buffer.apply(Transaction::new(
-            version,
-            vec![TextEdit::new(range, replacement)],
-        ))?;
-        // The undo step runs the edit backwards, so it starts at the caret the
-        // edit produced and ends at the caret the edit started from.
+        let applied = self.buffer.apply(Transaction::new(version, edits))?;
+        // The undo step runs the edit backwards, so it starts at the carets
+        // the edit produced and ends at the carets the edit started from.
         self.undo_stack.push(HistoryEntry {
             transaction: applied.inverse,
-            caret_before: caret,
-            caret_after: caret_before,
+            carets_from: carets_to.clone(),
+            carets_to: carets_from,
         });
         // A new edit invalidates the redo branch.
         self.redo_stack.clear();
-        self.reset_selection(caret);
+        self.set_carets(&carets_to);
         Ok(())
     }
 
-    /// Points the selection at `caret`, replacing the previous anchors.
-    fn reset_selection(&mut self, caret: TextOffset) {
-        self.release_selection();
-        let anchor = self.buffer.anchor(caret, Bias::Right);
-        let head = self.buffer.anchor(caret, Bias::Right);
-        self.selection = Some(Selection { anchor, head });
-    }
-
-    fn release_selection(&mut self) {
-        if let Some(previous) = self.selection.take() {
-            self.buffer.release_anchor(&previous.anchor);
-            self.buffer.release_anchor(&previous.head);
+    /// Releases the anchors of every selection.
+    fn release_selections(&mut self) {
+        for selection in self.selections.drain(..) {
+            self.buffer.release_anchor(&selection.anchor);
+            self.buffer.release_anchor(&selection.head);
         }
     }
+}
+
+/// Merges the ranges that cover the same text into one.
+///
+/// Two carets in the same place, or a caret inside another caret's selection,
+/// would make the transaction invalid: the text only has one place to put the
+/// new text. Merging keeps the edit well defined, and the carets that were
+/// merged end up in the same place anyway.
+fn merge_ranges(ranges: Vec<Range<TextOffset>>) -> Vec<Range<TextOffset>> {
+    let mut sorted = ranges;
+    sorted.sort_by_key(|range| (range.start, range.end));
+    let mut merged: Vec<Range<TextOffset>> = Vec::with_capacity(sorted.len());
+    for range in sorted {
+        match merged.last_mut() {
+            Some(last) if covers_same_text(last, &range) => {
+                last.end = last.end.max(range.end);
+            }
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+/// Whether two ranges cover the same text.
+fn covers_same_text(a: &Range<TextOffset>, b: &Range<TextOffset>) -> bool {
+    if a.start < a.end && b.start < b.end {
+        return a.start < b.end && b.start < a.end;
+    }
+    // At least one of them is empty: it lies inside the other when its point
+    // is inside the other range.
+    let (point, range) = if a.is_empty() {
+        (a.start, b)
+    } else {
+        (b.start, a)
+    };
+    range.start <= point && point <= range.end
 }
 
 #[cfg(test)]
@@ -390,5 +634,160 @@ mod tests {
         assert_eq!(editor.text(), "h!ello");
         editor.undo().unwrap();
         assert_eq!(editor.text(), "hello");
+    }
+
+    #[test]
+    fn typing_at_two_carets_writes_at_both_of_them() {
+        let mut editor = Editor::new("one two");
+        editor.move_right();
+        editor.add_cursor(TextOffset(5));
+        assert_eq!(editor.cursor_count(), 2);
+
+        editor.insert("X").unwrap();
+        assert_eq!(editor.text(), "oXne tXwo");
+        assert_eq!(editor.carets(), vec![TextOffset(2), TextOffset(7)]);
+    }
+
+    #[test]
+    fn a_caret_in_the_same_place_as_another_is_not_added_twice() {
+        let mut editor = Editor::new("one");
+        editor.move_right();
+        editor.add_cursor(TextOffset(1));
+        assert_eq!(editor.cursor_count(), 1);
+    }
+
+    #[test]
+    fn a_caret_inside_another_selection_is_merged_into_it() {
+        let mut editor = Editor::new("hello");
+        editor.select_range(TextOffset(1), TextOffset(4));
+        editor.add_cursor(TextOffset(2));
+        assert_eq!(editor.cursor_count(), 2);
+
+        editor.insert("X").unwrap();
+        assert_eq!(editor.text(), "hXo");
+        assert_eq!(editor.cursor_count(), 1);
+    }
+
+    #[test]
+    fn backspace_at_two_carets_deletes_at_both_of_them() {
+        let mut editor = Editor::new("one two");
+        editor.move_right();
+        editor.add_cursor(TextOffset(5));
+        editor.backspace().unwrap();
+        assert_eq!(editor.text(), "ne wo");
+        assert_eq!(editor.carets(), vec![TextOffset(0), TextOffset(3)]);
+    }
+
+    #[test]
+    fn the_carets_are_kept_in_the_order_of_the_text() {
+        let mut editor = Editor::new("one two");
+        editor.add_cursor(TextOffset(4));
+        editor.add_cursor(TextOffset(2));
+        assert_eq!(
+            editor.carets(),
+            vec![TextOffset(0), TextOffset(2), TextOffset(4)]
+        );
+    }
+
+    #[test]
+    fn dropping_the_extra_carets_keeps_the_primary_one() {
+        let mut editor = Editor::new("one two");
+        editor.add_cursor(TextOffset(4));
+        editor.collapse_to_primary();
+        assert_eq!(editor.cursor_count(), 1);
+        assert_eq!(editor.caret(), TextOffset(0));
+    }
+
+    #[test]
+    fn undo_puts_every_caret_back() {
+        let mut editor = Editor::new("one two");
+        editor.move_right();
+        editor.add_cursor(TextOffset(5));
+        editor.insert("X").unwrap();
+        assert_eq!(editor.text(), "oXne tXwo");
+        assert_eq!(editor.carets(), vec![TextOffset(2), TextOffset(7)]);
+
+        editor.undo().unwrap();
+        assert_eq!(editor.text(), "one two");
+        assert_eq!(editor.carets(), vec![TextOffset(1), TextOffset(5)]);
+    }
+
+    #[test]
+    fn a_multi_caret_edit_is_one_step_of_the_history() {
+        let mut editor = Editor::new("one two");
+        editor.move_right();
+        editor.add_cursor(TextOffset(5));
+        editor.insert("X").unwrap();
+        editor.undo().unwrap();
+        assert_eq!(editor.text(), "one two");
+        assert!(!editor.can_undo(), "the whole edit was undone at once");
+    }
+
+    #[test]
+    fn moving_left_moves_every_caret() {
+        let mut editor = Editor::new("one two");
+        editor.move_right();
+        editor.add_cursor(TextOffset(5));
+        editor.move_left();
+        assert_eq!(editor.carets(), vec![TextOffset(0), TextOffset(4)]);
+    }
+
+    #[test]
+    fn holding_shift_extends_the_selection() {
+        let mut editor = Editor::new("hello");
+        editor.extend_right();
+        assert_eq!(
+            editor.selection().range(editor.buffer()),
+            TextOffset(0)..TextOffset(1)
+        );
+        editor.extend_right();
+        assert_eq!(
+            editor.selection().range(editor.buffer()),
+            TextOffset(0)..TextOffset(2)
+        );
+    }
+
+    #[test]
+    fn extending_to_the_left_shrinks_the_selection() {
+        let mut editor = Editor::new("hello");
+        editor.select_range(TextOffset(0), TextOffset(3));
+        editor.extend_left();
+        assert_eq!(
+            editor.selection().range(editor.buffer()),
+            TextOffset(0)..TextOffset(2)
+        );
+    }
+
+    #[test]
+    fn extending_moves_every_head() {
+        let mut editor = Editor::new("one two");
+        editor.move_right();
+        editor.add_cursor(TextOffset(5));
+        editor.extend_right();
+        let ranges: Vec<_> = editor
+            .selections()
+            .iter()
+            .map(|selection| selection.range(editor.buffer()))
+            .collect();
+        assert_eq!(
+            ranges,
+            vec![TextOffset(1)..TextOffset(2), TextOffset(5)..TextOffset(6)]
+        );
+    }
+
+    #[test]
+    fn delete_removes_the_character_after_the_caret() {
+        let mut editor = Editor::new("hello");
+        editor.delete_forward().unwrap();
+        assert_eq!(editor.text(), "ello");
+        assert_eq!(editor.caret(), TextOffset(0));
+    }
+
+    #[test]
+    fn deleting_at_the_end_of_the_text_does_nothing() {
+        let mut editor = Editor::new("x");
+        editor.move_right();
+        editor.delete_forward().unwrap();
+        assert_eq!(editor.text(), "x");
     }
 }

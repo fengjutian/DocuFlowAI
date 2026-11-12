@@ -72,6 +72,14 @@ $LINE_HEIGHT = 22
 if (-not (Test-Path $exe)) {
     throw "the editor is not built; run 'cargo build -p codeweaver-editor' first"
 }
+# The check drives the editor that is on disk, so that one has to be the one
+# the sources describe. `cargo test` does not build it: it only builds the
+# test harness next to it.
+$newest = Get-ChildItem -Path (Join-Path $root 'crates') -Recurse -Include *.rs |
+    Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if ($newest -and (Get-Item $exe).LastWriteTime -lt $newest.LastWriteTime) {
+    throw "the editor is older than its sources; run 'cargo build -p codeweaver-editor' first"
+}
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
 # The fixture is read as UTF-8 on purpose: PowerShell reads a script without
 # a byte order mark as ANSI, so the text must not travel through the script.
