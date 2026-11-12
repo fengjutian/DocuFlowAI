@@ -1175,3 +1175,68 @@ recorded before the fix look like. The run recorded after the fix shows no such 
 Consequence: P0-022 is signed off. The rule it rests on: a timeline is read from the journal and
 nothing else, one execution keeps its journal order, the recorded time only interleaves
 executions, and what the journal cannot vouch for is reported rather than smoothed away.
+## D-072: One rule, one implementation: the ledger and the runtime score read the counters the same way
+Status: accepted
+Context: P0-023 asks for one thing — "能关联 Token、模型和执行时间" — and the lab already had the
+ledger that answers it (`GET /api/v1/usage`, `GET /api/v1/executions/{id}/usage`), plus a runtime
+score that read token counts of its own. Two readers. The ledger's reader knew the gateway's shape
+(`usage.{input_tokens,output_tokens,total_tokens}`); the runtime score's reader knew the primary
+runtime's shape (one set of counters per assistant message) and took only the first assistant
+message. So the runtime the product actually runs on was never accounted for at all: the run the user
+had just watched cost the model real tokens, and the cost page showed nothing for it. A cost page
+that shows nothing for the runtime that did the work is not a cost page.
+
+Decision: three rules, and the first one is the reason the other two exist.
+
+1. One rule, one implementation. `src/accounting/token-usage.ts` is the only reader of a runtime's
+   counters; the ledger and the runtime score both use it. Two readers are how a payload ends up
+   accounted for in one place and not the other — and the runtime that was missed was the primary
+   one. The primary runtime reports one set of counters per assistant message, because every
+   assistant message is one model request, so a run that asked the model five times spent the sum of
+   five sets. The first implementation read one of them and called it the run's cost.
+2. The usage record is written from the journal, not from the live event stream. The journal is
+   where a run's history actually is, and it is the only thing that survives a restart. The duration
+   is the journal's own start→terminal span, so the number in the cost page and the span in the audit
+   timeline are one number rather than two measurements of the same run. `onRecorded` is awaited, so
+   "the run is over in the journal" and "the run is accounted for" are the same moment rather than a
+   race with a write still in flight.
+3. The model in the record is what the runtime said. The primary runtime names its model and the
+   record carries that name; the gateway names none, and the record says `unknown` — a made-up model
+   is worse than a missing one. The parts must also explain the total: prompt + completion +
+   cached + cache-write = total, which is why the cache-write count was added to the record (the
+   primary runtime's total includes it, and a total its parts cannot explain is a number nobody can
+   check).
+
+Evidence: the probe `accounting-phase0` runs both runtimes — the primary one in process against the
+real model, and the remote one through the pinned gateway — and reads the cost back out of the
+ledger. The yardstick is deliberately not the product's extractor: the probe reads the raw payload
+keys itself, because a checker that reads a payload the same way the writer does cannot tell a
+faithful transcription from a shared mistake. Thirteen links are asserted. On the primary runtime:
+`recorded` (the ledger holds a record — the link that failed before the fix), `tokens-agree` (530
+prompt + 105 completion + 764 cached = 1399, the numbers the runtime reported),
+`model-named` (MiniMax-M3, the model the runtime said), `timing-agree` (2824ms is the journal's own
+span), `tokens-explain`. On the gateway: the same links, except `model-unnamed` — the gateway named
+no model, so the record says `unknown` instead of guessing — and 12404 + 8 = 12412 tokens over
+7262ms. Then the ledger as a whole: `summary-consistent` (13811 tokens is the sum of the two
+records), `model-groups`, `not-found` (an execution that was never run is refused with a 404, not
+answered with an empty record that reads like a free run) and `durable` (the probe restarts the
+server over the same data directory and both records are still there, with the same numbers). The
+verdict logic has 15 unit tests, most of them the cases that have to fail: a run the ledger never
+recorded, tokens that disagree with the runtime, a model the runtime never named, a duration that is
+somebody else's, a total its parts do not explain, a summary that is not the sum, an unknown id
+answered with 200, and a ledger that forgets the run after a restart.
+
+Two things fell out of it, and the second one was the probe's own. The first was the product's: the
+two readers described above, which left the primary runtime uncosted. The second was a probe that
+asked the remote runtime to look at a file, so the gateway's agent went exploring and the arm did
+not finish inside its budget — and the probe reported that as a failure, which is what it should
+do. The fix was to ask the remote runtime for a word instead of a reading (a turn that answers in
+seconds) and to give each arm its own budget, because a remote runtime answers slower than an
+in-process one. A probe that cannot finish its scenario reports failed; it never reports passed.
+
+The console's 「用量统计」page shows the cached tokens next to the prompt tokens, because the runtime
+counts them separately and a total that cannot be explained by its parts is a number nobody can
+check.
+
+Consequence: P0-023 is signed off. The rule it rests on: one reader for the counters, the record
+written from the journal, and every number in it — model included — exactly what the runtime said.

@@ -556,6 +556,46 @@ The console has a 「审计时间线」page for it: it reads the timeline from t
 execution with the stages it went through, and calls out the runs whose recorded timestamps
 disagree with their own order.
 
+## Cost accounting
+
+```bash
+npm run validate:accounting
+```
+
+Signs off P0-023 (token / model / execution-time accounting) on both runtimes: the primary one (Pi,
+in process, against the real model) and the remote one (the pinned Hermes gateway). The report goes
+to `reports/phase0-accounting.json` and joins the Phase 0 aggregate.
+
+The ledger already existed and it was wrong in the way that matters. It read the counters out of a
+payload shape only the *remote* runtime reports, so the primary runtime — the one the product runs
+on — was never accounted for at all: the cost page showed nothing for the run the user had just
+watched. The rule it rests on now (D-072): **one rule, one implementation**. The counters are read
+by one reader (`src/accounting/token-usage.ts`), and the ledger and the runtime score both use it.
+
+| Link | Why |
+|---|---|
+| Recorded | the ledger holds a record for the execution — the link that failed before the fix |
+| Tokens agree | the ledger's numbers are the runtime's own, read straight out of the recorded terminal payload |
+| Model named / unnamed | the model in the record is exactly what the runtime said: the primary runtime names one, the gateway does not, and the record says `unknown` rather than guessing |
+| Timing agree | the duration is the journal's own start→terminal span, so the cost page and the audit timeline cannot disagree about how long a run took |
+| Tokens explain | the parts add up to the total (prompt + completion + cached + cache write) |
+| Summary consistent | the summary is the sum of the records, grouped by model |
+| Not found | an execution that was never run is refused with a 404, not answered with an empty record that reads like a free run |
+| Durable | the record survives a restart — the probe restarts the server over the same data directory and reads it back |
+
+The yardstick is deliberately *not* the product's extractor: the probe reads the raw payload keys
+itself, because a checker that reads a payload the same way the writer does cannot tell a faithful
+transcription from a shared mistake. The primary runtime reports one set of counters per assistant
+message — every assistant message is one model request — so the run's cost is the sum of them, and
+the first implementation read one of them and called it the cost.
+
+The record is written from the journal, not from the live event stream: the duration is the
+journal's own start→terminal span, so the number in the cost page and the span in the audit timeline
+are one number rather than two measurements of the same run.
+
+The console's 「用量统计」page shows the cached tokens next to the prompt tokens, because the runtime
+counts them separately and a total its parts cannot explain is a number nobody can check.
+
 ## Multi-runtime policy and runtime scoring
 
 ```bash
