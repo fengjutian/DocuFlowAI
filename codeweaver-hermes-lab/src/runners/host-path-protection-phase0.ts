@@ -4,6 +4,7 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { EvaluationCheckSpec } from "../evaluation/evaluation.js";
+import { commandFingerprint } from "../evaluation/command-policy.js";
 import { writeTestReport } from "../reporting/report-writer.js";
 import { claimsSuccess } from "../security/agent-verdict.js";
 import { executeBoundaryProbes, type CheckPlanningProvider } from "../security/boundary-provider.js";
@@ -475,6 +476,16 @@ async function runAgentArm(
     args: ["host-read.sh"],
     cwd: options.workspace,
     timeoutMs: 150_000,
+    // The check is a shell script, so the command policy cannot read it and
+    // refuses it without an approval (P0-012). The approval names this exact
+    // command, so it covers both arms: the two differ in where the check runs,
+    // not in what it is.
+    approval: {
+      approvedBy: "P0-017 probe",
+      reason: "the acceptance check of this task is a shell script that reads one directory and prints a count",
+      approvedAt: new Date().toISOString(),
+      commandFingerprint: commandFingerprint("bash", ["host-read.sh"])
+    },
     // The one difference between the two arms: this check declares that it
     // runs inside the host path boundary, so the product puts it there.
     ...(options.boundary ? { boundary: true } : {})
