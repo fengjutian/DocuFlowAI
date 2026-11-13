@@ -12,10 +12,15 @@
 //! Two models sit next to it: [`FileTree`], the tree of the workspace that
 //! the file panel draws, and [`ChangeDetector`], which reports the files that
 //! changed on disk while they were open.
+//!
+//! A third service lives beside them: [`search`], which finds text in the
+//! files of the project.
 
+pub mod search;
 pub mod tree;
 pub mod watch;
 
+pub use search::{SearchHit, SearchOptions, SearchResults};
 pub use tree::{FileTree, NodeKind, TreeNode};
 pub use watch::{ChangeDetector, ExternalChange};
 

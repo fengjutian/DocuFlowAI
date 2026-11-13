@@ -256,14 +256,36 @@ fn read_children(directory: &Path, depth: usize, ignored: &[String]) -> io::Resu
     Ok(children)
 }
 
+/// The names of the directories that never enter the workspace by default.
+///
+/// The hidden entries are not among them: the file panel hides them, but a
+/// search that missed the files of `.github` would miss a lot.
+pub fn ignored_directories() -> Vec<String> {
+    DEFAULT_IGNORED_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+/// Whether a directory of that name is kept out, by the given rules.
+///
+/// The names are compared without regard to case, so `Target` is skipped
+/// like `target`.
+pub fn is_ignored_directory(name: &str, ignored: &[String]) -> bool {
+    let name = name.to_lowercase();
+    ignored
+        .iter()
+        .filter(|entry| entry.as_str() != HIDDEN_MARKER)
+        .any(|entry| entry.to_lowercase() == name)
+}
+
 /// Whether an entry is kept out of the tree.
 fn is_ignored(name: &str, is_directory: bool, ignored: &[String]) -> bool {
+    if is_directory && is_ignored_directory(name, ignored) {
+        return true;
+    }
     for entry in ignored {
-        if entry == HIDDEN_MARKER {
-            if name.starts_with('.') {
-                return true;
-            }
-        } else if is_directory && name.to_lowercase() == entry.to_lowercase() {
+        if entry == HIDDEN_MARKER && name.starts_with('.') {
             return true;
         }
     }
