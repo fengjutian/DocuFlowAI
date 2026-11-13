@@ -211,7 +211,7 @@ pub struct NativeApplication {
     command_history: Vec<String>,
     /// The panel that finds text in the files of the project, when it is open.
     search: Option<SearchPanel>,
-    /// The text that was looked for last time.
+    /// The text that was in the box the last time.
     ///
     /// It is kept so that the person who searches twice does not have to
     /// type the same word twice.
@@ -2847,6 +2847,15 @@ impl NativeApplication {
         Ok(())
     }
 
+    /// Whether a panel that takes every key is open.
+    ///
+    /// A panel opens over the window and the keys go to the one that is on
+    /// top: two panels open at once means the one below is stuck and the
+    /// person does not know which one he is typing into.
+    fn a_modal_is_open(&self) -> bool {
+        self.rename_box.is_some() || self.command_box.is_some() || self.search.is_some()
+    }
+
     /// Handles the keys of the panel of the changes.
     ///
     /// Ctrl+Shift+G opens the panel. While the panel is open it takes every
@@ -2860,6 +2869,10 @@ impl NativeApplication {
 
         // The panel is not open: Ctrl+Shift+G opens it.
         if self.git.is_none() {
+            // A panel that takes every key does not open over another one.
+            if self.a_modal_is_open() {
+                return false;
+            }
             if !(self.modifiers.control_key() && self.modifiers.shift_key()) {
                 return false;
             }
@@ -3262,6 +3275,10 @@ impl NativeApplication {
     fn handle_command_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
         let Some(mut box_) = self.command_box.take() else {
             // The box is not open: Ctrl+Shift+P opens it.
+            // A panel that takes every key does not open over another one.
+            if self.a_modal_is_open() {
+                return false;
+            }
             if !(self.modifiers.control_key() && self.modifiers.shift_key()) {
                 return false;
             }
@@ -3373,6 +3390,10 @@ impl NativeApplication {
     fn handle_search_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
         let Some(mut panel) = self.search.take() else {
             // The panel is not open: Ctrl+Shift+F opens it.
+            // A panel that takes every key does not open over another one.
+            if self.a_modal_is_open() {
+                return false;
+            }
             if !(self.modifiers.control_key() && self.modifiers.shift_key()) {
                 return false;
             }
@@ -3399,6 +3420,9 @@ impl NativeApplication {
                 return true;
             }
         }
+        // The text that was in the box is kept: the person who searches
+        // twice does not have to type the same word twice.
+        self.search_needle = panel.needle().to_owned();
         self.search = Some(panel);
         true
     }
@@ -3434,6 +3458,14 @@ impl NativeApplication {
         let line = hit.line.saturating_sub(1);
         let offset = pane.editor.buffer().line_range(line).start;
         pane.editor.set_carets(&[offset]);
+        // The line that was found is scrolled into the picture: a place that
+        // is not on the screen is not opened.
+        let scale_factor = self
+            .window
+            .as_ref()
+            .map(|window| window.scale_factor())
+            .unwrap_or(1.0);
+        self.keep_caret_visible(scale_factor);
         // The place is said in words that are inside the project: the path
         // that starts at the drive of the machine says less.
         let place = hit
@@ -5374,6 +5406,93 @@ mod tests {
         app.handle_find_bar_key(&named(NamedKey::Enter), None);
         let find = app.find.as_ref().expect("the find bar is open");
         assert_eq!(find.current_index(), 1);
+    }
+
+    /// An application with a file that is open, and the panel of the search
+    /// open on it.
+    fn app_with_search() -> NativeApplication {
+        let directory = scratch_dir("search-app");
+        let file = directory.join("notes.txt");
+        fs::write(&file, "the needle is here\n").unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        app.handle_search_key(&character("f"), None);
+        app.modifiers = ModifiersState::default();
+        app
+    }
+
+    #[test]
+    fn the_search_key_opens_the_panel() {
+        let app = app_with_search();
+        assert!(app.search.is_some(), "the panel of the search is open");
+    }
+
+    #[test]
+    fn the_panel_of_the_search_takes_the_keys_while_it_is_open() {
+        let mut app = app_with_search();
+        assert!(app.handle_search_key(&character("n"), Some("n")));
+        let panel = app.search.as_ref().expect("the panel is open");
+        assert_eq!(panel.needle(), "n");
+        assert_eq!(
+            app.editor().text(),
+            "the needle is here\n",
+            "the word did not go into the document"
+        );
+    }
+
+    #[test]
+    fn the_escape_key_closes_the_panel_of_the_search() {
+        let mut app = app_with_search();
+        assert!(app.handle_search_key(&named(NamedKey::Escape), None));
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn a_panel_does_not_open_over_another_one() {
+        let mut app = app_with_search();
+        // The box of the command does not open over the panel of the search.
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(!app.handle_command_key(&character("p"), None));
+        assert!(app.command_box.is_none());
+        // And the panel of the changes does not open over it either.
+        assert!(!app.handle_git_key(&character("g"), None));
+        assert!(app.git.is_none());
+    }
+
+    #[test]
+    fn the_search_opens_the_place_that_is_picked() {
+        let directory = scratch_dir("search-opens");
+        let file = directory.join("notes.txt");
+        fs::write(&file, "the first line\nthe needle is here\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        app.handle_search_key(&character("f"), None);
+        app.modifiers = ModifiersState::default();
+        for letter in ["n", "e", "e", "d", "l", "e"] {
+            app.handle_search_key(&character(letter), Some(letter));
+        }
+        app.handle_search_key(&named(NamedKey::Enter), None);
+
+        // The answer comes in on the thread of the search.
+        for _ in 0..200 {
+            if app.pump_search() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let panel = app.search.as_ref().expect("the panel is open");
+        assert_eq!(panel.hits().len(), 1, "the word was found");
+
+        // The focus is on the places now, so the enter key opens one of them.
+        assert!(app.handle_search_key(&named(NamedKey::Enter), None));
+        assert!(app.search.is_none(), "the panel is closed");
+        let expected = app.editor().buffer().line_range(1).start.0;
+        assert_eq!(
+            app.editor().caret().0,
+            expected,
+            "the caret is on the line that was found"
+        );
     }
 
     /// A directory of scratch files for the checks that need more than one.

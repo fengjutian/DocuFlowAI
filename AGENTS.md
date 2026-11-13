@@ -75,6 +75,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\
 ## Git
 
 - 默认分支 `main`。**不要 `git add` / `git commit` / `git stash`** —— 本仓库有并发自动提交机制，工作区脏是正常的。
+- 自动提交会**在回合中途**发生：刚写完的新文件可能已经被提交掉，`git status` 里它显示成「已修改」甚至干脆不出现。**`git status` 不是「这一轮改了什么」的清单**——要确认文件内容，用 Read/Grep 直接看盘上的文件，别拿 diff 当唯一依据。
 
 ## 安全
 

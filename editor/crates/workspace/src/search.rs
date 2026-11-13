@@ -80,10 +80,23 @@ pub struct SearchResults {
 
 /// Searches for `needle` in the files of the project rooted at `root`.
 ///
-/// The places are in the order the files are walked in, and the lines are in
-/// the order they are in the file. A directory that cannot be read is
-/// skipped: one unreadable folder does not stop the whole search.
+/// The places are in the order of the files, and the lines are in the order
+/// they are in the file. A directory that cannot be read is skipped: one
+/// unreadable folder does not stop the whole search.
 pub fn search(root: &Path, needle: &str, options: SearchOptions) -> SearchResults {
+    let mut results = walk(root, needle, options);
+    // The places are sorted by the file they are in: a list in the order the
+    // disk gave the files is not a list a person can read.
+    results.hits.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.line.cmp(&right.line))
+    });
+    results
+}
+
+/// Walks the project and collects the places the text is in.
+fn walk(root: &Path, needle: &str, options: SearchOptions) -> SearchResults {
     let mut results = SearchResults::default();
     if needle.is_empty() {
         return results;
@@ -215,6 +228,19 @@ mod tests {
         assert_eq!(results.hits[0].text, "the needle is here");
         assert_eq!(results.files, 2, "both files are read");
         assert!(!results.truncated);
+    }
+
+    #[test]
+    fn the_places_are_in_the_order_of_the_files() {
+        let root = scratch("search-sorts-the-places");
+        write_file(&root.join("b.txt"), "the needle is here\n");
+        write_file(&root.join("a.txt"), "the needle is here\n");
+
+        let results = search(&root, "needle", SearchOptions::default());
+
+        assert_eq!(results.hits.len(), 2);
+        assert_eq!(results.hits[0].path, root.join("a.txt"));
+        assert_eq!(results.hits[1].path, root.join("b.txt"));
     }
 
     #[test]

@@ -186,11 +186,13 @@ impl SearchPanel {
     /// Starts the search.
     ///
     /// The search runs on a thread of its own; the answer comes in later.
-    pub fn start_search(&mut self) {
+    /// Returns whether the search was started: an empty text is not searched
+    /// for.
+    pub fn start_search(&mut self) -> bool {
         let needle = self.box_.text().trim().to_owned();
         if needle.is_empty() {
             self.status = "要找的文字不能是空的".to_owned();
-            return;
+            return false;
         }
         let root = self.root.clone();
         let (sender, answers) = channel();
@@ -205,6 +207,7 @@ impl SearchPanel {
         self.running = true;
         self.hits.clear();
         self.selected = 0;
+        true
     }
 
     /// Collects the answer of the search, if it has come.
@@ -264,10 +267,11 @@ impl SearchPanel {
             Key::Named(NamedKey::Enter) => {
                 return match self.focus {
                     SearchFocus::Input => {
-                        self.start_search();
-                        // The places that were found are what the person
-                        // looks at now.
-                        self.focus = SearchFocus::Results;
+                        if self.start_search() {
+                            // The places that were found are what the person
+                            // looks at now.
+                            self.focus = SearchFocus::Results;
+                        }
                         SearchCommand::None
                     }
                     SearchFocus::Results => {
