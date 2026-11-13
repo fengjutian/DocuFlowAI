@@ -526,6 +526,61 @@ impl Editor {
         Ok(())
     }
 
+    /// Replaces the given ranges with their own text and keeps the carets
+    /// where they were.
+    ///
+    /// The edits are applied in one transaction, so the text changes in one
+    /// step and the undo history has one entry for all of them. This is what
+    /// a formatter needs: the server answers with a list of edits, and the
+    /// user undoes the whole formatting with one undo.
+    pub fn replace_edits(
+        &mut self,
+        edits: Vec<(Range<TextOffset>, String)>,
+    ) -> Result<(), ApplyError> {
+        if edits.is_empty() {
+            return Ok(());
+        }
+        // The edits are sorted, so the shift of a caret can be worked out
+        // from the edits that come before it.
+        let mut sorted = edits;
+        sorted.sort_by_key(|(range, _)| (range.start, range.end));
+        let carets_from = self.carets();
+
+        let mut text_edits = Vec::with_capacity(sorted.len());
+        let mut changes = Vec::with_capacity(sorted.len());
+        for (range, text) in &sorted {
+            text_edits.push(TextEdit::new(range.clone(), text));
+            changes.push((range.start.0, range.end.0, text.len()));
+        }
+
+        // A caret moves with the text that came before it.
+        let mut carets_to = Vec::with_capacity(carets_from.len());
+        for caret in &carets_from {
+            let mut moved = 0isize;
+            for (start, end, length) in &changes {
+                if *start <= caret.0 {
+                    moved += *length as isize - (*end - *start) as isize;
+                }
+            }
+            carets_to.push(TextOffset((caret.0 as isize + moved) as usize));
+        }
+
+        let version = self.buffer.version();
+        let applied = self.buffer.apply(Transaction::new(version, text_edits))?;
+        self.last_change = Some(applied.change.clone());
+        // The undo step runs the edits backwards, so it starts at the carets
+        // the edits produced and ends at the carets they started from.
+        self.undo_stack.push(HistoryEntry {
+            transaction: applied.inverse,
+            carets_from: carets_to.clone(),
+            carets_to: carets_from,
+        });
+        // A new edit invalidates the redo branch.
+        self.redo_stack.clear();
+        self.set_carets(&carets_to);
+        Ok(())
+    }
+
     /// Releases the anchors of every selection.
     fn release_selections(&mut self) {
         for selection in self.selections.drain(..) {
