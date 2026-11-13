@@ -31,7 +31,7 @@ V0.5.0 把编辑器与 Agent 之间接成了一条闭环：用户挑上下文 �
 | 语言能力 | 语法高亮（后台）、LSP 补全与诊断、LSP 格式化、LSP 重命名、LSP 代码操作 | 按范围格式化、onType 格式化、重命名预备（prepareRename） | 可用 |
 | 调试 | DAP 客户端、断点（`F9`）、调试会话（`F5`）、单步（`F10`/`F11`/`Shift+F11`）、顶帧变量面板 | 条件断点、命中次数、表达式求值、调用栈全览、多线程、调试控制台 | 最小可用 |
 | Agent | ACP 客户端、面板、审批、流式输出、上下文选择、Diff 按块批准、应用到缓冲区、冲突合并、轨迹 | 语义冲突判断（靠构建与测试发现） | 可用 |
-| 开发工具 | 任务运行器（`Ctrl+Shift+B` 跑构建，输出流进下方面板）、Git 改动面板（`Ctrl+Shift+G` 看状态与 diff、`S` 暂存、`C` 提交） | 终端交互、DAP（本期计划） | 基础可用 |
+| 开发工具 | 任务运行器（`Ctrl+Shift+B` 跑构建、`Ctrl+Shift+P` 跑任意命令，输出流进下方面板）、Git 改动面板（`Ctrl+Shift+G` 看状态与 diff、`S` 暂存、`C` 提交） | 终端交互（伪终端）、DAP 的条件断点与表达式求值（本期计划） | 基础可用 |
 
 ## 3. V0.6.0 开发项
 
@@ -47,6 +47,10 @@ V0.5.0 把编辑器与 Agent 之间接成了一条闭环：用户挑上下文 �
 - 任务在跑的时候再按一次键，不会起第二个任务：一次只跑一个。
 - 输出面板可以关掉（`Esc`），关掉不影响任务继续跑。
 - 任务的进程模型：另起的子进程，输出走管道，编辑器退出时任务被停掉。
+- `Ctrl+Shift+P` 打开一个输入框写**任意命令**，回车就跑：命令在打开的文件所属的工程目录里跑，输出进同一个输出面板。跑过的命令**记在历史里**，输入框里按上下键就能翻出上一次的命令，再跑一遍不用重新打。
+- 命令按 shell 的规矩拆开：空白分开算，引号里的算**一个**参数（`"C:\Program Files\x.exe"` 是一个整体）；引号没关上时状态栏**明说**命令写错了，不猜着跑。
+- 命令是空的、没有工程（不知道在哪儿跑）、程序起不来时，状态栏**明说**原因，不静默什么都不发生。
+- 输入框开着的时候它自己吃键：命令不会被敲进正文里，`Esc` 取消。
 
 ### DF-0602 Git 状态、Diff、暂存与提交（进行中：实现完成，窗口验收待跑）
 
@@ -155,6 +159,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\format-check.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\rename-check.ps1
 # 窗口级证据：构建任务的输出流进了下方面板
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\task-check.ps1
+# 窗口级证据：Ctrl+Shift+P 跑任意命令，输出进面板，命令记在历史里
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\command-check.ps1
 # 窗口级证据：改动面板列出了改过的文件、显示 diff、S 暂存、C 提交
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\git-check.ps1
 # 单元级证据：git 模块的检查要在工作区之外跑（低完整性进程起不了 git）
@@ -189,6 +195,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\debug-check.ps1
 | `tools\format-check.ps1` | 真实 rust-analyzer 排版 → 正文像素变化；脏标记出现；一次撤销整体回退 | 上一轮已过 4/4，本轮待重跑 |
 | `tools\rename-check.ps1` | `F2` 改名 → 打开的文件被改、没打开的文件写进了磁盘、一次撤销整体回退 | 新写，**未跑** |
 | `tools\task-check.ps1` | `Ctrl+Shift+B` 跑构建 → 输出面板画出来了、面板里有输出、`Esc` 关掉 | 新写，**未跑** |
+| `tools\command-check.ps1` | `Ctrl+Shift+P` 打开命令框 → 命令进框不进正文 → 回车跑、输出进面板 → 再开一次按上键，命令还在 | 新写，**未跑** |
 | `tools\git-check.ps1` | `Ctrl+Shift+G` 打开改动面板 → 面板盖住窗口、列出改过的文件、显示 diff、`S` 暂存（git 也这么说）、`C` 问提交说明并真的提交、`Esc` 关掉 | 新写，**未跑** |
 | `tools\git-unit-check.ps1` | git 模块的单元检查（10 项：状态、diff、暂存、提交、面板接线）——在工作区之外跑，因为低完整性进程起不了 `git` | 新写，**未跑** |
 | `tools\debug-check.ps1` | `F9` 断点画在正文边上 → `F5` 起调试会话、面板在窗口下方 → 顶帧的变量（名字、类型、值）在面板里 → `F10` 走一步后程序又停住 | 新写，**未跑** |
@@ -213,7 +220,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\debug-check.ps1
 
 ## 7. 本期结转
 
-- 任务运行器现在只跑**构建任务**（`Ctrl+Shift+B`，命令由工程的清单决定）。要跑任意命令需要一个输入框和命令历史；要做真正的交互式终端还需要伪终端（PTY），Windows 上没有 POSIX 那套现成的东西。任务运行器的进程模型已经定了（另起子进程、输出走管道、编辑器退出时任务被停掉），这两件是往上加东西。
+- 任务运行器现在能跑**构建任务**（`Ctrl+Shift+B`，命令由工程的清单决定）和**任意命令**（`Ctrl+Shift+P`，命令自己写，跑过的命令记在历史里，上下键就能翻出来）。还没做的是：命令的工作目录不能自己选（现在固定是打开的文件所属的工程目录）、历史不落盘（关掉窗口就没了）、没有交互式终端——真终端需要伪终端（PTY），Windows 上没有 POSIX 那套现成的东西。任务运行器的进程模型已经定了（另起子进程、输出走管道、编辑器退出时任务被停掉），这几件是往上加东西。
 - Git（DF-0602）已经定下用**命令行 `git`**（机器上有 git 就够，不引第三方库），代价是低完整性进程起不了 `git`（见 §6.3）。还没做的是：暂存区里挑文件（现在只暂存选中那一个）、取消暂存（`git restore --staged`）、在面板里看某一次提交（`git log`）、分支与远端（`git branch`、fetch/push）。
 - 调试（DF-0606）现在只做到**最小**的一套：断点、单步、顶帧的变量。还没做的是：条件断点与命中次数、表达式求值（`watch`）、调用栈全览（现在只取顶帧）、多线程、`debug console`、以及按工程配适配器（现在适配器在命令行上用 `--dap <program>` 点名，没有 `launch.json`）。断点按行号记着，**文件改了行数之后断点不会跟着走**——这是下一件要做的事。
 - 格式化现在只接了 `textDocument/formatting`；按范围格式化（只排一段）与 `onType` 格式化留到后面。

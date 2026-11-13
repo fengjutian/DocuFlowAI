@@ -8,6 +8,7 @@
 //! the name is in the document without keeping that in two places.
 
 use codeweaver_text::Buffer;
+use winit::keyboard::{Key, NamedKey};
 
 /// The box that asks for the new name.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -130,6 +131,57 @@ impl RenameBox {
             return;
         }
         self.caret = self.next_boundary(self.caret);
+    }
+
+    /// Puts other text into the box.
+    ///
+    /// The caret goes to the end of the new text: the text is something the
+    /// user is looking at, and the caret is where they go on from there.
+    pub fn set_text(&mut self, text: &str) {
+        self.current = text.to_owned();
+        self.caret = self.current.len();
+    }
+
+    /// Gives a key to the box.
+    ///
+    /// The keys that move the caret and change the text are the ones of the
+    /// box. Anything else is not the box's, and the caller decides what to
+    /// do with it.
+    ///
+    /// `control` says whether the control key is held: a key with it is
+    /// not text, and text must not land in the box because of it.
+    ///
+    /// Returns whether the key was one of the box's.
+    pub fn handle_key<T: AsRef<str>>(
+        &mut self,
+        key: &Key<T>,
+        text: Option<&str>,
+        control: bool,
+    ) -> bool {
+        match key {
+            Key::Named(NamedKey::Backspace) => self.backspace(),
+            Key::Named(NamedKey::Delete) => self.delete(),
+            Key::Named(NamedKey::ArrowLeft) => self.left(),
+            Key::Named(NamedKey::ArrowRight) => self.right(),
+            Key::Named(NamedKey::Home) => self.home(),
+            Key::Named(NamedKey::End) => self.end(),
+            Key::Character(character) if !control => {
+                let character = character.as_ref();
+                if character.chars().any(char::is_control) {
+                    // The key did not produce text of its own; the text of the
+                    // event is what the user typed.
+                    match text.filter(|typed| !typed.chars().any(char::is_control)) {
+                        Some(typed) => self.type_text(typed),
+                        // Nothing was typed at all: this key is not the box's.
+                        None => return false,
+                    }
+                } else {
+                    self.type_text(character);
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// Moves the caret to the beginning of the name.

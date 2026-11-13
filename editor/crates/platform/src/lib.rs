@@ -1,5 +1,6 @@
 mod agent;
 mod code_action;
+mod command;
 mod completion;
 mod context;
 mod debug;
@@ -36,6 +37,7 @@ use codeweaver_ui::TextMeasurer;
 use codeweaver_workspace::{ChangeDetector, Document, ExternalChange, FileTree, Workspace};
 use codeweaver_workbench::{close_decision, CloseDecision, Tab, TabBar, TabId};
 use code_action::ActionPopup;
+use command::CommandBox;
 use completion::CompletionPopup;
 use debug::{Breakpoints, DebugPanel, DebugState, DebugStep, Debugger};
 use editor_view::{
@@ -197,6 +199,12 @@ pub struct NativeApplication {
     formatting: Option<u64>,
     /// The box that asks for the new name, when it is open.
     rename_box: Option<RenameBox>,
+    /// The box that asks for a command, when it is open.
+    command_box: Option<CommandBox>,
+    /// The commands that were run before.
+    ///
+    /// They are kept in the order they were run, the newest last.
+    command_history: Vec<String>,
     /// The rename request that is on its way.
     ///
     /// The request is about one place in one document, and it is only good
@@ -388,6 +396,8 @@ impl NativeApplication {
             settings: None,
             formatting: None,
             rename_box: None,
+            command_box: None,
+            command_history: Vec::new(),
             renaming: None,
             pending_diff: None,
             selected_hunk: 0,
@@ -2295,22 +2305,9 @@ impl NativeApplication {
             Key::Named(NamedKey::ArrowRight) => rename.right(),
             Key::Named(NamedKey::Home) => rename.home(),
             Key::Named(NamedKey::End) => rename.end(),
-            Key::Character(character) if !self.modifiers.control_key() => {
-                let character = character.as_ref();
-                if character.chars().any(char::is_control) {
-                    // The key did not produce text of its own; the text of
-                    // the event is what the user typed.
-                    if let Some(typed) = text.filter(|typed| !typed.chars().any(char::is_control)) {
-                        rename.type_text(typed);
-                    } else {
-                        handled = false;
-                    }
-                } else {
-                    rename.type_text(character);
-                }
-            }
             _ => {
-                handled = false;
+                // The keys that change the text are the box's own.
+                handled = rename.handle_key(key, text, self.modifiers.control_key());
             }
         }
         if keep {
@@ -3244,6 +3241,116 @@ impl NativeApplication {
         }
         changed
     }
+
+    /// Handles the keys of the box that asks for a command.
+    ///
+    /// Ctrl+Shift+P opens the box. While the box is open it takes every
+    /// key: a command that is typed into the document is not a command.
+    fn handle_command_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
+        let Some(mut box_) = self.command_box.take() else {
+            // The box is not open: Ctrl+Shift+P opens it.
+            if !(self.modifiers.control_key() && self.modifiers.shift_key()) {
+                return false;
+            }
+            let Some(letter) = key_letter(key) else {
+                return false;
+            };
+            if !letter.eq_ignore_ascii_case(&'p') {
+                return false;
+            }
+            // Only one box at a time: the box that asks for a new name gives
+            // up its place.
+            self.rename_box = None;
+            self.command_box = Some(CommandBox::new());
+            self.status = Some("写命令，回车就跑，Esc 取消".to_owned());
+            return true;
+        };
+
+        // Whether the box stays open.
+        let mut keep = true;
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.status = Some("取消了命令".to_owned());
+                keep = false;
+            }
+            Key::Named(NamedKey::Enter) => {
+                keep = false;
+                self.run_command(box_.text());
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                if let Some(previous) = box_.previous(&self.command_history) {
+                    box_.set_text(&previous);
+                }
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if let Some(next) = box_.next(&self.command_history) {
+                    box_.set_text(&next);
+                }
+            }
+            _ => {
+                box_.handle_key(key, text, self.modifiers.control_key());
+            }
+        }
+        if keep {
+            self.command_box = Some(box_);
+        }
+        true
+    }
+
+    /// Runs the command that was written.
+    ///
+    /// The command runs in the folder of the project the open file belongs
+    /// to, and its output goes into the panel of the task.
+    fn run_command(&mut self, line: &str) {
+        let line = line.trim();
+        if line.is_empty() {
+            self.status = Some("命令不能是空的".to_owned());
+            return;
+        }
+        let (program, args) = match task::split_command(line) {
+            Ok(parts) => parts,
+            Err(error) => {
+                self.status = Some(format!("命令写错了：{error}"));
+                return;
+            }
+        };
+        // The command joins the history, whether it worked or not: what was
+        // typed is what is worth repeating.
+        self.command_history.push(line.to_owned());
+        if self.command_history.len() > 50 {
+            self.command_history.remove(0);
+        }
+        let Some(path) = self.panes[self.active]
+            .document
+            .as_ref()
+            .map(|document| document.path().to_path_buf())
+        else {
+            self.status = Some("这个文件不属于任何工程，不知道在哪儿跑这个命令".to_owned());
+            return;
+        };
+        if let Some(task) = self.task.as_ref()
+            && task.is_running()
+        {
+            self.status = Some("已经有任务在跑了".to_owned());
+            return;
+        }
+
+        let root = lsp::workspace_root(&path);
+        let title = format!("{program} {}", args.join(" "));
+        match Task::start(&program, &args, &root) {
+            Ok(task) => {
+                self.task = Some(task);
+                self.task_output = TaskOutput::default();
+                self.task_title = title.clone();
+                self.task_panel = true;
+                self.status = Some(format!("正在跑：{title}"));
+            }
+            Err(error) => {
+                eprintln!("could not start the task: {error}");
+                self.status = Some(format!("命令起不来：{error}"));
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for NativeApplication {
@@ -3382,6 +3489,12 @@ impl ApplicationHandler for NativeApplication {
                 // F9 puts a breakpoint, F5 starts the debugging, F10 and F11
                 // walk through the program.
                 if self.handle_debug_key(&event.logical_key.as_ref()) {
+                    window.request_redraw();
+                    return;
+                }
+                // Ctrl+Shift+P opens the box that asks for a command. While
+                // the box is open it takes every key.
+                if self.handle_command_key(&event.logical_key.as_ref(), event.text.as_deref()) {
                     window.request_redraw();
                     return;
                 }
@@ -3639,6 +3752,7 @@ impl ApplicationHandler for NativeApplication {
                         settings: self.settings.as_ref(),
                         git: self.git.as_ref(),
                         commit: self.commit_box.as_ref(),
+                        command: self.command_box.as_ref().map(|box_| box_.field()),
                         debug: debug_panel,
                         breakpoints: &breakpoints,
                         conflicts: conflict,
@@ -3716,6 +3830,8 @@ struct Chrome<'a> {
     git: Option<&'a GitPanel>,
     /// The box that asks for the message of a commit, when it is open.
     commit: Option<&'a RenameBox>,
+    /// The box that asks for a command, when it is open.
+    command: Option<&'a RenameBox>,
     /// The panel of the debugger, when there is a session.
     debug: Option<DebugPanel<'a>>,
     /// The lines of the breakpoints of the file that is on screen.
@@ -3966,8 +4082,15 @@ fn build_scene(
 
     push_find_bar(&mut scene, size, body, chrome.find, &mut ui_measurer);
 
-    // The box that asks for the new name floats over the body.
-    push_rename_box(&mut scene, size, body, chrome.rename, &mut ui_measurer);
+    // The box that asks for the new name floats over the body. The box that
+    // asks for a command is the same box, and only one of them is open.
+    push_rename_box(
+        &mut scene,
+        size,
+        body,
+        chrome.rename.or(chrome.command),
+        &mut ui_measurer,
+    );
 
     // The list of completions floats under the caret.
     if let Some(popup) = chrome.completion
@@ -6307,5 +6430,74 @@ mod tests {
 
         let status = app.status.clone().unwrap_or_default();
         assert!(status.contains("不能是空的"), "got {status}");
+    }
+
+    #[test]
+    fn the_command_box_asks_for_a_command_and_remembers_it() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(app.handle_command_key(&character("p"), None));
+        assert!(app.command_box.is_some(), "the box asks for a command");
+        app.modifiers = ModifiersState::default();
+
+        for letter in ["c", "a", "t"] {
+            app.handle_command_key(&character(letter), None);
+        }
+        let typed = app
+            .command_box
+            .as_ref()
+            .expect("the box is open")
+            .text()
+            .to_owned();
+        assert_eq!(typed, "cat");
+
+        // Enter runs it. There is no file, so the editor says that it does
+        // not know where to run it -- and the command is kept anyway.
+        app.handle_command_key(&named(NamedKey::Enter), None);
+        assert!(app.command_box.is_none(), "the box is closed");
+        assert_eq!(app.command_history, vec!["cat".to_owned()]);
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("不知道在哪儿跑"), "got {status}");
+
+        // The next time the box opens, the command is there: the up key
+        // walks the history.
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(app.handle_command_key(&character("p"), None));
+        app.modifiers = ModifiersState::default();
+        app.handle_command_key(&named(NamedKey::ArrowUp), None);
+        let typed = app
+            .command_box
+            .as_ref()
+            .expect("the box is open")
+            .text()
+            .to_owned();
+        assert_eq!(typed, "cat");
+    }
+
+    #[test]
+    fn a_command_that_is_not_written_is_not_run() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(app.handle_command_key(&character("p"), None));
+        app.modifiers = ModifiersState::default();
+
+        app.handle_command_key(&named(NamedKey::Enter), None);
+        assert!(app.command_history.is_empty(), "nothing was run");
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("不能是空的"), "got {status}");
+    }
+
+    #[test]
+    fn the_command_box_takes_every_key_while_it_is_open() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(app.handle_command_key(&character("p"), None));
+        app.modifiers = ModifiersState::default();
+
+        // A key that is not the box's is swallowed by the box: the document
+        // behind it must not see it.
+        assert!(app.handle_command_key(&character("x"), None));
+        assert_eq!(app.editor().text(), "", "the text is not touched");
+        assert!(app.command_box.is_some(), "the box stays open");
     }
 }

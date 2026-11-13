@@ -201,6 +201,57 @@ pub fn build_command(root: &Path) -> Option<(String, Vec<String>)> {
     None
 }
 
+/// Splits a command line into the program and its arguments.
+///
+/// The rules are the ones of a shell: blanks separate the arguments, and
+/// what is in quotes is **one** argument, whatever is in it.
+pub fn split_command(line: &str) -> Result<(String, Vec<String>), String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current = String::new();
+    // Whether something was written: an empty pair of quotes is an
+    // argument, even though it is empty.
+    let mut written = false;
+    // The quote that is open, if one is.
+    let mut quote: Option<char> = None;
+
+    for character in line.chars() {
+        match quote {
+            Some(mark) => {
+                if character == mark {
+                    quote = None;
+                } else {
+                    current.push(character);
+                }
+            }
+            None => {
+                if character == '"' || character == '\'' {
+                    quote = Some(character);
+                    written = true;
+                } else if character.is_whitespace() {
+                    if written {
+                        parts.push(std::mem::take(&mut current));
+                        written = false;
+                    }
+                } else {
+                    current.push(character);
+                    written = true;
+                }
+            }
+        }
+    }
+    if let Some(mark) = quote {
+        return Err(format!("引号 {mark} 没关上"));
+    }
+    if written {
+        parts.push(current);
+    }
+    let Some(program) = parts.first().cloned() else {
+        return Err("命令是空的".to_owned());
+    };
+    let args = parts[1..].to_vec();
+    Ok((program, args))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,5 +343,36 @@ mod tests {
         let (program, args) = build_command(&directory).expect("there is a build command");
         assert_eq!(program, "npm");
         assert_eq!(args, vec!["run".to_owned(), "build".to_owned()]);
+    }
+
+    #[test]
+    fn a_command_line_is_split_into_the_program_and_its_arguments() {
+        let (program, args) = split_command("cargo build --release").expect("the line is split");
+        assert_eq!(program, "cargo");
+        assert_eq!(args, vec!["build".to_owned(), "--release".to_owned()]);
+    }
+
+    #[test]
+    fn what_is_in_quotes_is_one_argument() {
+        let (program, args) =
+            split_command("\"C:\\Program Files\\tool.exe\" --flag").expect("the line is split");
+        assert_eq!(program, "C:\\Program Files\\tool.exe");
+        assert_eq!(args, vec!["--flag".to_owned()]);
+
+        let (program, args) = split_command("echo \"one argument\"").expect("the line is split");
+        assert_eq!(program, "echo");
+        assert_eq!(args, vec!["one argument".to_owned()]);
+    }
+
+    #[test]
+    fn a_quote_that_is_not_closed_is_said_out_loud() {
+        let error = split_command("echo \"one argument").expect_err("the line is wrong");
+        assert!(error.contains("没关上"), "got {error}");
+    }
+
+    #[test]
+    fn an_empty_command_has_no_program() {
+        let error = split_command("   ").expect_err("there is no command");
+        assert!(error.contains("空"), "got {error}");
     }
 }
