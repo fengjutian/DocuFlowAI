@@ -62,6 +62,21 @@ pub fn workspace_root(path: &Path) -> PathBuf {
     path.parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
+/// The range of the line the given offset is on.
+///
+/// The code operations of a server are asked about a place in the document,
+/// and the line of the caret is the place the user is working on.
+pub fn line_range(buffer: &Buffer, offset: usize) -> Range {
+    let line = buffer.line_of_offset(offset);
+    let text = buffer.line_text(line);
+    let start = buffer.line_range(line).start.0;
+    let end = start + text.len();
+    Range {
+        start: positions::position_at(buffer, start),
+        end: positions::position_at(buffer, end),
+    }
+}
+
 /// The changes the server is told about.
 ///
 /// One edit is told as a range and the text that goes there: the range is
@@ -113,8 +128,35 @@ pub fn formatting_changes(
     buffer: &Buffer,
     edits: &[TextEdit],
 ) -> Option<Vec<(TextRange<TextOffset>, String)>> {
+    changes_of(buffer, edits)
+}
+
+/// The edits of a rename answer, as ranges of the buffer.
+///
+/// The places the server gives are in its own units, so they are worked out
+/// against the text that is there now. A place that is not in the document
+/// means the answer is about a different text, and it is not applied at all:
+/// a renaming that lands in the wrong place is worse than no renaming.
+pub fn rename_changes(
+    buffer: &Buffer,
+    edits: &[TextEdit],
+) -> Option<Vec<(TextRange<TextOffset>, String)>> {
+    changes_of(buffer, edits)
+}
+
+/// The edits of an answer, as ranges of the buffer.
+fn changes_of(
+    buffer: &Buffer,
+    edits: &[TextEdit],
+) -> Option<Vec<(TextRange<TextOffset>, String)>> {
+    let lines = buffer.line_count();
     let mut changes = Vec::with_capacity(edits.len());
     for edit in edits {
+        // A place that is in a line the file does not have is not a place in
+        // the file: the answer is about another text.
+        if edit.range.start.line as usize >= lines || edit.range.end.line as usize >= lines {
+            return None;
+        }
         let start = positions::offset_at(buffer, edit.range.start)?;
         let end = positions::offset_at(buffer, edit.range.end)?;
         changes.push((TextOffset(start)..TextOffset(end), edit.new_text.clone()));

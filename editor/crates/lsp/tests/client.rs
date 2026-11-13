@@ -139,6 +139,70 @@ fn the_completions_of_the_server_arrive() {
 }
 
 #[test]
+fn the_code_actions_of_the_server_arrive() {
+    let client = client();
+    client
+        .did_open("file:///tmp/main.rs", "rust", 1, "fn main() {}\n")
+        .expect("the document opens");
+
+    client
+        .request_code_action(
+            "file:///tmp/main.rs",
+            Range {
+                start: Position::new(0, 0),
+                end: Position::new(0, 12),
+            },
+            &[],
+        )
+        .expect("the request goes through");
+
+    let answer = wait_for(|| {
+        let mut answers = client.drain_code_actions();
+        (!answers.is_empty()).then(|| answers.remove(0))
+    });
+    let actions = answer.expect("the server answered");
+    assert_eq!(actions.len(), 2);
+    assert_eq!(actions[0].title, "Rename the function");
+    // The first action brings edits of its own.
+    let edit = actions[0].edit.as_ref().expect("the action has an edit");
+    let edits = edit.edits_of("file:///tmp/main.rs");
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].new_text, "run");
+    // The second one runs a command and has no edit.
+    assert!(actions[1].edit.is_none());
+    let command = actions[1].command.as_ref().expect("the action has a command");
+    assert_eq!(command.command, "cargo.test");
+}
+
+#[test]
+fn the_edits_of_a_rename_request_arrive() {
+    let client = client();
+    client
+        .did_open("file:///tmp/main.rs", "rust", 1, "fn main() {}\n")
+        .expect("the document opens");
+
+    client
+        .request_rename("file:///tmp/main.rs", Position::new(0, 3), "run")
+        .expect("the request goes through");
+
+    let answer = wait_for(|| {
+        let mut answers = client.drain_renames();
+        (!answers.is_empty()).then(|| answers.remove(0))
+    });
+    let edit = answer.expect("the server answered");
+    // The rename reaches more than the file it was asked about.
+    assert_eq!(edit.files().len(), 2);
+    let edits = edit.edits_of("file:///tmp/main.rs");
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].new_text, "run");
+    assert_eq!(edits[0].range.start, Position::new(0, 3));
+    assert_eq!(edits[0].range.end, Position::new(0, 7));
+    let others = edit.edits_of("file:///tmp/other.rs");
+    assert_eq!(others.len(), 1);
+    assert_eq!(others[0].new_text, "run");
+}
+
+#[test]
 fn the_edits_of_a_formatting_request_arrive() {
     let client = client();
     client

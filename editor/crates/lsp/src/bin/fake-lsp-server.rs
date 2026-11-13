@@ -106,6 +106,70 @@ fn handle(message: &Value, output: &mut impl Write, documents: &mut HashMap<Stri
             });
             write(output, &answer);
         }
+        (Some(id), "textDocument/rename") => {
+            // A rename says which files change: the file that was asked
+            // about and another one, the way the rename of a function
+            // reaches the file that calls it.
+            let answer = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "changes": {
+                        "file:///tmp/main.rs": [
+                            {
+                                "range": {
+                                    "start": { "line": 0, "character": 3 },
+                                    "end": { "line": 0, "character": 7 }
+                                },
+                                "newText": "run"
+                            }
+                        ],
+                        "file:///tmp/other.rs": [
+                            {
+                                "range": {
+                                    "start": { "line": 0, "character": 0 },
+                                    "end": { "line": 0, "character": 4 }
+                                },
+                                "newText": "run"
+                            }
+                        ]
+                    }
+                }
+            });
+            write(output, &answer);
+        }
+        (Some(id), "textDocument/codeAction") => {
+            // Two actions: one that changes the text of the document and
+            // one that runs a command.
+            let answer = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": [
+                    {
+                        "title": "Rename the function",
+                        "kind": "quickfix",
+                        "edit": {
+                            "changes": {
+                                "file:///tmp/main.rs": [
+                                    {
+                                        "range": {
+                                            "start": { "line": 0, "character": 3 },
+                                            "end": { "line": 0, "character": 7 }
+                                        },
+                                        "newText": "run"
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        "title": "Run the tests",
+                        "command": "cargo.test"
+                    }
+                ]
+            });
+            write(output, &answer);
+        }
         (Some(id), _) => {
             // Every other request gets an empty answer, so that the server
             // carries on with what it was doing.

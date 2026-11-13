@@ -36,8 +36,9 @@ use serde_json::{Value, json};
 use crate::{
     framing::{FrameReader, serialize},
     protocol::{
-        CompletionList, Diagnostic, Position, TextChange, TextDocumentIdentifier, TextDocumentItem,
-        TextDocumentSyncKind, TextEdit, VersionedTextDocumentIdentifier,
+        CodeAction, CompletionList, Diagnostic, Position, Range, ServerCommand, TextChange,
+        TextDocumentIdentifier, TextDocumentItem, TextDocumentSyncKind, TextEdit,
+        VersionedTextDocumentIdentifier, WorkspaceEdit,
     },
 };
 
@@ -101,6 +102,12 @@ enum Pending {
     /// A formatting answer is a list of edits, and it has to be told apart
     /// from the answers of the other requests.
     Formatting(Sender<Result<Vec<TextEdit>, LspError>>),
+    /// A rename answer says which files change, so it has its own way in.
+    Rename(Sender<Result<WorkspaceEdit, LspError>>),
+    /// The code actions the server offers, and the commands that go with them.
+    CodeActions(Sender<Result<Vec<CodeAction>, LspError>>),
+    /// The answer of a command the editor ran for the server.
+    Command(Sender<Result<Value, LspError>>),
 }
 
 /// The document that was opened before the handshake was done.
@@ -129,6 +136,15 @@ pub struct Client {
     formattings: Receiver<Result<Vec<TextEdit>, LspError>>,
     /// Where the answer of a formatting request goes.
     formatting_sender: Sender<Result<Vec<TextEdit>, LspError>>,
+    renames: Receiver<Result<WorkspaceEdit, LspError>>,
+    /// Where the answer of a rename request goes.
+    rename_sender: Sender<Result<WorkspaceEdit, LspError>>,
+    code_actions: Receiver<Result<Vec<CodeAction>, LspError>>,
+    /// Where the answers of the code action requests go.
+    code_action_sender: Sender<Result<Vec<CodeAction>, LspError>>,
+    commands: Receiver<Result<Value, LspError>>,
+    /// Where the answers of the commands go.
+    command_sender: Sender<Result<Value, LspError>>,
     running: Arc<AtomicBool>,
     /// Whether the handshake is done.
     ready: Arc<AtomicBool>,
@@ -167,9 +183,15 @@ impl Client {
         let (completion_sender, completions) = channel();
         let (response_sender, responses) = channel();
         let (formatting_sender, formattings) = channel();
+        let (rename_sender, renames) = channel();
+        let (code_action_sender, code_actions) = channel();
+        let (command_sender, commands) = channel();
         let client_completions = completion_sender.clone();
         let client_responses = response_sender.clone();
         let client_formattings = formatting_sender.clone();
+        let client_renames = rename_sender.clone();
+        let client_code_actions = code_action_sender.clone();
+        let client_commands = command_sender.clone();
         let pending: Arc<Mutex<HashMap<i64, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_id = Arc::new(Mutex::new(1));
         let running = Arc::new(AtomicBool::new(true));
@@ -223,6 +245,12 @@ impl Client {
             response_sender: client_responses,
             formattings,
             formatting_sender: client_formattings,
+            renames,
+            rename_sender: client_renames,
+            code_actions,
+            code_action_sender: client_code_actions,
+            commands,
+            command_sender: client_commands,
             running,
             ready,
             sync_kind,
@@ -406,6 +434,88 @@ impl Client {
         self.write(&message)
     }
 
+    /// Asks the server to rename the thing at a place in the document.
+    ///
+    /// The answer arrives later: it is in [`Client::drain_renames`].
+    pub fn request_rename(
+        &self,
+        uri: &str,
+        position: Position,
+        new_name: &str,
+    ) -> Result<(), LspError> {
+        let id = self.next_id();
+        self.pending
+            .lock()
+            .expect("the pending lock is not poisoned")
+            .insert(id, Pending::Rename(self.rename_sender.clone()));
+
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/rename",
+            "params": {
+                "textDocument": TextDocumentIdentifier { uri: uri.to_owned() },
+                "position": position,
+                "newName": new_name,
+            },
+        });
+        self.write(&message)
+    }
+
+    /// Asks the server what it offers to do about a place in the document.
+    ///
+    /// The answer arrives later: it is in [`Client::drain_code_actions`].
+    pub fn request_code_action(
+        &self,
+        uri: &str,
+        range: Range,
+        diagnostics: &[Diagnostic],
+    ) -> Result<(), LspError> {
+        let id = self.next_id();
+        self.pending
+            .lock()
+            .expect("the pending lock is not poisoned")
+            .insert(id, Pending::CodeActions(self.code_action_sender.clone()));
+
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/codeAction",
+            "params": {
+                "textDocument": TextDocumentIdentifier { uri: uri.to_owned() },
+                "range": range,
+                "context": { "diagnostics": diagnostics },
+            },
+        });
+        self.write(&message)
+    }
+
+    /// Runs a command for the server.
+    ///
+    /// The answer arrives later: it is in [`Client::drain_commands`].
+    pub fn execute_command(
+        &self,
+        name: &str,
+        arguments: Vec<Value>,
+    ) -> Result<(), LspError> {
+        let id = self.next_id();
+        self.pending
+            .lock()
+            .expect("the pending lock is not poisoned")
+            .insert(id, Pending::Command(self.command_sender.clone()));
+
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "workspace/executeCommand",
+            "params": {
+                "command": name,
+                "arguments": arguments,
+            },
+        });
+        self.write(&message)
+    }
+
     /// Asks the server something else.
     ///
     /// The answer arrives later: it is in [`Client::drain_responses`].
@@ -451,6 +561,23 @@ impl Client {
     /// last call.
     pub fn drain_formattings(&self) -> Vec<Result<Vec<TextEdit>, LspError>> {
         self.formattings.try_iter().collect()
+    }
+
+    /// Returns the answers of the rename requests that arrived since the last
+    /// call.
+    pub fn drain_renames(&self) -> Vec<Result<WorkspaceEdit, LspError>> {
+        self.renames.try_iter().collect()
+    }
+
+    /// Returns the answers of the code action requests that arrived since the
+    /// last call.
+    pub fn drain_code_actions(&self) -> Vec<Result<Vec<CodeAction>, LspError>> {
+        self.code_actions.try_iter().collect()
+    }
+
+    /// Returns the answers of the commands that arrived since the last call.
+    pub fn drain_commands(&self) -> Vec<Result<Value, LspError>> {
+        self.commands.try_iter().collect()
     }
 
     /// The next id of a request.
@@ -630,6 +757,15 @@ fn read_loop(
             Pending::Formatting(sender) => {
                 let _ = sender.send(Err(LspError::Closed));
             }
+            Pending::Rename(sender) => {
+                let _ = sender.send(Err(LspError::Closed));
+            }
+            Pending::CodeActions(sender) => {
+                let _ = sender.send(Err(LspError::Closed));
+            }
+            Pending::Command(sender) => {
+                let _ = sender.send(Err(LspError::Closed));
+            }
             Pending::Completion(_) => {}
         }
     }
@@ -709,6 +845,15 @@ fn dispatch(
                 }
                 Pending::Formatting(sender) => {
                     let _ = sender.send(outcome.and_then(text_edits));
+                }
+                Pending::Rename(sender) => {
+                    let _ = sender.send(outcome.and_then(workspace_edit));
+                }
+                Pending::CodeActions(sender) => {
+                    let _ = sender.send(outcome.and_then(code_actions));
+                }
+                Pending::Command(sender) => {
+                    let _ = sender.send(outcome);
                 }
                 Pending::Answer(sender) => {
                     let _ = sender.send(outcome);
@@ -805,4 +950,48 @@ fn text_edits(value: Value) -> Result<Vec<TextEdit>, LspError> {
     serde_json::from_value(value).map_err(|error| LspError::Protocol(format!(
         "the server answered with edits that could not be read: {error}"
     )))
+}
+
+/// The answer of a request that changes files, in the editor's own shape.
+///
+/// The two shapes of the answer are read in the protocol module, so that the
+/// renaming and the code actions are understood in the same way.
+fn workspace_edit(value: Value) -> Result<WorkspaceEdit, LspError> {
+    crate::protocol::read_workspace_edit(value).map_err(LspError::Protocol)
+}
+
+/// The answer of a code action request, in the editor's own shape.
+///
+/// The server answers with a list of actions. An older server answers with a
+/// list of commands instead: a command with a title is an action that has no
+/// edit of its own, and it is understood as one.
+fn code_actions(value: Value) -> Result<Vec<CodeAction>, LspError> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    let entries = value.as_array().ok_or_else(|| {
+        LspError::Protocol("the server answered with code actions that could not be read".to_owned())
+    })?;
+    let mut actions = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let action = match serde_json::from_value::<CodeAction>(entry.clone()) {
+            Ok(action) => action,
+            Err(_) => {
+                // The older shape: a title and the name of a command.
+                let command: ServerCommand = serde_json::from_value(entry.clone()).map_err(|error| {
+                    LspError::Protocol(format!(
+                        "the server answered with a code action that could not be read: {error}"
+                    ))
+                })?;
+                CodeAction {
+                    title: command.title.clone(),
+                    kind: None,
+                    edit: None,
+                    command: Some(command),
+                }
+            }
+        };
+        actions.push(action);
+    }
+    Ok(actions)
 }

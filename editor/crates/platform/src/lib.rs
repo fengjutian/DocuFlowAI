@@ -1,4 +1,5 @@
 mod agent;
+mod code_action;
 mod completion;
 mod context;
 mod diff_review;
@@ -8,8 +9,10 @@ mod input;
 mod lsp;
 mod pane;
 mod paths;
+mod rename;
 mod settings;
 mod shell;
+mod task;
 
 use std::{ops::Range, path::{Path, PathBuf}, sync::Arc, time::Duration};
 
@@ -17,7 +20,10 @@ use anyhow::{Context, Result};
 use codeweaver_agent_acp::ToolStatus;
 use codeweaver_agent_ui::{ContextItem, HunkDecision};
 use codeweaver_editor_core::Editor;
-use codeweaver_lsp::{Client as LspClient, LspEvent, ServerConfig, protocol::TextEdit};
+use codeweaver_lsp::{
+    Client as LspClient, LspEvent, ServerConfig,
+    protocol::{TextEdit, WorkspaceEdit},
+};
 use codeweaver_render::{
     Color, FrameScene, Point, Rect, Renderer, RendererError, Size, TextFamily, TextStyle,
 };
@@ -26,6 +32,7 @@ use codeweaver_text::TextOffset;
 use codeweaver_ui::TextMeasurer;
 use codeweaver_workspace::{ChangeDetector, Document, ExternalChange, FileTree, Workspace};
 use codeweaver_workbench::{close_decision, CloseDecision, Tab, TabBar, TabId};
+use code_action::ActionPopup;
 use completion::CompletionPopup;
 use editor_view::{
     BodyOverlay, EditorView, FindOverlay, LINE_HEIGHT, MarkSeverity, RendererMeasurer,
@@ -33,7 +40,9 @@ use editor_view::{
 use find::{FindBar, FindField};
 use input::TextInputState;
 use pane::EditorPane;
+use rename::RenameBox;
 use settings::Settings;
+use task::{Task, TaskOutput, TaskPanel, TaskState};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -58,6 +67,11 @@ const WINDOW_TITLE: &str = "CodeWeaver";
 const TAB_BAR_HEIGHT: f32 = 34.0;
 /// The width of the panel the file tree is drawn in.
 const SIDEBAR_WIDTH: f32 = 220.0;
+/// The height of the output panel of a task.
+const TASK_PANEL_HEIGHT: f32 = 200.0;
+
+/// The changes of one file, as ranges of its text.
+type FileChanges = Vec<(std::ops::Range<TextOffset>, String)>;
 
 /// The question the window is asking the user.
 ///
@@ -124,6 +138,24 @@ pub struct NativeApplication {
     server_generation: i64,
     /// The completions the server offered, when the list is open.
     completion: Option<CompletionPopup>,
+    /// The things the server offers to do about the place of the caret, when
+    /// the list is open.
+    actions: Option<ActionPopup>,
+    /// The file the code operations were asked about, and the version of its
+    /// text when they were asked.
+    ///
+    /// The list may be picked long after the question was asked, and the tab
+    /// on screen may be another one by then: the operations belong to the
+    /// file that was asked about.
+    action_target: Option<(String, u64)>,
+    /// The task that is running, when there is one.
+    task: Option<Task>,
+    /// What the task has said.
+    task_output: TaskOutput,
+    /// What the task was asked to do.
+    task_title: String,
+    /// Whether the output panel of the task is open.
+    task_panel: bool,
     /// The tabs that are open.
     tabs: TabBar,
     /// The pane of every tab, in the order of the tabs.
@@ -145,6 +177,13 @@ pub struct NativeApplication {
     /// comes back for a text that has changed since then is not put into the
     /// buffer.
     formatting: Option<u64>,
+    /// The box that asks for the new name, when it is open.
+    rename_box: Option<RenameBox>,
+    /// The rename request that is on its way.
+    ///
+    /// The request is about one place in one document, and it is only good
+    /// for the text that was there when it was made.
+    renaming: Option<RenameRequest>,
     /// The change the agent proposed for the file that is open, and the
     /// version of the buffer it was computed against.
     ///
@@ -173,6 +212,43 @@ struct PendingConflict {
     selected: usize,
     /// What the user chose for each conflict.
     choices: Vec<codeweaver_diff::Choice>,
+}
+
+/// A rename request that is on its way.
+struct RenameRequest {
+    /// The file the request is about.
+    ///
+    /// The renaming is about this file and not about the tab that happens
+    /// to be on screen when the answer comes back.
+    uri: String,
+    /// The version of the text the request was made for.
+    version: u64,
+    /// The name the user asked for.
+    new_name: String,
+}
+
+/// What came of a change that was put into the files.
+struct EditOutcome {
+    /// Whether anything changed.
+    changed: bool,
+    /// How many files were changed.
+    files: usize,
+    /// How many of them were not open in the editor and were written to disk.
+    written: usize,
+    /// Why nothing was changed, when nothing was.
+    reason: Option<String>,
+}
+
+impl EditOutcome {
+    /// Nothing was changed, and this is why.
+    fn failed(reason: String) -> Self {
+        EditOutcome {
+            changed: false,
+            files: 0,
+            written: 0,
+            reason: Some(reason),
+        }
+    }
 }
 
 /// A change the agent proposed for the file that is open.
@@ -274,6 +350,12 @@ impl NativeApplication {
             server,
             server_generation: 1,
             completion: None,
+            actions: None,
+            action_target: None,
+            task: None,
+            task_output: TaskOutput::default(),
+            task_title: String::new(),
+            task_panel: false,
             tabs,
             panes,
             active: 0,
@@ -282,6 +364,8 @@ impl NativeApplication {
             prompt: None,
             settings: None,
             formatting: None,
+            rename_box: None,
+            renaming: None,
             pending_diff: None,
             selected_hunk: 0,
             selected_context: 0,
@@ -1269,7 +1353,7 @@ impl NativeApplication {
 
     /// How many lines of the body fit on screen.
     fn visible_lines(&self, scale_factor: f64) -> usize {
-        let body = editor_body_rect(self.window_size(scale_factor));
+        let body = editor_body_rect(self.window_size(scale_factor), self.task_panel_height());
         ((body.size.height / LINE_HEIGHT).floor() as usize).max(1)
     }
 
@@ -1278,11 +1362,12 @@ impl NativeApplication {
     /// The layout is only rebuilt when something it depends on changed, so
     /// a mouse move does not pay for measuring the text again.
     fn rebuild_layout(&mut self, scale_factor: f64) {
+        let bottom = self.task_panel_height();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
         let size = renderer.logical_size(scale_factor);
-        let body = editor_body_rect(size);
+        let body = editor_body_rect(size, bottom);
         let mut measurer = RendererMeasurer::new(renderer, TextFamily::Monospace);
         let pane = &mut self.panes[self.active];
         pane.view.layout(
@@ -1382,6 +1467,82 @@ impl NativeApplication {
                 }
             }
         }
+
+        // The rename answers are put into the buffers. The edits of one file
+        // are one change of that file.
+        let renames = match self.server.as_ref() {
+            Some(server) => server.drain_renames(),
+            None => Vec::new(),
+        };
+        for answer in renames {
+            match answer {
+                Ok(edit) => {
+                    // The answer is only about the text that was there when
+                    // it was asked for. A text that changed in the meantime
+                    // is a different text, and the edits do not fit it.
+                    let Some(request) = self.renaming.take() else {
+                        continue;
+                    };
+                    if self.apply_rename(edit, &request) {
+                        changed = true;
+                    }
+                }
+                Err(error) => {
+                    self.renaming = None;
+                    eprintln!("could not rename: {error}");
+                    self.status = Some(format!("重命名失败：{error}"));
+                    changed = true;
+                }
+            }
+        }
+
+        // The code actions the server offers open the list of the things it
+        // can do about the place of the caret. Nothing is changed before the
+        // user has picked one.
+        let answers = match self.server.as_ref() {
+            Some(server) => server.drain_code_actions(),
+            None => Vec::new(),
+        };
+        for answer in answers {
+            match answer {
+                Ok(actions) => {
+                    if actions.is_empty() {
+                        self.status = Some("这里没有可以做的操作".to_owned());
+                    } else if let Some(popup) = ActionPopup::new(actions) {
+                        let count = popup.len();
+                        self.actions = Some(popup);
+                        self.status = Some(format!(
+                            "有 {count} 个操作，上下键挑，回车确认，Esc 取消"
+                        ));
+                    }
+                    changed = true;
+                }
+                Err(error) => {
+                    eprintln!("could not get the code actions: {error}");
+                    self.status = Some(format!("代码操作失败：{error}"));
+                    changed = true;
+                }
+            }
+        }
+
+        // The answers of the commands that were run for the server.
+        let commands = match self.server.as_ref() {
+            Some(server) => server.drain_commands(),
+            None => Vec::new(),
+        };
+        for answer in commands {
+            match answer {
+                Ok(_) => {
+                    self.status = Some("服务器把命令做完了".to_owned());
+                    changed = true;
+                }
+                Err(error) => {
+                    eprintln!("the command of the server failed: {error}");
+                    self.status = Some(format!("命令没跑起来：{error}"));
+                    changed = true;
+                }
+            }
+        }
         changed
     }
 
@@ -1390,20 +1551,26 @@ impl NativeApplication {
     /// The server is told about every edit, so its answers are about the text
     /// that is on screen and not about the text as the file was opened.
     fn tell_server_about_the_change(&mut self) {
-        let Some(uri) = self.panes[self.active].document_uri.clone() else {
+        let active = self.active;
+        self.tell_server_about_the_change_of(active);
+    }
+
+    /// Tells the language server what the text of one tab looks like now.
+    fn tell_server_about_the_change_of(&mut self, pane: usize) {
+        let Some(uri) = self.panes[pane].document_uri.clone() else {
             return;
         };
-        let Some(change) = self.panes[self.active].editor.last_change() else {
+        let Some(change) = self.panes[pane].editor.last_change() else {
             return;
         };
-        let version = self.panes[self.active].editor.buffer().version();
-        if self.panes[self.active].server_version == Some(version) {
+        let version = self.panes[pane].editor.buffer().version();
+        if self.panes[pane].server_version == Some(version) {
             // The server already knows about this text.
             return;
         }
-        let changes = lsp::changes_for(self.panes[self.active].editor.buffer(), change);
-        let text = self.panes[self.active].editor.text();
-        self.panes[self.active].server_version = Some(version);
+        let changes = lsp::changes_for(self.panes[pane].editor.buffer(), change);
+        let text = self.panes[pane].editor.text();
+        self.panes[pane].server_version = Some(version);
         self.server_generation += 1;
         let generation = self.server_generation;
         if let Some(server) = self.server.as_ref()
@@ -1442,7 +1609,8 @@ impl NativeApplication {
             self.press_file_tree(cursor, size);
             return;
         }
-        let body = editor_body_rect(size);
+        let bottom = self.task_panel_height();
+        let body = editor_body_rect(size, bottom);
         if !body.contains(cursor) {
             return;
         }
@@ -1465,7 +1633,8 @@ impl NativeApplication {
         let Some(cursor) = self.cursor else {
             return;
         };
-        let body = editor_body_rect(self.window_size(scale_factor));
+        let bottom = self.task_panel_height();
+        let body = editor_body_rect(self.window_size(scale_factor), bottom);
         let pane = &mut self.panes[self.active];
         pane.view.drag(
             &mut pane.editor,
@@ -1786,6 +1955,563 @@ impl NativeApplication {
         true
     }
 
+    /// Handles the key that asks to rename the thing at the caret.
+    ///
+    /// F2 renames, the way it does in the other editors.
+    fn handle_rename_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
+        if !matches!(key, Key::Named(NamedKey::F2)) {
+            return false;
+        }
+        self.open_rename_box();
+        true
+    }
+    /// Handles the key that asks the language server what it offers to do
+    /// about the place of the caret.
+    ///
+    /// Alt+Enter opens the list of the things the server offers, the way it
+    /// does in the other editors. Ctrl+. is not used for it: that key
+    /// cancels the turn of the agent.
+    fn handle_action_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
+        if self.actions.is_some() {
+            let mut actions = self.actions.take().expect("the list is open");
+            match key {
+                Key::Named(NamedKey::Escape) => {
+                    // The list closes and the editor takes the keyboard back.
+                    self.status = Some("取消了代码操作".to_owned());
+                    self.action_target = None;
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    actions.select_next();
+                    self.actions = Some(actions);
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    actions.select_previous();
+                    self.actions = Some(actions);
+                    return true;
+                }
+                Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
+                    self.apply_code_action(&actions);
+                    return true;
+                }
+                _ => {
+                    // The key was not one of the list: the list closes and
+                    // the key goes on to the editor.
+                }
+            }
+        }
+
+        if self.modifiers.alt_key() && is_enter(key) {
+            self.request_code_action();
+            return true;
+        }
+        false
+    }
+
+    /// Asks the server what it offers to do about the place of the caret.
+    ///
+    /// The answer comes later: the window collects it and opens the list of
+    /// the things the server offers.
+    fn request_code_action(&mut self) {
+        let Some(uri) = self.panes[self.active].document_uri.clone() else {
+            self.status = Some("这个文件没有语言服务器，代码操作不了".to_owned());
+            return;
+        };
+        let caret = self.panes[self.active].editor.caret().0;
+        let range = lsp::line_range(self.panes[self.active].editor.buffer(), caret);
+        let outcome = self
+            .server
+            .as_ref()
+            .map(|server| server.request_code_action(&uri, range, &[]));
+        match outcome {
+            Some(Ok(())) => {
+                // The file the operations are about, and the version of its
+                // text: the list may be picked much later.
+                self.action_target = Some((
+                    uri,
+                    self.panes[self.active].editor.version(),
+                ));
+                self.status = Some("正在问服务器这里能做什么…".to_owned());
+            }
+            Some(Err(error)) => {
+                eprintln!("could not ask the server for code actions: {error}");
+                self.status = Some(format!("代码操作请求失败：{error}"));
+            }
+            None => self.status = Some("没有语言服务器，代码操作不了".to_owned()),
+        }
+    }
+
+    /// Does the thing the user picked from the list.
+    ///
+    /// A code action either brings edits of its own or runs a command; the
+    /// first is put into the files, the second is given to the server.
+    fn apply_code_action(&mut self, actions: &ActionPopup) {
+        let Some(action) = actions.selected_action() else {
+            return;
+        };
+        let title = action.title.clone();
+        if let Some(edit) = action.edit.as_ref() {
+            // The operations belong to the file they were asked about, not to
+            // the tab that happens to be on screen.
+            let (uri, version) = match self.action_target.clone() {
+                Some(target) => target,
+                None => (
+                    self.panes[self.active].document_uri.clone().unwrap_or_default(),
+                    self.panes[self.active].editor.version(),
+                ),
+            };
+            let outcome = self.apply_workspace_edit(edit, &uri, version, "代码操作");
+            match outcome.reason {
+                Some(reason) => self.status = Some(reason),
+                None => {
+                    let mut message = format!("做了：{title}");
+                    if outcome.files > 1 {
+                        message.push_str(&format!("（改了 {} 个文件", outcome.files));
+                        if outcome.written > 0 {
+                            message.push_str(&format!(
+                                "，其中 {} 个不在编辑器里，已写入磁盘",
+                                outcome.written
+                            ));
+                        }
+                        message.push('）');
+                    }
+                    self.status = Some(message);
+                }
+            }
+            return;
+        }
+        if let Some(command) = action.command.as_ref() {
+            let outcome = self.server.as_ref().map(|server| {
+                server.execute_command(&command.command, command.arguments.clone())
+            });
+            match outcome {
+                Some(Ok(())) => self.status = Some(format!("让服务器去做：{title}")),
+                Some(Err(error)) => {
+                    eprintln!("could not run the command of the server: {error}");
+                    self.status = Some(format!("命令没跑起来：{error}"));
+                }
+                None => self.status = Some("没有语言服务器，这个操作做不了".to_owned()),
+            }
+            return;
+        }
+        self.status = Some(format!("这个操作编辑器做不了：{title}"));
+    }
+    /// The room that is kept at the bottom of the window for the output of a
+    /// task.
+    fn task_panel_height(&self) -> f32 {
+        if self.task_panel {
+            TASK_PANEL_HEIGHT
+        } else {
+            0.0
+        }
+    }
+
+    /// Handles the keys of the task.
+    ///
+    /// Ctrl+Shift+B builds the project, the way it does in the other
+    /// editors. Esc closes the output panel; the task keeps running.
+    fn handle_task_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
+        if self.task_panel && matches!(key, Key::Named(NamedKey::Escape)) {
+            self.task_panel = false;
+            return true;
+        }
+        if !(self.modifiers.control_key() && self.modifiers.shift_key()) {
+            return false;
+        }
+        let Some(letter) = key_letter(key) else {
+            return false;
+        };
+        if !letter.eq_ignore_ascii_case(&'b') {
+            return false;
+        }
+        self.start_build_task();
+        true
+    }
+
+    /// Starts the build task of the project the open file belongs to.
+    ///
+    /// The command is the one the manifest of the project says. A project
+    /// that has no manifest has nothing to build, and the editor says so
+    /// instead of doing nothing.
+    fn start_build_task(&mut self) {
+        if let Some(task) = self.task.as_ref()
+            && task.is_running()
+        {
+            // One task at a time: two builds of the same project would fight
+            // over the same files.
+            self.status = Some("已经有任务在跑了".to_owned());
+            return;
+        }
+        let Some(path) = self.panes[self.active]
+            .document
+            .as_ref()
+            .map(|document| document.path().to_path_buf())
+        else {
+            self.status = Some("这个文件不属于任何工程，没有可以跑的命令".to_owned());
+            return;
+        };
+        let root = lsp::workspace_root(&path);
+        let Some((program, args)) = task::build_command(&root) else {
+            self.status = Some(format!("{} 里没有可以跑的命令", root.display()));
+            return;
+        };
+        let title = format!("{program} {}", args.join(" "));
+        match Task::start(&program, &args, &root) {
+            Ok(task) => {
+                self.task = Some(task);
+                self.task_output = TaskOutput::default();
+                self.task_title = title.clone();
+                self.task_panel = true;
+                self.status = Some(format!("正在跑：{title}"));
+            }
+            Err(error) => {
+                eprintln!("could not start the task: {error}");
+                self.status = Some(format!("任务起不来：{error}"));
+            }
+        }
+    }
+
+    /// Collects what the task has said.
+    ///
+    /// The task talks on a thread of its own, so what it has said is
+    /// collected once per frame, the way the output of the agent is.
+    fn pump_task(&mut self) -> bool {
+        let Some(task) = self.task.as_ref() else {
+            return false;
+        };
+        let output = task.output();
+        if output == self.task_output {
+            return false;
+        }
+        let state = output.state.clone();
+        let lines = output.lines.len();
+        self.task_output = output;
+        if !matches!(state, TaskState::Running) {
+            // The task is done: what it says is said once.
+            self.status = Some(TaskPanel::state_text(&state));
+        } else if lines > 0 {
+            self.status = Some(format!("正在跑…（{lines} 行）"));
+        }
+        true
+    }
+
+
+
+    /// Opens the box that asks for the new name.
+    ///
+    /// The box starts with the name that is under the caret, so that the
+    /// usual case is a change of a few letters.
+    fn open_rename_box(&mut self) {
+        if self.server.is_none() {
+            self.status = Some("没有语言服务器，重命名不了".to_owned());
+            return;
+        }
+        let caret = self.panes[self.active].editor.caret().0;
+        let Some((start, end)) = rename::word_at_caret(self.panes[self.active].editor.buffer(), caret)
+        else {
+            self.status = Some("光标处没有可以重命名的名字".to_owned());
+            return;
+        };
+        let name = self.panes[self.active]
+            .editor
+            .buffer()
+            .slice(TextOffset(start)..TextOffset(end))
+            .to_owned();
+        self.rename_box = Some(RenameBox::new(name, start));
+        self.status = Some("输入新名字，回车确认，Esc 取消".to_owned());
+    }
+
+    /// Gives a key to the box that asks for the new name.
+    ///
+    /// While the box is open it takes every key: a name that is typed into
+    /// the document is not a name.
+    ///
+    /// Returns `true` when the key belonged to the box.
+    fn handle_rename_box_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
+        let Some(mut rename) = self.rename_box.take() else {
+            return false;
+        };
+
+        let mut handled = true;
+        let mut keep = true;
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.status = Some("取消了重命名".to_owned());
+                keep = false;
+            }
+            Key::Named(NamedKey::Enter) => {
+                keep = false;
+                self.request_rename(&rename);
+            }
+            Key::Named(NamedKey::Backspace) => rename.backspace(),
+            Key::Named(NamedKey::Delete) => rename.delete(),
+            Key::Named(NamedKey::ArrowLeft) => rename.left(),
+            Key::Named(NamedKey::ArrowRight) => rename.right(),
+            Key::Named(NamedKey::Home) => rename.home(),
+            Key::Named(NamedKey::End) => rename.end(),
+            Key::Character(character) if !self.modifiers.control_key() => {
+                let character = character.as_ref();
+                if character.chars().any(char::is_control) {
+                    // The key did not produce text of its own; the text of
+                    // the event is what the user typed.
+                    if let Some(typed) = text.filter(|typed| !typed.chars().any(char::is_control)) {
+                        rename.type_text(typed);
+                    } else {
+                        handled = false;
+                    }
+                } else {
+                    rename.type_text(character);
+                }
+            }
+            _ => {
+                handled = false;
+            }
+        }
+        if keep {
+            self.rename_box = Some(rename);
+        }
+        handled
+    }
+
+    /// Asks the server to rename the thing at the caret.
+    ///
+    /// The answer comes later: it is put into the buffers by
+    /// [`Self::apply_rename`], when the window collects what the server has
+    /// to say.
+    fn request_rename(&mut self, rename: &RenameBox) {
+        let new_name = rename.text().to_owned();
+        if new_name.is_empty() {
+            self.status = Some("新名字不能是空的".to_owned());
+            return;
+        }
+        if rename.is_unchanged() {
+            self.status = Some("名字没有变，没有重命名".to_owned());
+            return;
+        }
+        let Some(uri) = self.panes[self.active].document_uri.clone() else {
+            self.status = Some("这个文件没有语言服务器，重命名不了".to_owned());
+            return;
+        };
+        let position = lsp::position_of(self.panes[self.active].editor.buffer(), rename.start());
+        let outcome = self
+            .server
+            .as_ref()
+            .map(|server| server.request_rename(&uri, position, &new_name));
+        match outcome {
+            Some(Ok(())) => {
+                // The version is the version of the text the request is
+                // about: an answer that comes back for a text that has
+                // changed since then does not fit the text that is there
+                // now.
+                self.renaming = Some(RenameRequest {
+                    uri,
+                    version: self.panes[self.active].editor.version(),
+                    new_name,
+                });
+                self.status = Some("正在重命名…".to_owned());
+            }
+            Some(Err(error)) => {
+                eprintln!("could not ask the server to rename: {error}");
+                self.status = Some(format!("重命名请求失败：{error}"));
+            }
+            None => self.status = Some("没有语言服务器，重命名不了".to_owned()),
+        }
+    }
+
+    /// Puts the edits of a rename answer where they belong.
+    ///
+    /// The edits of one file are one change of that file: they go in as one
+    /// transaction, so one undo takes the whole renaming back.
+    ///
+    /// A file that is not open in the editor is written to disk through the
+    /// workspace service, which refuses to overwrite a file that changed
+    /// behind the editor's back.
+    ///
+    /// Returns whether anything changed.
+    /// Puts the edits of a rename answer where they belong.
+    ///
+    /// The edits of one file are one change of that file: they go in as one
+    /// transaction, so one undo takes the whole renaming back.
+    ///
+    /// Returns whether anything changed.
+    fn apply_rename(&mut self, edit: WorkspaceEdit, request: &RenameRequest) -> bool {
+        let outcome = self.apply_workspace_edit(&edit, &request.uri, request.version, "重命名");
+        let Some(reason) = outcome.reason else {
+            let mut message = format!("已重命名为 {}", request.new_name);
+            if outcome.files > 1 {
+                message.push_str(&format!("（改了 {} 个文件", outcome.files));
+                if outcome.written > 0 {
+                    message.push_str(&format!("，其中 {} 个不在编辑器里，已写入磁盘", outcome.written));
+                }
+                message.push('）');
+            }
+            self.status = Some(message);
+            return outcome.changed;
+        };
+        self.status = Some(reason);
+        false
+    }
+
+    /// Puts the edits of a change where they belong.
+    ///
+    /// The edits of one file are one change of that file: they go in as one
+    /// transaction, so one undo takes the whole change back.
+    ///
+    /// A file that is not open in the editor is written to disk through the
+    /// workspace service, which refuses to overwrite a file that changed
+    /// behind the editor's back.
+    ///
+    /// `uri` is the file the change was asked about, and `version` is the
+    /// version of its text when the question was asked: a change that does
+    /// not fit the text that is there now is not put in.
+    ///
+    /// `what` is how the change is called to the user: a renaming and a code
+    /// action are the same work with different words.
+    fn apply_workspace_edit(
+        &mut self,
+        edit: &WorkspaceEdit,
+        uri: &str,
+        version: u64,
+        what: &str,
+    ) -> EditOutcome {
+        // The change is about the file that was asked about. The tab on
+        // screen may be another one by now, and the file may be gone.
+        let Some(pane) = self.pane_of_a_file(uri) else {
+            return EditOutcome::failed(format!("{what}的那个文件已经不在编辑器里了"));
+        };
+        if version != self.panes[pane].editor.version() {
+            return EditOutcome::failed(format!("文件在{what}期间变了，{what}结果没有用上"));
+        }
+        if !edit.resource_operations.is_empty() {
+            return EditOutcome::failed("服务器要改文件的名字，这个编辑器还做不到".to_owned());
+        }
+        let files = edit.files();
+        if files.is_empty() {
+            return EditOutcome::failed("没有要改的地方".to_owned());
+        }
+
+        // Every file is worked out before anything is changed: a change that
+        // lands in the wrong place is worse than no change at all.
+        let mut planned: Vec<(String, FileChanges)> = Vec::new();
+        for file in &files {
+            let edits = edit.edits_of(file);
+            if edits.is_empty() {
+                continue;
+            }
+            let Some(changes) = self.changes_of_a_file(file, &edits) else {
+                return EditOutcome::failed(format!(
+                    "{what}结果和 {} 对不上，没有改",
+                    codeweaver_lsp::protocol::uri_to_path(file)
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| file.clone())
+                ));
+            };
+            planned.push((file.clone(), changes));
+        }
+        if planned.is_empty() {
+            return EditOutcome::failed("没有要改的地方".to_owned());
+        }
+
+        // The files that are not open in the editor go to disk first: if one
+        // of them cannot be written, nothing is changed in the editor either.
+        let mut written = 0usize;
+        for (file, changes) in &planned {
+            if self.pane_of_a_file(file).is_some() {
+                continue;
+            }
+            if let Err(error) = self.write_a_file(file, changes) {
+                return EditOutcome::failed(format!("{what}没有做完：{error}"));
+            }
+            written += 1;
+        }
+
+        // The files that are open in the editor change in their buffers.
+        let mut changed_files = 0usize;
+        for (file, changes) in &planned {
+            let Some(index) = self.pane_of_a_file(file) else {
+                continue;
+            };
+            if let Err(error) = self.panes[index].editor.replace_edits(changes.clone()) {
+                return EditOutcome::failed(format!("{what}结果写不进去：{error}"));
+            }
+            changed_files += 1;
+        }
+        if changed_files > 0 {
+            self.sync_dirty_flags();
+            // The server has to hear about the new text: its answers are
+            // about the text that is on screen and not about the text as the
+            // file was opened.
+            for index in 0..self.panes.len() {
+                self.tell_server_about_the_change_of(index);
+            }
+        }
+        EditOutcome {
+            changed: changed_files + written > 0,
+            files: changed_files + written,
+            written,
+            reason: None,
+        }
+    }
+
+    /// The tab whose file is the one with the given URI.
+    fn pane_of_a_file(&self, uri: &str) -> Option<usize> {
+        self.panes
+            .iter()
+            .position(|pane| pane.document_uri.as_deref() == Some(uri))
+    }
+
+    /// The changes of one file, as ranges of its text.
+    ///
+    /// The file is the one that is open in the editor, or the one on disk
+    /// when it is not open. A place that is not in the file means the answer
+    /// is about a different text, and the file is not changed at all.
+    fn changes_of_a_file(
+        &self,
+        uri: &str,
+        edits: &[TextEdit],
+    ) -> Option<Vec<(std::ops::Range<TextOffset>, String)>> {
+        if let Some(index) = self.pane_of_a_file(uri) {
+            return lsp::rename_changes(self.panes[index].editor.buffer(), edits);
+        }
+        let path = codeweaver_lsp::protocol::uri_to_path(uri)?;
+        let document = self.workspace.open(&path).ok()?;
+        lsp::rename_changes(&codeweaver_text::Buffer::new(document.saved_text()), edits)
+    }
+
+    /// Writes the changes of a file that is not open in the editor to disk.
+    fn write_a_file(
+        &mut self,
+        uri: &str,
+        changes: &[(std::ops::Range<TextOffset>, String)],
+    ) -> Result<(), String> {
+        let Some(path) = codeweaver_lsp::protocol::uri_to_path(uri) else {
+            return Err(format!("{uri} 不是编辑器能写的文件"));
+        };
+        let mut document = self
+            .workspace
+            .open(&path)
+            .map_err(|error| format!("{} 读不了：{error}", path.display()))?;
+        let mut buffer = codeweaver_text::Buffer::new(document.saved_text());
+        // The edits have to be in the order of the text, and they may not
+        // overlap.
+        let mut sorted = changes.to_vec();
+        sorted.sort_by_key(|(range, _)| (range.start, range.end));
+        let text_edits = sorted
+            .iter()
+            .map(|(range, text)| {
+                codeweaver_text::TextEdit::new(range.clone(), text.clone())
+            })
+            .collect();
+        let transaction = codeweaver_text::Transaction::new(buffer.version(), text_edits);
+        buffer
+            .apply(transaction)
+            .map_err(|error| format!("{} 改不了：{error}", path.display()))?;
+        self.workspace
+            .save(&mut document, &buffer.text())
+            .map_err(|error| format!("{} 写不进去：{error}", path.display()))
+    }
+
     /// Opens the find bar when the user asks for it.
     ///
     /// Ctrl+F finds, Ctrl+H finds and replaces.
@@ -2045,6 +2771,11 @@ impl ApplicationHandler for NativeApplication {
         {
             window.request_redraw();
         }
+        if self.pump_task()
+            && let Some(window) = self.window.as_ref()
+        {
+            window.request_redraw();
+        }
         event_loop.set_control_flow(ControlFlow::WaitUntil(
             std::time::Instant::now() + Duration::from_millis(100),
         ));
@@ -2083,6 +2814,8 @@ impl ApplicationHandler for NativeApplication {
                         // into the bar instead of the document.
                         if let Some(find) = self.find.as_mut() {
                             find.type_text(&self.panes[self.active].editor, &text);
+                        } else if let Some(rename) = self.rename_box.as_mut() {
+                            rename.type_text(&text);
                         } else if let Err(error) = self.panes[self.active].editor.insert(&text) {
                             eprintln!("failed to commit IME text: {error}");
                         }
@@ -2137,6 +2870,29 @@ impl ApplicationHandler for NativeApplication {
                 }
                 // Alt+Shift+F asks the language server to format the file.
                 if self.handle_format_key(&event.logical_key.as_ref()) {
+                    window.request_redraw();
+                    return;
+                }
+                // F2 asks to rename the thing at the caret.
+                if self.handle_rename_key(&event.logical_key.as_ref()) {
+                    window.request_redraw();
+                    return;
+                }
+                // Alt+Enter asks the server what it offers to do about the
+                // place of the caret.
+                if self.handle_action_key(&event.logical_key.as_ref()) {
+                    window.request_redraw();
+                    return;
+                }
+                // Ctrl+Shift+B builds the project; Esc closes the output of
+                // the task.
+                if self.handle_task_key(&event.logical_key.as_ref()) {
+                    window.request_redraw();
+                    return;
+                }
+                // While the box that asks for the new name is open, the keys
+                // go to it.
+                if self.handle_rename_box_key(&event.logical_key.as_ref(), event.text.as_deref()) {
                     window.request_redraw();
                     return;
                 }
@@ -2280,6 +3036,10 @@ impl ApplicationHandler for NativeApplication {
                 if self.pump_lsp() {
                     window.request_redraw();
                 }
+                // The task talks on a thread of its own as well.
+                if self.pump_task() {
+                    window.request_redraw();
+                }
                 // The highlighter answers on its own thread as well. The
                 // answer belongs to a version of the text: an answer that
                 // arrives after the text changed again is dropped.
@@ -2293,6 +3053,13 @@ impl ApplicationHandler for NativeApplication {
                 }
                 // The status line is read before the renderer is borrowed.
                 let status_line = self.status_line();
+                // The output of the task is read before the renderer is
+                // borrowed as well.
+                let task_panel = self.task_panel.then(|| TaskPanel {
+                    lines: &self.task_output.lines,
+                    state: &self.task_output.state,
+                    title: &self.task_title,
+                });
                 let scale_factor = window.scale_factor();
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
@@ -2324,8 +3091,11 @@ impl ApplicationHandler for NativeApplication {
                         agent_error: self.agent_error.as_deref(),
                         status_line,
                         find: self.find.as_ref(),
+                        rename: self.rename_box.as_ref(),
                         marks: &pane.marks,
                         completion: self.completion.as_ref(),
+                        actions: self.actions.as_ref(),
+                        task_panel,
                         tabs: self.tabs.tabs(),
                         active: self.active,
                         tree: self.tree.as_ref(),
@@ -2382,10 +3152,16 @@ struct Chrome<'a> {
     status_line: String,
     /// The find bar, when it is open.
     find: Option<&'a FindBar>,
+    /// The box that asks for the new name, when it is open.
+    rename: Option<&'a RenameBox>,
     /// The things the language server found wrong in the document.
     marks: &'a [editor_view::Mark],
     /// The list of completions, when it is open.
     completion: Option<&'a CompletionPopup>,
+    /// The things the server offers to do, when the list is open.
+    actions: Option<&'a ActionPopup>,
+    /// The output of the task, when the panel is open.
+    task_panel: Option<TaskPanel<'a>>,
     /// The tabs that are open.
     tabs: &'a [Tab],
     /// The tab that is on screen.
@@ -2447,6 +3223,20 @@ fn is_comma<T: AsRef<str>>(key: &Key<T>) -> bool {
     }
 }
 
+/// Whether the key is the enter key, whatever the keyboard layout says.
+///
+/// A machine with a Chinese input method does not name the keys that are
+/// pressed with a modifier: the virtual key code is the same on every
+/// layout, so it is the second opinion.
+fn is_enter<T: AsRef<str>>(key: &Key<T>) -> bool {
+    match key {
+        Key::Named(NamedKey::Enter) => true,
+        // VK_RETURN, the key the enter is on.
+        Key::Unidentified(NativeKey::Windows(code)) => *code == 0x0D,
+        _ => false,
+    }
+}
+
 fn build_scene(
     renderer: &mut Renderer,
     size: Size,
@@ -2457,7 +3247,14 @@ fn build_scene(
     chrome: Chrome<'_>,
 ) -> FrameScene {
     let viewport = Rect::new(0.0, 0.0, size.width, size.height);
-    let body = editor_body_rect(size);
+    // The output panel of the task takes the room at the bottom of the
+    // window, and the text of the document does not go under it.
+    let bottom = if chrome.task_panel.is_some() {
+        TASK_PANEL_HEIGHT
+    } else {
+        0.0
+    };
+    let body = editor_body_rect(size, bottom);
     let mut scene = FrameScene::default();
 
     // A panel that is drawn over the window hides what is under it.
@@ -2585,6 +3382,9 @@ fn build_scene(
 
     push_find_bar(&mut scene, size, body, chrome.find, &mut ui_measurer);
 
+    // The box that asks for the new name floats over the body.
+    push_rename_box(&mut scene, size, body, chrome.rename, &mut ui_measurer);
+
     // The list of completions floats under the caret.
     if let Some(popup) = chrome.completion
         && let Some(point) = view.point_of(editor_state.caret().0)
@@ -2598,6 +3398,26 @@ fn build_scene(
             &mut ui_measurer,
         );
     }
+
+    // The list of the things the server offers floats under the caret as
+    // well.
+    if let Some(popup) = chrome.actions
+        && let Some(point) = view.point_of(editor_state.caret().0)
+    {
+        code_action::draw(
+            &mut scene,
+            Rect::new(0.0, 0.0, size.width, size.height),
+            body,
+            popup,
+            point,
+            &mut ui_measurer,
+        );
+    }
+    // The output of the task is at the bottom of the window.
+    if let Some(panel) = chrome.task_panel {
+        push_task_panel(&mut scene, size, &panel);
+    }
+
     scene
 }
 
@@ -2643,7 +3463,10 @@ fn sidebar_rect(size: Size) -> Rect {
 }
 
 /// The area the text body is drawn in.
-fn editor_body_rect(size: Size) -> Rect {
+///
+/// `bottom` is the room that is kept at the bottom of the window for the
+/// output panel of a task: the text of the document does not go under it.
+fn editor_body_rect(size: Size, bottom: f32) -> Rect {
     let panel = agent_panel_rect(size);
     let left = SIDEBAR_WIDTH + 16.0;
     let right = panel.origin.x - 16.0;
@@ -2651,7 +3474,7 @@ fn editor_body_rect(size: Size) -> Rect {
         left,
         TAB_BAR_HEIGHT + 44.0,
         (right - left).max(1.0),
-        (size.height - TAB_BAR_HEIGHT - 76.0).max(1.0),
+        (size.height - TAB_BAR_HEIGHT - 76.0 - bottom).max(1.0),
     )
 }
 
@@ -3101,6 +3924,182 @@ fn push_find_field(
     }
 }
 
+/// The place of the box that asks for the new name.
+///
+/// The box sits in the top left corner of the body: it is in the way of
+/// nothing, and it is where the eye goes first when it is told to rename
+/// something.
+fn rename_box_rect(body: Rect) -> Rect {
+    let width = 380.0f32.min(body.size.width.max(1.0));
+    Rect::new(body.origin.x + 8.0, body.origin.y + 8.0, width, 40.0)
+}
+
+/// Draws the box that asks for the new name.
+fn push_rename_box(
+    scene: &mut FrameScene,
+    size: Size,
+    body: Rect,
+    rename: Option<&RenameBox>,
+    measurer: &mut dyn TextMeasurer,
+) {
+    let Some(rename) = rename else {
+        return;
+    };
+    let viewport = Rect::new(0.0, 0.0, size.width, size.height);
+    let box_ = rename_box_rect(body);
+
+    scene.push_quad(box_, Color::rgb(0.10, 0.12, 0.16), viewport);
+    scene.push_quad(
+        Rect::new(box_.origin.x, box_.origin.y, box_.size.width, 1.0),
+        Color::rgb(0.30, 0.58, 0.96),
+        viewport,
+    );
+
+    // The name that is being renamed, in a quieter colour.
+    let label = format!("把 {} 改名为", rename.original());
+    let label_width = measurer.measure(&label, 13.0).width;
+    scene.push_text(
+        label,
+        Rect::new(
+            box_.origin.x + 12.0,
+            box_.origin.y + 11.0,
+            label_width + 4.0,
+            20.0,
+        ),
+        TextStyle {
+            clip: viewport,
+            color: Color::rgb(0.55, 0.60, 0.68),
+            font_size: 13.0,
+            line_height: 20.0,
+            family: TextFamily::SansSerif,
+        },
+    );
+
+    // The field the new name is typed into.
+    let field = Rect::new(
+        box_.origin.x + 16.0 + label_width,
+        box_.origin.y + 8.0,
+        (box_.size.width - label_width - 32.0).max(1.0),
+        24.0,
+    );
+    scene.push_quad(field, Color::rgb(0.06, 0.07, 0.09), viewport);
+    scene.push_quad(
+        Rect::new(field.origin.x, field.origin.y, field.size.width, 1.0),
+        Color::rgb(0.30, 0.58, 0.96),
+        viewport,
+    );
+
+    let text = rename.text();
+    let before = text.get(..rename.caret().min(text.len())).unwrap_or("");
+    let width_before = measurer.measure(before, 14.0).width;
+    scene.push_text(
+        text.to_owned(),
+        Rect::new(
+            field.origin.x + 6.0,
+            field.origin.y + 2.0,
+            (field.size.width - 12.0).max(1.0),
+            (field.size.height - 4.0).max(1.0),
+        ),
+        TextStyle {
+            clip: field,
+            color: Color::rgb(0.86, 0.89, 0.94),
+            font_size: 14.0,
+            line_height: 20.0,
+            family: TextFamily::SansSerif,
+        },
+    );
+    // The caret stands where the user put it, not at the end of the name.
+    scene.push_quad(
+        Rect::new(
+            field.origin.x + 6.0 + width_before + 1.0,
+            field.origin.y + 4.0,
+            1.5,
+            (field.size.height - 8.0).max(1.0),
+        ),
+        Color::rgb(0.30, 0.58, 0.96),
+        field,
+    );
+}
+
+/// The place of the output panel of the task.
+///
+/// The panel is at the bottom of the window, under the text of the document.
+fn task_panel_rect(size: Size) -> Rect {
+    Rect::new(
+        0.0,
+        size.height - TASK_PANEL_HEIGHT,
+        size.width,
+        TASK_PANEL_HEIGHT,
+    )
+}
+
+/// Draws the output panel of the task.
+///
+/// The panel says what the task was asked to do and what it is doing now,
+/// and under that the lines the task has said, the newest at the bottom.
+fn push_task_panel(scene: &mut FrameScene, size: Size, panel: &TaskPanel<'_>) {
+    let viewport = Rect::new(0.0, 0.0, size.width, size.height);
+    let rect = task_panel_rect(size);
+    scene.push_quad(rect, Color::rgb(0.055, 0.063, 0.082), viewport);
+    scene.push_quad(
+        Rect::new(rect.origin.x, rect.origin.y, rect.size.width, 1.0),
+        Color::rgb(0.16, 0.18, 0.22),
+        viewport,
+    );
+
+    let failed = TaskPanel::is_failure(panel.state);
+    let title = format!(
+        "{} · {}",
+        panel.title,
+        TaskPanel::state_text(panel.state)
+    );
+    scene.push_text(
+        title,
+        Rect::new(
+            rect.origin.x + 12.0,
+            rect.origin.y + 8.0,
+            (rect.size.width - 24.0).max(1.0),
+            20.0,
+        ),
+        TextStyle {
+            clip: viewport,
+            color: if failed {
+                Color::rgb(0.93, 0.58, 0.55)
+            } else {
+                Color::rgb(0.72, 0.78, 0.88)
+            },
+            font_size: 13.0,
+            line_height: 18.0,
+            family: TextFamily::SansSerif,
+        },
+    );
+
+    // The lines the task has said, the newest at the bottom.
+    let height = 18.0;
+    let room = ((rect.size.height - 44.0) / height).floor().max(1.0) as usize;
+    let shown = panel.lines.len().min(room);
+    let first = panel.lines.len() - shown;
+    for (index, line) in panel.lines.iter().skip(first).enumerate() {
+        let y = rect.origin.y + 32.0 + index as f32 * height;
+        scene.push_text(
+            line.clone(),
+            Rect::new(
+                rect.origin.x + 12.0,
+                y,
+                (rect.size.width - 24.0).max(1.0),
+                height,
+            ),
+            TextStyle {
+                clip: viewport,
+                color: Color::rgb(0.78, 0.81, 0.87),
+                font_size: 13.0,
+                line_height: 18.0,
+                family: TextFamily::SansSerif,
+            },
+        );
+    }
+}
+
 /// Draws the agent panel on the right of the window.
 fn push_agent_panel(
     scene: &mut FrameScene,
@@ -3261,6 +4260,7 @@ mod tests {
     use super::*;
     use std::fs;
 
+    use codeweaver_lsp::protocol::CodeAction;
     use codeweaver_text::TextOffset;
     use codeweaver_ui::MonospaceMeasurer;
 
@@ -4003,6 +5003,510 @@ mod tests {
         app.modifiers = ModifiersState::SHIFT;
         assert!(!app.handle_format_key(&character("f")));
     }
+
+    /// The edits of a rename, in the shape the server answers in.
+    fn rename_edit(uri: &str, new_text: &str) -> WorkspaceEdit {
+        let mut changes = std::collections::BTreeMap::new();
+        changes.insert(
+            uri.to_owned(),
+            vec![TextEdit {
+                range: codeweaver_lsp::protocol::Range {
+                    start: codeweaver_lsp::protocol::Position::new(0, 3),
+                    end: codeweaver_lsp::protocol::Position::new(0, 7),
+                },
+                new_text: new_text.to_owned(),
+            }],
+        );
+        WorkspaceEdit {
+            changes,
+            document_changes: Vec::new(),
+            resource_operations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_edits_of_a_rename_go_into_the_buffer() {
+        let path = scratch("rename.txt");
+        fs::write(&path, "fn main() {}\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(path.clone())).expect("the application starts");
+        let uri = codeweaver_lsp::protocol::file_uri(&path);
+        app.panes[0].document_uri = Some(uri.clone());
+        let before = app.editor().version();
+
+        let request = RenameRequest {
+            uri: uri.clone(),
+            version: before,
+            new_name: "run".to_owned(),
+        };
+        assert!(
+            app.apply_rename(rename_edit(&uri, "run"), &request),
+            "the file changed"
+        );
+        assert_eq!(app.editor().text(), "fn run() {}\n");
+        assert_eq!(
+            app.editor().version(),
+            before + 1,
+            "the edits of one file are one change of the document"
+        );
+        // One undo takes the whole renaming back.
+        app.editor_mut().undo().unwrap();
+        assert_eq!(app.editor().text(), "fn main() {}\n");
+    }
+
+    #[test]
+    fn a_rename_answer_for_another_text_is_not_put_in() {
+        let path = scratch("rename-stale.txt");
+        fs::write(&path, "fn main() {}\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(path.clone())).expect("the application starts");
+        let uri = codeweaver_lsp::protocol::file_uri(&path);
+        app.panes[0].document_uri = Some(uri.clone());
+        let before = app.editor().version();
+
+        // The request was made for another version of the text.
+        let request = RenameRequest {
+            uri: uri.clone(),
+            version: before + 1,
+            new_name: "run".to_owned(),
+        };
+        assert!(!app.apply_rename(rename_edit(&uri, "run"), &request));
+        assert_eq!(app.editor().text(), "fn main() {}\n");
+        assert!(
+            app.status
+                .as_ref()
+                .expect("the editor said something")
+                .contains("变了"),
+            "the editor has to say why the renaming was not used"
+        );
+    }
+
+    #[test]
+    fn a_rename_of_a_file_that_is_not_open_goes_to_the_disk() {
+        let directory = scratch_dir("rename-other");
+        let main = directory.join("main.txt");
+        let other = directory.join("other.txt");
+        fs::write(&main, "fn main() {}\n").unwrap();
+        fs::write(&other, "fn main() {}\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(main.clone())).expect("the application starts");
+        let main_uri = codeweaver_lsp::protocol::file_uri(&main);
+        let other_uri = codeweaver_lsp::protocol::file_uri(&other);
+        app.panes[0].document_uri = Some(main_uri.clone());
+        let before = app.editor().version();
+
+        // The renaming reaches the file that is open and the file that is
+        // not open in the editor.
+        let mut edit = rename_edit(&main_uri, "run");
+        edit.changes.insert(other_uri.clone(), edit.changes[&main_uri].clone());
+
+        let request = RenameRequest {
+            uri: main_uri.clone(),
+            version: before,
+            new_name: "run".to_owned(),
+        };
+        assert!(app.apply_rename(edit, &request), "the renaming happened");
+        assert_eq!(app.editor().text(), "fn run() {}\n");
+        assert_eq!(
+            fs::read_to_string(&other).unwrap(),
+            "fn run() {}\n",
+            "the file that is not open in the editor was written to the disk"
+        );
+    }
+
+    #[test]
+    fn a_rename_that_does_not_fit_the_file_is_not_put_in() {
+        let path = scratch("rename-mismatch.txt");
+        fs::write(&path, "fn main() {}\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(path.clone())).expect("the application starts");
+        let uri = codeweaver_lsp::protocol::file_uri(&path);
+        app.panes[0].document_uri = Some(uri.clone());
+        let before = app.editor().version();
+
+        // The place of the edit is not in the file.
+        let mut changes = std::collections::BTreeMap::new();
+        changes.insert(
+            uri.clone(),
+            vec![TextEdit {
+                range: codeweaver_lsp::protocol::Range {
+                    start: codeweaver_lsp::protocol::Position::new(9, 0),
+                    end: codeweaver_lsp::protocol::Position::new(9, 4),
+                },
+                new_text: "run".to_owned(),
+            }],
+        );
+        let request = RenameRequest {
+            uri: uri.clone(),
+            version: before,
+            new_name: "run".to_owned(),
+        };
+        assert!(
+            !app.apply_rename(
+                WorkspaceEdit {
+                    changes,
+                    document_changes: Vec::new(),
+                    resource_operations: Vec::new(),
+                },
+                &request
+            )
+        );
+        assert_eq!(app.editor().text(), "fn main() {}\n");
+        assert!(
+            app.status
+                .as_ref()
+                .expect("the editor said something")
+                .contains("对不上"),
+            "the editor has to say why the renaming was not used"
+        );
+    }
+
+    #[test]
+    fn the_rename_key_says_when_there_is_no_server() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.editor_mut().load_text("let value = 1;\n");
+
+        assert!(app.handle_rename_key(&named(NamedKey::F2)));
+        assert!(
+            app.status
+                .as_ref()
+                .expect("the editor said something")
+                .contains("没有语言服务器"),
+            "the editor has to say why it cannot rename"
+        );
+        assert!(
+            app.rename_box.is_none(),
+            "there is nothing to rename without a server"
+        );
+    }
+
+    #[test]
+    fn the_rename_key_is_only_the_f2_key() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        assert!(!app.handle_rename_key(&character("f")));
+        assert!(!app.handle_rename_key(&named(NamedKey::Enter)));
+    }
+
+    #[test]
+    fn the_box_that_asks_for_the_name_takes_the_keys() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.rename_box = Some(RenameBox::new("value", 4));
+
+        app.handle_rename_box_key(&character("s"), Some("s"));
+        let rename = app.rename_box.as_ref().expect("the box is open");
+        assert_eq!(rename.text(), "values");
+
+        // The box goes away when the name is confirmed.
+        app.handle_rename_box_key(&named(NamedKey::Enter), None);
+        assert!(app.rename_box.is_none());
+        assert!(
+            app.status
+                .as_ref()
+                .expect("the editor said something")
+                .contains("没有语言服务器"),
+            "the editor has to say why it cannot rename"
+        );
+    }
+
+    #[test]
+    fn the_box_goes_away_when_the_renaming_is_cancelled() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.rename_box = Some(RenameBox::new("value", 4));
+
+        app.handle_rename_box_key(&named(NamedKey::Escape), None);
+        assert!(app.rename_box.is_none());
+        assert!(
+            app.status
+                .as_ref()
+                .expect("the editor said something")
+                .contains("取消")
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_changed_is_not_sent_to_the_server() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.rename_box = Some(RenameBox::new("value", 4));
+
+        app.handle_rename_box_key(&named(NamedKey::Enter), None);
+        assert!(
+            app.status
+                .as_ref()
+                .expect("the editor said something")
+                .contains("没有变"),
+            "the editor has to say that nothing was renamed"
+        );
+    }
+    /// A code action that changes the text of the file that is open.
+    fn code_action(uri: &str, new_text: &str) -> CodeAction {
+        CodeAction {
+            title: "改个名".to_owned(),
+            kind: Some("quickfix".to_owned()),
+            edit: Some(rename_edit(uri, new_text)),
+            command: None,
+        }
+    }
+
+    /// A code action that only runs a command.
+    fn command_action(title: &str) -> CodeAction {
+        CodeAction {
+            title: title.to_owned(),
+            kind: None,
+            edit: None,
+            command: Some(codeweaver_lsp::protocol::ServerCommand {
+                title: title.to_owned(),
+                command: "some.command".to_owned(),
+                arguments: Vec::new(),
+            }),
+        }
+    }
+
+    #[test]
+    fn the_edits_of_a_code_action_go_into_the_buffer() {
+        let path = scratch("action.txt");
+        fs::write(&path, "fn main() {}\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(path.clone())).expect("the application starts");
+        let uri = codeweaver_lsp::protocol::file_uri(&path);
+        app.panes[0].document_uri = Some(uri.clone());
+        let before = app.editor().version();
+
+        let popup = ActionPopup::new(vec![code_action(&uri, "run")]).expect("there is a list");
+        app.apply_code_action(&popup);
+
+        assert_eq!(app.editor().text(), "fn run() {}\n");
+        assert_eq!(
+            app.editor().version(),
+            before + 1,
+            "the edits of the action are one change of the document"
+        );
+        assert!(
+            app.status
+                .as_ref()
+                .expect("the editor said something")
+                .contains("改个名"),
+            "the editor has to say what it did"
+        );
+    }
+
+    #[test]
+    fn a_code_action_that_only_runs_a_command_says_so() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        let popup = ActionPopup::new(vec![command_action("整理导入")]).expect("there is a list");
+
+        app.apply_code_action(&popup);
+
+        assert!(
+            app.status
+                .as_ref()
+                .expect("the editor said something")
+                .contains("没有语言服务器"),
+            "the editor has to say why the command did not run"
+        );
+    }
+
+    #[test]
+    fn the_list_of_actions_is_picked_with_the_arrow_keys() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        let uri = "file:///tmp/main.rs";
+        app.actions = Some(
+            ActionPopup::new(vec![code_action(uri, "one"), code_action(uri, "two")])
+                .expect("there is a list"),
+        );
+
+        app.handle_action_key(&named(NamedKey::ArrowDown));
+        let actions = app.actions.as_ref().expect("the list is open");
+        assert_eq!(actions.selected(), 1);
+        app.handle_action_key(&named(NamedKey::ArrowUp));
+        let actions = app.actions.as_ref().expect("the list is open");
+        assert_eq!(actions.selected(), 0);
+    }
+
+    #[test]
+    fn the_build_key_says_when_there_is_nothing_to_build() {
+        // A file that belongs to no project has nothing to build.
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+
+        assert!(app.handle_task_key(&character("b")));
+        assert!(
+            app.status
+                .as_ref()
+                .expect("the editor said something")
+                .contains("没有可以跑的命令"),
+            "the editor has to say that there is nothing to run"
+        );
+        assert!(!app.task_panel, "there is no output without a task");
+    }
+
+    #[test]
+    fn a_second_task_is_not_started_while_one_is_running() {
+        let directory = scratch_dir("task-second");
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.task = Some(
+            Task::start(
+                "cmd",
+                &["/c".to_owned(), "ping -n 20 127.0.0.1 > nul".to_owned()],
+                &directory,
+            )
+            .expect("the task starts"),
+        );
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+
+        assert!(app.handle_task_key(&character("b")));
+        assert!(
+            app.status
+                .as_ref()
+                .expect("the editor said something")
+                .contains("已经有任务在跑了"),
+            "the editor has to say that there is already a task"
+        );
+    }
+
+    #[test]
+    fn the_build_key_is_only_control_and_shift_with_b() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        assert!(!app.handle_task_key(&character("b")));
+        app.modifiers = ModifiersState::CONTROL;
+        assert!(!app.handle_task_key(&character("b")));
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(!app.handle_task_key(&character("a")));
+    }
+
+    #[test]
+    fn the_output_panel_takes_the_room_at_the_bottom() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        assert_eq!(app.task_panel_height(), 0.0);
+        app.task_panel = true;
+        assert_eq!(app.task_panel_height(), TASK_PANEL_HEIGHT);
+    }
+
+    #[test]
+    fn the_output_of_the_task_is_collected() {
+        let directory = scratch_dir("task-collect");
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.task = Some(
+            Task::start(
+                "cmd",
+                &[
+                    "/c".to_owned(),
+                    "echo the task says hello".to_owned(),
+                ],
+                &directory,
+            )
+            .expect("the task starts"),
+        );
+
+        // The task talks on a thread of its own, so the output is waited for.
+        let mut noticed = false;
+        for _ in 0..400 {
+            if app.pump_task() {
+                noticed = true;
+            }
+            if app
+                .task_output
+                .lines
+                .iter()
+                .any(|line| line.contains("the task says hello"))
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(noticed, "the editor has to notice what the task said");
+        assert!(
+            app.task_output
+                .lines
+                .iter()
+                .any(|line| line.contains("the task says hello")),
+            "got {:?}",
+            app.task_output.lines
+        );
+    }
+
+    #[test]
+    fn the_escape_key_closes_the_output_of_the_task() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.task_panel = true;
+
+        assert!(app.handle_task_key(&named(NamedKey::Escape)));
+        assert!(!app.task_panel, "the panel is closed");
+    }
+
+    #[test]
+    fn the_edits_of_a_code_action_go_into_the_file_they_were_asked_about() {
+        let directory = scratch_dir("action-target");
+        let first = directory.join("first.txt");
+        let second = directory.join("second.txt");
+        fs::write(&first, "fn main() {}\n").unwrap();
+        fs::write(&second, "fn other() {}\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(first.clone())).expect("the application starts");
+        let first_uri = codeweaver_lsp::protocol::file_uri(&first);
+        app.panes[0].document_uri = Some(first_uri.clone());
+        // The operations were asked about the first file.
+        app.action_target = Some((first_uri.clone(), app.editor().version()));
+
+        // The user looks at the other file before picking one.
+        assert!(app.open_file(&second));
+        let second_index = app.active;
+
+        let popup = ActionPopup::new(vec![code_action(&first_uri, "run")]).expect("there is a list");
+        app.apply_code_action(&popup);
+
+        assert_eq!(
+            app.panes[0].editor.text(),
+            "fn run() {}\n",
+            "the edit went into the file the operations were asked about"
+        );
+        assert_eq!(
+            app.panes[second_index].editor.text(),
+            "fn other() {}\n",
+            "the file on screen was not touched"
+        );
+    }
+
+    #[test]
+    fn the_code_action_key_says_when_there_is_no_server() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::ALT;
+
+        assert!(app.handle_action_key(&named(NamedKey::Enter)));
+        assert!(
+            app.status
+                .as_ref()
+                .expect("the editor said something")
+                .contains("没有语言服务器"),
+            "the editor has to say why it cannot ask for code actions"
+        );
+    }
+
+    #[test]
+    fn the_code_action_key_is_only_alt_and_enter() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        assert!(!app.handle_action_key(&named(NamedKey::Enter)));
+        app.modifiers = ModifiersState::ALT;
+        assert!(!app.handle_action_key(&character("a")));
+    }
+
+    #[test]
+    fn the_list_of_actions_goes_away_when_it_is_cancelled() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        let uri = "file:///tmp/main.rs";
+        app.actions = Some(
+            ActionPopup::new(vec![code_action(uri, "one")]).expect("there is a list"),
+        );
+
+        app.handle_action_key(&named(NamedKey::Escape));
+        assert!(app.actions.is_none());
+        assert!(
+            app.status
+                .as_ref()
+                .expect("the editor said something")
+                .contains("取消")
+        );
+    }
+
 
     #[test]
     fn clicking_a_tab_brings_it_to_the_front() {
