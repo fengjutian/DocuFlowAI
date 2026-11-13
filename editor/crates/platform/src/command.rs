@@ -42,6 +42,14 @@ impl CommandBox {
         self.text.set_text(text);
     }
 
+    /// Adds text at the caret of the command.
+    ///
+    /// The text that an input method composes goes into the box, not into
+    /// the document behind it.
+    pub fn type_text(&mut self, text: &str) {
+        self.text.type_text(text);
+    }
+
     /// Gives a key to the text of the command.
     ///
     /// Returns whether the key was one of the box's.

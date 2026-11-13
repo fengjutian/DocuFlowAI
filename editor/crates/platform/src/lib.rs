@@ -13,6 +13,7 @@ mod lsp;
 mod pane;
 mod paths;
 mod rename;
+mod search;
 mod settings;
 mod shell;
 mod task;
@@ -34,7 +35,9 @@ use codeweaver_render::{
 use codeweaver_syntax::{Highlight, Language};
 use codeweaver_text::TextOffset;
 use codeweaver_ui::TextMeasurer;
-use codeweaver_workspace::{ChangeDetector, Document, ExternalChange, FileTree, Workspace};
+use codeweaver_workspace::{
+    ChangeDetector, Document, ExternalChange, FileTree, SearchHit, Workspace,
+};
 use codeweaver_workbench::{close_decision, CloseDecision, Tab, TabBar, TabId};
 use code_action::ActionPopup;
 use command::CommandBox;
@@ -48,6 +51,7 @@ use git::GitPanel;
 use input::TextInputState;
 use pane::EditorPane;
 use rename::RenameBox;
+use search::{SearchCommand, SearchPanel};
 use settings::Settings;
 use task::{Task, TaskOutput, TaskPanel, TaskState};
 use winit::{
@@ -205,6 +209,13 @@ pub struct NativeApplication {
     ///
     /// They are kept in the order they were run, the newest last.
     command_history: Vec<String>,
+    /// The panel that finds text in the files of the project, when it is open.
+    search: Option<SearchPanel>,
+    /// The text that was looked for last time.
+    ///
+    /// It is kept so that the person who searches twice does not have to
+    /// type the same word twice.
+    search_needle: String,
     /// The rename request that is on its way.
     ///
     /// The request is about one place in one document, and it is only good
@@ -398,6 +409,8 @@ impl NativeApplication {
             rename_box: None,
             command_box: None,
             command_history: Vec::new(),
+            search: None,
+            search_needle: String::new(),
             renaming: None,
             pending_diff: None,
             selected_hunk: 0,
@@ -3351,6 +3364,97 @@ impl NativeApplication {
             }
         }
     }
+
+    /// Handles the keys of the panel that finds text in the files.
+    ///
+    /// Ctrl+Shift+F opens the panel. While the panel is open it takes every
+    /// key: a word that is typed into the document behind it is not a word
+    /// the person is looking for.
+    fn handle_search_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
+        let Some(mut panel) = self.search.take() else {
+            // The panel is not open: Ctrl+Shift+F opens it.
+            if !(self.modifiers.control_key() && self.modifiers.shift_key()) {
+                return false;
+            }
+            let Some(letter) = key_letter(key) else {
+                return false;
+            };
+            if !letter.eq_ignore_ascii_case(&'f') {
+                return false;
+            }
+            self.open_search_panel();
+            return true;
+        };
+
+        match panel.handle_key(key, text, self.modifiers.control_key()) {
+            SearchCommand::None => {}
+            SearchCommand::Close => {
+                self.status = Some("关掉了查找面板".to_owned());
+                // The panel goes away and is not put back.
+                return true;
+            }
+            SearchCommand::Open(hit) => {
+                let root = panel.root().to_path_buf();
+                self.open_search_hit(&hit, &root);
+                return true;
+            }
+        }
+        self.search = Some(panel);
+        true
+    }
+
+    /// Opens the panel that finds text in the files of the project.
+    ///
+    /// The files that are searched are the ones of the project the open file
+    /// belongs to: the folder that holds the manifest of the project.
+    fn open_search_panel(&mut self) {
+        let Some(path) = self.panes[self.active]
+            .document
+            .as_ref()
+            .map(|document| document.path().to_path_buf())
+        else {
+            self.status = Some("没有打开的文件，不知道在哪儿找".to_owned());
+            return;
+        };
+        let root = lsp::workspace_root(&path);
+        let needle = self.search_needle.clone();
+        self.search = Some(SearchPanel::new(root, &needle));
+        self.status = Some("写要找的文字，回车开始找".to_owned());
+    }
+
+    /// Opens the file of a place the search found, and puts the caret there.
+    ///
+    /// The caret is on the line that was found: the place is the point of
+    /// the whole search.
+    fn open_search_hit(&mut self, hit: &SearchHit, root: &Path) {
+        if !self.open_file(&hit.path) {
+            return;
+        }
+        let pane = &mut self.panes[self.active];
+        let line = hit.line.saturating_sub(1);
+        let offset = pane.editor.buffer().line_range(line).start;
+        pane.editor.set_carets(&[offset]);
+        // The place is said in words that are inside the project: the path
+        // that starts at the drive of the machine says less.
+        let place = hit
+            .path
+            .strip_prefix(root)
+            .unwrap_or(&hit.path)
+            .display()
+            .to_string();
+        self.status = Some(format!("打开了 {place} 的第 {} 行", hit.line));
+    }
+
+    /// Collects the answer of the search, if it has come.
+    ///
+    /// The search runs on a thread of its own, so the window has to wake up
+    /// to hear what it found.
+    fn pump_search(&mut self) -> bool {
+        let Some(panel) = self.search.as_mut() else {
+            return false;
+        };
+        panel.pump()
+    }
 }
 
 impl ApplicationHandler for NativeApplication {
@@ -3384,6 +3488,13 @@ impl ApplicationHandler for NativeApplication {
             window.request_redraw();
         }
         if self.pump_task()
+            && let Some(window) = self.window.as_ref()
+        {
+            window.request_redraw();
+        }
+        // The search runs on a thread of its own, so the window has to wake
+        // up to hear what it found.
+        if self.pump_search()
             && let Some(window) = self.window.as_ref()
         {
             window.request_redraw();
@@ -3428,6 +3539,12 @@ impl ApplicationHandler for NativeApplication {
                             find.type_text(&self.panes[self.active].editor, &text);
                         } else if let Some(rename) = self.rename_box.as_mut() {
                             rename.type_text(&text);
+                        } else if let Some(commit) = self.commit_box.as_mut() {
+                            commit.type_text(&text);
+                        } else if let Some(command) = self.command_box.as_mut() {
+                            command.type_text(&text);
+                        } else if let Some(search) = self.search.as_mut() {
+                            search.type_text(&text);
                         } else if let Err(error) = self.panes[self.active].editor.insert(&text) {
                             eprintln!("failed to commit IME text: {error}");
                         }
@@ -3483,6 +3600,12 @@ impl ApplicationHandler for NativeApplication {
                 // Ctrl+Shift+G opens the panel of the changes. While the
                 // panel is open it takes every key.
                 if self.handle_git_key(&event.logical_key.as_ref(), event.text.as_deref()) {
+                    window.request_redraw();
+                    return;
+                }
+                // Ctrl+Shift+F opens the panel that finds text in the files.
+                // While the panel is open it takes every key.
+                if self.handle_search_key(&event.logical_key.as_ref(), event.text.as_deref()) {
                     window.request_redraw();
                     return;
                 }
@@ -3753,6 +3876,7 @@ impl ApplicationHandler for NativeApplication {
                         git: self.git.as_ref(),
                         commit: self.commit_box.as_ref(),
                         command: self.command_box.as_ref().map(|box_| box_.field()),
+                        search: self.search.as_ref(),
                         debug: debug_panel,
                         breakpoints: &breakpoints,
                         conflicts: conflict,
@@ -3832,6 +3956,8 @@ struct Chrome<'a> {
     commit: Option<&'a RenameBox>,
     /// The box that asks for a command, when it is open.
     command: Option<&'a RenameBox>,
+    /// The panel that finds text in the files, when it is open.
+    search: Option<&'a SearchPanel>,
     /// The panel of the debugger, when there is a session.
     debug: Option<DebugPanel<'a>>,
     /// The lines of the breakpoints of the file that is on screen.
@@ -3946,6 +4072,14 @@ fn build_scene(
         }
         // The box that asks for the message of the commit floats over it.
         push_rename_box(&mut scene, size, body, chrome.commit, &mut ui_measurer);
+        return scene;
+    }
+
+    // The panel that finds text in the files covers the window, the way the
+    // panel of the changes does.
+    if let Some(panel) = chrome.search {
+        let mut ui_measurer = RendererMeasurer::new(renderer, TextFamily::SansSerif);
+        search::draw_panel(&mut scene, viewport, size, panel, &mut ui_measurer);
         return scene;
     }
 
