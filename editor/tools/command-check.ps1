@@ -214,6 +214,7 @@ function Get-VirtualKey([char]$character) {
     if ($character -eq ' ') { return 0x20 }
     if ($character -eq '/') { return 0xBF }
     if ($character -eq '.') { return 0xBE }
+    if ($character -eq '-') { return 0xBD }
     $code = [int][char]$character
     if ($code -ge 97 -and $code -le 122) { return 0x41 + ($code - 97) }
     if ($code -ge 48 -and $code -le 57) { return 0x30 + ($code - 48) }

@@ -6,11 +6,14 @@
 //! - `initialize` says what the adapter can do, and then that it is ready;
 //! - `setBreakpoints` answers with the breakpoints that were asked for;
 //! - `launch` starts the program, says what it printed and that it stopped;
-//! - `stackTrace` answers with one frame, `scopes` with one group of
-//!   variables, and `variables` with two variables;
+//! - `stackTrace` answers with three frames, `scopes` with one group of
+//!   variables, and `variables` with two variables; every frame has
+//!   variables of its own, so that the frame the editor asks about can be
+//!   told from the answer;
 //! - `next`, `stepIn` and `stepOut` stop the program again, `continue` lets
 //!   it run on, and `terminate` ends the session.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
 use codeweaver_dap::framing::{FrameReader, serialize};
@@ -48,6 +51,11 @@ struct Adapter {
     path: Option<String>,
     /// The lines the breakpoints are on.
     lines: Vec<u32>,
+    /// The condition of every breakpoint, by the line it is on.
+    ///
+    /// The adapter does not work the condition out: it only says what it was
+    /// told, so that the editor can be checked against the protocol.
+    conditions: BTreeMap<u32, String>,
 }
 
 impl Adapter {
@@ -78,12 +86,19 @@ impl Adapter {
                 // the program is to stop.
                 self.path = source_path(message);
                 self.lines = breakpoint_lines(message);
+                self.conditions = breakpoint_conditions(message);
                 let breakpoints: Vec<Value> = self
                     .lines
                     .iter()
                     .enumerate()
                     .map(|(index, line)| {
-                        json!({ "id": index + 1, "verified": true, "line": line })
+                        let mut breakpoint = json!({ "id": index + 1, "verified": true, "line": line });
+                        // The condition is said back, so that the editor can
+                        // be checked against the protocol.
+                        if let Some(condition) = self.conditions.get(line) {
+                            breakpoint["message"] = json!(format!("条件：{condition}"));
+                        }
+                        breakpoint
                     })
                     .collect();
                 let body = json!({ "breakpoints": breakpoints });
@@ -113,34 +128,67 @@ impl Adapter {
                 // The program stopped at the first breakpoint that was set.
                 let line = self.lines.first().copied().unwrap_or(1);
                 let path = self.path.clone().unwrap_or_else(|| "main.rs".to_owned());
+                // The stack has more than one frame: the editor shows the
+                // whole stack, and the person may pick any frame of it.
+                let frames = [
+                    (1, "main", line),
+                    (2, "helper", line.saturating_sub(1).max(1)),
+                    (3, "outer", line.saturating_sub(2).max(1)),
+                ];
+                let stack: Vec<Value> = frames
+                    .iter()
+                    .map(|(id, name, line)| {
+                        json!({
+                            "id": id,
+                            "name": name,
+                            "line": line,
+                            "column": 1,
+                            "source": { "path": path },
+                        })
+                    })
+                    .collect();
                 let body = json!({
-                    "stackFrames": [{
-                        "id": 1,
-                        "name": "main",
-                        "line": line,
-                        "column": 1,
-                        "source": { "path": path },
-                    }],
-                    "totalFrames": 1,
+                    "stackFrames": stack,
+                    "totalFrames": frames.len(),
                 });
                 self.answer(output, seq, body);
             }
             "scopes" => {
+                // The number of the group of variables says which frame the
+                // variables belong to: the editor asks for the group of the
+                // frame it is showing.
+                let frame_id = message
+                    .get("arguments")
+                    .and_then(|arguments| arguments.get("frameId"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(1);
                 let body = json!({
                     "scopes": [{
                         "name": "Locals",
-                        "variablesReference": 10,
+                        "variablesReference": 100 + frame_id,
                         "expensive": false,
                     }],
                 });
                 self.answer(output, seq, body);
             }
             "variables" => {
+                // Every frame has variables of its own: the number of the
+                // group says which frame they belong to.
+                let reference = message
+                    .get("arguments")
+                    .and_then(|arguments| arguments.get("variablesReference"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let (first, second) = match reference {
+                    102 => ("total", "6"),
+                    103 => ("depth", "2"),
+                    _ => ("count", "3"),
+                };
                 let body = json!({
                     "variables": [
                         {
-                            "name": "count",
-                            "value": "3",
+                            "name": first,
+                            "value": second,
                             "type": "i32",
                             "variablesReference": 0,
                         },
@@ -151,6 +199,28 @@ impl Adapter {
                             "variablesReference": 0,
                         },
                     ],
+                });
+                self.answer(output, seq, body);
+            }
+            "evaluate" => {
+                // The adapter does not really work the expression out: it
+                // says a worth that is always the same. What it does look
+                // at is the expression: an empty one is refused, so that the
+                // contract can be checked — the editor has to send the
+                // expression the person wrote.
+                let expression = message
+                    .get("arguments")
+                    .and_then(|arguments| arguments.get("expression"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if expression.trim().is_empty() {
+                    self.failure(output, seq, "the expression is empty");
+                    return;
+                }
+                let body = json!({
+                    "result": "42",
+                    "type": "i32",
+                    "variablesReference": 0,
                 });
                 self.answer(output, seq, body);
             }
@@ -265,6 +335,30 @@ fn breakpoint_lines(message: &Value) -> Vec<u32> {
                 .iter()
                 .filter_map(Value::as_u64)
                 .map(|line| line as u32)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The condition of every breakpoint of a request, by the line it is on.
+fn breakpoint_conditions(message: &Value) -> BTreeMap<u32, String> {
+    let Some(arguments) = message.get("arguments") else {
+        return BTreeMap::new();
+    };
+    arguments
+        .get("breakpoints")
+        .and_then(Value::as_array)
+        .map(|breakpoints| {
+            breakpoints
+                .iter()
+                .filter_map(|breakpoint| {
+                    let line = breakpoint.get("line").and_then(Value::as_u64)? as u32;
+                    let condition = breakpoint
+                        .get("condition")
+                        .and_then(Value::as_str)?
+                        .to_owned();
+                    Some((line, condition))
+                })
                 .collect()
         })
         .unwrap_or_default()

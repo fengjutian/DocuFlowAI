@@ -31,6 +31,10 @@ const BOX_WIDTH: f32 = 640.0;
 const BOX_HEIGHT: f32 = 40.0;
 /// The place of the list of the places, from the top of the window.
 const LIST_TOP: f32 = 66.0;
+/// The place of the box of the replacement, from the top of the window.
+const REPLACE_TOP: f32 = BOX_TOP + BOX_HEIGHT + 8.0;
+/// How much lower the list is when the panel replaces as well as finds.
+const REPLACE_ROOM: f32 = 48.0;
 /// The height of one row of the list of the places.
 const ROW_HEIGHT: f32 = 22.0;
 /// The width of the column that says where the place is.
@@ -39,6 +43,10 @@ const PLACE_WIDTH: f32 = 300.0;
 /// The keys the panel takes.
 pub const HINT: &str = "↑↓ 挑结果 · Enter 打开 · Tab 换地方 · Esc 关掉";
 
+/// The keys the panel takes, when it replaces as well as finds.
+pub const REPLACE_HINT: &str =
+    "↑↓ 挑结果 · Enter 打开 · Tab 换地方 · 替换那一栏回车全换 · Esc 关掉";
+
 /// Where the focus of the panel is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchFocus {
@@ -46,6 +54,8 @@ pub enum SearchFocus {
     Input,
     /// The list of the places is being picked from.
     Results,
+    /// The text that replaces what was found is being written.
+    Replace,
 }
 
 /// What the panel wants the window to do.
@@ -57,12 +67,25 @@ pub enum SearchCommand {
     Close,
     /// The file of the place that is picked is to be opened.
     Open(SearchHit),
+    /// Everything that was found is to be replaced by something else.
+    ReplaceAll {
+        /// The text that was looked for.
+        needle: String,
+        /// The text that takes its place.
+        replacement: String,
+    },
 }
 
 /// The panel that finds text in the files of the project.
 pub struct SearchPanel {
     /// The box the text is written in.
     box_: RenameBox,
+    /// The box the replacement is written in.
+    ///
+    /// It is only shown when the panel replaces as well as finds.
+    replace: RenameBox,
+    /// Whether the panel replaces as well as finds.
+    replacing: bool,
     /// The root of the project that is searched.
     root: PathBuf,
     /// The places the text was found.
@@ -85,19 +108,63 @@ impl SearchPanel {
     /// The text that was looked for last time is in the box already: the
     /// person who searches twice does not want to type it twice.
     pub fn new(root: PathBuf, needle: &str) -> Self {
+        Self::open(root, needle, false)
+    }
+
+    /// Opens the panel over the project rooted at `root`, to replace as well
+    /// as to find.
+    ///
+    /// The box of the replacement is there from the start: the person who
+    /// wants to replace knows what they want to replace it with.
+    pub fn with_replace(root: PathBuf, needle: &str) -> Self {
+        Self::open(root, needle, true)
+    }
+
+    /// Opens the panel, with or without the box of the replacement.
+    fn open(root: PathBuf, needle: &str, replacing: bool) -> Self {
         let mut box_ = RenameBox::message("查找");
         if !needle.is_empty() {
             box_.set_text(needle);
         }
         SearchPanel {
             box_,
+            replace: RenameBox::message("替换"),
+            replacing,
             root,
             hits: Vec::new(),
             selected: 0,
             focus: SearchFocus::Input,
-            status: "写要找的文字，回车开始找".to_owned(),
+            status: if replacing {
+                "写要找的文字，回车开始找；Tab 换到替换那一栏".to_owned()
+            } else {
+                "写要找的文字，回车开始找".to_owned()
+            },
             running: false,
             answers: None,
+        }
+    }
+
+    /// The text that replaces what was found.
+    pub fn replacement(&self) -> &str {
+        self.replace.text()
+    }
+
+    /// The box the replacement is written in, for the window to draw.
+    pub fn replace_field(&self) -> &RenameBox {
+        &self.replace
+    }
+
+    /// Whether the panel replaces as well as finds.
+    pub fn is_replacing(&self) -> bool {
+        self.replacing
+    }
+
+    /// The keys the panel takes, said at the bottom of it.
+    pub fn hint(&self) -> &'static str {
+        if self.replacing {
+            REPLACE_HINT
+        } else {
+            HINT
         }
     }
 
@@ -111,12 +178,23 @@ impl SearchPanel {
         &self.box_
     }
 
-    /// Adds text at the caret of the text that is looked for.
+    /// Adds text at the caret of the text that is being written.
     ///
-    /// The text that an input method composes goes into the box, not into
-    /// the document behind it.
+    /// The text that an input method composes goes into the box that has the
+    /// focus, not into the document behind it.
     pub fn type_text(&mut self, text: &str) {
-        self.box_.type_text(text);
+        match self.focus {
+            SearchFocus::Replace => self.replace.type_text(text),
+            _ => self.box_.type_text(text),
+        }
+    }
+
+    /// The box that has the focus.
+    fn focused(&mut self) -> &mut RenameBox {
+        match self.focus {
+            SearchFocus::Replace => &mut self.replace,
+            _ => &mut self.box_,
+        }
     }
 
     /// The root of the project that is searched.
@@ -252,7 +330,14 @@ impl SearchPanel {
             Key::Named(NamedKey::Tab) => {
                 self.focus = match self.focus {
                     SearchFocus::Input => SearchFocus::Results,
-                    SearchFocus::Results => SearchFocus::Input,
+                    SearchFocus::Results => {
+                        if self.replacing {
+                            SearchFocus::Replace
+                        } else {
+                            SearchFocus::Input
+                        }
+                    }
+                    SearchFocus::Replace => SearchFocus::Input,
                 };
                 return SearchCommand::None;
             }
@@ -287,12 +372,34 @@ impl SearchPanel {
                             None => SearchCommand::None,
                         }
                     }
+                    SearchFocus::Replace => {
+                        let needle = self.box_.text().trim().to_owned();
+                        if needle.is_empty() {
+                            self.status = "要找的文字不能是空的".to_owned();
+                            return SearchCommand::None;
+                        }
+                        if self.is_running() {
+                            self.status = "还在找".to_owned();
+                            return SearchCommand::None;
+                        }
+                        if self.hits.is_empty() {
+                            self.status = "没有找到可以替换的地方".to_owned();
+                            return SearchCommand::None;
+                        }
+                        let replacement = self.replace.text().to_owned();
+                        SearchCommand::ReplaceAll {
+                            needle,
+                            replacement,
+                        }
+                    }
                 };
             }
             Key::Named(NamedKey::Backspace) | Key::Named(NamedKey::Delete) => {
                 // A key that changes the text belongs to the text.
-                self.focus = SearchFocus::Input;
-                self.box_.handle_key(key, text, control);
+                if self.focus != SearchFocus::Replace {
+                    self.focus = SearchFocus::Input;
+                }
+                self.focused().handle_key(key, text, control);
                 return SearchCommand::None;
             }
             Key::Character(character) if !control => {
@@ -305,14 +412,16 @@ impl SearchPanel {
                         self.box_.type_text(typed);
                     }
                 } else {
-                    self.focus = SearchFocus::Input;
-                    self.box_.type_text(character);
+                    if self.focus != SearchFocus::Replace {
+                        self.focus = SearchFocus::Input;
+                    }
+                    self.focused().type_text(character);
                 }
                 return SearchCommand::None;
             }
             _ => {}
         }
-        self.box_.handle_key(key, text, control);
+        self.focused().handle_key(key, text, control);
         SearchCommand::None
     }
 }
@@ -322,23 +431,32 @@ pub fn draw_background(scene: &mut FrameScene, viewport: Rect) {
     scene.push_quad(viewport, Color::rgb(0.055, 0.063, 0.082), viewport);
 }
 
-/// Draws the panel of the search.
-pub fn draw_panel(
+/// What is written in one of the boxes of the panel.
+struct BoxText<'a> {
+    /// The name of the box.
+    label: &'a str,
+    /// The text that is written in it.
+    text: &'a str,
+    /// Whether the box has the focus.
+    focused: bool,
+}
+
+/// Draws one of the boxes of the panel.
+///
+/// The box has a name of its own, the text that is written in it, and a
+/// caret when it has the focus: the person has to see where what they type
+/// goes.
+fn draw_box(
     scene: &mut FrameScene,
     viewport: Rect,
-    size: Size,
-    panel: &SearchPanel,
+    top: f32,
+    width: f32,
+    box_text: BoxText<'_>,
     measurer: &mut dyn TextMeasurer,
 ) {
-    draw_background(scene, viewport);
-
-    // The box the text is written in.
-    let box_ = Rect::new(
-        BOX_LEFT,
-        BOX_TOP,
-        BOX_WIDTH.min((size.width - BOX_LEFT * 2.0).max(1.0)),
-        BOX_HEIGHT,
-    );
+    let label = box_text.label;
+    let text = box_text.text;
+    let box_ = Rect::new(BOX_LEFT, top, width, BOX_HEIGHT);
     scene.push_quad(box_, Color::rgb(0.10, 0.12, 0.16), viewport);
     scene.push_quad(
         Rect::new(box_.origin.x, box_.origin.y, box_.size.width, 1.0),
@@ -347,10 +465,9 @@ pub fn draw_panel(
     );
 
     // The name of the box.
-    let label = panel.field().title();
-    let label_width = measurer.measure(&label, 13.0).width;
+    let label_width = measurer.measure(label, 13.0).width;
     scene.push_text(
-        label,
+        label.to_owned(),
         Rect::new(
             box_.origin.x + 12.0,
             box_.origin.y + 11.0,
@@ -366,16 +483,15 @@ pub fn draw_panel(
         },
     );
 
-    // The text that is looked for.
+    // The text that is written in the box.
     let field = Rect::new(
         box_.origin.x + 16.0 + label_width,
         box_.origin.y + 8.0,
         (box_.size.width - label_width - 32.0).max(1.0),
         24.0,
     );
-    let needle = panel.needle();
-    let empty = needle.is_empty();
-    let shown = if empty { "（还没写）" } else { needle };
+    let empty = text.is_empty();
+    let shown = if empty { "（还没写）" } else { text };
     scene.push_text(
         shown.to_owned(),
         Rect::new(
@@ -396,9 +512,9 @@ pub fn draw_panel(
             family: TextFamily::SansSerif,
         },
     );
-    if panel.focus() == SearchFocus::Input {
+    if box_text.focused {
         // The caret stands after the text that was typed.
-        let width = measurer.measure(needle, 14.0).width;
+        let width = measurer.measure(text, 14.0).width;
         scene.push_quad(
             Rect::new(
                 field.origin.x + 6.0 + width + 1.0,
@@ -410,13 +526,57 @@ pub fn draw_panel(
             field,
         );
     }
+}
+
+/// Draws the panel of the search.
+pub fn draw_panel(
+    scene: &mut FrameScene,
+    viewport: Rect,
+    size: Size,
+    panel: &SearchPanel,
+    measurer: &mut dyn TextMeasurer,
+) {
+    draw_background(scene, viewport);
+
+    // The box the text is written in.
+    let width = BOX_WIDTH.min((size.width - BOX_LEFT * 2.0).max(1.0));
+    draw_box(
+        scene,
+        viewport,
+        BOX_TOP,
+        width,
+        BoxText {
+            label: &panel.field().title(),
+            text: panel.needle(),
+            focused: panel.focus() == SearchFocus::Input,
+        },
+        measurer,
+    );
+
+    // The box the replacement is written in, when the panel replaces as well
+    // as finds.
+    let room = if panel.is_replacing() { REPLACE_ROOM } else { 0.0 };
+    if panel.is_replacing() {
+        draw_box(
+            scene,
+            viewport,
+            REPLACE_TOP,
+            width,
+            BoxText {
+                label: &panel.replace_field().title(),
+                text: panel.replacement(),
+                focused: panel.focus() == SearchFocus::Replace,
+            },
+            measurer,
+        );
+    }
 
     // What the search says.
     scene.push_text(
         panel.status().to_owned(),
         Rect::new(
             BOX_LEFT,
-            LIST_TOP,
+            LIST_TOP + room,
             (size.width - BOX_LEFT * 2.0).max(1.0),
             20.0,
         ),
@@ -432,12 +592,12 @@ pub fn draw_panel(
     // The places the text was found.
     let list = Rect::new(
         BOX_LEFT,
-        LIST_TOP + 24.0,
+        LIST_TOP + room + 24.0,
         (size.width - BOX_LEFT * 2.0).max(1.0),
-        (size.height - LIST_TOP - 60.0).max(1.0),
+        (size.height - LIST_TOP - room - 60.0).max(1.0),
     );
-    let room = (list.size.height / ROW_HEIGHT).floor().max(1.0) as usize;
-    let shown = panel.hits().len().min(room);
+    let rows = (list.size.height / ROW_HEIGHT).floor().max(1.0) as usize;
+    let shown = panel.hits().len().min(rows);
     let first = if shown == 0 {
         0
     } else {
@@ -489,7 +649,7 @@ pub fn draw_panel(
 
     // The keys the panel takes are said at the bottom of it.
     scene.push_text(
-        HINT.to_owned(),
+        panel.hint().to_owned(),
         Rect::new(
             BOX_LEFT,
             size.height - 36.0,
@@ -547,6 +707,57 @@ mod tests {
         let panel = SearchPanel::new(PathBuf::from("C:\\project"), "");
         assert_eq!(panel.needle(), "");
         assert_eq!(panel.field().title(), "查找");
+    }
+
+    #[test]
+    fn the_panel_that_replaces_has_a_box_for_the_replacement() {
+        let panel = SearchPanel::with_replace(PathBuf::from("C:\\project"), "needle");
+        assert!(panel.is_replacing());
+        assert_eq!(panel.needle(), "needle");
+        assert_eq!(panel.replacement(), "");
+        assert_eq!(panel.replace_field().title(), "替换");
+    }
+
+    #[test]
+    fn the_tab_key_moves_to_the_replacement_when_the_panel_replaces() {
+        let mut panel = SearchPanel::with_replace(PathBuf::from("C:\\project"), "");
+        panel.handle_key(&named(NamedKey::Tab), None, false);
+        assert_eq!(panel.focus(), SearchFocus::Results);
+        panel.handle_key(&named(NamedKey::Tab), None, false);
+        assert_eq!(panel.focus(), SearchFocus::Replace);
+        panel.handle_key(&named(NamedKey::Tab), None, false);
+        assert_eq!(panel.focus(), SearchFocus::Input);
+    }
+
+    #[test]
+    fn what_is_typed_in_the_replacement_stays_in_the_replacement() {
+        let mut panel = SearchPanel::with_replace(PathBuf::from("C:\\project"), "needle");
+        // The tab key twice: the text, the places, the replacement.
+        panel.handle_key(&named(NamedKey::Tab), None, false);
+        panel.handle_key(&named(NamedKey::Tab), None, false);
+        assert_eq!(panel.focus(), SearchFocus::Replace);
+
+        panel.handle_key(&character("p"), Some("p"), false);
+        assert_eq!(panel.replacement(), "p");
+        assert_eq!(panel.needle(), "needle", "the text that is looked for is not touched");
+    }
+
+    #[test]
+    fn there_is_nothing_to_replace_when_nothing_was_found() {
+        let mut panel = SearchPanel::with_replace(PathBuf::from("C:\\project"), "needle");
+        panel.handle_key(&named(NamedKey::Tab), None, false);
+        panel.handle_key(&named(NamedKey::Tab), None, false);
+        panel.handle_key(&character("p"), Some("p"), false);
+
+        assert_eq!(
+            panel.handle_key(&named(NamedKey::Enter), None, false),
+            SearchCommand::None
+        );
+        assert!(
+            panel.status().contains("没有找到"),
+            "the panel has to say why: {}",
+            panel.status()
+        );
     }
 
     #[test]

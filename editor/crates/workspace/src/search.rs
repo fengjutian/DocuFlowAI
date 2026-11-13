@@ -183,6 +183,40 @@ impl Matcher {
     }
 }
 
+/// The places of the text in a text, as byte ranges.
+///
+/// The rules are the ones of the search: the case of the letters does not
+/// count unless it is asked for.
+///
+/// A text whose lower case is not the same length as the text itself has no
+/// places: the places in the lower case would not be the places in the text,
+/// and a change in the wrong place is worse than no change at all. That is
+/// what the `None` says.
+pub fn places_of(text: &str, needle: &str, case_sensitive: bool) -> Option<Vec<(usize, usize)>> {
+    if needle.is_empty() {
+        return Some(Vec::new());
+    }
+    if case_sensitive {
+        let places = text
+            .match_indices(needle)
+            .map(|(index, _)| (index, index + needle.len()))
+            .collect();
+        return Some(places);
+    }
+    let lower_needle = needle.to_lowercase();
+    let lower_text = text.to_lowercase();
+    if lower_text.len() != text.len() {
+        // Some letter of this text is longer when it is folded: the places
+        // in the folded text are not the places in the text.
+        return None;
+    }
+    let places = lower_text
+        .match_indices(&lower_needle)
+        .map(|(index, _)| (index, index + needle.len()))
+        .collect();
+    Some(places)
+}
+
 /// Whether the bytes are a file of pictures and other things that are not text.
 ///
 /// A zero byte is what tells a text file from a picture: a text file has
@@ -381,5 +415,40 @@ mod tests {
 
         assert_eq!(results.hits.len(), 3);
         assert!(results.truncated, "the search says that it stopped early");
+    }
+
+    #[test]
+    fn the_places_of_the_text_are_its_own_places() {
+        let text = "the needle is here and the needle is there";
+        let places = places_of(text, "needle", true).expect("the text can be looked at");
+        assert_eq!(places.len(), 2);
+        assert_eq!(&text[places[0].0..places[0].1], "needle");
+        assert_eq!(&text[places[1].0..places[1].1], "needle");
+        // The second place is after the first one.
+        assert!(places[1].0 > places[0].1);
+    }
+
+    #[test]
+    fn the_case_of_the_letters_does_not_count_when_it_is_not_asked_for() {
+        let text = "Needle and needle";
+        let places = places_of(text, "needle", false).expect("the text can be looked at");
+        assert_eq!(places.len(), 2);
+        assert_eq!(&text[places[0].0..places[0].1], "Needle");
+    }
+
+    #[test]
+    fn a_text_that_cannot_be_folded_safely_has_no_places() {
+        // The lower case of this letter is longer than the letter itself:
+        // the places in the folded text are not the places in the text.
+        let text = "\u{0130}needle";
+        assert!(places_of(text, "needle", false).is_none());
+        // The exact case is safe.
+        assert!(places_of(text, "needle", true).is_some());
+    }
+
+    #[test]
+    fn there_are_no_places_in_an_empty_text() {
+        let places = places_of("anything", "", true).expect("the text can be looked at");
+        assert!(places.is_empty());
     }
 }

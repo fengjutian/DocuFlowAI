@@ -91,6 +91,73 @@ fn a_breakpoint_is_placed_where_it_was_asked_for() {
 }
 
 #[test]
+fn the_condition_of_a_breakpoint_reaches_the_adapter() {
+    let client = client();
+    client
+        .set_breakpoints_with_conditions(
+            "file:///tmp/main.rs",
+            &[(7, Some("count > 3".to_owned())), (9, None)],
+        )
+        .expect("the breakpoints go through");
+
+    let answer = wait_for(|| {
+        let mut answers = client.drain_breakpoints();
+        (!answers.is_empty()).then(|| answers.remove(0))
+    });
+    let breakpoints = answer.expect("the adapter answered");
+    assert_eq!(breakpoints.len(), 2);
+    assert_eq!(breakpoints[0].line, Some(7));
+    assert!(
+        breakpoints[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("count > 3")),
+        "the adapter was told the condition: {:?}",
+        breakpoints[0].message
+    );
+    assert!(
+        breakpoints[1].message.is_none(),
+        "a breakpoint without a condition has none: {:?}",
+        breakpoints[1].message
+    );
+}
+
+#[test]
+fn an_expression_is_worth_what_the_adapter_says() {
+    let client = client();
+    client
+        .evaluate("count + 1", 1)
+        .expect("the expression goes through");
+
+    let answer = wait_for(|| {
+        let mut answers = client.drain_evaluations();
+        (!answers.is_empty()).then(|| answers.remove(0))
+    });
+    let value = answer.expect("the adapter answered");
+    assert_eq!(value.result, "42");
+    assert_eq!(value.type_.as_deref(), Some("i32"));
+    assert_eq!(value.line("count + 1"), "count + 1: i32 = 42");
+}
+
+#[test]
+fn an_expression_the_adapter_refuses_is_an_error() {
+    let client = client();
+    // The adapter looks at the expression: an empty one is refused. That is
+    // how the contract proves that the expression was sent at all.
+    client.evaluate("", 1).expect("the request goes through");
+
+    let answer = wait_for(|| {
+        let mut answers = client.drain_evaluations();
+        (!answers.is_empty()).then(|| answers.remove(0))
+    });
+    let error = answer.expect_err("the adapter refused");
+    assert!(
+        error.to_string().contains("empty"),
+        "the reason has to be said out loud: {error}"
+    );
+}
+
+#[test]
 fn the_program_stops_at_the_breakpoint() {
     let client = running_client();
 
@@ -121,10 +188,17 @@ fn the_stack_of_the_stopped_program_is_known() {
         (!answers.is_empty()).then(|| answers.remove(0))
     });
     let frames = answer.expect("the adapter answered");
-    assert_eq!(frames.len(), 1);
+    // The stack has more than one frame: the editor shows the whole stack.
+    assert_eq!(frames.len(), 3);
     assert_eq!(frames[0].name, "main");
     // The frame is on the line of the breakpoint.
     assert_eq!(frames[0].line, Some(7));
+    assert_eq!(frames[1].name, "helper");
+    assert_eq!(frames[2].name, "outer");
+    // Every frame has a number of its own: the variables are asked for by
+    // it.
+    assert_ne!(frames[0].id, frames[1].id);
+    assert_ne!(frames[1].id, frames[2].id);
 }
 
 #[test]
@@ -137,24 +211,56 @@ fn the_variables_of_the_frame_are_known() {
         let mut answers = client.drain_scopes();
         (!answers.is_empty()).then(|| answers.remove(0))
     });
-    let scopes = answer.expect("the adapter answered");
+    let (frame_id, scopes) = answer.expect("the adapter answered");
+    // The answer says the frame the groups belong to.
+    assert_eq!(frame_id, 1);
     assert_eq!(scopes.len(), 1);
-    assert_eq!(scopes[0].variables_reference, 10);
+    assert_eq!(scopes[0].variables_reference, 101);
 
     client
-        .variables(scopes[0].variables_reference)
+        .variables(1, scopes[0].variables_reference)
         .expect("the request goes through");
     let answer = wait_for(|| {
         let mut answers = client.drain_variables();
         (!answers.is_empty()).then(|| answers.remove(0))
     });
-    let variables = answer.expect("the adapter answered");
+    let (frame_id, variables) = answer.expect("the adapter answered");
+    // The answer says the frame the variables belong to.
+    assert_eq!(frame_id, 1);
     assert_eq!(variables.len(), 2);
     assert_eq!(variables[0].name, "count");
     assert_eq!(variables[0].value, "3");
     assert_eq!(variables[0].type_.as_deref(), Some("i32"));
     assert_eq!(variables[1].name, "name");
     assert_eq!(variables[1].value, "greeting");
+}
+
+#[test]
+fn the_variables_of_another_frame_are_known() {
+    let client = running_client();
+    events_until(&client, |event| matches!(event, DapEvent::Stopped { .. }));
+
+    // The second frame of the stack has variables of its own.
+    client.scopes(2).expect("the request goes through");
+    let answer = wait_for(|| {
+        let mut answers = client.drain_scopes();
+        (!answers.is_empty()).then(|| answers.remove(0))
+    });
+    let (frame_id, scopes) = answer.expect("the adapter answered");
+    assert_eq!(frame_id, 2);
+    assert_eq!(scopes[0].variables_reference, 102);
+
+    client
+        .variables(2, scopes[0].variables_reference)
+        .expect("the request goes through");
+    let answer = wait_for(|| {
+        let mut answers = client.drain_variables();
+        (!answers.is_empty()).then(|| answers.remove(0))
+    });
+    let (frame_id, variables) = answer.expect("the adapter answered");
+    assert_eq!(frame_id, 2);
+    assert_eq!(variables[0].name, "total");
+    assert_eq!(variables[0].value, "6");
 }
 
 #[test]

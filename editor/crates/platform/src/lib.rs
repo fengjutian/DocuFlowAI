@@ -42,7 +42,7 @@ use codeweaver_workbench::{close_decision, CloseDecision, Tab, TabBar, TabId};
 use code_action::ActionPopup;
 use command::CommandBox;
 use completion::CompletionPopup;
-use debug::{Breakpoints, DebugPanel, DebugState, DebugStep, Debugger};
+use debug::{BreakpointMark, Breakpoints, DebugPanel, DebugState, DebugStep, Debugger};
 use editor_view::{
     BodyOverlay, EditorView, FindOverlay, LINE_HEIGHT, MarkSeverity, RendererMeasurer,
 };
@@ -180,6 +180,12 @@ pub struct NativeApplication {
     /// They belong to the files and not to the session: they are there
     /// whether a session is running or not.
     breakpoints: Breakpoints,
+    /// The box that asks for the condition of a breakpoint, when it is open.
+    breakpoint_condition: Option<CommandBox>,
+    /// The box that asks for an expression to be worked out, when it is open.
+    debug_expression: Option<CommandBox>,
+    /// The line the box that asks for a condition is about.
+    breakpoint_condition_line: Option<u32>,
     /// The tabs that are open.
     tabs: TabBar,
     /// The pane of every tab, in the order of the tabs.
@@ -209,6 +215,18 @@ pub struct NativeApplication {
     ///
     /// They are kept in the order they were run, the newest last.
     command_history: Vec<String>,
+    /// The line that is being typed into the terminal, when the terminal is
+    /// open.
+    ///
+    /// It is `None` when there is no terminal.
+    terminal_input: Option<CommandBox>,
+    /// Whether the keyboard is in the terminal.
+    ///
+    /// The terminal keeps running when the keyboard leaves it: `Esc` gives
+    /// the keyboard back to the document, and the shell goes on.
+    terminal_has_focus: bool,
+    /// The commands that were typed into the terminal.
+    terminal_history: Vec<String>,
     /// The panel that finds text in the files of the project, when it is open.
     search: Option<SearchPanel>,
     /// The text that was in the box the last time.
@@ -398,6 +416,9 @@ impl NativeApplication {
             debug_adapter: None,
             debug: None,
             breakpoints: Breakpoints::default(),
+            breakpoint_condition: None,
+            debug_expression: None,
+            breakpoint_condition_line: None,
             tabs,
             panes,
             active: 0,
@@ -409,6 +430,9 @@ impl NativeApplication {
             rename_box: None,
             command_box: None,
             command_history: Vec::new(),
+            terminal_input: None,
+            terminal_has_focus: false,
+            terminal_history: Vec::new(),
             search: None,
             search_needle: String::new(),
             renaming: None,
@@ -1690,6 +1714,11 @@ impl NativeApplication {
             self.press_file_tree(cursor, size);
             return;
         }
+        // The panel of the debugger is at the bottom of the window: a click
+        // on a frame of the stack picks that frame.
+        if self.press_the_debug_panel(cursor, size) {
+            return;
+        }
         let bottom = self.bottom_panel_height();
         let body = editor_body_rect(size, bottom);
         if !body.contains(cursor) {
@@ -1704,6 +1733,39 @@ impl NativeApplication {
             add,
         );
         self.keep_caret_visible(scale_factor);
+    }
+
+    /// Handles a click in the panel of the debugger.
+    ///
+    /// A click on a frame of the stack picks that frame: the variables that
+    /// are shown are the ones of the frame that is picked, and an
+    /// expression is asked about in it.
+    ///
+    /// Returns whether the click was on a frame: a click that was not is
+    /// none of the panel's business.
+    fn press_the_debug_panel(&mut self, cursor: Point, size: Size) -> bool {
+        if self.task_panel {
+            // The panel of the task is drawn over the panel of the
+            // debugger: the click is not on a frame.
+            return false;
+        }
+        let Some(debug) = self.debug.as_ref() else {
+            return false;
+        };
+        if debug.state != DebugState::Stopped {
+            return false;
+        }
+        let frames = debug.frames.len();
+        let Some(index) = debug::frame_at(cursor, size, frames) else {
+            return false;
+        };
+        let Some(debug) = self.debug.as_mut() else {
+            return false;
+        };
+        if debug.select_frame(index) {
+            self.status = Some(format!("挑了第 {} 帧", index + 1));
+        }
+        true
     }
 
     /// Handles the mouse moving while a drag is in progress.
@@ -2208,7 +2270,14 @@ impl NativeApplication {
     /// editors. Esc closes the output panel; the task keeps running.
     fn handle_task_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
         if self.task_panel && matches!(key, Key::Named(NamedKey::Escape)) {
-            self.task_panel = false;
+            if self.terminal_input.is_some() {
+                // The second Esc closes the terminal and stops the shell.
+                self.close_terminal();
+                self.task_panel = false;
+                self.status = Some("终端关了".to_owned());
+            } else {
+                self.task_panel = false;
+            }
             return true;
         }
         if !(self.modifiers.control_key() && self.modifiers.shift_key()) {
@@ -2230,6 +2299,12 @@ impl NativeApplication {
     /// that has no manifest has nothing to build, and the editor says so
     /// instead of doing nothing.
     fn start_build_task(&mut self) {
+        if self.terminal_input.is_some() {
+            // The terminal and the tasks share one place: a build would take
+            // the place of the terminal.
+            self.status = Some("终端开着呢，先把它关了（Esc）".to_owned());
+            return;
+        }
         if let Some(task) = self.task.as_ref()
             && task.is_running()
         {
@@ -2284,7 +2359,13 @@ impl NativeApplication {
         self.task_output = output;
         if !matches!(state, TaskState::Running) {
             // The task is done: what it says is said once.
-            self.status = Some(TaskPanel::state_text(&state));
+            if self.terminal_input.is_some() {
+                // The shell is gone: the terminal goes with it.
+                self.close_terminal();
+                self.status = Some(format!("终端关了：{}", TaskPanel::state_text(&state)));
+            } else {
+                self.status = Some(TaskPanel::state_text(&state));
+            }
         } else if lines > 0 {
             self.status = Some(format!("正在跑…（{lines} 行）"));
         }
@@ -2314,6 +2395,7 @@ impl NativeApplication {
             .slice(TextOffset(start)..TextOffset(end))
             .to_owned();
         self.rename_box = Some(RenameBox::new(name, start));
+        self.take_the_keyboard_from_the_terminal();
         self.status = Some("输入新名字，回车确认，Esc 取消".to_owned());
     }
 
@@ -2846,6 +2928,7 @@ impl NativeApplication {
         match self.load_git_panel(&root) {
             Ok(panel) => {
                 let count = panel.entries.len();
+                self.take_the_keyboard_from_the_terminal();
                 self.git = Some(panel);
                 self.status = Some(format!("改动面板打开了（{count} 个文件）"));
             }
@@ -2880,7 +2963,11 @@ impl NativeApplication {
     /// top: two panels open at once means the one below is stuck and the
     /// person does not know which one he is typing into.
     fn a_modal_is_open(&self) -> bool {
-        self.rename_box.is_some() || self.command_box.is_some() || self.search.is_some()
+        self.rename_box.is_some()
+            || self.command_box.is_some()
+            || self.search.is_some()
+            || self.breakpoint_condition.is_some()
+            || self.debug_expression.is_some()
     }
 
     /// Handles the keys of the panel of the changes.
@@ -3055,10 +3142,124 @@ impl NativeApplication {
         }
     }
 
+    /// Gives the keyboard back to the editor.
+    ///
+    /// The terminal has the keyboard while it is the one being typed into.
+    /// A panel or a box that opens takes the keyboard: what is typed after
+    /// that goes into the panel, not into the terminal.
+    fn take_the_keyboard_from_the_terminal(&mut self) {
+        self.terminal_has_focus = false;
+    }
+
+    /// Handles the keys of the box that asks for an expression.
+    ///
+    /// Ctrl+Shift+E opens the box. While the box is open it takes every
+    /// key: an expression that is typed into the document is not an
+    /// expression.
+    fn handle_debug_expression_key<T: AsRef<str>>(
+        &mut self,
+        key: &Key<T>,
+        text: Option<&str>,
+    ) -> bool {
+        let Some(mut box_) = self.debug_expression.take() else {
+            // The box is not open: Ctrl+Shift+E opens it.
+            // A panel that takes every key does not open over another one.
+            if self.a_modal_is_open() {
+                return false;
+            }
+            if !(self.modifiers.control_key() && self.modifiers.shift_key()) {
+                return false;
+            }
+            let Some(letter) = key_letter(key) else {
+                return false;
+            };
+            if !letter.eq_ignore_ascii_case(&'e') {
+                return false;
+            }
+            self.ask_for_an_expression();
+            return true;
+        };
+
+        // Whether the box stays open.
+        let mut keep = true;
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.status = Some("没求值".to_owned());
+                keep = false;
+            }
+            Key::Named(NamedKey::Enter) => {
+                keep = false;
+                self.evaluate_the_expression(box_.text());
+            }
+            _ => {
+                box_.handle_key(key, text, self.modifiers.control_key());
+            }
+        }
+        if keep {
+            self.debug_expression = Some(box_);
+        }
+        true
+    }
+
+    /// Asks for an expression to be worked out.
+    ///
+    /// The expression is in the language of the program: the adapter is the
+    /// one that knows it. The program has to be stopped, because an
+    /// expression is asked about in a frame, and there is no frame while the
+    /// program runs.
+    fn ask_for_an_expression(&mut self) {
+        let Some(debug) = self.debug.as_ref() else {
+            self.status = Some("没有调试会话，没法求值".to_owned());
+            return;
+        };
+        if debug.state != DebugState::Stopped {
+            self.status = Some("程序在跑，停下来才能求值".to_owned());
+            return;
+        }
+        if debug.frame_id.is_none() {
+            self.status = Some("还没有拿到栈帧，等一等再求值".to_owned());
+            return;
+        }
+        self.take_the_keyboard_from_the_terminal();
+        self.debug_expression = Some(CommandBox::titled("求值"));
+        self.status = Some("写表达式，回车求值，Esc 取消".to_owned());
+    }
+
+    /// Asks the adapter what the expression is worth.
+    ///
+    /// The answer comes later, on the thread of the adapter: the panel says
+    /// it when it arrives.
+    fn evaluate_the_expression(&mut self, expression: &str) {
+        let expression = expression.trim();
+        if expression.is_empty() {
+            self.status = Some("表达式不能是空的".to_owned());
+            return;
+        }
+        let Some(debug) = self.debug.as_mut() else {
+            self.status = Some("没有调试会话，没法求值".to_owned());
+            return;
+        };
+        let Some(frame_id) = debug.frame_id else {
+            self.status = Some("还没有栈帧，没法求值".to_owned());
+            return;
+        };
+        // The expression is kept: the answer does not carry it, and the
+        // answer has to be said with what was asked.
+        debug.evaluating.push(expression.to_owned());
+        if let Err(error) = debug.client.evaluate(expression, frame_id) {
+            debug.evaluating.pop();
+            debug.push_output(&format!("{expression} 求不了：{error}"));
+            return;
+        }
+        self.status = Some(format!("求值：{expression}"));
+    }
+
     /// Handles the keys of the debugger.
     ///
     /// F9 puts a breakpoint on the line of the caret, F5 starts the
     /// session, F10 and F11 walk through the program, and F8 ends it.
+    /// Ctrl+F9 is not here: the box that asks for the condition of a
+    /// breakpoint takes it, and it takes it before this.
     fn handle_debug_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
         match key {
             Key::Named(NamedKey::F9) => {
@@ -3137,8 +3338,120 @@ impl NativeApplication {
         self.tell_the_adapter_about_the_breakpoints(&uri);
     }
 
-    /// Remembers where the breakpoint of a line is.
+    /// Asks for the condition of the breakpoint on the line of the caret.
     ///
+    /// A condition says what has to be true for the program to stop at that
+    /// line: `count > 3` stops the program only when the count is bigger
+    /// than three. An empty condition is no condition: the breakpoint stops
+    /// the program every time it comes to that line.
+    fn ask_for_the_condition_of_the_breakpoint(&mut self) {
+        let Some(uri) = self.uri_of_the_open_file() else {
+            self.status = Some("这个文件没有地址，断点放不了".to_owned());
+            return;
+        };
+        let Some(line) = self.the_line_of_the_caret() else {
+            self.status = Some("光标不在哪一行，断点放不了".to_owned());
+            return;
+        };
+        if !self.breakpoints.lines_of(&uri).contains(&line) {
+            self.status = Some(format!("第 {line} 行还没有断点（F9 先放一个）"));
+            return;
+        }
+        let mut box_ = CommandBox::titled("断点条件");
+        if let Some(condition) = self.breakpoints.condition_of(&uri, line) {
+            // The condition that is there is put in the box: a condition is
+            // changed by writing it again, not by writing it from nothing.
+            box_.set_text(condition);
+        }
+        self.take_the_keyboard_from_the_terminal();
+        self.breakpoint_condition = Some(box_);
+        self.breakpoint_condition_line = Some(line);
+        self.status = Some("写条件，回车记住；空的表示每次都停；Esc 取消".to_owned());
+    }
+
+    /// The line the caret is on.
+    fn the_line_of_the_caret(&self) -> Option<u32> {
+        let caret = self.panes[self.active].editor.caret().0;
+        let line = self.panes[self.active].editor.buffer().line_of_offset(caret) + 1;
+        Some(line as u32)
+    }
+
+    /// Handles the keys of the box that asks for the condition.
+    ///
+    /// Ctrl+F9 opens the box. While the box is open it takes every key: a
+    /// condition that is typed into the document is not a condition.
+    fn handle_breakpoint_condition_key<T: AsRef<str>>(
+        &mut self,
+        key: &Key<T>,
+        text: Option<&str>,
+    ) -> bool {
+        let Some(mut box_) = self.breakpoint_condition.take() else {
+            // The box is not open: Ctrl+F9 opens it.
+            // A panel that takes every key does not open over another one.
+            if self.a_modal_is_open() {
+                return false;
+            }
+            if !matches!(key, Key::Named(NamedKey::F9)) {
+                return false;
+            }
+            // Ctrl+F9 and not Ctrl+Shift+F9: the shift is another key.
+            if !self.modifiers.control_key() || self.modifiers.shift_key() {
+                return false;
+            }
+            self.ask_for_the_condition_of_the_breakpoint();
+            return true;
+        };
+
+        // Whether the box stays open.
+        let mut keep = true;
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.status = Some("没改条件".to_owned());
+                keep = false;
+            }
+            Key::Named(NamedKey::Enter) => {
+                keep = false;
+                self.set_the_condition_of_the_breakpoint(box_.text());
+            }
+            _ => {
+                box_.handle_key(key, text, self.modifiers.control_key());
+            }
+        }
+        if keep {
+            self.breakpoint_condition = Some(box_);
+        } else {
+            self.breakpoint_condition_line = None;
+        }
+        true
+    }
+
+    /// Remembers the condition that was written.
+    ///
+    /// An empty condition takes the condition away: the breakpoint stops the
+    /// program every time it comes to that line again.
+    fn set_the_condition_of_the_breakpoint(&mut self, condition: &str) {
+        let Some(uri) = self.uri_of_the_open_file() else {
+            self.status = Some("这个文件没有地址，断点放不了".to_owned());
+            return;
+        };
+        let Some(line) = self.breakpoint_condition_line.take() else {
+            self.status = Some("不知道是哪个断点，条件没记住".to_owned());
+            return;
+        };
+        let condition = condition.trim();
+        if condition.is_empty() {
+            self.breakpoints.set_condition(&uri, line, None);
+            self.status = Some(format!("第 {line} 行的条件去掉了，每次都停"));
+        } else {
+            self.breakpoints.set_condition(&uri, line, Some(condition));
+            self.status = Some(format!("第 {line} 行的条件：{condition}"));
+        }
+        // The adapter has to hear about it: a condition it does not know
+        // about is a condition that is not worked out.
+        self.tell_the_adapter_about_the_breakpoints(&uri);
+    }
+
+    /// Remembers where the breakpoint of a line is.    ///
     /// The place is an anchor in the buffer of the file: it follows the text
     /// when the file changes.
     fn remember_the_place_of_the_breakpoint(&mut self, uri: &str, line: u32) {
@@ -3167,13 +3480,15 @@ impl NativeApplication {
     ///
     /// The adapter only stops the program where it was told to: a breakpoint
     /// it does not know about is a breakpoint that does not stop anything.
+    /// The conditions go with them: a condition the adapter does not know
+    /// about is a condition that is not worked out.
     fn tell_the_adapter_about_the_breakpoints(&mut self, uri: &str) {
         if self.debug.is_none() {
             return;
         }
-        let lines = self.breakpoints.lines_of(uri);
+        let breakpoints = self.breakpoints.with_conditions_of(uri);
         if let Some(debug) = self.debug.as_mut()
-            && let Err(error) = debug.client.set_breakpoints(uri, &lines)
+            && let Err(error) = debug.client.set_breakpoints_with_conditions(uri, &breakpoints)
         {
             eprintln!("could not tell the adapter about the breakpoints: {error}");
         }
@@ -3293,7 +3608,7 @@ impl NativeApplication {
         }
         // The breakpoints are read before the session is borrowed: the
         // session hands them to the adapter when it says it is ready.
-        let breakpoints = self.breakpoints.all();
+        let breakpoints = self.breakpoints.all_with_conditions();
         let Some(debug) = self.debug.as_mut() else {
             return false;
         };
@@ -3307,8 +3622,9 @@ impl NativeApplication {
                     if breakpoints.is_empty() {
                         debug.push_output("一个断点都没有，程序不会停");
                     }
-                    for (uri, lines) in &breakpoints {
-                        if let Err(error) = debug.client.set_breakpoints(uri, lines) {
+                    for (uri, marks) in &breakpoints {
+                        if let Err(error) = debug.client.set_breakpoints_with_conditions(uri, marks)
+                        {
                             debug.push_output(&format!("断点放不下：{error}"));
                         }
                     }
@@ -3325,6 +3641,11 @@ impl NativeApplication {
                     debug.state = DebugState::Stopped;
                     debug.variables.clear();
                     debug.frame = None;
+                    debug.frame_id = None;
+                    // The stack of the program is read again: the program
+                    // walked on, and the stack it is in is another one.
+                    debug.frames.clear();
+                    debug.selected_frame = 0;
                     if let Err(error) = debug.client.stack_trace(thread_id) {
                         debug.push_output(&format!("栈帧读不到：{error}"));
                     }
@@ -3333,7 +3654,19 @@ impl NativeApplication {
                     debug.state = DebugState::Running;
                 }
                 DapEvent::Output { text, .. } => debug.push_output(&text),
-                DapEvent::Breakpoint { .. } => {}
+                DapEvent::Breakpoint { verified, line, message } => {
+                    // The adapter says what it thinks of the breakpoint: a
+                    // condition it does not accept is said out loud, not
+                    // swallowed.
+                    let place = line
+                        .map(|line| format!("第 {line} 行"))
+                        .unwrap_or_else(|| "有一处".to_owned());
+                    if let Some(message) = message {
+                        debug.push_output(&format!("{place}的断点：{message}"));
+                    } else if !verified {
+                        debug.push_output(&format!("{place}的断点放不下"));
+                    }
+                }
                 DapEvent::Terminated => {
                     debug.state = DebugState::Finished;
                     debug.push_output("调试结束了");
@@ -3349,14 +3682,56 @@ impl NativeApplication {
             }
         }
 
-        // The frames of the stack, and then the variables of the top frame.
+        // What the adapter says about the breakpoints it was told.
+        //
+        // The answer of the adapter is where a condition it does not accept
+        // is said out loud: a condition that is swallowed is a condition the
+        // person never learns about.
+        for answer in debug.client.drain_breakpoints() {
+            match answer {
+                Ok(breakpoints) => {
+                    for breakpoint in breakpoints {
+                        if let Some(message) = breakpoint.message {
+                            debug.push_output(&format!("断点：{message}"));
+                        }
+                    }
+                }
+                Err(error) => debug.push_output(&format!("断点放不下：{error}")),
+            }
+        }
+
+        // What the adapter says about the worth of an expression.
+        //
+        // The answer does not carry the expression, so the one that was
+        // asked is taken off the list of the ones that are waiting.
+        for answer in debug.client.drain_evaluations() {
+            let expression = debug.evaluating.pop().unwrap_or_default();
+            match answer {
+                Ok(value) => debug.push_output(&value.line(&expression)),
+                Err(error) => debug.push_output(&format!("{expression} 求不了：{error}")),
+            }
+        }
+
+        // The frames of the stack, and then the variables of the frame that
+        // is picked.
         for answer in debug.client.drain_stack_traces() {
             match answer {
                 Ok(frames) => {
-                    if let Some(frame) = frames.first() {
-                        debug.frame = Some(frame.name.clone());
-                        if let Err(error) = debug.client.scopes(frame.id) {
-                            debug.push_output(&format!("变量读不到：{error}"));
+                    debug.frames = frames;
+                    debug.selected_frame = 0;
+                    match debug.frames.first() {
+                        Some(frame) => {
+                            debug.frame = Some(frame.name.clone());
+                            // The number of the frame is kept: an
+                            // expression is asked about in a frame.
+                            debug.frame_id = Some(frame.id);
+                            if let Err(error) = debug.client.scopes(frame.id) {
+                                debug.push_output(&format!("变量读不到：{error}"));
+                            }
+                        }
+                        None => {
+                            debug.frame = None;
+                            debug.frame_id = None;
                         }
                     }
                 }
@@ -3365,9 +3740,21 @@ impl NativeApplication {
         }
         for answer in debug.client.drain_scopes() {
             match answer {
-                Ok(scopes) => {
+                Ok((frame_id, scopes)) => {
+                    // The groups of a frame that is not the one on the
+                    // screen are of no use: the frame was picked again
+                    // while the answer was on its way.
+                    if !debug::the_answer_is_about_this_frame(frame_id, debug.frame_id) {
+                        continue;
+                    }
+                    // The variables of the frame are cleared before its
+                    // groups are asked for: the groups of a frame come one
+                    // after another, and they are all shown.
+                    debug.variables.clear();
                     for scope in &scopes {
-                        if let Err(error) = debug.client.variables(scope.variables_reference) {
+                        if let Err(error) =
+                            debug.client.variables(frame_id, scope.variables_reference)
+                        {
                             debug.push_output(&format!("变量读不到：{error}"));
                         }
                     }
@@ -3377,7 +3764,16 @@ impl NativeApplication {
         }
         for answer in debug.client.drain_variables() {
             match answer {
-                Ok(variables) => debug.variables = variables,
+                Ok((frame_id, variables)) => {
+                    // The variables of a frame that is not the one on the
+                    // screen would say something that is not true.
+                    if debug::the_answer_is_about_this_frame(frame_id, debug.frame_id) {
+                        // A frame may have more than one group of variables
+                        // (局部变量、参数、全局变量): they are all shown,
+                        // not only the last one that came.
+                        debug.variables.extend(variables);
+                    }
+                }
                 Err(error) => debug.push_output(&format!("变量读不到：{error}")),
             }
         }
@@ -3407,6 +3803,7 @@ impl NativeApplication {
             // Only one box at a time: the box that asks for a new name gives
             // up its place.
             self.rename_box = None;
+            self.take_the_keyboard_from_the_terminal();
             self.command_box = Some(CommandBox::new());
             self.status = Some("写命令，回车就跑，Esc 取消".to_owned());
             return true;
@@ -3498,6 +3895,183 @@ impl NativeApplication {
         }
     }
 
+    /// Opens the terminal, or gives it the keyboard back.
+    ///
+    /// The terminal is a shell whose input is a pipe: it lives in the folder
+    /// of the project and what is typed goes into it. The keyboard belongs
+    /// to the terminal until `Esc` gives it back to the document.
+    fn open_terminal(&mut self) {
+        if self.terminal_input.is_some() {
+            // The terminal is already there: it takes the keyboard back.
+            self.terminal_has_focus = true;
+            self.status = Some("终端拿到了键盘：写命令回车就跑".to_owned());
+            return;
+        }
+        // A panel that takes every key does not open over another one.
+        if self.a_modal_is_open() {
+            self.status = Some("有个面板开着，先把它关掉再开终端".to_owned());
+            return;
+        }
+        let Some(path) = self.panes[self.active]
+            .document
+            .as_ref()
+            .map(|document| document.path().to_path_buf())
+        else {
+            self.status = Some("这个文件不属于任何工程，不知道在哪儿开终端".to_owned());
+            return;
+        };
+        if let Some(task) = self.task.as_ref()
+            && task.is_running()
+        {
+            // The terminal and the tasks share one place: two of them at the
+            // same time would fight over the output panel.
+            self.status = Some("已经有任务在跑了（终端和任务共用一个地方）".to_owned());
+            return;
+        }
+        let root = lsp::workspace_root(&path);
+        let (program, args) = task::shell_command();
+        match Task::start_with_input(program, args.as_slice(), &root) {
+            Ok(task) => {
+                self.task = Some(task);
+                self.task_output = TaskOutput::default();
+                self.task_title = format!("终端 · {program}");
+                self.task_panel = true;
+                self.terminal_input = Some(CommandBox::titled("终端"));
+                self.terminal_has_focus = true;
+                self.status =
+                    Some("终端开着：写命令回车就跑，Esc 把键盘还给编辑器".to_owned());
+            }
+            Err(error) => {
+                eprintln!("could not start the terminal: {error}");
+                self.status = Some(format!("终端起不来：{error}"));
+            }
+        }
+    }
+
+    /// Closes the terminal.
+    ///
+    /// The shell is stopped: a shell that nobody is watching is a shell that
+    /// nobody can kill.
+    fn close_terminal(&mut self) {
+        if let Some(task) = self.task.as_ref() {
+            task.stop();
+        }
+        self.terminal_input = None;
+        self.terminal_has_focus = false;
+    }
+
+    /// Handles the keys of the terminal.
+    ///
+    /// Ctrl+Shift+T opens the terminal, and takes the keyboard back when it
+    /// is open. While the terminal has the keyboard, what is typed goes into
+    /// it and not into the document. The keys with a modifier still belong
+    /// to the editor: the shortcuts are the same wherever the focus is, and
+    /// the terminal gives the keyboard up when one of them is pressed.
+    fn handle_terminal_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
+        // Ctrl+Shift+T belongs to the terminal whether it is open or not.
+        if self.modifiers.control_key() && self.modifiers.shift_key() {
+            let is_the_terminal_key = key_letter(key)
+                .is_some_and(|letter| letter.eq_ignore_ascii_case(&'t'));
+            if is_the_terminal_key {
+                self.open_terminal();
+                return true;
+            }
+        }
+
+        // The terminal is not open, or the keyboard is not in it: the key
+        // belongs to the editor.
+        let Some(mut box_) = self.terminal_input.take() else {
+            return false;
+        };
+        if !self.terminal_has_focus {
+            self.terminal_input = Some(box_);
+            return false;
+        }
+
+        // The keys with a modifier belong to the editor.
+        //
+        // The terminal gives the keyboard up as well: the shortcut that is
+        // pressed opens something of its own (the find bar, for one), and
+        // what is typed after that has to go there and not here.
+        if self.modifiers.control_key() || self.modifiers.alt_key() {
+            self.terminal_has_focus = false;
+            self.terminal_input = Some(box_);
+            return false;
+        }
+
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                // The keyboard goes back to the document; the shell keeps
+                // running.
+                self.terminal_has_focus = false;
+                self.terminal_input = Some(box_);
+                self.status =
+                    Some("键盘还给编辑器了，终端还在跑（Ctrl+Shift+T 回去）".to_owned());
+                true
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.send_to_the_terminal(box_.text());
+                box_.set_text("");
+                self.terminal_input = Some(box_);
+                true
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                if let Some(previous) = box_.previous(&self.terminal_history) {
+                    box_.set_text(&previous);
+                }
+                self.terminal_input = Some(box_);
+                true
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if let Some(next) = box_.next(&self.terminal_history) {
+                    box_.set_text(&next);
+                }
+                self.terminal_input = Some(box_);
+                true
+            }
+            Key::Named(NamedKey::Backspace)
+            | Key::Named(NamedKey::Delete)
+            | Key::Named(NamedKey::ArrowLeft)
+            | Key::Named(NamedKey::ArrowRight)
+            | Key::Named(NamedKey::Home)
+            | Key::Named(NamedKey::End)
+            | Key::Character(_) => {
+                box_.handle_key(key, text, false);
+                self.terminal_input = Some(box_);
+                true
+            }
+            _ => {
+                // The key is not the terminal's: the editor may have it.
+                self.terminal_input = Some(box_);
+                false
+            }
+        }
+    }
+
+    /// Sends the line that was typed to the shell.
+    ///
+    /// The shell reads its input from a pipe, so nothing echoes it: the
+    /// editor says the line itself, so that the panel shows what was typed.
+    fn send_to_the_terminal(&mut self, line: &str) {
+        if line.trim().is_empty() {
+            return;
+        }
+        let Some(task) = self.task.as_ref() else {
+            self.status = Some("没有终端可以写".to_owned());
+            return;
+        };
+        task.echo(line);
+        if let Err(error) = task.write_input(&format!("{line}\n")) {
+            self.status = Some(format!("写不进去：{error}"));
+            return;
+        }
+        // The command joins the history, so that it can be run again.
+        self.terminal_history.push(line.to_owned());
+        if self.terminal_history.len() > 50 {
+            self.terminal_history.remove(0);
+        }
+    }
+
     /// Handles the keys of the panel that finds text in the files.
     ///
     /// Ctrl+Shift+F opens the panel. While the panel is open it takes every
@@ -3505,7 +4079,8 @@ impl NativeApplication {
     /// the person is looking for.
     fn handle_search_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
         let Some(mut panel) = self.search.take() else {
-            // The panel is not open: Ctrl+Shift+F opens it.
+            // The panel is not open: Ctrl+Shift+F opens it, and Ctrl+Shift+H
+            // opens it to replace as well as to find.
             // A panel that takes every key does not open over another one.
             if self.a_modal_is_open() {
                 return false;
@@ -3516,11 +4091,15 @@ impl NativeApplication {
             let Some(letter) = key_letter(key) else {
                 return false;
             };
-            if !letter.eq_ignore_ascii_case(&'f') {
-                return false;
+            if letter.eq_ignore_ascii_case(&'f') {
+                self.open_search_panel(false);
+                return true;
             }
-            self.open_search_panel();
-            return true;
+            if letter.eq_ignore_ascii_case(&'h') {
+                self.open_search_panel(true);
+                return true;
+            }
+            return false;
         };
 
         match panel.handle_key(key, text, self.modifiers.control_key()) {
@@ -3535,6 +4114,25 @@ impl NativeApplication {
                 self.open_search_hit(&hit, &root);
                 return true;
             }
+            SearchCommand::ReplaceAll { needle, replacement } => {
+                let (files, places, skipped) = self.replace_in_the_files(&needle, &replacement);
+                // The files that are open are dirty now, and the server has to
+                // hear about the new text.
+                self.sync_dirty_flags();
+                for index in 0..self.panes.len() {
+                    self.tell_server_about_the_change_of(index);
+                }
+                let mut said = format!("改了 {files} 个文件里的 {places} 处");
+                if skipped > 0 {
+                    said.push_str(&format!("（{skipped} 个文件没有改）"));
+                }
+                self.status = Some(said);
+                // The places that were found are the old ones: the search runs
+                // again, so that the list is the list of what is there now.
+                panel.start_search();
+                self.search = Some(panel);
+                return true;
+            }
         }
         // The text that was in the box is kept: the person who searches
         // twice does not have to type the same word twice.
@@ -3547,7 +4145,10 @@ impl NativeApplication {
     ///
     /// The files that are searched are the ones of the project the open file
     /// belongs to: the folder that holds the manifest of the project.
-    fn open_search_panel(&mut self) {
+    ///
+    /// With `replacing` the panel has a box for the text that takes the
+    /// place of what is found: it replaces as well as it finds.
+    fn open_search_panel(&mut self, replacing: bool) {
         let Some(path) = self.panes[self.active]
             .document
             .as_ref()
@@ -3558,8 +4159,114 @@ impl NativeApplication {
         };
         let root = lsp::workspace_root(&path);
         let needle = self.search_needle.clone();
-        self.search = Some(SearchPanel::new(root, &needle));
-        self.status = Some("写要找的文字，回车开始找".to_owned());
+        self.take_the_keyboard_from_the_terminal();
+        self.search = Some(if replacing {
+            SearchPanel::with_replace(root, &needle)
+        } else {
+            SearchPanel::new(root, &needle)
+        });
+        self.status = Some(if replacing {
+            "写要找的文字，回车开始找；Tab 换到替换那一栏".to_owned()
+        } else {
+            "写要找的文字，回车开始找".to_owned()
+        });
+    }
+
+    /// Replaces everything that was found with something else.
+    ///
+    /// The files that are open in the editor change in their buffers, as one
+    /// transaction each: the undo takes them back. The files that are not
+    /// open go to disk, and the undo does not take them back — the same
+    /// trade-off the renaming of the language server makes.
+    ///
+    /// The places are found again in the text as it is now: a file that
+    /// changed since the search is left alone, rather than changed in the
+    /// wrong place.
+    ///
+    /// Returns how many files were changed, how many places were replaced,
+    /// and how many files were left alone.
+    fn replace_in_the_files(&mut self, needle: &str, replacement: &str) -> (usize, usize, usize) {
+        let Some(panel) = self.search.as_ref() else {
+            return (0, 0, 0);
+        };
+        // The files that were found, in the order they were found.
+        let mut files: Vec<PathBuf> = Vec::new();
+        for hit in panel.hits() {
+            if !files.contains(&hit.path) {
+                files.push(hit.path.clone());
+            }
+        }
+        let mut changed_files = 0;
+        let mut changed_places = 0;
+        let mut skipped = 0;
+        for path in files {
+            let uri = codeweaver_lsp::protocol::file_uri(&path);
+            match self.replace_in_a_file(&uri, needle, replacement) {
+                Ok(places) if places > 0 => {
+                    changed_files += 1;
+                    changed_places += places;
+                }
+                Ok(_) => skipped += 1,
+                Err(error) => {
+                    eprintln!("could not replace the text in {}: {error}", path.display());
+                    skipped += 1;
+                }
+            }
+        }
+        (changed_files, changed_places, skipped)
+    }
+
+    /// Replaces the text in one file.
+    ///
+    /// The file that is open in the editor changes in its buffer, as one
+    /// transaction: the undo takes it back. The file that is not open goes to
+    /// disk.
+    fn replace_in_a_file(
+        &mut self,
+        uri: &str,
+        needle: &str,
+        replacement: &str,
+    ) -> Result<usize, String> {
+        // The places are found in the text as it is now.
+        let (text, index): (String, Option<usize>) = match self.pane_of_a_file(uri) {
+            Some(index) => (self.panes[index].editor.buffer().text(), Some(index)),
+            None => {
+                let path = codeweaver_lsp::protocol::uri_to_path(uri)
+                    .ok_or_else(|| "不是编辑器能改的文件".to_owned())?;
+                let document = self
+                    .workspace
+                    .open(&path)
+                    .map_err(|error| format!("读不了：{error}"))?;
+                (document.saved_text().to_owned(), None)
+            }
+        };
+        let Some(places) = codeweaver_workspace::search::places_of(&text, needle, false) else {
+            return Err("这个文件里有折叠后长度不一样的大小写字母，没敢改".to_owned());
+        };
+        if places.is_empty() {
+            // The file does not hold the text any more: it changed since the
+            // search.
+            return Ok(0);
+        }
+        let changes: Vec<(std::ops::Range<TextOffset>, String)> = places
+            .iter()
+            .map(|(start, end)| {
+                (
+                    TextOffset(*start)..TextOffset(*end),
+                    replacement.to_owned(),
+                )
+            })
+            .collect();
+        match index {
+            Some(index) => {
+                self.panes[index]
+                    .editor
+                    .replace_edits(changes)
+                    .map_err(|error| format!("写不进去：{error}"))?;
+            }
+            None => self.write_a_file(uri, &changes)?,
+        }
+        Ok(places.len())
     }
 
     /// Opens the file of a place the search found, and puts the caret there.
@@ -3691,8 +4398,16 @@ impl ApplicationHandler for NativeApplication {
                             commit.type_text(&text);
                         } else if let Some(command) = self.command_box.as_mut() {
                             command.type_text(&text);
+                        } else if let Some(condition) = self.breakpoint_condition.as_mut() {
+                            condition.type_text(&text);
+                        } else if let Some(expression) = self.debug_expression.as_mut() {
+                            expression.type_text(&text);
                         } else if let Some(search) = self.search.as_mut() {
                             search.type_text(&text);
+                        } else if self.terminal_has_focus
+                            && let Some(terminal) = self.terminal_input.as_mut()
+                        {
+                            terminal.type_text(&text);
                         } else if let Err(error) = self.panes[self.active].editor.insert(&text) {
                             eprintln!("failed to commit IME text: {error}");
                         }
@@ -3757,6 +4472,21 @@ impl ApplicationHandler for NativeApplication {
                     window.request_redraw();
                     return;
                 }
+                // Ctrl+F9 asks for the condition of the breakpoint on the
+                // line of the caret. While the box is open it takes every
+                // key.
+                if self.handle_breakpoint_condition_key(&event.logical_key.as_ref(), event.text.as_deref())
+                {
+                    window.request_redraw();
+                    return;
+                }
+                // Ctrl+Shift+E asks for an expression to be worked out. While
+                // the box is open it takes every key.
+                if self.handle_debug_expression_key(&event.logical_key.as_ref(), event.text.as_deref())
+                {
+                    window.request_redraw();
+                    return;
+                }
                 // F9 puts a breakpoint, F5 starts the debugging, F10 and F11
                 // walk through the program.
                 if self.handle_debug_key(&event.logical_key.as_ref()) {
@@ -3766,6 +4496,12 @@ impl ApplicationHandler for NativeApplication {
                 // Ctrl+Shift+P opens the box that asks for a command. While
                 // the box is open it takes every key.
                 if self.handle_command_key(&event.logical_key.as_ref(), event.text.as_deref()) {
+                    window.request_redraw();
+                    return;
+                }
+                // Ctrl+Shift+T opens the terminal. While the terminal has the
+                // focus, what is typed goes into it.
+                if self.handle_terminal_key(&event.logical_key.as_ref(), event.text.as_deref()) {
                     window.request_redraw();
                     return;
                 }
@@ -3967,6 +4703,8 @@ impl ApplicationHandler for NativeApplication {
                     lines: &self.task_output.lines,
                     state: &self.task_output.state,
                     title: &self.task_title,
+                    input: self.terminal_input.as_ref().map(|box_| box_.field()),
+                    focused: self.terminal_has_focus,
                 });
                 // The panel of the debugger is read before the renderer is
                 // borrowed as well.
@@ -3975,13 +4713,25 @@ impl ApplicationHandler for NativeApplication {
                     output: &debug.output,
                     variables: &debug.variables,
                     frame: debug.frame.as_deref(),
+                    frames: &debug.frames,
+                    selected_frame: debug.selected_frame,
                     program: &debug.program,
                 });
                 // The breakpoints of the file that is on screen are the ones
                 // that are drawn in its margin.
                 let breakpoints = self
                     .uri_of_the_open_file()
-                    .map(|uri| self.breakpoints.lines_of(&uri))
+                    .map(|uri| {
+                        let conditions = self.breakpoints.conditions_of(&uri);
+                        self.breakpoints
+                            .lines_of(&uri)
+                            .into_iter()
+                            .map(|line| BreakpointMark {
+                                line,
+                                conditional: conditions.contains_key(&line),
+                            })
+                            .collect::<Vec<_>>()
+                    })
                     .unwrap_or_default();
                 let scale_factor = window.scale_factor();
                 let Some(renderer) = self.renderer.as_mut() else {
@@ -4027,6 +4777,8 @@ impl ApplicationHandler for NativeApplication {
                         git: self.git.as_ref(),
                         commit: self.commit_box.as_ref(),
                         command: self.command_box.as_ref().map(|box_| box_.field()),
+                        condition: self.breakpoint_condition.as_ref().map(|box_| box_.field()),
+                        expression: self.debug_expression.as_ref().map(|box_| box_.field()),
                         search: self.search.as_ref(),
                         debug: debug_panel,
                         breakpoints: &breakpoints,
@@ -4107,12 +4859,17 @@ struct Chrome<'a> {
     commit: Option<&'a RenameBox>,
     /// The box that asks for a command, when it is open.
     command: Option<&'a RenameBox>,
+    /// The box that asks for the condition of a breakpoint, when it is open.
+    condition: Option<&'a RenameBox>,
+    /// The box that asks for an expression, when it is open.
+    expression: Option<&'a RenameBox>,
     /// The panel that finds text in the files, when it is open.
     search: Option<&'a SearchPanel>,
     /// The panel of the debugger, when there is a session.
     debug: Option<DebugPanel<'a>>,
     /// The lines of the breakpoints of the file that is on screen.
-    breakpoints: &'a [u32],
+    /// The breakpoints of the file that is on screen, as they are drawn.
+    breakpoints: &'a [BreakpointMark],
     /// The conflicts between the buffer and a proposed change.
     conflicts: Option<ConflictView>,
 }
@@ -4320,17 +5077,23 @@ fn build_scene(
 
         // The breakpoints of the file that is on screen are drawn in the
         // margin of the text: a breakpoint that cannot be seen is a
-        // breakpoint nobody knows about.
-        for line in chrome.breakpoints {
-            let index = *line as usize;
+        // breakpoint nobody knows about. A breakpoint with a condition is
+        // drawn in another colour: it stops the program only sometimes.
+        for mark in chrome.breakpoints {
+            let index = mark.line as usize;
             if index == 0 || index > editor_state.buffer().line_count() {
                 continue;
             }
             let offset = editor_state.buffer().line_range(index - 1).start.0;
             if let Some((_, y)) = view.point_of(offset) {
+                let colour = if mark.conditional {
+                    Color::rgb(0.95, 0.68, 0.25)
+                } else {
+                    Color::rgb(0.90, 0.35, 0.35)
+                };
                 scene.push_quad(
                     Rect::new(body.origin.x - 12.0, body.origin.y + y + 6.0, 8.0, 8.0),
-                    Color::rgb(0.90, 0.35, 0.35),
+                    colour,
                     body,
                 );
             }
@@ -4368,12 +5131,18 @@ fn build_scene(
     push_find_bar(&mut scene, size, body, chrome.find, &mut ui_measurer);
 
     // The box that asks for the new name floats over the body. The box that
-    // asks for a command is the same box, and only one of them is open.
+    // asks for a command, the box that asks for the condition of a
+    // breakpoint and the box that asks for an expression are the same box,
+    // and only one of them is open.
     push_rename_box(
         &mut scene,
         size,
         body,
-        chrome.rename.or(chrome.command),
+        chrome
+            .rename
+            .or(chrome.command)
+            .or(chrome.condition)
+            .or(chrome.expression),
         &mut ui_measurer,
     );
 
@@ -4407,7 +5176,7 @@ fn build_scene(
     }
     // The output of the task is at the bottom of the window.
     if let Some(panel) = chrome.task_panel {
-        push_task_panel(&mut scene, size, &panel);
+        push_task_panel(&mut scene, size, &panel, &mut ui_measurer);
     }
     // The panel of the debugger is at the bottom of the window as well.
     if let Some(panel) = chrome.debug {
@@ -5033,7 +5802,13 @@ fn task_panel_rect(size: Size) -> Rect {
 ///
 /// The panel says what the task was asked to do and what it is doing now,
 /// and under that the lines the task has said, the newest at the bottom.
-fn push_task_panel(scene: &mut FrameScene, size: Size, panel: &TaskPanel<'_>) {
+/// When the task takes input, the line that is being typed is under them.
+fn push_task_panel(
+    scene: &mut FrameScene,
+    size: Size,
+    panel: &TaskPanel<'_>,
+    measurer: &mut dyn TextMeasurer,
+) {
     let viewport = Rect::new(0.0, 0.0, size.width, size.height);
     let rect = task_panel_rect(size);
     scene.push_quad(rect, Color::rgb(0.055, 0.063, 0.082), viewport);
@@ -5072,7 +5847,10 @@ fn push_task_panel(scene: &mut FrameScene, size: Size, panel: &TaskPanel<'_>) {
 
     // The lines the task has said, the newest at the bottom.
     let height = 18.0;
-    let room = ((rect.size.height - 44.0) / height).floor().max(1.0) as usize;
+    // The room the lines have is smaller when there is a line being typed
+    // under them.
+    let taken = if panel.input.is_some() { 28.0 } else { 0.0 };
+    let room = ((rect.size.height - 44.0 - taken) / height).floor().max(1.0) as usize;
     let shown = panel.lines.len().min(room);
     let first = panel.lines.len() - shown;
     for (index, line) in panel.lines.iter().skip(first).enumerate() {
@@ -5093,6 +5871,49 @@ fn push_task_panel(scene: &mut FrameScene, size: Size, panel: &TaskPanel<'_>) {
                 family: TextFamily::SansSerif,
             },
         );
+    }
+
+    // The line that is being typed into the task.
+    if let Some(input) = panel.input {
+        let y = rect.origin.y + rect.size.height - 26.0;
+        let prompt = "> ";
+        let text = input.text();
+        scene.push_text(
+            format!("{prompt}{text}"),
+            Rect::new(
+                rect.origin.x + 12.0,
+                y,
+                (rect.size.width - 24.0).max(1.0),
+                20.0,
+            ),
+            TextStyle {
+                clip: viewport,
+                color: if panel.focused {
+                    Color::rgb(0.86, 0.89, 0.94)
+                } else {
+                    // The keyboard is not here: the line is dimmer.
+                    Color::rgb(0.48, 0.52, 0.60)
+                },
+                font_size: 13.0,
+                line_height: 18.0,
+                family: TextFamily::SansSerif,
+            },
+        );
+        // The caret stands where the person put it, not at the end.
+        if panel.focused {
+            let prompt_width = measurer.measure(prompt, 13.0).width;
+            let before = measurer.measure(&text[..input.caret()], 13.0).width;
+            scene.push_quad(
+                Rect::new(
+                    rect.origin.x + 12.0 + prompt_width + before,
+                    y + 1.0,
+                    1.5,
+                    16.0,
+                ),
+                Color::rgb(0.30, 0.58, 0.96),
+                rect,
+            );
+        }
     }
 }
 
@@ -5643,8 +6464,220 @@ mod tests {
     }
 
     #[test]
-    fn the_place_of_a_breakpoint_is_released_when_it_is_taken_away() {
-        let directory = scratch_dir("breakpoint-released");
+    fn the_condition_key_asks_for_the_condition_of_the_breakpoint() {
+        let mut app = app_with_file("breakpoint-condition");
+        let uri = app.uri_of_the_open_file().expect("the file has an address");
+        app.toggle_breakpoint();
+        assert_eq!(app.breakpoints.lines_of(&uri), vec![1]);
+
+        app.modifiers = ModifiersState::CONTROL;
+        assert!(app.handle_breakpoint_condition_key(&named(NamedKey::F9), None));
+        assert!(
+            app.breakpoint_condition.is_some(),
+            "the box that asks for the condition is open"
+        );
+        assert_eq!(app.breakpoint_condition_line, Some(1));
+    }
+
+    #[test]
+    fn a_condition_that_is_written_is_remembered() {
+        let mut app = app_with_file("breakpoint-condition-written");
+        let uri = app.uri_of_the_open_file().expect("the file has an address");
+        app.toggle_breakpoint();
+
+        app.modifiers = ModifiersState::CONTROL;
+        app.handle_breakpoint_condition_key(&named(NamedKey::F9), None);
+        app.modifiers = ModifiersState::default();
+        for letter in ["c", ">", "3"] {
+            app.handle_breakpoint_condition_key(&character(letter), Some(letter));
+        }
+        app.handle_breakpoint_condition_key(&named(NamedKey::Enter), None);
+
+        assert_eq!(app.breakpoints.condition_of(&uri, 1), Some("c>3"));
+        assert!(
+            app.breakpoint_condition.is_none(),
+            "the box is closed"
+        );
+    }
+
+    #[test]
+    fn an_empty_condition_takes_the_condition_away() {
+        let mut app = app_with_file("breakpoint-condition-empty");
+        let uri = app.uri_of_the_open_file().expect("the file has an address");
+        app.toggle_breakpoint();
+        app.breakpoints.set_condition(&uri, 1, Some("c>3"));
+
+        // The box opens with the condition that is there.
+        app.modifiers = ModifiersState::CONTROL;
+        app.handle_breakpoint_condition_key(&named(NamedKey::F9), None);
+        app.modifiers = ModifiersState::default();
+        let box_ = app.breakpoint_condition.as_ref().expect("the box is there");
+        assert_eq!(box_.text(), "c>3");
+
+        // The condition is taken away by writing nothing.
+        app.handle_breakpoint_condition_key(&named(NamedKey::Enter), None);
+        assert_eq!(app.breakpoints.condition_of(&uri, 1), None);
+        assert_eq!(
+            app.breakpoints.lines_of(&uri),
+            vec![1],
+            "the breakpoint is still there"
+        );
+    }
+
+    #[test]
+    fn a_line_without_a_breakpoint_has_no_condition_to_ask_for() {
+        let mut app = app_with_file("breakpoint-condition-none");
+        app.modifiers = ModifiersState::CONTROL;
+        app.handle_breakpoint_condition_key(&named(NamedKey::F9), None);
+
+        assert!(
+            app.breakpoint_condition.is_none(),
+            "there is no box to open"
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("还没有断点")),
+            "the editor has to say why: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn without_a_debug_session_there_is_nothing_to_evaluate() {
+        let mut app = app_with_file("debug-expression-none");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(app.handle_debug_expression_key(&character("e"), None));
+        assert!(
+            app.debug_expression.is_none(),
+            "there is no box to open"
+        );
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("没有调试会话")),
+            "the editor has to say why: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn an_empty_expression_is_not_asked_about() {
+        let mut app = app_with_file("debug-expression-empty");
+        app.evaluate_the_expression("   ");
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("不能是空的")),
+            "the editor has to say why: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn the_expression_box_takes_the_keys_that_are_typed() {
+        let mut app = app_with_file("debug-expression-typed");
+        app.debug_expression = Some(CommandBox::titled("求值"));
+
+        for letter in ["c", "o", "u", "n", "t"] {
+            assert!(app.handle_debug_expression_key(&character(letter), Some(letter)));
+        }
+        let box_ = app.debug_expression.as_ref().expect("the box is there");
+        assert_eq!(box_.text(), "count");
+
+        // The box closes when the expression is asked about.
+        app.handle_debug_expression_key(&named(NamedKey::Enter), None);
+        assert!(app.debug_expression.is_none(), "the box is closed");
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("没有调试会话")),
+            "the editor has to say why it cannot ask: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn the_text_is_replaced_in_the_files_that_were_found() {
+        let directory = scratch_dir("search-replaces");
+        let file = directory.join("notes.txt");
+        fs::write(&file, "the needle is here\nand the needle is there\n").unwrap();
+        let other = directory.join("other.txt");
+        fs::write(&other, "a needle here\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        // The panel is opened to find and to replace.
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        app.handle_search_key(&character("h"), None);
+        app.modifiers = ModifiersState::default();
+        for letter in ["n", "e", "e", "d", "l", "e"] {
+            app.handle_search_key(&character(letter), Some(letter));
+        }
+        app.handle_search_key(&named(NamedKey::Enter), None);
+
+        // The search runs on a thread of its own: the answer comes later.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while app
+            .search
+            .as_ref()
+            .is_some_and(|panel| panel.is_running())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the search did not finish"
+            );
+            app.pump_search();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let hits = app
+            .search
+            .as_ref()
+            .map(|panel| panel.hits().len())
+            .unwrap_or(0);
+        assert_eq!(hits, 2, "the text is in two files");
+
+        // The tab key twice: the places, and then the replacement.
+        app.handle_search_key(&named(NamedKey::Tab), None);
+        app.handle_search_key(&named(NamedKey::Tab), None);
+        for letter in ["p", "i", "n"] {
+            app.handle_search_key(&character(letter), Some(letter));
+        }
+        app.handle_search_key(&named(NamedKey::Enter), None);
+
+        // The file that is open changes in its buffer.
+        assert_eq!(
+            app.editor().text(),
+            "the pin is here\nand the pin is there\n"
+        );
+        // The file that is not open goes to disk.
+        assert_eq!(
+            fs::read_to_string(&other).unwrap(),
+            "a pin here\n",
+            "the file on disk was changed"
+        );
+        // One undo takes the whole change back.
+        app.editor_mut().undo().expect("the change can be taken back");
+        assert_eq!(app.editor().text(), "the needle is here\nand the needle is there\n");
+    }
+
+    #[test]
+    fn a_file_that_does_not_hold_the_text_any_more_is_not_changed() {
+        let directory = scratch_dir("search-replaces-changed");
+        let file = directory.join("notes.txt");
+        fs::write(&file, "the needle is here\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        // The file does not hold the text any more: the search found it, but
+        // the file changed after that.
+        let (files, places, skipped) = app.replace_in_the_files("needle", "pin");
+        assert_eq!(files, 0);
+        assert_eq!(places, 0);
+        assert_eq!(skipped, 0, "there was no file to change at all");
+        assert_eq!(app.editor().text(), "the needle is here\n");
+    }
+
+    #[test]
+    fn the_place_of_a_breakpoint_is_released_when_it_is_taken_away() {        let directory = scratch_dir("breakpoint-released");
         let file = directory.join("notes.txt");
         fs::write(&file, "one\ntwo\n").unwrap();
 
@@ -5689,6 +6722,150 @@ mod tests {
         app.follow_the_breakpoints();
 
         assert_eq!(app.breakpoints.lines_of(&uri), vec![4]);
+    }
+
+    /// An application with a file that is open.
+    fn app_with_file(name: &str) -> NativeApplication {
+        let directory = scratch_dir(name);
+        let file = directory.join("notes.txt");
+        fs::write(&file, "one\ntwo\n").unwrap();
+        NativeApplication::new(Some(file)).expect("the application starts")
+    }
+
+    #[test]
+    fn the_terminal_key_opens_the_terminal() {
+        let mut app = app_with_file("terminal-opens");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(app.handle_terminal_key(&character("t"), None));
+        assert!(app.terminal_input.is_some(), "the terminal is there");
+        assert!(app.terminal_has_focus, "the terminal has the keyboard");
+        assert!(app.task_panel, "the panel of the task is open");
+    }
+
+    #[test]
+    fn what_is_typed_goes_into_the_terminal_and_not_into_the_document() {
+        let mut app = app_with_file("terminal-types");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        app.handle_terminal_key(&character("t"), None);
+        app.modifiers = ModifiersState::default();
+
+        assert!(app.handle_terminal_key(&character("e"), Some("e")));
+        let terminal = app.terminal_input.as_ref().expect("the terminal is there");
+        assert_eq!(terminal.text(), "e");
+        assert_eq!(
+            app.editor().text(),
+            "one\ntwo\n",
+            "the letter did not go into the document"
+        );
+    }
+
+    #[test]
+    fn the_escape_key_gives_the_keyboard_back_to_the_document() {
+        let mut app = app_with_file("terminal-escape");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        app.handle_terminal_key(&character("t"), None);
+        app.modifiers = ModifiersState::default();
+
+        assert!(app.handle_terminal_key(&named(NamedKey::Escape), None));
+        assert!(
+            !app.terminal_has_focus,
+            "the keyboard is the document's again"
+        );
+        assert!(
+            app.terminal_input.is_some(),
+            "the terminal is still there: the shell goes on"
+        );
+
+        // What is typed now goes into the document.
+        assert!(!app.handle_terminal_key(&character("x"), Some("x")));
+        let terminal = app.terminal_input.as_ref().expect("the terminal is there");
+        assert_eq!(terminal.text(), "", "the letter did not go into the terminal");
+        assert!(
+            app.editor().text().contains('x'),
+            "the letter went into the document: {:?}",
+            app.editor().text()
+        );
+    }
+
+    #[test]
+    fn the_terminal_key_takes_the_keyboard_back() {
+        let mut app = app_with_file("terminal-back");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        app.handle_terminal_key(&character("t"), None);
+        app.modifiers = ModifiersState::default();
+        app.handle_terminal_key(&named(NamedKey::Escape), None);
+        assert!(!app.terminal_has_focus);
+
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(app.handle_terminal_key(&character("t"), None));
+        assert!(app.terminal_has_focus, "the keyboard is in the terminal again");
+        app.modifiers = ModifiersState::default();
+        assert!(app.handle_terminal_key(&character("e"), Some("e")));
+        let terminal = app.terminal_input.as_ref().expect("the terminal is there");
+        assert_eq!(terminal.text(), "e");
+    }
+
+    #[test]
+    fn a_task_cannot_start_while_the_terminal_is_open() {
+        let mut app = app_with_file("terminal-task");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        app.handle_terminal_key(&character("t"), None);
+
+        app.start_build_task();
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("终端")),
+            "the editor has to say why: {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn the_terminal_gives_the_keyboard_up_when_a_shortcut_is_pressed() {
+        let mut app = app_with_file("terminal-shortcut");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        app.handle_terminal_key(&character("t"), None);
+        app.modifiers = ModifiersState::default();
+
+        // Ctrl and a letter: the shortcut belongs to the editor.
+        app.modifiers = ModifiersState::CONTROL;
+        assert!(!app.handle_terminal_key(&character("f"), Some("f")));
+        assert!(
+            !app.terminal_has_focus,
+            "the keyboard is the editor's again, so what is typed goes where the shortcut opened"
+        );
+    }
+
+    #[test]
+    fn the_enter_key_sends_the_line_to_the_shell() {
+        let mut app = app_with_file("terminal-sends");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        app.handle_terminal_key(&character("t"), None);
+        app.modifiers = ModifiersState::default();
+        for letter in ["e", "c", "h", "o"] {
+            app.handle_terminal_key(&character(letter), Some(letter));
+        }
+        app.handle_terminal_key(&named(NamedKey::Enter), None);
+
+        // The shell says it on a thread of its own.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let output = app
+                .task
+                .as_ref()
+                .expect("the shell is running")
+                .output();
+            if output.lines.iter().any(|line| line.contains("hello")) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell did not say it: {:?}",
+                output.lines
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 
     /// A directory of scratch files for the checks that need more than one.

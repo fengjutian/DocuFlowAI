@@ -13,13 +13,20 @@
 #
 # 1. F9 puts a breakpoint on the line of the caret, and the breakpoint is
 #    drawn in the margin of the text.
-# 2. A line that is put above the breakpoint moves the breakpoint with it: the
+# 2. Ctrl+F9 gives the breakpoint a condition, and a breakpoint with a
+#    condition is drawn in another colour.
+# 3. A line that is put above the breakpoint moves the breakpoint with it: the
 #    breakpoint follows the text it is on, and the undo takes it back.
-# 3. F5 starts the debug session, and the panel of the debugger is drawn at
+# 4. F5 starts the debug session, and the panel of the debugger is drawn at
 #    the bottom of the window.
-# 4. The variables of the frame the program is stopped in are in the panel:
+# 5. The variables of the frame the program is stopped in are in the panel:
 #    the name, the type and the value of every variable.
-# 5. F10 walks one line, and the program stops again with its variables.
+# 6. F10 walks one line, and the program stops again with its variables.
+# 7. Ctrl+Shift+E asks for an expression, and what the adapter says about
+#    it is in the panel.
+# 8. The stack of the program is in the panel, and a click on a frame of it
+#    picks that frame: the mark of the frame that is picked moves to the
+#    frame that was clicked on.
 #
 # The keys are injected into the system, the way a keyboard would, because the
 # window reads the state of the modifiers from the keyboard itself.
@@ -38,10 +45,13 @@ $run = Join-Path $env:LOCALAPPDATA 'CodeWeaver\check'
 $project = Join-Path $run 'debug-project'
 $source = Join-Path $project 'main.rs'
 $shotBreakpoint = Join-Path $logs 'debug-breakpoint.png'
+$shotConditional = Join-Path $logs 'debug-conditional.png'
 $shotMoved = Join-Path $logs 'debug-moved.png'
 $shotUndone = Join-Path $logs 'debug-undone.png'
 $shotStopped = Join-Path $logs 'debug-stopped.png'
+$shotPicked = Join-Path $logs 'debug-picked.png'
 $shotStepped = Join-Path $logs 'debug-stepped.png'
+$shotEvaluated = Join-Path $logs 'debug-evaluated.png'
 $report = Join-Path $logs 'debug-check.json'
 
 $sig = @'
@@ -63,6 +73,7 @@ public class Win32 {
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int command);
   [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
   [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint flags, int dx, int dy, uint data, UIntPtr extra);
   [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr value);
   [DllImport("user32.dll")] public static extern IntPtr GetThreadDpiAwarenessContext();
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -115,6 +126,7 @@ $VK_Z = 0x5A
 $VK_F5 = 0x74
 $VK_F9 = 0x78
 $VK_F10 = 0x79
+$VK_E = 0x45
 
 function To-Srgb([double]$value) {
     if ($value -le 0.0031308) { return $value * 12.92 }
@@ -124,21 +136,44 @@ function To-Bytes([double[]]$value) {
     return @($value | ForEach-Object { [int][Math]::Round($_ * 255) })
 }
 # The ground of the panel of the debugger, the colour of the breakpoint in
-# the margin, the colour of the text of a variable, and the colour of what
-# the adapter said.
+# the margin, the colour of a breakpoint with a condition, the colour of the
+# text of a variable, the colour of what the adapter said, the colour of the
+# text of a frame of the stack, and the colour of the mark of the frame that
+# is picked.
 $GROUND_RGB = To-Bytes @(0.055, 0.063, 0.082)
 $BREAKPOINT_RGB = To-Bytes @(0.90, 0.35, 0.35)
+$CONDITIONAL_RGB = To-Bytes @(0.95, 0.68, 0.25)
 $VARIABLE_RGB = To-Bytes @(0.82, 0.86, 0.92)
 $OUTPUT_RGB = To-Bytes @(0.62, 0.67, 0.76)
+$FRAME_RGB = To-Bytes @(0.74, 0.80, 0.70)
+$MARKER_RGB = To-Bytes @(0.30, 0.58, 0.96)
 
 # The places of the panel, in the pixels of the window.
 #
 # The panel is at the bottom of the window, under the text of the document,
 # and the breakpoint is in the margin of the text, on the left.
+#
+# The panel is 220 pixels high and the window is 750: the panel starts at
+# 530. Its title is at 538, the headings of the two columns are at 562, and
+# the first row of them is at 580. The column of the stack is on the left:
+# the mark of the frame that is picked is at 12, and the text of the frames
+# is at 24. The column of the variables is at 328.
+#
+# The adapter answers with three frames and two variables, so what the
+# adapter said starts under the taller of the two columns, at 634.
 $PANEL_HEIGHT = 220
 $BREAKPOINT_X = 224
 $BREAKPOINT_Y = 84
-$VARIABLE_Y = 170
+$MARKER_X = 12
+$FRAME_X = 24
+$FRAME_Y = 580
+$VARIABLE_X = 328
+$VARIABLE_Y = 580
+$OUTPUT_Y = 634
+
+# The flags of the mouse of Windows.
+$MOUSEEVENTF_LEFTDOWN = 0x0002
+$MOUSEEVENTF_LEFTUP = 0x0004
 
 if (-not (Test-Path $exe)) {
     throw "the editor is not built; run 'cargo build -p codeweaver-editor' first"
@@ -223,6 +258,49 @@ function Send-Key([int]$virtualKey) {
     Start-Sleep -Milliseconds 60
     [Win32]::keybd_event([byte]$virtualKey, 0, [uint32]2, [UIntPtr]::Zero)
     Start-Sleep -Milliseconds 60
+}
+
+# The key of one character.
+function Get-VirtualKey([char]$character) {
+    if ($character -eq ' ') { return 0x20 }
+    $code = [int][char]$character
+    if ($code -ge 97 -and $code -le 122) { return 0x41 + ($code - 97) }
+    if ($code -ge 48 -and $code -le 57) { return 0x30 + ($code - 48) }
+    throw "the check cannot press the key $character"
+}
+
+# Types a text.
+function Send-Text([string]$text) {
+    foreach ($character in $text.ToCharArray()) {
+        if ($character -eq '>') {
+            # The greater-than sign is the period with the shift held.
+            Send-Chord @($VK_SHIFT) 0xBE
+            continue
+        }
+        Send-Key (Get-VirtualKey $character)
+    }
+}
+
+# Clicks on a place of the window.
+#
+# The place is in the pixels of the window, the way the editor counts them.
+# The cursor is put there, the button goes down, and the button comes up.
+# The cursor goes away from the editor again afterwards: the editor follows
+# the real cursor, and a cursor that is left over the window would be a race
+# for the checks that come after.
+function Click-At([IntPtr]$handle, [double]$x, [double]$y) {
+    $where = New-Object Win32+POINT
+    $where.X = To-Screen $x
+    $where.Y = To-Screen $y
+    [Win32]::ClientToScreen($handle, [ref]$where) | Out-Null
+    [Win32]::SetCursorPos($where.X, $where.Y) | Out-Null
+    Start-Sleep -Milliseconds 300
+    [Win32]::mouse_event($MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 120
+    [Win32]::mouse_event($MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 600
+    [Win32]::SetCursorPos(10, 10) | Out-Null
+    Start-Sleep -Milliseconds 300
 }
 
 function Save-Window([IntPtr]$handle, [string]$path) {
@@ -385,6 +463,25 @@ try {
         Write-Host "pixels of the breakpoint in the margin: $dot"
         Check 'the breakpoint is drawn in the margin' ($dot -gt 10) "$dot pixels of the breakpoint"
 
+        # Ctrl+F9 gives the breakpoint a condition, and a breakpoint with a
+        # condition is drawn in another colour: it stops the program only
+        # sometimes.
+        $previous = Focus-Editor $handle
+        Send-Chord @($VK_CONTROL) $VK_F9
+        Start-Sleep -Seconds 2
+        Send-Text 'x>3'
+        Start-Sleep -Seconds 2
+        Send-Key $VK_RETURN
+        Start-Sleep -Seconds 2
+
+        $conditionalShot = Save-Window $handle $shotConditional
+        Write-Host "saved $shotConditional"
+        $amber = Count-In $conditionalShot (To-Screen $BREAKPOINT_X) (To-Screen $BREAKPOINT_Y) (To-Screen 20) (To-Screen 20) $CONDITIONAL_RGB 14
+        $red = Count-In $conditionalShot (To-Screen $BREAKPOINT_X) (To-Screen $BREAKPOINT_Y) (To-Screen 20) (To-Screen 20) $BREAKPOINT_RGB 14
+        Write-Host "pixels of the breakpoint with a condition: $amber of the other colour, $red of the plain one"
+        Check 'a breakpoint with a condition is drawn in another colour' ($amber -gt 10 -and $red -lt 10) `
+            "$amber pixels of the conditional breakpoint, $red pixels of the plain one"
+
         # A line that is put above the breakpoint moves the breakpoint with it.
         $previous = Focus-Editor $handle
         Send-Key $VK_RETURN
@@ -392,8 +489,8 @@ try {
 
         $movedShot = Save-Window $handle $shotMoved
         Write-Host "saved $shotMoved"
-        $below = Count-In $movedShot (To-Screen $BREAKPOINT_X) (To-Screen ($BREAKPOINT_Y + 22)) (To-Screen 20) (To-Screen 20) $BREAKPOINT_RGB 14
-        $above = Count-In $movedShot (To-Screen $BREAKPOINT_X) (To-Screen $BREAKPOINT_Y) (To-Screen 20) (To-Screen 20) $BREAKPOINT_RGB 14
+        $below = Count-In $movedShot (To-Screen $BREAKPOINT_X) (To-Screen ($BREAKPOINT_Y + 22)) (To-Screen 20) (To-Screen 20) $CONDITIONAL_RGB 14
+        $above = Count-In $movedShot (To-Screen $BREAKPOINT_X) (To-Screen $BREAKPOINT_Y) (To-Screen 20) (To-Screen 20) $CONDITIONAL_RGB 14
         Write-Host "pixels of the breakpoint: $below on the line below, $above on the line above"
         Check 'the breakpoint follows the text above it' ($below -gt 10 -and $above -lt 10) "$below pixels below, $above pixels above"
 
@@ -404,7 +501,7 @@ try {
 
         $undoneShot = Save-Window $handle $shotUndone
         Write-Host "saved $shotUndone"
-        $back = Count-In $undoneShot (To-Screen $BREAKPOINT_X) (To-Screen $BREAKPOINT_Y) (To-Screen 20) (To-Screen 20) $BREAKPOINT_RGB 14
+        $back = Count-In $undoneShot (To-Screen $BREAKPOINT_X) (To-Screen $BREAKPOINT_Y) (To-Screen 20) (To-Screen 20) $CONDITIONAL_RGB 14
         Write-Host "pixels of the breakpoint after the undo: $back"
         Check 'the breakpoint goes back with the undo' ($back -gt 10) "$back pixels of the breakpoint"
 
@@ -418,8 +515,8 @@ try {
         for ($attempt = 1; $attempt -le 6; $attempt++) {
             Start-Sleep -Seconds 3
             $shot = Save-Window $handle $shotStopped
-            $variables = Count-In $shot (To-Screen 12) (To-Screen $VARIABLE_Y) (To-Screen 500) (To-Screen 20) $VARIABLE_RGB 14
-            $said = Count-In $shot (To-Screen 12) (To-Screen ($VARIABLE_Y + 40)) (To-Screen 500) (To-Screen 120) $OUTPUT_RGB 14
+            $variables = Count-In $shot (To-Screen $VARIABLE_X) (To-Screen $VARIABLE_Y) (To-Screen 500) (To-Screen 20) $VARIABLE_RGB 14
+            $said = Count-In $shot (To-Screen 12) (To-Screen $OUTPUT_Y) (To-Screen 500) (To-Screen 100) $OUTPUT_RGB 14
             Write-Host "attempt ${attempt}: $variables pixels of variables, $said pixels of what the adapter said"
             if ($variables -gt 20) {
                 $stoppedShot = $shot
@@ -435,31 +532,80 @@ try {
 
         Check 'what the adapter said is in the panel' ($said -gt 20) "$said pixels of what the adapter said"
 
-        # F10 walks one line, and the program stops again.
+        # The stack of the program is in the panel, and the frame that is
+        # picked is marked.
+        $stack = Count-In $stoppedShot (To-Screen $FRAME_X) (To-Screen $FRAME_Y) (To-Screen 280) (To-Screen 40) $FRAME_RGB 14
+        Write-Host "pixels of the frames of the stack: $stack"
+        Check 'the stack of the program is in the panel' ($stack -gt 20) "$stack pixels of the frames"
+
+        $marked = Count-In $stoppedShot (To-Screen $MARKER_X) (To-Screen $FRAME_Y) (To-Screen 6) (To-Screen 18) $MARKER_RGB 14
+        Write-Host "pixels of the mark of the frame that is picked: $marked"
+        Check 'the frame that is picked is marked' ($marked -gt 5) "$marked pixels of the mark"
+
+        # A click on the second frame of the stack picks that frame: the
+        # mark moves to the frame that was clicked on.
+        $previous = Focus-Editor $handle
+        Click-At $handle 40 ($FRAME_Y + 18)
+        Start-Sleep -Seconds 2
+
+        $pickedShot = Save-Window $handle $shotPicked
+        Write-Host "saved $shotPicked"
+        $markedSecond = Count-In $pickedShot (To-Screen $MARKER_X) (To-Screen ($FRAME_Y + 18)) (To-Screen 6) (To-Screen 18) $MARKER_RGB 14
+        $markedFirst = Count-In $pickedShot (To-Screen $MARKER_X) (To-Screen $FRAME_Y) (To-Screen 6) (To-Screen 18) $MARKER_RGB 14
+        Write-Host "pixels of the mark: $markedFirst on the first frame, $markedSecond on the second one"
+        Check 'a click picks the frame that was clicked on' ($markedSecond -gt 5 -and $markedFirst -lt 5) `
+            "$markedSecond pixels on the second frame, $markedFirst on the first one"
+
+        # The frame that is picked is the top one again: the program stops
+        # at the same place, and the stack is read again.
         $previous = Focus-Editor $handle
         Send-Key $VK_F10
         Start-Sleep -Seconds 3
 
         $steppedShot = Save-Window $handle $shotStepped
         Write-Host "saved $shotStepped"
-        $stepped = Count-In $steppedShot (To-Screen 12) (To-Screen $VARIABLE_Y) (To-Screen 500) (To-Screen 20) $VARIABLE_RGB 14
+        $stepped = Count-In $steppedShot (To-Screen $VARIABLE_X) (To-Screen $VARIABLE_Y) (To-Screen 500) (To-Screen 20) $VARIABLE_RGB 14
         Write-Host "pixels of the variables after the step: $stepped"
         Check 'the program stops again after a step' ($stepped -gt 20) "$stepped pixels of the variables"
+
+        # Ctrl+Shift+E asks for an expression to be worked out, and what the
+        # adapter says about it is in the panel.
+        $previous = Focus-Editor $handle
+        Send-Chord @($VK_CONTROL, $VK_SHIFT) $VK_E
+        Start-Sleep -Seconds 2
+        Send-Text 'count'
+        Start-Sleep -Seconds 2
+        Send-Key $VK_RETURN
+        Start-Sleep -Seconds 3
+
+        $evaluatedShot = Save-Window $handle $shotEvaluated
+        Write-Host "saved $shotEvaluated"
+        $evaluated = Count-In $evaluatedShot (To-Screen 12) (To-Screen $OUTPUT_Y) (To-Screen 500) (To-Screen 100) $OUTPUT_RGB 14
+        Write-Host "pixels of what the panel says: $said before, $evaluated after"
+        Check 'the worth of the expression is in the panel' ($evaluated -gt $said) `
+            "$evaluated pixels after, $said before"
 
         $result = @{
             checks = $script:checks
             project = $project
             pixels = @{
                 breakpoint = $dot
+                conditional = $amber
+                conditionalPlain = $red
                 breakpointBelow = $below
                 breakpointAbove = $above
                 breakpointAfterUndo = $back
                 ground = $ground
                 variables = $variables
                 output = $said
+                stack = $stack
+                marker = $marked
+                markerAfterClick = $markedSecond
+                markerBeforeClick = $markedFirst
                 variablesAfterStep = $stepped
+                outputAfterEvaluation = $evaluated
             }
-            shots = @($shotBreakpoint, $shotMoved, $shotUndone, $shotStopped, $shotStepped)
+            shots = @($shotBreakpoint, $shotConditional, $shotMoved, $shotUndone, $shotStopped, $shotPicked, $shotStepped, $shotEvaluated)
         }
         [System.IO.File]::WriteAllText($report, ($result | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
         Write-Host "saved $report"

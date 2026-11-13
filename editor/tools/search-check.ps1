@@ -16,6 +16,9 @@
 # 4. The enter key opens the file of the place that is picked: the panel goes
 #    away, the document is there again, and the editor says what it opened.
 # 5. The escape key closes the panel.
+# 6. Ctrl+Shift+H opens the panel to replace as well as to find: the box of
+#    the replacement is there, and what is written in it replaces what was
+#    found, in the files that are open and in the files that are not.
 #
 # The keys are injected into the system, the way a keyboard would, because the
 # window reads the state of the modifiers from the keyboard itself.
@@ -36,6 +39,8 @@ $shotPanel = Join-Path $logs 'search-panel.png'
 $shotFound = Join-Path $logs 'search-found.png'
 $shotOpened = Join-Path $logs 'search-opened.png'
 $shotEmpty = Join-Path $logs 'search-empty.png'
+$shotReplace = Join-Path $logs 'search-replace.png'
+$shotUndone = Join-Path $logs 'search-undone.png'
 $report = Join-Path $logs 'search-check.json'
 
 $sig = @'
@@ -106,7 +111,9 @@ $VK_CONTROL = 0x11
 $VK_ESCAPE = 0x1B
 $VK_RETURN = 0x0D
 $VK_BACK = 0x08
+$VK_TAB = 0x09
 $VK_F = 0x46
+$VK_H = 0x48
 
 function To-Srgb([double]$value) {
     if ($value -le 0.0031308) { return $value * 12.92 }
@@ -123,6 +130,7 @@ $TYPED_RGB = To-Bytes @(0.86, 0.89, 0.94)
 $PLACE_RGB = To-Bytes @(0.62, 0.70, 0.86)
 $BODY_RGB = To-Bytes @(0.075, 0.086, 0.11)
 $STATUS_RGB = To-Bytes @(0.55, 0.60, 0.70)
+$BOX_RGB = To-Bytes @(0.10, 0.12, 0.16)
 
 # The places of the panel and of the window, in the pixels of the window.
 #
@@ -493,6 +501,54 @@ try {
         Write-Host "pixels of the ground after the escape: $closedGround"
         Check 'the escape key closes the panel' ($closedGround -lt 10000) "$closedGround pixels of the ground"
 
+        # Ctrl+Shift+H opens the panel to replace as well as to find.
+        $previous = Focus-Editor $handle
+        Send-Chord @($VK_CONTROL, $VK_SHIFT) $VK_H
+        Start-Sleep -Seconds 3
+
+        $replaceShot = Save-Window $handle $shotReplace
+        Write-Host "saved $shotReplace"
+        $replaceTop = To-Screen ($BOX_Y + $BOX_HEIGHT + 8)
+        $replaceBox = Count-In $replaceShot $boxLeft $replaceTop $boxWidth $boxHeight $BOX_RGB 6
+        Write-Host "pixels of the box of the replacement: $replaceBox"
+        Check 'the panel has a box for the replacement' ($replaceBox -gt 500) "$replaceBox pixels of the box"
+
+        # The word is written again, the search runs, and then the
+        # replacement is written in the box of the replacement.
+        $previous = Focus-Editor $handle
+        for ($i = 0; $i -lt 12; $i++) { Send-Key $VK_BACK }
+        Send-Word 'needle'
+        Send-Key $VK_RETURN
+        Start-Sleep -Seconds 4
+        $previous = Focus-Editor $handle
+        Send-Key $VK_TAB
+        Send-Key $VK_TAB
+        Send-Word 'pin'
+        Send-Key $VK_RETURN
+        Start-Sleep -Seconds 5
+
+        # The file that is not open in the editor goes to disk.
+        $other = Join-Path $project 'other\notes2.txt'
+        $onDisk = [System.IO.File]::ReadAllText($other)
+        Write-Host "the file on disk says: $onDisk"
+        Check 'the text is replaced in the files that were found' `
+            ($onDisk -match 'the pin is over here') "the file says: $onDisk"
+
+        # The file that is open in the editor changes in its buffer: the
+        # undo takes it back.
+        $previous = Focus-Editor $handle
+        Send-Key $VK_ESCAPE
+        Start-Sleep -Seconds 2
+        $previous = Focus-Editor $handle
+        Send-Chord @($VK_CONTROL) $VK_Z
+        Start-Sleep -Seconds 3
+
+        $undoneShot = Save-Window $handle $shotUndone
+        Write-Host "saved $shotUndone"
+        $undone = Count-In $undoneShot $bodyLeft $bodyTop $bodyWidth $bodyHeight $BODY_RGB 3
+        Write-Host "pixels of the document after the undo: $undone"
+        Check 'the document is there again after the undo' ($undone -gt 10000) "$undone pixels of the document"
+
         $result = @{
             checks = $script:checks
             project = $project
@@ -505,8 +561,11 @@ try {
                 status = $said
                 placesOfTheHiddenWord = $none
                 groundAfterEscape = $closedGround
+                replaceBox = $replaceBox
+                documentAfterUndo = $undone
             }
-            shots = @($shotPanel, $shotFound, $shotOpened, $shotEmpty)
+            replaced = $onDisk
+            shots = @($shotPanel, $shotFound, $shotOpened, $shotEmpty, $shotReplace, $shotUndone)
         }
         [System.IO.File]::WriteAllText($report, ($result | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
         Write-Host "saved $report"

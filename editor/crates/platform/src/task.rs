@@ -9,12 +9,14 @@
 //! after the window is closed is a task nobody is watching.
 
 use std::{
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::Path,
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+use crate::rename::RenameBox;
 
 /// What a task is doing now.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -47,6 +49,13 @@ pub struct TaskPanel<'a> {
     pub state: &'a TaskState,
     /// What the task was asked to do.
     pub title: &'a str,
+    /// The line that is being typed into the task, when it takes input.
+    pub input: Option<&'a RenameBox>,
+    /// Whether the keyboard is in the line that is being typed.
+    ///
+    /// A line that is not being typed into is drawn dimmer, and without a
+    /// caret: the person has to see that what he types goes somewhere else.
+    pub focused: bool,
 }
 
 impl TaskPanel<'_> {
@@ -79,6 +88,11 @@ pub struct Task {
     output: Arc<Mutex<TaskOutput>>,
     /// The process of the task, so that it can be stopped.
     child: Arc<Mutex<Option<Child>>>,
+    /// The standard input of the task, when the task takes input.
+    ///
+    /// A terminal is a task whose input is a pipe: what the person types
+    /// goes into it.
+    input: Arc<Mutex<Option<ChildStdin>>>,
 }
 
 impl Task {
@@ -92,16 +106,43 @@ impl Task {
         args: &[String],
         directory: &Path,
     ) -> Result<Self, std::io::Error> {
+        Self::start_with(program, args, directory, false)
+    }
+
+    /// Starts a program that takes input, and watches what it says.
+    ///
+    /// The standard input of the program is a pipe: what the person types
+    /// goes into it. This is what a terminal is.
+    pub fn start_with_input(
+        program: &str,
+        args: &[String],
+        directory: &Path,
+    ) -> Result<Self, std::io::Error> {
+        Self::start_with(program, args, directory, true)
+    }
+
+    /// Starts a program, and says whether it takes input.
+    fn start_with(
+        program: &str,
+        args: &[String],
+        directory: &Path,
+        takes_input: bool,
+    ) -> Result<Self, std::io::Error> {
         let mut command = Command::new(program);
         command
             .args(args)
             .current_dir(directory)
-            .stdin(Stdio::null())
+            .stdin(if takes_input {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn()?;
         let stdout = child.stdout.take().expect("stdout was piped");
         let stderr = child.stderr.take().expect("stderr was piped");
+        let input = child.stdin.take();
 
         let output = Arc::new(Mutex::new(TaskOutput::default()));
         // The output is read on threads of its own: a task that says a lot
@@ -147,7 +188,11 @@ impl Task {
             }
         });
 
-        Ok(Task { output, child })
+        Ok(Task {
+            output,
+            child,
+            input: Arc::new(Mutex::new(input)),
+        })
     }
 
     /// What the task has said so far.
@@ -161,6 +206,30 @@ impl Task {
     /// Whether the task is still running.
     pub fn is_running(&self) -> bool {
         self.output().state == TaskState::Running
+    }
+
+    /// Writes a line into the task.
+    ///
+    /// The task says nothing about it: a program that reads its input is
+    /// the one that says something.
+    pub fn write_input(&self, text: &str) -> Result<(), String> {
+        let mut guard = self.input.lock().expect("the input lock is not poisoned");
+        let Some(input) = guard.as_mut() else {
+            return Err("这个任务不收输入".to_owned());
+        };
+        input
+            .write_all(text.as_bytes())
+            .and_then(|_| input.flush())
+            .map_err(|error| format!("写不进去：{error}"))
+    }
+
+    /// Puts a line into what the task has said.
+    ///
+    /// A shell that reads its input from a pipe echoes nothing: the editor
+    /// says the line itself, so that the panel shows what was typed.
+    pub fn echo(&self, line: &str) {
+        let mut output = self.output.lock().expect("the output lock is not poisoned");
+        output.lines.push(line.to_owned());
     }
 
     /// Stops the task.
@@ -177,6 +246,22 @@ impl Drop for Task {
         // A task that keeps running after the editor is gone is a task
         // nobody is watching.
         self.stop();
+    }
+}
+
+/// The shell of the machine.
+///
+/// It is a shell and not a terminal: the program is started with its input
+/// as a pipe, so that what the person types goes into it. A program that
+/// wants the whole screen (an editor of its own) does not work in it.
+pub fn shell_command() -> (&'static str, Vec<String>) {
+    #[cfg(windows)]
+    {
+        ("cmd.exe", Vec::new())
+    }
+    #[cfg(not(windows))]
+    {
+        ("sh", Vec::new())
     }
 }
 
@@ -280,6 +365,64 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn a_task_that_takes_input_reads_what_is_written_to_it() {
+        let directory = scratch_dir("task-input");
+        let task = Task::start_with_input(
+            "cmd",
+            &[
+                "/v:on".to_owned(),
+                "/c".to_owned(),
+                "set /p answer= && echo you said !answer!".to_owned(),
+            ],
+            &directory,
+        )
+        .expect("the task starts");
+
+        task.write_input("hello\n").expect("the input is written");
+
+        let output = wait_for_output(&task, |output| {
+            output.lines.iter().any(|line| line.contains("you said hello"))
+        });
+        assert!(
+            output.lines.iter().any(|line| line.contains("you said hello")),
+            "got {:?}",
+            output.lines
+        );
+    }
+
+    #[test]
+    fn a_task_that_does_not_take_input_says_so() {
+        let directory = scratch_dir("task-no-input");
+        let task = Task::start("cmd", &["/c".to_owned(), "echo hi".to_owned()], &directory)
+            .expect("the task starts");
+        let error = task
+            .write_input("hello\n")
+            .expect_err("the task does not take input");
+        assert!(error.contains("不收输入"), "got {error}");
+    }
+
+    #[test]
+    fn what_the_editor_says_is_in_what_the_task_has_said() {
+        let directory = scratch_dir("task-echo");
+        let task = Task::start("cmd", &["/c".to_owned(), "echo hi".to_owned()], &directory)
+            .expect("the task starts");
+        task.echo("the line that was typed");
+        let output = task.output();
+        assert!(
+            output.lines.contains(&"the line that was typed".to_owned()),
+            "got {:?}",
+            output.lines
+        );
+    }
+
+    #[test]
+    fn the_shell_of_the_machine_is_the_shell_of_the_machine() {
+        let (program, args) = shell_command();
+        assert!(!program.is_empty());
+        assert!(args.is_empty(), "the shell takes no arguments");
     }
 
     #[test]

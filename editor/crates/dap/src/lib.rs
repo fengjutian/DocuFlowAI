@@ -31,7 +31,7 @@ use std::{
 use serde_json::{Value, json};
 
 use crate::framing::{FrameReader, serialize};
-use crate::protocol::{Breakpoint, Scope, StackFrame, Variable};
+use crate::protocol::{Breakpoint, EvaluateResult, Scope, StackFrame, Variable};
 
 /// Something went wrong while talking to the adapter.
 #[derive(Debug, thiserror::Error)]
@@ -105,9 +105,28 @@ enum Pending {
     /// The answer of `stackTrace` is the list of the frames.
     StackTrace(Sender<Result<Vec<StackFrame>, DapError>>),
     /// The answer of `scopes` is the list of the groups of variables.
-    Scopes(Sender<Result<Vec<Scope>, DapError>>),
+    ///
+    /// The answer carries the frame the groups belong to: the editor has to
+    /// know whose groups these are.
+    Scopes {
+        /// The frame the groups belong to.
+        frame_id: i64,
+        /// The channel the answer goes to.
+        sender: Sender<Result<(i64, Vec<Scope>), DapError>>,
+    },
     /// The answer of `variables` is the list of the variables.
-    Variables(Sender<Result<Vec<Variable>, DapError>>),
+    ///
+    /// The answer carries the frame the variables belong to: the request
+    /// itself does not say it, and the editor has to know whose variables
+    /// it is looking at.
+    Variables {
+        /// The frame the variables belong to.
+        frame_id: i64,
+        /// The channel the answer goes to.
+        sender: Sender<Result<(i64, Vec<Variable>), DapError>>,
+    },
+    /// The answer of `evaluate` is the worth of the expression.
+    Evaluation(Sender<Result<EvaluateResult, DapError>>),
 }
 
 /// What a message of the adapter says.
@@ -224,8 +243,9 @@ pub struct Client {
     responses: Receiver<Result<Value, DapError>>,
     breakpoints: Receiver<Result<Vec<Breakpoint>, DapError>>,
     stack_traces: Receiver<Result<Vec<StackFrame>, DapError>>,
-    scopes: Receiver<Result<Vec<Scope>, DapError>>,
-    variables: Receiver<Result<Vec<Variable>, DapError>>,
+    scopes: Receiver<Result<(i64, Vec<Scope>), DapError>>,
+    variables: Receiver<Result<(i64, Vec<Variable>), DapError>>,
+    evaluations: Receiver<Result<EvaluateResult, DapError>>,
     /// Whether the adapter has said that it is ready.
     ready: Arc<AtomicBool>,
     /// Whether the adapter is still there.
@@ -241,8 +261,9 @@ struct Senders {
     responses: Sender<Result<Value, DapError>>,
     breakpoints: Sender<Result<Vec<Breakpoint>, DapError>>,
     stack_traces: Sender<Result<Vec<StackFrame>, DapError>>,
-    scopes: Sender<Result<Vec<Scope>, DapError>>,
-    variables: Sender<Result<Vec<Variable>, DapError>>,
+    scopes: Sender<Result<(i64, Vec<Scope>), DapError>>,
+    variables: Sender<Result<(i64, Vec<Variable>), DapError>>,
+    evaluations: Sender<Result<EvaluateResult, DapError>>,
 }
 
 impl Client {
@@ -270,6 +291,7 @@ impl Client {
         let (stack_trace_sender, stack_traces) = channel();
         let (scope_sender, scopes) = channel();
         let (variable_sender, variables) = channel();
+        let (evaluation_sender, evaluations) = channel();
         let senders = Senders {
             events: event_sender,
             responses: response_sender,
@@ -277,6 +299,7 @@ impl Client {
             stack_traces: stack_trace_sender,
             scopes: scope_sender,
             variables: variable_sender,
+            evaluations: evaluation_sender,
         };
         let pending: Arc<Mutex<HashMap<i64, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_seq = Arc::new(Mutex::new(1));
@@ -305,6 +328,7 @@ impl Client {
             stack_traces,
             scopes,
             variables,
+            evaluations,
             ready,
             running,
             reader: Some(reader),
@@ -347,21 +371,39 @@ impl Client {
         uri: &str,
         lines: &[u32],
     ) -> Result<(), DapError> {
-        let breakpoints: Vec<crate::protocol::SourceBreakpoint> = lines
+        let breakpoints: Vec<(u32, Option<String>)> =
+            lines.iter().map(|line| (*line, None)).collect();
+        self.set_breakpoints_with_conditions(uri, &breakpoints)
+    }
+
+    /// Tells the adapter where the breakpoints are, and what has to be true
+    /// for the program to stop at them.
+    ///
+    /// A breakpoint without a condition stops the program every time it comes
+    /// to that line. A breakpoint with one stops it only when the condition
+    /// is true, which is what the adapter has to work out.
+    pub fn set_breakpoints_with_conditions(
+        &self,
+        uri: &str,
+        breakpoints: &[(u32, Option<String>)],
+    ) -> Result<(), DapError> {
+        let source_breakpoints: Vec<crate::protocol::SourceBreakpoint> = breakpoints
             .iter()
-            .map(|line| crate::protocol::SourceBreakpoint {
+            .map(|(line, condition)| crate::protocol::SourceBreakpoint {
                 line: *line,
                 source: Some(crate::protocol::Source {
                     path: Some(uri.to_owned()),
                     name: None,
                 }),
+                condition: condition.clone(),
             })
             .collect();
+        let lines: Vec<u32> = breakpoints.iter().map(|(line, _)| *line).collect();
         self.request(
             "setBreakpoints",
             json!({
                 "source": { "path": uri },
-                "breakpoints": breakpoints,
+                "breakpoints": source_breakpoints,
                 "lines": lines,
             }),
             Some(Pending::Breakpoints(self.breakpoints_sender())),
@@ -421,20 +463,50 @@ impl Client {
     }
 
     /// Asks for the groups of variables of a frame.
+    ///
+    /// The answer carries the frame the groups belong to: the groups of one
+    /// frame are not the groups of another.
     pub fn scopes(&self, frame_id: i64) -> Result<(), DapError> {
         self.request(
             "scopes",
             json!({ "frameId": frame_id }),
-            Some(Pending::Scopes(self.scopes_sender())),
+            Some(Pending::Scopes {
+                frame_id,
+                sender: self.scopes_sender(),
+            }),
         )
     }
 
     /// Asks for the variables of a group.
-    pub fn variables(&self, reference: i64) -> Result<(), DapError> {
+    ///
+    /// The frame is not part of the request: the adapter is asked for the
+    /// group of variables alone. The editor keeps the frame with the
+    /// answer, because the variables of one frame are not the variables of
+    /// another.
+    pub fn variables(&self, frame_id: i64, reference: i64) -> Result<(), DapError> {
         self.request(
             "variables",
             json!({ "variablesReference": reference }),
-            Some(Pending::Variables(self.variables_sender())),
+            Some(Pending::Variables {
+                frame_id,
+                sender: self.variables_sender(),
+            }),
+        )
+    }
+
+    /// Asks the adapter what an expression is worth.
+    ///
+    /// The expression is in the language of the program that is being
+    /// debugged: the adapter is the one that knows it.
+    pub fn evaluate(&self, expression: &str, frame_id: i64) -> Result<(), DapError> {
+        self.request(
+            "evaluate",
+            json!({
+                "expression": expression,
+                "frameId": frame_id,
+                "context": "repl",
+            }),
+            Some(Pending::Evaluation(self.evaluations_sender())),
         )
     }
 
@@ -459,13 +531,22 @@ impl Client {
     }
 
     /// The answers of the requests for the groups of variables.
-    pub fn drain_scopes(&self) -> Vec<Result<Vec<Scope>, DapError>> {
+    ///
+    /// Every answer says the frame the groups belong to.
+    pub fn drain_scopes(&self) -> Vec<Result<(i64, Vec<Scope>), DapError>> {
         drain(&self.scopes)
     }
 
     /// The answers of the requests for the variables.
-    pub fn drain_variables(&self) -> Vec<Result<Vec<Variable>, DapError>> {
+    ///
+    /// Every answer says the frame the variables belong to.
+    pub fn drain_variables(&self) -> Vec<Result<(i64, Vec<Variable>), DapError>> {
         drain(&self.variables)
+    }
+
+    /// The answers of the requests for the worth of an expression.
+    pub fn drain_evaluations(&self) -> Vec<Result<EvaluateResult, DapError>> {
+        drain(&self.evaluations)
     }
 
     /// Stops the adapter and waits for it.
@@ -550,13 +631,19 @@ impl Client {
     }
 
     /// A channel for the answers of the requests for the groups of variables.
-    fn scopes_sender(&self) -> Sender<Result<Vec<Scope>, DapError>> {
+    fn scopes_sender(&self) -> Sender<Result<(i64, Vec<Scope>), DapError>> {
         self.senders.scopes.clone()
     }
 
     /// A channel for the answers of the requests for the variables.
-    fn variables_sender(&self) -> Sender<Result<Vec<Variable>, DapError>> {
+    fn variables_sender(&self) -> Sender<Result<(i64, Vec<Variable>), DapError>> {
         self.senders.variables.clone()
+    }
+
+    /// A channel for the answers of the requests for the worth of an
+    /// expression.
+    fn evaluations_sender(&self) -> Sender<Result<EvaluateResult, DapError>> {
+        self.senders.evaluations.clone()
     }
 }
 
@@ -654,16 +741,22 @@ fn dispatch(
                         None => read_list(&body, "stackFrames"),
                     });
                 }
-                Pending::Scopes(sender) => {
+                Pending::Scopes { frame_id, sender } => {
                     let _ = sender.send(match error {
                         Some(error) => Err(error),
-                        None => read_list(&body, "scopes"),
+                        None => read_list(&body, "scopes").map(|scopes| (frame_id, scopes)),
                     });
                 }
-                Pending::Variables(sender) => {
+                Pending::Variables { frame_id, sender } => {
                     let _ = sender.send(match error {
                         Some(error) => Err(error),
-                        None => read_list(&body, "variables"),
+                        None => read_list(&body, "variables").map(|variables| (frame_id, variables)),
+                    });
+                }
+                Pending::Evaluation(sender) => {
+                    let _ = sender.send(match error {
+                        Some(error) => Err(error),
+                        None => read_one(&body),
                     });
                 }
             }
@@ -709,6 +802,15 @@ fn read_list<T: serde::de::DeserializeOwned>(
         DapError::Protocol(format!("the answer of the adapter has no `{name}` in it"))
     })?;
     serde_json::from_value(list.clone()).map_err(|error| DapError::Protocol(error.to_string()))
+}
+
+/// Reads the answer of `evaluate`: the worth of the expression.
+///
+/// A body that is not the shape of an answer is an error and not an empty
+/// value: an empty value and a wrong shape look the same, and only one of
+/// them is true.
+fn read_one(body: &Value) -> Result<EvaluateResult, DapError> {
+    serde_json::from_value(body.clone()).map_err(|error| DapError::Protocol(error.to_string()))
 }
 
 #[cfg(test)]

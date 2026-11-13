@@ -21,8 +21,15 @@ pub struct CommandBox {
 impl CommandBox {
     /// Opens the box, ready to take a command.
     pub fn new() -> Self {
+        Self::titled("运行命令")
+    }
+
+    /// Opens the box with a title of its own.
+    ///
+    /// The terminal asks for a line of its own, and says so.
+    pub fn titled(title: &str) -> Self {
         CommandBox {
-            text: RenameBox::message("运行命令"),
+            text: RenameBox::message(title),
             at: None,
         }
     }

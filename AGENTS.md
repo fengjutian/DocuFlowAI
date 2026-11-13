@@ -40,6 +40,12 @@ python scripts/dev.py --runtime pi
 powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\tools\format-check.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\tools\rename-check.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\tools\task-check.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\tools\command-check.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\tools\terminal-check.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\tools\git-check.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\tools\git-unit-check.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\tools\debug-check.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\tools\search-check.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\tools\settings-check.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\tools\agent-check.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\tools\workbench-check.ps1
@@ -63,6 +69,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\
 - 分层单向依赖：`app`（组合）→ `platform`（窗口/输入/IME）→ `render`（GPU），`ui`/`text`/`editor-core` 只通过稳定接口用下层能力；业务状态不进渲染层。
 - 一次语义变更 = **一次事务**（如格式化、Agent 批量改动），保证撤销一次整体回退。
 - 失败要**明说原因**：没有语言服务器、服务器断开、状态冲突等，都要在状态栏给出原因，不静默什么都不发生。
+- **键盘焦点只有一个**：终端开着时键盘在终端上（`terminal_has_focus`），别的地方要键（面板、输入框、快捷键）先把焦点要回去；模态面板用 `a_modal_is_open()` 挡住同时开两个。终端与构建任务共用下方面板，互斥时状态栏**明说**原因。
 
 ## 环境约束（Windows / PowerShell 5.1）
 
