@@ -34,6 +34,15 @@ async function main(): Promise<void> {
   const runtimeId =
     process.env["CODEWEAVER_ACP_RUNTIME_ID"] ?? (config.pi ? "pi-local" : "auto");
 
+  // The capabilities an editor session grants the agent.
+  //
+  // `request_diff` proposes a change without writing it; the editor shows the
+  // change and the user decides which parts of it reach the buffer.
+  // `request_apply_diff` is deliberately absent: it writes to the worktree
+  // on its own, which would put a change in front of the user that they never
+  // approved.
+  const editorTools = ["read_file", "request_diff"];
+
   const policyFor = ({ cwd, taskId }: { cwd: string; taskId: string }): PolicySnapshot => ({
     snapshotId: `pol_acp_${taskId}`,
     projectId,
@@ -41,7 +50,7 @@ async function main(): Promise<void> {
     executionId: "",
     worktreeId: taskId,
     policyVersion: "acp-default-1",
-    grantedCapabilities: ["read_file", "search_code", "generate_diff"],
+    grantedCapabilities: editorTools,
     allowedPaths: [cwd],
     expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
   });
@@ -53,7 +62,7 @@ async function main(): Promise<void> {
       projectId,
       contextSnapshotId: "acp-context",
       policySnapshotId: "acp-policy",
-      allowedTools: ["read_file", "search_code", "generate_diff"],
+      allowedTools: editorTools,
       timeoutSeconds,
       runtimeId
     },

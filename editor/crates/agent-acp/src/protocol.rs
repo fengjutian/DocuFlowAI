@@ -54,10 +54,31 @@ impl StopReason {
 }
 
 /// A content block inside a prompt.
+///
+/// The text block is what the user asked for. The resource block is a piece
+/// of material the user chose to attach: a file, a selection, another tab.
+/// They are different things and the endpoint keeps them apart, because the
+/// model has to know which is the instruction and which is the material.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PromptBlock {
     Text { text: String },
+    Resource { uri: String, text: String },
+}
+
+impl PromptBlock {
+    /// A block of plain text.
+    pub fn text(text: impl Into<String>) -> Self {
+        PromptBlock::Text { text: text.into() }
+    }
+
+    /// A block of attached material.
+    pub fn resource(uri: impl Into<String>, text: impl Into<String>) -> Self {
+        PromptBlock::Resource {
+            uri: uri.into(),
+            text: text.into(),
+        }
+    }
 }
 
 /// A message chunk the agent streamed.
@@ -90,6 +111,32 @@ pub struct ToolCall {
     pub tool_call_id: String,
     pub title: String,
     pub status: ToolStatus,
+    /// What kind of tool this is: `edit`, `read`, `execute` and so on.
+    pub kind: String,
+    /// The content the tool produced, such as a proposed diff.
+    pub content: Vec<ToolCallContent>,
+}
+
+/// One piece of content a tool call produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolCallContent {
+    /// A change the agent proposes to make.
+    ///
+    /// The patch is a unified diff. It is kept as text rather than as parsed
+    /// hunks on purpose: the editor parses it against the text that is in the
+    /// buffer, so a proposal that was computed against an older version of
+    /// the file is caught instead of being applied where it no longer fits.
+    Diff {
+        /// The path the change is about.
+        path: String,
+        /// The unified diff.
+        patch: String,
+    },
+    /// Plain text the tool produced.
+    Text {
+        /// The text.
+        text: String,
+    },
 }
 
 /// One option of a permission request.
@@ -194,15 +241,64 @@ impl SessionUpdate {
                     .and_then(|status| status.as_str())
                     .map(ToolStatus::from_wire)
                     .unwrap_or(ToolStatus::InProgress);
+                let kind = value
+                    .get("kind")
+                    .and_then(|kind| kind.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                let content = parse_tool_content(value.get("content"));
                 Some(SessionUpdate::ToolCall(ToolCall {
                     tool_call_id,
                     title,
                     status,
+                    kind,
+                    content,
                 }))
             }
             other => Some(SessionUpdate::Unknown(other.to_owned())),
         }
     }
+}
+
+/// Parses the content blocks a tool call carries.
+///
+/// A block the editor does not know is dropped rather than kept: an unknown
+/// kind of content cannot be shown, and showing nothing is better than
+/// showing something wrong.
+fn parse_tool_content(value: Option<&Value>) -> Vec<ToolCallContent> {
+    let Some(items) = value.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            let kind = item.get("type").and_then(|kind| kind.as_str())?;
+            match kind {
+                "diff" => {
+                    let path = item
+                        .get("path")
+                        .and_then(|path| path.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    let patch = item
+                        .get("patch")
+                        .and_then(|patch| patch.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    Some(ToolCallContent::Diff { path, patch })
+                }
+                "text" => {
+                    let text = item
+                        .get("text")
+                        .and_then(|text| text.as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    Some(ToolCallContent::Text { text })
+                }
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// The outcome of a permission request, as the editor answers it.

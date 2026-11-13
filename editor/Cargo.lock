@@ -274,6 +274,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "codeweaver-diff"
+version = "0.4.0"
+
+[[package]]
 name = "codeweaver-editor"
 version = "0.4.0"
 dependencies = [
@@ -307,6 +311,7 @@ dependencies = [
  "anyhow",
  "codeweaver-agent-acp",
  "codeweaver-agent-ui",
+ "codeweaver-diff",
  "codeweaver-editor-core",
  "codeweaver-lsp",
  "codeweaver-render",

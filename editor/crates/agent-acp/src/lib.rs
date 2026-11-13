@@ -18,5 +18,5 @@ pub use framing::{FrameReader, Framing};
 pub use protocol::{
     AgentInfo, InitializeResult, MessageChunk, PROTOCOL_VERSION, PermissionOption,
     PermissionOutcome, PermissionRequest, PromptBlock, PromptCompleted, SessionCreated,
-    SessionUpdate, StopReason, ToolCall, ToolStatus, permission_result,
+    SessionUpdate, StopReason, ToolCall, ToolCallContent, ToolStatus, permission_result,
 };

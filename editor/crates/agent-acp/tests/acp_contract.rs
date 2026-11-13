@@ -162,6 +162,7 @@ fn maps_tool_calls_onto_editor_events() {
             tool_call_id,
             title,
             status,
+            ..
         } if *status == ToolStatus::InProgress => Some((tool_call_id.clone(), title.clone())),
         _ => None,
     });

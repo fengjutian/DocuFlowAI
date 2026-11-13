@@ -43,6 +43,10 @@ pub enum SessionEvent {
         tool_call_id: String,
         title: String,
         status: crate::protocol::ToolStatus,
+        /// What kind of tool this is.
+        kind: String,
+        /// The content the tool produced, such as a proposed diff.
+        content: Vec<crate::protocol::ToolCallContent>,
     },
     /// The agent is asking for permission.
     PermissionRequested {
@@ -194,6 +198,18 @@ impl Client {
     /// [`SessionEvent::TurnCompleted`]. The editor never blocks on a turn:
     /// the event loop drains the stream once per frame.
     pub fn start_prompt(&self, session_id: &str, text: &str) -> Result<(), AcpError> {
+        self.start_prompt_blocks(session_id, &[PromptBlock::text(text)])
+    }
+
+    /// Starts a turn made of several blocks.
+    ///
+    /// The instruction and the attached material travel together but stay
+    /// apart: the endpoint tells the model which is which.
+    pub fn start_prompt_blocks(
+        &self,
+        session_id: &str,
+        blocks: &[PromptBlock],
+    ) -> Result<(), AcpError> {
         let id = {
             let mut next = self
                 .next_id
@@ -210,7 +226,7 @@ impl Client {
             "method": "session/prompt",
             "params": {
                 "sessionId": session_id,
-                "prompt": [PromptBlock::Text { text: text.to_owned() }],
+                "prompt": blocks,
             },
         });
         self.write(&message)?;
@@ -537,6 +553,8 @@ fn dispatch(
                             tool_call_id: call.tool_call_id,
                             title: call.title,
                             status: call.status,
+                            kind: call.kind,
+                            content: call.content,
                         });
                     }
                     SessionUpdate::Unknown(_) => {}

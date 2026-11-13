@@ -262,13 +262,18 @@ export function toSessionUpdate(event: AgentRuntimeEvent): AcpSessionUpdate | un
         ? { sessionUpdate: "agent_message_chunk", content: { type: "text", text } }
         : undefined;
     }
-    case "tool.started":
+    case "tool.started": {
+      const title = toolTitle(event);
+      const content = toolCallContent(event);
       return {
         sessionUpdate: "tool_call",
         toolCallId: String(event.payload["toolCallId"] ?? event.payload["tool"] ?? event.eventId),
-        title: toolTitle(event),
-        status: "in_progress"
+        title,
+        kind: toolKind(title),
+        status: "in_progress",
+        ...(content.length > 0 ? { content } : {})
       };
+    }
     case "tool.completed":
       return {
         sessionUpdate: "tool_call_update",
@@ -314,10 +319,61 @@ function payloadText(payload: Record<string, unknown>): string {
 }
 
 /**
+ * What kind of tool this is, as the editor draws it.
+ *
+ * The kind is what the editor keys its behaviour on: a tool that proposes a
+ * change is not a tool that reads a file, and the panel shows them
+ * differently.
+ */
+export function toolKind(title: string): string {
+  if (title === "request_diff" || title === "request_apply_diff") return "edit";
+  if (title === "read_file") return "read";
+  if (title === "evaluate_changes") return "check";
+  return "other";
+}
+
+/**
+ * The content a tool call carries, taken from the arguments the runtime sent.
+ *
+ * A tool that proposes a change passes the change as a unified diff. It
+ * travels as the tool call's content so the editor can show the change and
+ * let the user decide about it, instead of writing it to the worktree behind
+ * their back.
+ */
+export function toolCallContent(event: AgentRuntimeEvent): Array<Record<string, unknown>> {
+  const patch = event.payload["patch"];
+  if (typeof patch !== "string" || patch.trim() === "") return [];
+  const path = patchPath(patch);
+  if (!path) return [];
+  return [{ type: "diff", path, patch }];
+}
+
+/**
+ * The file a unified diff is about.
+ *
+ * The path comes from the diff itself rather than from the tool's arguments:
+ * the diff names the file it changes, and that is the file the editor has to
+ * show the change in.
+ */
+export function patchPath(patch: string): string | undefined {
+  for (const rawLine of patch.split(/\r?\n/)) {
+    if (rawLine.startsWith("+++ ") && rawLine.slice(4).trim() !== "/dev/null") {
+      const candidate = rawLine.slice(4).split("\t")[0]!.trim();
+      return candidate.replace(/^[ab]\//, "");
+    }
+    if (rawLine.startsWith("--- ") && rawLine.slice(4).trim() !== "/dev/null") {
+      const candidate = rawLine.slice(4).split("\t")[0]!.trim();
+      return candidate.replace(/^[ab]\//, "");
+    }
+  }
+  return undefined;
+}
+
+/**
  * The tool's name, as the runtime reported it.
  *
- * The runtimes do not agree on the key: Pi carries `toolName`, Hermes carries `tool`. Reading only
- * one of them makes the editor label every tool call "tool", which is exactly what the first
+ * The runtimes do not agree on the key: Pi carries `toolName`, Hermes carries `tool`. Reading only one
+ * of them makes the editor label every tool call "tool", which is exactly what the first
  * editor probe saw — the call was real, its name was not.
  */
 export function toolTitle(event: AgentRuntimeEvent, fallback = "tool"): string {

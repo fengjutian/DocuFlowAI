@@ -1,0 +1,9 @@
+[package]
+name = "codeweaver-diff"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Unified diff parsing, hunk level application, and three way merge for the CodeWeaver editor"
+
+[dependencies]

@@ -14,8 +14,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use codeweaver_agent_acp::{Client, EndpointConfig, PermissionOutcome};
-use codeweaver_agent_ui::AgentPanel;
+use codeweaver_agent_acp::{Client, EndpointConfig, PermissionOutcome, PromptBlock};
+use codeweaver_agent_ui::{AgentPanel, ContextItem};
 
 /// How the editor finds the agent endpoint.
 ///
@@ -79,12 +79,29 @@ impl AgentSession {
         &self.panel
     }
 
-    /// Starts a turn with the given prompt.
-    pub fn start_prompt(&mut self, prompt: &str) -> Result<(), String> {
+    /// The panel, for the callers that change what it shows.
+    pub fn panel_mut(&mut self) -> &mut AgentPanel {
+        &mut self.panel
+    }
+
+    /// Starts a turn made of an instruction and the context the user chose.
+    ///
+    /// The instruction and the material travel as separate blocks: the
+    /// endpoint tells the model which is which, so the model can tell a
+    /// request from a file.
+    pub fn start_prompt_with_context(
+        &mut self,
+        instruction: &str,
+        context: &[ContextItem],
+    ) -> Result<(), String> {
         self.panel.begin_turn();
         self.started_at = Instant::now();
+        let mut blocks = vec![PromptBlock::text(instruction)];
+        for item in context {
+            blocks.push(PromptBlock::resource(item.path.clone(), item.text.clone()));
+        }
         self.client
-            .start_prompt(&self.session_id, prompt)
+            .start_prompt_blocks(&self.session_id, &blocks)
             .map_err(|error| error.to_string())
     }
 

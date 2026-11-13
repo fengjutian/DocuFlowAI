@@ -230,9 +230,12 @@ function Save-Window([IntPtr]$handle, [string]$path) {
     return @{
         Bitmap = $bitmap
         Ok = $ok
-        # Where the client area starts inside the picture.
-        Left = [int](To-Physical ($origin.X - $window.Left))
-        Top = [int](To-Physical ($origin.Y - $window.Top))
+        # Where the client area starts inside the picture. The difference
+        # between the two is already in the pixels of the screen: the window
+        # is per-monitor aware, and the calls come from a process that is
+        # not, so the difference is the one the screen shows.
+        Left = $origin.X - $window.Left
+        Top = $origin.Y - $window.Top
         Width = [int](To-Physical $client.Right)
         Height = [int](To-Physical $client.Bottom)
     }
@@ -379,12 +382,17 @@ try {
         }
         Write-Output 'the selection is drawn'
 
-        # The find bar sits in the top right corner of the body. Without it
-        # open, that corner holds nothing but text.
-        $findLeft = $left + [int](0.25 * $shot_result.Width)
-        $findTop = $top + [int](To-Physical $BODY_Y)
-        $findWidth = [int](0.65 * $shot_result.Width)
-        $findHeight = [int](To-Physical 60)
+        # The find bar sits in the top right corner of the body. What it puts
+        # there is a thin line of colour under the top of the search field.
+        #
+        # The line is looked for in a thin band, and not in the whole corner:
+        # the caret of the document is drawn in the same colour, and it sits
+        # in the corner too. A band that is too tall would find the caret and
+        # call it a find bar.
+        $findLeft = $left + [int](To-Physical 340)
+        $findTop = $top + [int](To-Physical 88)
+        $findWidth = [int](To-Physical 360)
+        $findHeight = [int](To-Physical 16)
         $accentBefore = Count-Color $picture $findLeft $findTop $findWidth $findHeight $ACCENT_RGB 14
         Write-Output "accent pixels where the find bar will be: $accentBefore"
         if ($accentBefore -gt 5) {
@@ -415,10 +423,10 @@ try {
         $left = $find_result.Left
         $top = $find_result.Top
 
-        $findLeft = $left + [int](0.25 * $find_result.Width)
-        $findTop = $top + [int](To-Physical $BODY_Y)
-        $findWidth = [int](0.65 * $find_result.Width)
-        $findHeight = [int](To-Physical 60)
+        $findLeft = $left + [int](To-Physical 340)
+        $findTop = $top + [int](To-Physical 88)
+        $findWidth = [int](To-Physical 360)
+        $findHeight = [int](To-Physical 16)
         $accent = Count-Color $findPicture $findLeft $findTop $findWidth $findHeight $ACCENT_RGB 14
         Write-Output "accent pixels in the find bar: $accent"
         if ($accent -lt 40) {

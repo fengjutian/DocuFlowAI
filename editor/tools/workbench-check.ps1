@@ -104,6 +104,8 @@ $SWP_SHOWWINDOW = 0x0040
 $WM_MOUSEMOVE = 0x0200
 $WM_LBUTTONDOWN = 0x0201
 $WM_LBUTTONUP = 0x0202
+$WM_KEYDOWN = 0x0100
+$WM_KEYUP = 0x0101
 $WM_CHAR = 0x0102
 $MK_LBUTTON = 0x0001
 
@@ -165,6 +167,21 @@ function Send-Mouse([IntPtr]$handle, [uint32]$message, [int]$x, [int]$y, [int]$e
     [Win32]::PostMessage($handle, $message, [IntPtr]0, [IntPtr]$packed) | Out-Null
 }
 
+# Presses a key.
+#
+# Only the key goes down and comes up. The character is not posted with it:
+# the window makes the character out of the key by itself, the same way it
+# does when a person types. A character that is posted on its own is dropped
+# by the window, because it does not know which key made it.
+function Send-Key([IntPtr]$handle, [int]$virtualKey, [int]$scanCode) {
+    $repeat = [int64]1
+    $scanned = [int64]$scanCode -shl 16
+    $flags = [int64]0xC0000000
+    $down = $repeat -bor $scanned -bor $flags
+    [Win32]::PostMessage($handle, $WM_KEYDOWN, [IntPtr]$virtualKey, [IntPtr]$down) | Out-Null
+    [Win32]::PostMessage($handle, $WM_KEYUP, [IntPtr]$virtualKey, [IntPtr]$down) | Out-Null
+}
+
 function Save-Window([IntPtr]$handle, [string]$path) {
     # A minimised window has no client area to draw into, and a window that
     # was never shown does not redraw. The restore is retried: something else
@@ -188,11 +205,11 @@ function Save-Window([IntPtr]$handle, [string]$path) {
     $origin = New-Object Win32+POINT
     [Win32]::ClientToScreen($handle, [ref]$origin) | Out-Null
 
-    # The window is drawn into the picture in the units of the calls, so the
-    # picture is as big as the window and the client area starts where the
-    # client area and the window differ.
-    $width = $window.Right - $window.Left
-    $height = $window.Bottom - $window.Top
+    # The window is drawn into the picture in the pixels of the screen, so
+    # the picture is as big as the window is on the screen, and the client
+    # area starts where the client area and the window differ.
+    $width = [int](To-Physical ($window.Right - $window.Left))
+    $height = [int](To-Physical ($window.Bottom - $window.Top))
     $bitmap = New-Object System.Drawing.Bitmap $width, $height
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     $hdc = $graphics.GetHdc()
@@ -208,8 +225,8 @@ function Save-Window([IntPtr]$handle, [string]$path) {
         # Where the client area starts inside the picture.
         Left = $origin.X - $window.Left
         Top = $origin.Y - $window.Top
-        Width = $client.Right
-        Height = $client.Bottom
+        Width = [int](To-Physical $client.Right)
+        Height = [int](To-Physical $client.Bottom)
     }
 }
 
@@ -249,8 +266,24 @@ function Left-Of-Color($picture, [int]$left, [int]$top, [int]$width, [int]$heigh
     return -1
 }
 
+# The number of pixels that are different in two pictures.
+function Count-Difference($first, $second) {
+    $count = 0
+    $width = [Math]::Min($first.Width, $second.Width)
+    $height = [Math]::Min($first.Height, $second.Height)
+    for ($y = 0; $y -lt $height; $y++) {
+        for ($x = 0; $x -lt $width; $x++) {
+            $a = $first.GetPixel($x, $y)
+            $b = $second.GetPixel($x, $y)
+            if ($a.R -ne $b.R -or $a.G -ne $b.G -or $a.B -ne $b.B) { $count++ }
+        }
+    }
+    return $count
+}
+
 # The number of bright pixels in a rectangle: the text of the tree is much
-# brighter than the panel it is drawn on.
+# brighter than the panel it is drawn on. The panel is a dark grey, so the
+# line between them is high enough to tell the text from the panel.
 function Count-Bright($picture, [int]$left, [int]$top, [int]$width, [int]$height) {
     $count = 0
     for ($y = $top; $y -lt $top + $height; $y++) {
@@ -258,7 +291,7 @@ function Count-Bright($picture, [int]$left, [int]$top, [int]$width, [int]$height
         for ($x = $left; $x -lt $left + $width; $x++) {
             if ($x -lt 0 -or $x -ge $picture.Width) { continue }
             $pixel = $picture.GetPixel($x, $y)
-            if ($pixel.R -ge 70 -and $pixel.G -ge 70) { $count++ }
+            if ($pixel.R -ge 120 -and $pixel.G -ge 120) { $count++ }
         }
     }
     return $count
@@ -334,17 +367,16 @@ try {
         $left = $treeShot.Left
         $top = $treeShot.Top
         # The tree is under the strip of tabs, on the left of the window.
-        $treeTop = $top + $TAB_STRIP_HEIGHT
-        $treeHeight = $TREE_ROW_HEIGHT * 3
-        $treeWidth = $SIDEBAR_WIDTH
+        $treeTop = $top + [int](To-Physical $TAB_STRIP_HEIGHT)
+        $treeHeight = [int](To-Physical ($TREE_ROW_HEIGHT * 3))
+        $treeWidth = [int](To-Physical $SIDEBAR_WIDTH)
         $bright = Count-Bright $picture $left $treeTop $treeWidth $treeHeight
         Write-Host "bright pixels in the tree: $bright"
         Check 'the tree of files is drawn' ($bright -ge 20) "$bright bright pixels in the tree"
-
         # The tab that is in front is marked with a bar of colour under the
         # top of the strip.
         $barTop = $top
-        $barHeight = 3
+        $barHeight = [int](To-Physical 3)
         $barBefore = Left-Of-Color $picture $left $barTop $treeWidth $barHeight $ACTIVE_RGB 14
         Write-Host "the bar of the tab in front starts at: $barBefore"
         Check 'the tab in front is marked' ($barBefore -ge 0) "the bar starts at $barBefore"
@@ -376,7 +408,28 @@ try {
         # 3. Typing makes the tab dirty, and the dirty mark is drawn.
         [Win32]::SetCursorPos(10, 10) | Out-Null
         Start-Sleep -Milliseconds 300
-        [Win32]::PostMessage($handle, $WM_CHAR, [IntPtr][int][char]'x', [IntPtr]0) | Out-Null
+        # The arrow key first: the caret moves, and the picture changes. It
+        # says whether the key messages arrive at all.
+        Send-Key $handle 0x28 0x50
+        Start-Sleep -Seconds 2
+        $arrowShot = Save-Window $handle (Join-Path $logs 'workbench-arrow.png')
+        $arrowPicture = $arrowShot.Bitmap
+        $moved = Count-Difference $picture $arrowPicture
+        Write-Host "pixels that changed after the arrow key: $moved"
+        Check 'the keyboard reaches the editor' ($moved -ge 1) "$moved pixels changed"
+
+        # The file is not changed yet, so there is no dirty mark yet.
+        $dotBefore = Count-Color $arrowPicture $left ($top + [int](To-Physical 5)) $treeWidth ([int](To-Physical 26)) $DIRTY_RGB 18
+        Write-Host "pixels of the dirty mark before the text changed: $dotBefore"
+        Check 'a file that is not changed has no dirty mark' ($dotBefore -lt 3) `
+            "$dotBefore pixels of the dirty mark"
+
+        # The letter X would not do here: the window makes the character out
+        # of the key by itself, and on a machine with an input method the
+        # character comes from the input method and not from the key. The
+        # Delete key needs no character: it deletes the character under the
+        # caret, and the text of the document changes.
+        Send-Key $handle 0x2e 0x53
         Start-Sleep -Seconds 2
 
         $dirtyShot = Save-Window $handle $shotDirty
@@ -385,8 +438,8 @@ try {
         $left = $dirtyShot.Left
         $top = $dirtyShot.Top
         # The dot is drawn in the strip, below the bar of the tab in front.
-        $dotTop = $top + 5
-        $dotHeight = 26
+        $dotTop = $top + [int](To-Physical 5)
+        $dotHeight = [int](To-Physical 26)
         $dot = Count-Color $picture $left $dotTop $treeWidth $dotHeight $DIRTY_RGB 18
         Write-Host "pixels of the dirty mark: $dot"
         Check 'a changed file is marked in the strip' ($dot -ge 3) "$dot pixels of the dirty mark"

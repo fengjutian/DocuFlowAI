@@ -9,6 +9,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 codeweaver-agent-acp = { path = "../agent-acp" }
 codeweaver-agent-ui = { path = "../agent-ui" }
+codeweaver-diff = { path = "../diff" }
 codeweaver-editor-core = { path = "../editor-core" }
 codeweaver-lsp = { path = "../lsp" }
 codeweaver-render = { path = "../render" }

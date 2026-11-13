@@ -173,8 +173,18 @@ export class AcpAgentServer {
 
 export function extractPromptText(params: AcpPromptParams): string {
   if (!Array.isArray(params.prompt)) return "";
-  return params.prompt
-    .filter(block => block?.type === "text" && typeof block.text === "string")
-    .map(block => block.text)
-    .join("\n");
+  const parts: string[] = [];
+  for (const block of params.prompt) {
+    if (block?.type === "text" && typeof block.text === "string") {
+      parts.push(block.text);
+      continue;
+    }
+    if (block?.type === "resource" && typeof block.text === "string") {
+      // The path stays with the text: the model has to know which file the
+      // material came from, otherwise it cannot say what it is looking at.
+      const uri = typeof block.uri === "string" ? block.uri : "unknown";
+      parts.push(`--- context: ${uri} ---\n${block.text}\n--- end context: ${uri} ---`);
+    }
+  }
+  return parts.join("\n");
 }

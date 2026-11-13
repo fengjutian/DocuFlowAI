@@ -4,6 +4,7 @@ members = [
     "crates/agent-acp",
     "crates/agent-ui",
     "crates/app",
+    "crates/diff",
     "crates/editor-core",
     "crates/lsp",
     "crates/platform",

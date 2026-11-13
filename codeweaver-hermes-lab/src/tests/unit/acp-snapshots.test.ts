@@ -266,6 +266,37 @@ test("acp: a tool call without a name still reaches the editor", () => {
   assert.equal(update?.title, "tool");
 });
 
+test("acp: a tool that proposes a change carries the change to the editor", () => {
+  const patch = ["--- a/src/app.rs", "+++ b/src/app.rs", "@@ -1,1 +1,2 @@", " keep", "+added"].join("\n");
+  const update = toSessionUpdate(
+    toolStarted({ toolCallId: "call-4", toolName: "request_diff", patch })
+  );
+  assert.equal(update?.sessionUpdate, "tool_call");
+  assert.equal(update?.kind, "edit");
+
+  // The change travels as the tool call's content, so the editor can show it
+  // and let the user decide — the endpoint does not write it on its own.
+  const content = update?.content as Array<{ type: string; path: string; patch: string }> | undefined;
+  assert.equal(content?.length, 1);
+  assert.equal(content?.[0]?.type, "diff");
+  assert.equal(content?.[0]?.path, "src/app.rs");
+  assert.equal(content?.[0]?.patch, patch);
+});
+
+test("acp: a tool that does not propose a change carries no content", () => {
+  const update = toSessionUpdate(toolStarted({ toolCallId: "call-5", toolName: "read_file" }));
+  assert.equal(update?.kind, "read");
+  assert.equal(update?.content, undefined);
+});
+
+test("acp: the kind of a tool is what the editor keys its behaviour on", () => {
+  assert.equal(toSessionUpdate(toolStarted({ toolName: "read_file" }))?.kind, "read");
+  assert.equal(toSessionUpdate(toolStarted({ toolName: "request_diff" }))?.kind, "edit");
+  assert.equal(toSessionUpdate(toolStarted({ toolName: "request_apply_diff" }))?.kind, "edit");
+  assert.equal(toSessionUpdate(toolStarted({ toolName: "evaluate_changes" }))?.kind, "check");
+  assert.equal(toSessionUpdate(toolStarted({ toolName: "something_else" }))?.kind, "other");
+});
+
 test("acp: a failed run tells the editor why it failed", () => {
   const failed: AgentRuntimeEvent = {
     ...toolStarted({}),

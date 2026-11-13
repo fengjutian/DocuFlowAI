@@ -17,7 +17,18 @@ export interface AcpSessionNewParams {
 
 export interface AcpPromptParams {
   sessionId: string;
-  prompt: Array<{ type: "text"; text: string }>;
+  /**
+   * The prompt's blocks.
+   *
+   * A `text` block is what the user asked for; a `resource` block is a piece
+   * of material the user chose to attach. They travel together but stay
+   * apart, because the model has to know which is the instruction and which
+   * is the material.
+   */
+  prompt: Array<
+    | { type: "text"; text: string }
+    | { type: "resource"; uri: string; text: string }
+  >;
 }
 
 export type AcpStopReason = "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";

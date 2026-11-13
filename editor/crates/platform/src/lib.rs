@@ -1,5 +1,7 @@
 mod agent;
 mod completion;
+mod context;
+mod diff_review;
 pub mod editor_view;
 pub mod find;
 mod input;
@@ -11,6 +13,7 @@ use std::{ops::Range, path::{Path, PathBuf}, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use codeweaver_agent_acp::ToolStatus;
+use codeweaver_agent_ui::{ContextItem, HunkDecision};
 use codeweaver_editor_core::Editor;
 use codeweaver_lsp::{Client as LspClient, LspEvent, ServerConfig};
 use codeweaver_render::{
@@ -130,6 +133,46 @@ pub struct NativeApplication {
     detector: ChangeDetector,
     /// The question the window is asking the user, if it is asking one.
     prompt: Option<Prompt>,
+    /// The change the agent proposed for the file that is open, and the
+    /// version of the buffer it was computed against.
+    ///
+    /// The version is what decides whether the change still fits: a change
+    /// that was computed against an older version of the text has to be
+    /// merged rather than applied.
+    pending_diff: Option<PendingDiff>,
+    /// The block of the proposed change the keys act on.
+    selected_hunk: usize,
+    /// The piece of context the keys act on.
+    selected_context: usize,
+    /// The conflicts between the buffer and the proposed change.
+    ///
+    /// They are settled one at a time; the merged text is written once they
+    /// all are.
+    conflicts: Option<PendingConflict>,
+}
+
+/// A change that conflicts with what the buffer holds.
+struct PendingConflict {
+    /// The path the change is about.
+    path: String,
+    /// The merge, with its conflicts.
+    merge: codeweaver_diff::Merge,
+    /// The conflict the keys act on.
+    selected: usize,
+    /// What the user chose for each conflict.
+    choices: Vec<codeweaver_diff::Choice>,
+}
+
+/// A change the agent proposed for the file that is open.
+struct PendingDiff {
+    /// The unified diff the agent sent.
+    patch: String,
+    /// The version of the buffer when the change arrived.
+    base_version: u64,
+    /// The text of the buffer when the change arrived.
+    base_text: String,
+    /// The path the change is about.
+    path: String,
 }
 
 impl NativeApplication {
@@ -225,6 +268,10 @@ impl NativeApplication {
             tree,
             detector,
             prompt: None,
+            pending_diff: None,
+            selected_hunk: 0,
+            selected_context: 0,
+            conflicts: None,
         })
     }
 
@@ -705,10 +752,338 @@ impl NativeApplication {
 
     /// Collects the agent's output. Returns `true` when something arrived.
     pub fn pump_agent(&mut self) -> bool {
-        match self.agent.as_mut() {
+        let arrived = match self.agent.as_mut() {
             Some(session) => session.pump(),
             None => false,
+        };
+        if arrived {
+            self.note_new_diff();
         }
+        arrived
+    }
+
+    /// Records the baseline of a change the agent just proposed.
+    ///
+    /// The version of the buffer when the change arrives is what the change
+    /// is compared against later. It has to be read when the change arrives,
+    /// because a moment later the buffer may have moved on and the baseline
+    /// would be wrong.
+    fn note_new_diff(&mut self) {
+        let Some(session) = self.agent.as_ref() else {
+            return;
+        };
+        let Some(proposal) = session.panel().pending_diffs.last() else {
+            return;
+        };
+        let path = proposal.path.clone();
+        let already = self
+            .pending_diff
+            .as_ref()
+            .is_some_and(|pending| pending.path == path);
+        if already {
+            return;
+        }
+        // The patch is read from the tool call the change came with.
+        let Some(patch) = self.patch_for(&path) else {
+            return;
+        };
+        self.note_pending_diff(path, patch);
+    }
+
+    /// The unified diff the agent sent for a path.
+    fn patch_for(&self, path: &str) -> Option<String> {
+        let session = self.agent.as_ref()?;
+        session.panel().patches.get(path).cloned()
+    }
+
+    /// Rebuilds the list of context the user can pick from.
+    ///
+    /// The list is rebuilt whenever the state it describes changes: a tab
+    /// was opened, the selection moved, the file that is open changed.
+    pub fn refresh_agent_context(&mut self) {
+        let Some(session) = self.agent.as_mut() else {
+            return;
+        };
+        let current = self
+            .panes
+            .get(self.active)
+            .and_then(|pane| pane.document.as_ref())
+            .map(|document| document.display_path())
+            .zip(
+                self.panes
+                    .get(self.active)
+                    .map(|pane| pane.editor.text()),
+            );
+        let selection = self
+            .panes
+            .get(self.active)
+            .and_then(|pane| context::selection_text(&pane.editor))
+            .zip(
+                self.panes
+                    .get(self.active)
+                    .and_then(|pane| pane.document.as_ref())
+                    .map(|document| document.display_path()),
+            );
+        let tabs: Vec<(String, String)> = self
+            .panes
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != self.active)
+            .filter_map(|(_, pane)| {
+                let document = pane.document.as_ref()?;
+                Some((document.display_path(), pane.editor.text()))
+            })
+            .collect();
+
+        let current = current
+            .as_ref()
+            .map(|(path, text)| (path.as_str(), text.as_str()));
+        let selection = selection
+            .as_ref()
+            .map(|(path, text)| (path.as_str(), text.as_str()));
+        let tab_refs: Vec<(&str, &str)> = tabs
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+
+        let items = context::build_context(current, selection, &tab_refs);
+        session.panel_mut().set_context(items);
+    }
+
+    /// Chooses or unchooses one piece of context.
+    pub fn toggle_agent_context(&mut self, index: usize) {
+        let Some(session) = self.agent.as_mut() else {
+            return;
+        };
+        let id = session
+            .panel()
+            .context
+            .get(index)
+            .map(|item| item.id.clone());
+        if let Some(id) = id {
+            session.panel_mut().toggle_context(&id);
+        }
+    }
+
+    /// Picks the next piece of context in or out.
+    ///
+    /// The context list is short and the user is looking at the panel, so
+    /// one key that walks through the list is enough to choose what goes
+    /// with the prompt.
+    fn cycle_agent_context(&mut self) -> bool {
+        let Some(session) = self.agent.as_ref() else {
+            return false;
+        };
+        let count = session.panel().context.len();
+        if count == 0 {
+            return false;
+        }
+        let next = (self.selected_context + 1) % count;
+        self.selected_context = next;
+        self.toggle_agent_context(next);
+        true
+    }
+
+    /// The path of the file that is open, as the agent names it.
+    fn open_path(&self) -> Option<String> {
+        self.panes
+            .get(self.active)
+            .and_then(|pane| pane.document.as_ref())
+            .map(|document| document.display_path())
+    }
+
+    /// Decides about one block of the proposed change.
+    ///
+    /// Returns whether there was a change to decide about: a key that means
+    /// nothing when no change is waiting is left to the editor.
+    fn decide_hunk(&mut self, index: usize, decision: HunkDecision) -> bool {
+        let Some(path) = self.open_path() else {
+            return false;
+        };
+        let Some(session) = self.agent.as_mut() else {
+            return false;
+        };
+        let Some(proposal) = session.panel().diff_for(&path) else {
+            return false;
+        };
+        if index >= proposal.hunks.len() {
+            return false;
+        }
+        session.panel_mut().decide_hunk(&path, index, decision);
+        true
+    }
+
+    /// Picks the block the next keys act on.
+    fn select_hunk(&mut self, index: usize) -> bool {
+        let Some(path) = self.open_path() else {
+            return false;
+        };
+        let Some(session) = self.agent.as_mut() else {
+            return false;
+        };
+        let Some(proposal) = session.panel().diff_for(&path) else {
+            return false;
+        };
+        if index >= proposal.hunks.len() {
+            return false;
+        }
+        self.selected_hunk = index;
+        true
+    }
+
+    /// Decides about the block that is picked.
+    fn decide_selected_hunk(&mut self, decision: HunkDecision) -> bool {
+        self.decide_hunk(self.selected_hunk, decision)
+    }
+
+    /// Decides about every block of the proposed change.
+    fn decide_whole_file(&mut self, decision: HunkDecision) -> bool {
+        let Some(path) = self.open_path() else {
+            return false;
+        };
+        let Some(session) = self.agent.as_mut() else {
+            return false;
+        };
+        if session.panel().diff_for(&path).is_none() {
+            return false;
+        }
+        session.panel_mut().decide_all_hunks(&path, decision);
+        true
+    }
+
+    /// Records the change the agent proposed for the file that is open.
+    ///
+    /// The version of the buffer at this moment is the baseline: it is what
+    /// the change is compared against when the user approves it.
+    fn note_pending_diff(&mut self, path: String, patch: String) {
+        let Some(pane) = self.panes.get(self.active) else {
+            return;
+        };
+        let base_version = pane.editor.version();
+        let base_text = pane.editor.text();
+        self.pending_diff = Some(PendingDiff {
+            patch,
+            base_version,
+            base_text,
+            path,
+        });
+    }
+
+    /// Applies the approved blocks of the pending change to the buffer.
+    ///
+    /// The change is written as one transaction, so one undo takes the whole
+    /// of it back. When the buffer moved on since the change was proposed,
+    /// the two are merged; a merge that still disagrees is not written, and
+    /// the conflicts are shown instead.
+    fn apply_pending_diff(&mut self) {
+        let Some(pending) = self.pending_diff.take() else {
+            return;
+        };
+        let Some(session) = self.agent.as_mut() else {
+            return;
+        };
+        let approved = session.panel().approved_hunks(&pending.path);
+        if approved.is_empty() {
+            return;
+        }
+        let Some(proposal) = session.panel().diff_for(&pending.path).cloned() else {
+            return;
+        };
+
+        let Some(pane) = self.panes.get(self.active) else {
+            return;
+        };
+        let current_text = pane.editor.text();
+        let current_version = pane.editor.version();
+
+        let outcome = diff_review::apply_proposal(
+            &proposal,
+            &pending.patch,
+            &pending.base_text,
+            pending.base_version,
+            &current_text,
+            current_version,
+            &approved,
+        );
+
+        let message = match outcome {
+            diff_review::ApplyOutcome::Applied {
+                text,
+                hunks,
+                added,
+                removed,
+                ..
+            } => {
+                // The text is written as one transaction, so one undo takes
+                // the whole change back.
+                let pane = &mut self.panes[self.active];
+                let length = pane.editor.buffer().len();
+                let range = TextOffset(0)..length;
+                if pane.editor.replace_ranges(vec![range], &text).is_err() {
+                    return;
+                }
+                format!("已应用 {hunks} 个变更块（+{added} -{removed}）")
+            }
+            diff_review::ApplyOutcome::DoesNotFit { line, expected, found, .. } => {
+                format!("第 {line} 行对不上：期望「{expected}」，实际「{found}」")
+            }
+            diff_review::ApplyOutcome::Conflict { merge } => {
+                // The two disagree. The text is not written: the conflicts
+                // are settled one at a time, and the merged text is written
+                // once they all are.
+                let count = diff_review::conflict_count(&merge);
+                self.conflicts = Some(PendingConflict {
+                    path: pending.path.clone(),
+                    merge,
+                    selected: 0,
+                    choices: Vec::new(),
+                });
+                format!("缓冲区已经变了，{count} 处冲突待处理")
+            }
+        };
+
+        let session = self.agent.as_mut().expect("the session is there");
+        session.panel_mut().record_applied(message.clone());
+        self.status = Some(message);
+    }
+
+    /// Settles one conflict: the buffer's version or the agent's.
+    ///
+    /// The last conflict settles the whole thing: the merged text is
+    /// written into the buffer as one transaction.
+    fn settle_conflict(&mut self, choice: codeweaver_diff::Choice) -> bool {
+        let Some(pending) = self.conflicts.as_mut() else {
+            return false;
+        };
+        let index = pending.selected;
+        if index >= pending.merge.conflicts.len() {
+            return false;
+        }
+        pending.choices.push(choice);
+        pending.selected += 1;
+
+        let settled = pending.selected >= pending.merge.conflicts.len();
+        let path = pending.path.clone();
+        if !settled {
+            return true;
+        }
+
+        let text = diff_review::merged_text(&pending.merge, &pending.choices);
+        let conflicts = self.conflicts.take();
+        let _ = conflicts;
+
+        let pane = &mut self.panes[self.active];
+        let length = pane.editor.buffer().len();
+        let range = TextOffset(0)..length;
+        if pane.editor.replace_ranges(vec![range], &text).is_err() {
+            return true;
+        }
+
+        let message = format!("冲突已合并，写入 {path}");
+        let session = self.agent.as_mut().expect("the session is there");
+        session.panel_mut().record_applied(message.clone());
+        self.status = Some(message);
+        true
     }
 
     /// The size of the window, in logical pixels.
@@ -941,6 +1316,15 @@ impl NativeApplication {
             return false;
         }
 
+        // Ctrl+Alt+Enter writes the approved blocks into the buffer.
+        if control && alt && matches!(key, Key::Named(NamedKey::Enter)) {
+            if self.pending_diff.is_some() {
+                self.apply_pending_diff();
+                return true;
+            }
+            return false;
+        }
+
         let Key::Character(character) = key else {
             return false;
         };
@@ -950,19 +1334,64 @@ impl NativeApplication {
         let letter = letter.to_ascii_lowercase();
 
         // Ctrl+Alt+A allows the pending permission, Ctrl+Alt+N denies it.
+        //
+        // A permission and a proposed change never wait at the same time: the
+        // agent asks for permission before it proposes anything, and the
+        // answer to a permission is the one thing it is waiting for. So the
+        // same two keys serve both, and the one that is actually waiting
+        // gets them.
         if control && alt {
-            let option = match letter {
-                'a' => Some("allow"),
-                'n' => Some("reject"),
-                _ => None,
-            };
-            if let (Some(option), Some(session)) = (option, self.agent.as_mut()) {
-                if let Err(error) = session.answer_permission(option) {
-                    eprintln!("could not answer the permission request: {error}");
+            let waiting_for_permission = self
+                .agent
+                .as_ref()
+                .and_then(|session| session.panel().pending_permission.as_ref())
+                .is_some();
+            if waiting_for_permission {
+                let option = match letter {
+                    'a' => Some("allow"),
+                    'n' => Some("reject"),
+                    _ => None,
+                };
+                if let (Some(option), Some(session)) = (option, self.agent.as_mut()) {
+                    if let Err(error) = session.answer_permission(option) {
+                        eprintln!("could not answer the permission request: {error}");
+                    }
+                    return true;
                 }
+                return false;
+            }
+        }
+
+        // The keys that decide about a proposed change. They only act when
+        // there is a change waiting for the open file; a key that means
+        // nothing is left to the editor.
+        if control && alt {
+            // Ctrl+Alt+1..9 pick the block the next keys act on.
+            let handled = match letter {
+                '1'..='9' => {
+                    let index = letter.to_digit(10).unwrap_or(1) as usize - 1;
+                    self.select_hunk(index)
+                }
+                // Ctrl+Alt+0 approves the whole file, Ctrl+Alt+Q rejects it.
+                '0' => self.decide_whole_file(HunkDecision::Approved),
+                'q' => self.decide_whole_file(HunkDecision::Rejected),
+                // Ctrl+Alt+C picks the next piece of context in and out.
+                'c' => self.cycle_agent_context(),
+                // Ctrl+Alt+K keeps the buffer's side of a conflict,
+                // Ctrl+Alt+J takes the agent's.
+                'k' => self.settle_conflict(codeweaver_diff::Choice::Ours),
+                'j' => self.settle_conflict(codeweaver_diff::Choice::Theirs),
+                // Ctrl+Alt+A approves the picked block, Ctrl+Alt+N rejects
+                // it. The same two keys answer a permission request, because
+                // approving a change and allowing a tool feel the same to
+                // the hand.
+                'a' => self.decide_selected_hunk(HunkDecision::Approved),
+                'n' => self.decide_selected_hunk(HunkDecision::Rejected),
+                _ => false,
+            };
+            if handled {
                 return true;
             }
-            return false;
         }
 
         if !control {
@@ -1211,6 +1640,10 @@ impl NativeApplication {
     }
 
     /// Starts an agent turn with the editor's current text as the prompt.
+    ///
+    /// The text the user chose as context travels with the prompt as
+    /// separate blocks, so the agent knows which is the request and which is
+    /// the material.
     pub fn start_agent_turn(&mut self) {
         let prompt = self.panes[self.active].editor.text();
         if prompt.trim().is_empty() {
@@ -1247,8 +1680,22 @@ impl NativeApplication {
             }
         }
 
+        self.refresh_agent_context();
+        let context: Vec<ContextItem> = self
+            .agent
+            .as_ref()
+            .map(|session| {
+                session
+                    .panel()
+                    .selected_context()
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
         if let Some(session) = self.agent.as_mut()
-            && let Err(error) = session.start_prompt(&prompt)
+            && let Err(error) = session.start_prompt_with_context(&prompt, &context)
         {
             eprintln!("could not start the turn: {error}");
         }
@@ -1546,6 +1993,19 @@ impl ApplicationHandler for NativeApplication {
                 };
                 let pane = &mut self.panes[self.active];
                 let prompt_text = self.prompt.as_ref().map(|prompt| prompt.text());
+                let conflict = self.conflicts.as_ref().map(|pending| ConflictView {
+                    total: pending.merge.conflicts.len(),
+                    selected: pending.selected,
+                    items: pending
+                        .merge
+                        .conflicts
+                        .iter()
+                        .map(|conflict| ConflictItem {
+                            ours: conflict.ours.join(" / "),
+                            theirs: conflict.theirs.join(" / "),
+                        })
+                        .collect(),
+                });
                 let scene = build_scene(
                     renderer,
                     renderer.logical_size(scale_factor),
@@ -1564,6 +2024,7 @@ impl ApplicationHandler for NativeApplication {
                         active: self.active,
                         tree: self.tree.as_ref(),
                         prompt: prompt_text.as_deref(),
+                        conflicts: conflict,
                     },
                 );
                 match renderer.render(&scene, scale_factor) {
@@ -1606,6 +2067,26 @@ struct Chrome<'a> {
     tree: Option<&'a FileTree>,
     /// The question the window is asking, if it is asking one.
     prompt: Option<&'a str>,
+    /// The conflicts between the buffer and a proposed change.
+    conflicts: Option<ConflictView>,
+}
+
+/// What the panel shows about the conflicts.
+struct ConflictView {
+    /// How many conflicts there are.
+    total: usize,
+    /// Which one the keys act on, counting from zero.
+    selected: usize,
+    /// The two sides of each conflict.
+    items: Vec<ConflictItem>,
+}
+
+/// The two sides of one conflict.
+struct ConflictItem {
+    /// What the buffer has.
+    ours: String,
+    /// What the agent proposed.
+    theirs: String,
 }
 
 /// The matches of a search that was not run.
@@ -1721,7 +2202,13 @@ fn build_scene(
         );
     }
 
-    push_agent_panel(&mut scene, size, chrome.agent, chrome.agent_error);
+    push_agent_panel(
+        &mut scene,
+        size,
+        chrome.agent,
+        chrome.agent_error,
+        chrome.conflicts.as_ref(),
+    );
 
     // The find bar is drawn in the sans-serif face, so it gets a measurer of
     // its own.
@@ -2155,6 +2642,7 @@ fn push_agent_panel(
     size: Size,
     agent: Option<&AgentSession>,
     agent_error: Option<&str>,
+    conflict: Option<&ConflictView>,
 ) {
     let viewport = Rect::new(0.0, 0.0, size.width, size.height);
     let panel = agent_panel_rect(size);
@@ -2198,7 +2686,52 @@ fn push_agent_panel(
     let body = match agent {
         Some(session) => {
             let panel = session.panel();
-            let mut body = panel.transcript.clone();
+            let mut body = String::new();
+
+            // The context the user may pick from. It comes first: what the
+            // agent gets to see is the user's decision, and it is made
+            // before the turn starts.
+            if !panel.context.is_empty() {
+                body.push_str("上下文\n");
+                for (index, item) in panel.context.iter().enumerate() {
+                    body.push_str(&format!(
+                        "\n{} {}（{} 字节）",
+                        if item.selected { "[x]" } else { "[ ]" },
+                        item.label(),
+                        item.bytes()
+                    ));
+                    let _ = index;
+                }
+                body.push('\n');
+            }
+
+            // A change the agent proposes, block by block.
+            for proposal in &panel.pending_diffs {
+                body.push_str(&format!(
+                    "\n变更 {path} · 批准 {approved} / 拒绝 {rejected}\n",
+                    path = proposal.path,
+                    approved = proposal.approved_count(),
+                    rejected = proposal.rejected_count(),
+                ));
+                for (index, hunk) in proposal.hunks.iter().enumerate() {
+                    let mark = match hunk.decision {
+                        HunkDecision::Approved => "+",
+                        HunkDecision::Rejected => "-",
+                        HunkDecision::Pending => " ",
+                    };
+                    body.push_str(&format!(
+                        "\n{mark} 第 {line} 行 {summary}",
+                        line = hunk.line,
+                        summary = hunk.summary(),
+                    ));
+                    let _ = index;
+                }
+            }
+
+            if !panel.transcript.is_empty() {
+                body.push('\n');
+                body.push_str(&panel.transcript);
+            }
             for tool in &panel.tools {
                 body.push_str(&format!(
                     "\n[{}] {}",
@@ -2215,6 +2748,23 @@ fn push_agent_panel(
                     "\n需要授权：{}（Ctrl+Alt+A 允许 / Ctrl+Alt+N 拒绝）",
                     pending.title
                 ));
+            }
+            if let Some(conflict) = conflict {
+                body.push_str(&format!(
+                    "\n冲突 {} 处 · 第 {} 处待选（Ctrl+Alt+K 保留我的 / Ctrl+Alt+J 用 Agent 的）",
+                    conflict.total,
+                    conflict.selected + 1
+                ));
+                for item in &conflict.items {
+                    body.push_str(&format!("\n  我的：{}", item.ours));
+                    body.push_str(&format!("\n  Agent：{}", item.theirs));
+                }
+            }
+            if !panel.trace.is_empty() {
+                body.push_str("\n轨迹\n");
+                for entry in &panel.trace {
+                    body.push_str(&format!("\n[{}] {}", entry.kind.label(), entry.detail));
+                }
             }
             if body.is_empty() {
                 "Ctrl+M 把当前内容交给 Agent；Ctrl+. 取消本轮".to_owned()
