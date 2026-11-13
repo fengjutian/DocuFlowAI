@@ -291,6 +291,7 @@ name = "codeweaver-editor"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "codeweaver-dap",
  "codeweaver-lsp",
  "codeweaver-platform",
 ]
@@ -320,6 +321,7 @@ dependencies = [
  "anyhow",
  "codeweaver-agent-acp",
  "codeweaver-agent-ui",
+ "codeweaver-dap",
  "codeweaver-diff",
  "codeweaver-editor-core",
  "codeweaver-lsp",

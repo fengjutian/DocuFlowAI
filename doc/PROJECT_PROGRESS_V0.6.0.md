@@ -2,7 +2,7 @@
 
 文档号：`V0.6.0`  
 产品版本：`0.6.0`  
-状态：进行中（DF-0602 / DF-0604 / DF-0605 实现完成，待统一回归）
+状态：进行中（DF-0602 / DF-0604 / DF-0605 / DF-0606 实现完成，待统一回归）
 更新日期：2026-11-13
 
 ## 1. 本期结论
@@ -18,7 +18,7 @@ V0.5.0 把编辑器与 Agent 之间接成了一条闭环：用户挑上下文 �
 3. **LSP 格式化、重命名、代码操作**（DF-0603 / DF-0604 / DF-0605）：语言服务器会的事，编辑器里按一下键就能用。
 4. **最小 DAP 调试能力**（DF-0606）：断点、单步、看变量。
 
-本期先落第三块与第二块：**DF-0603 LSP 格式化**、**DF-0604 LSP 重命名**、**DF-0605 LSP 代码操作**——语言服务器会的事，在编辑器里按一下键就能用；格式化与重命中的改动都是**一次**事务，撤销一次整体回退。加上 **DF-0602 Git 改动面板**（`Ctrl+Shift+G` 打开：改了什么、差在哪、暂存、提交，都看得见、点得动）。
+本期先落第三块与第二块：**DF-0603 LSP 格式化**、**DF-0604 LSP 重命名**、**DF-0605 LSP 代码操作**——语言服务器会的事，在编辑器里按一下键就能用；格式化与重命中的改动都是**一次**事务，撤销一次整体回退。加上 **DF-0602 Git 改动面板**（`Ctrl+Shift+G` 打开：改了什么、差在哪、暂存、提交，都看得见、点得动）与 **DF-0606 最小 DAP 调试**（`F9` 断点、`F5` 开始、`F10`/`F11` 单步、顶帧的变量摆在面板里）。
 
 ## 2. 当前完成度
 
@@ -29,6 +29,7 @@ V0.5.0 把编辑器与 Agent 之间接成了一条闭环：用户挑上下文 �
 | 工作区 | 文件读写、指纹、外部变更检测、文件树 | 全局搜索、项目索引 | 可用 |
 | 标签与会话 | 标签模型、多标签、脏状态、关闭确认 | 会话恢复、最近项目 | 可用 |
 | 语言能力 | 语法高亮（后台）、LSP 补全与诊断、LSP 格式化、LSP 重命名、LSP 代码操作 | 按范围格式化、onType 格式化、重命名预备（prepareRename） | 可用 |
+| 调试 | DAP 客户端、断点（`F9`）、调试会话（`F5`）、单步（`F10`/`F11`/`Shift+F11`）、顶帧变量面板 | 条件断点、命中次数、表达式求值、调用栈全览、多线程、调试控制台 | 最小可用 |
 | Agent | ACP 客户端、面板、审批、流式输出、上下文选择、Diff 按块批准、应用到缓冲区、冲突合并、轨迹 | 语义冲突判断（靠构建与测试发现） | 可用 |
 | 开发工具 | 任务运行器（`Ctrl+Shift+B` 跑构建，输出流进下方面板）、Git 改动面板（`Ctrl+Shift+G` 看状态与 diff、`S` 暂存、`C` 提交） | 终端交互、DAP（本期计划） | 基础可用 |
 
@@ -100,7 +101,7 @@ V0.5.0 把编辑器与 Agent 之间接成了一条闭环：用户挑上下文 �
 - 没有语言服务器、服务器断开、服务器说这里没有可用的操作时，编辑器在状态栏**明说**原因。
 - 协议形状、操作列表、按键处理都有单元测试。
 
-### DF-0606 最小 DAP 调试能力（进行中：实现中）
+### DF-0606 最小 DAP 调试能力（进行中：实现完成，窗口验收待跑）
 
 调试要能断、能走、能看变量。走 Debug Adapter Protocol：适配器是外部程序，编辑器跟它说「断在第几行」「走一步」「给我这一帧的变量」，适配器把程序停下来、把变量说出来。
 
@@ -158,6 +159,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\task-check.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\git-check.ps1
 # 单元级证据：git 模块的检查要在工作区之外跑（低完整性进程起不了 git）
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\git-unit-check.ps1
+# 窗口级证据：断点画出来了、调试面板里有变量
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\debug-check.ps1
 ```
 
 ### 6.2 实测结果
@@ -188,6 +191,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\git-unit-check.ps1
 | `tools\task-check.ps1` | `Ctrl+Shift+B` 跑构建 → 输出面板画出来了、面板里有输出、`Esc` 关掉 | 新写，**未跑** |
 | `tools\git-check.ps1` | `Ctrl+Shift+G` 打开改动面板 → 面板盖住窗口、列出改过的文件、显示 diff、`S` 暂存（git 也这么说）、`C` 问提交说明并真的提交、`Esc` 关掉 | 新写，**未跑** |
 | `tools\git-unit-check.ps1` | git 模块的单元检查（10 项：状态、diff、暂存、提交、面板接线）——在工作区之外跑，因为低完整性进程起不了 `git` | 新写，**未跑** |
+| `tools\debug-check.ps1` | `F9` 断点画在正文边上 → `F5` 起调试会话、面板在窗口下方 → 顶帧的变量（名字、类型、值）在面板里 → `F10` 走一步后程序又停住 | 新写，**未跑** |
 | `tools\settings-check.ps1` | 设置面板 5 项 | 上一轮已过 5/5，本轮待重跑 |
 | `tools\agent-check.ps1` | Agent 面板 6 项 | 上一轮已过 6/6，本轮待重跑 |
 | `tools\workbench-check.ps1` | 工作台 4 项 | 上一轮已过 4/4，本轮待重跑 |
@@ -203,7 +207,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\git-unit-check.ps1
 
 非窗口级的（本地跑，不抢桌面）：
 
-- `cargo test --workspace`（本轮 378 项全过；DF-0602 新加的 10 项 git 检查在这条命令里**会跳过**并打印 `BLOCKED`，因为低完整性起不了 `git`——真正的证据由 `tools\git-unit-check.ps1` 给）、`cargo clippy --workspace --all-targets`（本轮 0 告警）。
+- `cargo test --workspace`（本轮 378 项全过；DF-0602 新加的 10 项 git 检查在这条命令里**会跳过**并打印 `BLOCKED`，因为低完整性起不了 `git`——真正的证据由 `tools\git-unit-check.ps1` 给；DF-0606 新加的 `codeweaver-dap` 契约测试 7 项对着仓库里的假适配器跑，跟着这条命令一起跑就行）、`cargo clippy --workspace --all-targets`（本轮 0 告警）。
 - `cd codeweaver-hermes-lab; npm test`（运行时与 ACP 端点，本轮待跑）。
 - `cd codeweaver-workspace; npm run build`（控制台前端与 Tauri 外壳，本轮待跑）。
 
@@ -211,7 +215,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\git-unit-check.ps1
 
 - 任务运行器现在只跑**构建任务**（`Ctrl+Shift+B`，命令由工程的清单决定）。要跑任意命令需要一个输入框和命令历史；要做真正的交互式终端还需要伪终端（PTY），Windows 上没有 POSIX 那套现成的东西。任务运行器的进程模型已经定了（另起子进程、输出走管道、编辑器退出时任务被停掉），这两件是往上加东西。
 - Git（DF-0602）已经定下用**命令行 `git`**（机器上有 git 就够，不引第三方库），代价是低完整性进程起不了 `git`（见 §6.3）。还没做的是：暂存区里挑文件（现在只暂存选中那一个）、取消暂存（`git restore --staged`）、在面板里看某一次提交（`git log`）、分支与远端（`git branch`、fetch/push）。
-- 调试（DF-0606）牵扯 DAP 协议、线程状态、变量视图，本期只把位置留着。
+- 调试（DF-0606）现在只做到**最小**的一套：断点、单步、顶帧的变量。还没做的是：条件断点与命中次数、表达式求值（`watch`）、调用栈全览（现在只取顶帧）、多线程、`debug console`、以及按工程配适配器（现在适配器在命令行上用 `--dap <program>` 点名，没有 `launch.json`）。断点按行号记着，**文件改了行数之后断点不会跟着走**——这是下一件要做的事。
 - 格式化现在只接了 `textDocument/formatting`；按范围格式化（只排一段）与 `onType` 格式化留到后面。
 - 重命名与代码操作共用一条「服务器改文件」的管道：一次事务落进缓冲区，没开着的文件写到磁盘。**写到磁盘的那部分撤销不回来**——这是与 VS Code 一样的取舍，但要说清楚。
 - 还没接 `textDocument/prepareRename`（先问服务器这个名字能不能改）、没接重命名时的 `prepareCallHierarchy` 之类；代码操作没把诊断当上下文传给服务器（`context.diagnostics` 目前是空的）。

@@ -4,7 +4,7 @@ CodeWeaver：一个自研原生编辑器（Rust + wgpu/winit）、一个 Agent �
 
 ## 仓库结构
 
-- `editor/` — 自研原生编辑器，Rust workspace（13 个 crate，产品版本 `0.6.0`）
+- `editor/` — 自研原生编辑器，Rust workspace（14 个 crate，产品版本 `0.6.0`）
 - `codeweaver-hermes-lab/` — Agent 运行时与 ACP 端点（TypeScript/Node，`0.6.0`）
 - `codeweaver-workspace/` — 控制台前端 + Tauri 外壳（React/Vite/Tauri，`0.6.0`）
 - `client/` — 上游研究基线（Zed，只读，不提交）

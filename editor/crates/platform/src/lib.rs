@@ -2,6 +2,7 @@ mod agent;
 mod code_action;
 mod completion;
 mod context;
+mod debug;
 mod diff_review;
 pub mod editor_view;
 pub mod find;
@@ -20,6 +21,7 @@ use std::{ops::Range, path::{Path, PathBuf}, sync::Arc, time::Duration};
 use anyhow::{Context, Result};
 use codeweaver_agent_acp::ToolStatus;
 use codeweaver_agent_ui::{ContextItem, HunkDecision};
+use codeweaver_dap::{AdapterConfig, DapEvent};
 use codeweaver_editor_core::Editor;
 use codeweaver_lsp::{
     Client as LspClient, LspEvent, ServerConfig,
@@ -35,6 +37,7 @@ use codeweaver_workspace::{ChangeDetector, Document, ExternalChange, FileTree, W
 use codeweaver_workbench::{close_decision, CloseDecision, Tab, TabBar, TabId};
 use code_action::ActionPopup;
 use completion::CompletionPopup;
+use debug::{Breakpoints, DebugPanel, DebugState, DebugStep, Debugger};
 use editor_view::{
     BodyOverlay, EditorView, FindOverlay, LINE_HEIGHT, MarkSeverity, RendererMeasurer,
 };
@@ -162,6 +165,15 @@ pub struct NativeApplication {
     git: Option<GitPanel>,
     /// The box that asks for the message of a commit, when it is open.
     commit_box: Option<RenameBox>,
+    /// The debug adapter, when one is named.
+    debug_adapter: Option<AdapterConfig>,
+    /// The debug session, when there is one.
+    debug: Option<Debugger>,
+    /// The breakpoints of the editor.
+    ///
+    /// They belong to the files and not to the session: they are there
+    /// whether a session is running or not.
+    breakpoints: Breakpoints,
     /// The tabs that are open.
     tabs: TabBar,
     /// The pane of every tab, in the order of the tabs.
@@ -364,6 +376,9 @@ impl NativeApplication {
             task_panel: false,
             git: None,
             commit_box: None,
+            debug_adapter: None,
+            debug: None,
+            breakpoints: Breakpoints::default(),
             tabs,
             panes,
             active: 0,
@@ -394,6 +409,14 @@ impl NativeApplication {
     /// without touching the process environment.
     pub fn set_endpoint(&mut self, settings: EndpointSettings) {
         self.endpoint = Some(settings);
+    }
+
+    /// Sets the debug adapter to use.
+    ///
+    /// Without this, there is no debugger: the editor says so when a
+    /// session is asked for.
+    pub fn set_debug_adapter(&mut self, adapter: AdapterConfig) {
+        self.debug_adapter = Some(adapter);
     }
 
     pub fn run(mut self) -> Result<()> {
@@ -1361,7 +1384,7 @@ impl NativeApplication {
 
     /// How many lines of the body fit on screen.
     fn visible_lines(&self, scale_factor: f64) -> usize {
-        let body = editor_body_rect(self.window_size(scale_factor), self.task_panel_height());
+        let body = editor_body_rect(self.window_size(scale_factor), self.bottom_panel_height());
         ((body.size.height / LINE_HEIGHT).floor() as usize).max(1)
     }
 
@@ -1370,7 +1393,7 @@ impl NativeApplication {
     /// The layout is only rebuilt when something it depends on changed, so
     /// a mouse move does not pay for measuring the text again.
     fn rebuild_layout(&mut self, scale_factor: f64) {
-        let bottom = self.task_panel_height();
+        let bottom = self.bottom_panel_height();
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
@@ -1617,7 +1640,7 @@ impl NativeApplication {
             self.press_file_tree(cursor, size);
             return;
         }
-        let bottom = self.task_panel_height();
+        let bottom = self.bottom_panel_height();
         let body = editor_body_rect(size, bottom);
         if !body.contains(cursor) {
             return;
@@ -1641,7 +1664,7 @@ impl NativeApplication {
         let Some(cursor) = self.cursor else {
             return;
         };
-        let bottom = self.task_panel_height();
+        let bottom = self.bottom_panel_height();
         let body = editor_body_rect(self.window_size(scale_factor), bottom);
         let pane = &mut self.panes[self.active];
         pane.view.drag(
@@ -2113,6 +2136,20 @@ impl NativeApplication {
         } else {
             0.0
         }
+    }
+
+    /// The room that is kept at the bottom of the window for the panels.
+    ///
+    /// The output of the task and the panel of the debugger cannot both be
+    /// there at once: the taller one gets the room.
+    fn bottom_panel_height(&self) -> f32 {
+        let task = self.task_panel_height();
+        let debug = if self.debug.is_some() {
+            debug::DEBUG_PANEL_HEIGHT
+        } else {
+            0.0
+        };
+        task.max(debug)
     }
 
     /// Handles the keys of the task.
@@ -2967,6 +3004,246 @@ impl NativeApplication {
             Err(error) => self.status = Some(format!("提交没成：{error}")),
         }
     }
+
+    /// Handles the keys of the debugger.
+    ///
+    /// F9 puts a breakpoint on the line of the caret, F5 starts the
+    /// session, F10 and F11 walk through the program, and F8 ends it.
+    fn handle_debug_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
+        match key {
+            Key::Named(NamedKey::F9) => {
+                self.toggle_breakpoint();
+                true
+            }
+            Key::Named(NamedKey::F5) => {
+                self.start_debug_session();
+                true
+            }
+            Key::Named(NamedKey::F8) => {
+                self.stop_debug_session();
+                true
+            }
+            Key::Named(NamedKey::F10) => {
+                self.step_debug(DebugStep::Over);
+                true
+            }
+            Key::Named(NamedKey::F11) if self.modifiers.shift_key() => {
+                self.step_debug(DebugStep::Out);
+                true
+            }
+            Key::Named(NamedKey::F11) => {
+                self.step_debug(DebugStep::In);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The address of the file that is on screen.
+    fn uri_of_the_open_file(&self) -> Option<String> {
+        let path = self.panes[self.active]
+            .document
+            .as_ref()
+            .map(|document| document.path().to_path_buf())?;
+        Some(codeweaver_lsp::protocol::file_uri(&path))
+    }
+
+    /// Puts a breakpoint on the line of the caret, or takes it away.
+    fn toggle_breakpoint(&mut self) {
+        let Some(uri) = self.uri_of_the_open_file() else {
+            self.status = Some("这个文件没有地址，断点放不了".to_owned());
+            return;
+        };
+        let caret = self.panes[self.active].editor.caret().0;
+        let line = self.panes[self.active].editor.buffer().line_of_offset(caret) + 1;
+        if self.breakpoints.toggle(&uri, line as u32) {
+            self.status = Some(format!(
+                "第 {line} 行有了断点（{} 个）",
+                self.breakpoints.len()
+            ));
+        } else {
+            let count = self.breakpoints.len();
+            self.status = Some(if count == 0 {
+                "断点都撤了".to_owned()
+            } else {
+                format!("第 {line} 行的断点撤了（{count} 个）")
+            });
+        }
+    }
+
+    /// Starts a debug session.
+    fn start_debug_session(&mut self) {
+        if self.debug.is_some() {
+            self.status = Some("调试会话已经在跑了".to_owned());
+            return;
+        }
+        let Some(config) = self.debug_adapter.clone() else {
+            self.status = Some("没有调试适配器（用 --dap <program> 点名）".to_owned());
+            return;
+        };
+        let Some(path) = self.panes[self.active]
+            .document
+            .as_ref()
+            .map(|document| document.path().to_path_buf())
+        else {
+            self.status = Some("这个文件不属于任何工程，没有可以调试的程序".to_owned());
+            return;
+        };
+        let program = path.to_string_lossy().to_string();
+        let warning = if self.breakpoints.is_empty() {
+            Some("没有断点，程序不会停（按 F9 放一个）".to_owned())
+        } else {
+            None
+        };
+        match Debugger::start(&config, &program) {
+            Ok(debugger) => {
+                self.debug = Some(debugger);
+                self.status = Some(
+                    warning.unwrap_or_else(|| "调试会话起了，等适配器说准备好了".to_owned()),
+                );
+            }
+            Err(error) => {
+                self.status = Some(format!("调试会话起不来：{error}"));
+            }
+        }
+    }
+
+    /// Ends the debug session.
+    fn stop_debug_session(&mut self) {
+        let Some(mut debug) = self.debug.take() else {
+            self.status = Some("没有调试会话".to_owned());
+            return;
+        };
+        let _ = debug.client.terminate();
+        debug.client.shutdown();
+        self.status = Some("调试结束了".to_owned());
+    }
+
+    /// Walks the program one step.
+    fn step_debug(&mut self, step: DebugStep) {
+        let message = match self.debug.as_ref() {
+            None => Some("没有调试会话".to_owned()),
+            Some(debug) if debug.state != DebugState::Stopped => {
+                Some("程序没有停住，不能单步".to_owned())
+            }
+            Some(debug) => {
+                let thread_id = debug.thread_id;
+                let result = match step {
+                    DebugStep::Over => debug.client.next(thread_id),
+                    DebugStep::In => debug.client.step_in(thread_id),
+                    DebugStep::Out => debug.client.step_out(thread_id),
+                };
+                match result {
+                    Ok(()) => Some("走一步".to_owned()),
+                    Err(error) => Some(format!("走不了：{error}")),
+                }
+            }
+        };
+        if let Some(message) = message {
+            self.status = Some(message);
+        }
+    }
+
+    /// Collects what the adapter has said.
+    ///
+    /// The adapter talks on a thread of its own, so what it says is
+    /// collected once per frame, the way the output of the task is.
+    fn pump_debug(&mut self) -> bool {
+        if self.debug.is_none() {
+            return false;
+        }
+        // The breakpoints are read before the session is borrowed: the
+        // session hands them to the adapter when it says it is ready.
+        let breakpoints = self.breakpoints.all();
+        let Some(debug) = self.debug.as_mut() else {
+            return false;
+        };
+        let mut changed = false;
+
+        for event in debug.client.drain_events() {
+            changed = true;
+            match event {
+                DapEvent::Initialized => {
+                    // The breakpoints go first, and then the program starts.
+                    if breakpoints.is_empty() {
+                        debug.push_output("一个断点都没有，程序不会停");
+                    }
+                    for (uri, lines) in &breakpoints {
+                        if let Err(error) = debug.client.set_breakpoints(uri, lines) {
+                            debug.push_output(&format!("断点放不下：{error}"));
+                        }
+                    }
+                    if let Err(error) = debug.client.configuration_done() {
+                        debug.push_output(&format!("配置没完：{error}"));
+                    }
+                    if let Err(error) = debug.client.launch(&debug.program.clone(), &[]) {
+                        debug.push_output(&format!("程序起不来：{error}"));
+                    }
+                    debug.state = DebugState::Running;
+                }
+                DapEvent::Stopped { thread_id, .. } => {
+                    debug.thread_id = thread_id;
+                    debug.state = DebugState::Stopped;
+                    debug.variables.clear();
+                    debug.frame = None;
+                    if let Err(error) = debug.client.stack_trace(thread_id) {
+                        debug.push_output(&format!("栈帧读不到：{error}"));
+                    }
+                }
+                DapEvent::Continued { .. } => {
+                    debug.state = DebugState::Running;
+                }
+                DapEvent::Output { text, .. } => debug.push_output(&text),
+                DapEvent::Breakpoint { .. } => {}
+                DapEvent::Terminated => {
+                    debug.state = DebugState::Finished;
+                    debug.push_output("调试结束了");
+                }
+                DapEvent::Exited { code } => {
+                    debug.state = DebugState::Finished;
+                    debug.push_output(&format!("程序退出了，退出码 {code}"));
+                }
+                DapEvent::Disconnected { reason } => {
+                    debug.state = DebugState::Finished;
+                    debug.push_output(&reason);
+                }
+            }
+        }
+
+        // The frames of the stack, and then the variables of the top frame.
+        for answer in debug.client.drain_stack_traces() {
+            match answer {
+                Ok(frames) => {
+                    if let Some(frame) = frames.first() {
+                        debug.frame = Some(frame.name.clone());
+                        if let Err(error) = debug.client.scopes(frame.id) {
+                            debug.push_output(&format!("变量读不到：{error}"));
+                        }
+                    }
+                }
+                Err(error) => debug.push_output(&format!("栈帧读不到：{error}")),
+            }
+        }
+        for answer in debug.client.drain_scopes() {
+            match answer {
+                Ok(scopes) => {
+                    for scope in &scopes {
+                        if let Err(error) = debug.client.variables(scope.variables_reference) {
+                            debug.push_output(&format!("变量读不到：{error}"));
+                        }
+                    }
+                }
+                Err(error) => debug.push_output(&format!("变量读不到：{error}")),
+            }
+        }
+        for answer in debug.client.drain_variables() {
+            match answer {
+                Ok(variables) => debug.variables = variables,
+                Err(error) => debug.push_output(&format!("变量读不到：{error}")),
+            }
+        }
+        changed
+    }
 }
 
 impl ApplicationHandler for NativeApplication {
@@ -3099,6 +3376,12 @@ impl ApplicationHandler for NativeApplication {
                 // Ctrl+Shift+G opens the panel of the changes. While the
                 // panel is open it takes every key.
                 if self.handle_git_key(&event.logical_key.as_ref(), event.text.as_deref()) {
+                    window.request_redraw();
+                    return;
+                }
+                // F9 puts a breakpoint, F5 starts the debugging, F10 and F11
+                // walk through the program.
+                if self.handle_debug_key(&event.logical_key.as_ref()) {
                     window.request_redraw();
                     return;
                 }
@@ -3274,6 +3557,10 @@ impl ApplicationHandler for NativeApplication {
                 if self.pump_task() {
                     window.request_redraw();
                 }
+                // The debug adapter talks on a thread of its own as well.
+                if self.pump_debug() {
+                    window.request_redraw();
+                }
                 // The highlighter answers on its own thread as well. The
                 // answer belongs to a version of the text: an answer that
                 // arrives after the text changed again is dropped.
@@ -3294,6 +3581,21 @@ impl ApplicationHandler for NativeApplication {
                     state: &self.task_output.state,
                     title: &self.task_title,
                 });
+                // The panel of the debugger is read before the renderer is
+                // borrowed as well.
+                let debug_panel = self.debug.as_ref().map(|debug| DebugPanel {
+                    state: debug.state,
+                    output: &debug.output,
+                    variables: &debug.variables,
+                    frame: debug.frame.as_deref(),
+                    program: &debug.program,
+                });
+                // The breakpoints of the file that is on screen are the ones
+                // that are drawn in its margin.
+                let breakpoints = self
+                    .uri_of_the_open_file()
+                    .map(|uri| self.breakpoints.lines_of(&uri))
+                    .unwrap_or_default();
                 let scale_factor = window.scale_factor();
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
@@ -3337,6 +3639,8 @@ impl ApplicationHandler for NativeApplication {
                         settings: self.settings.as_ref(),
                         git: self.git.as_ref(),
                         commit: self.commit_box.as_ref(),
+                        debug: debug_panel,
+                        breakpoints: &breakpoints,
                         conflicts: conflict,
                     },
                 );
@@ -3412,6 +3716,10 @@ struct Chrome<'a> {
     git: Option<&'a GitPanel>,
     /// The box that asks for the message of a commit, when it is open.
     commit: Option<&'a RenameBox>,
+    /// The panel of the debugger, when there is a session.
+    debug: Option<DebugPanel<'a>>,
+    /// The lines of the breakpoints of the file that is on screen.
+    breakpoints: &'a [u32],
     /// The conflicts between the buffer and a proposed change.
     conflicts: Option<ConflictView>,
 }
@@ -3491,6 +3799,8 @@ fn build_scene(
     // window, and the text of the document does not go under it.
     let bottom = if chrome.task_panel.is_some() {
         TASK_PANEL_HEIGHT
+    } else if chrome.debug.is_some() {
+        debug::DEBUG_PANEL_HEIGHT
     } else {
         0.0
     };
@@ -3606,6 +3916,24 @@ fn build_scene(
             },
             &mut measurer,
         );
+
+        // The breakpoints of the file that is on screen are drawn in the
+        // margin of the text: a breakpoint that cannot be seen is a
+        // breakpoint nobody knows about.
+        for line in chrome.breakpoints {
+            let index = *line as usize;
+            if index == 0 || index > editor_state.buffer().line_count() {
+                continue;
+            }
+            let offset = editor_state.buffer().line_range(index - 1).start.0;
+            if let Some((_, y)) = view.point_of(offset) {
+                scene.push_quad(
+                    Rect::new(body.origin.x - 12.0, body.origin.y + y + 6.0, 8.0, 8.0),
+                    Color::rgb(0.90, 0.35, 0.35),
+                    body,
+                );
+            }
+        }
     }
 
     push_agent_panel(
@@ -3672,6 +4000,10 @@ fn build_scene(
     // The output of the task is at the bottom of the window.
     if let Some(panel) = chrome.task_panel {
         push_task_panel(&mut scene, size, &panel);
+    }
+    // The panel of the debugger is at the bottom of the window as well.
+    if let Some(panel) = chrome.debug {
+        debug::draw_panel(&mut scene, viewport, size, &panel);
     }
 
     scene

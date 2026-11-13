@@ -645,25 +645,25 @@ fn dispatch(
                 Pending::Breakpoints(sender) => {
                     let _ = sender.send(match error {
                         Some(error) => Err(error),
-                        None => Ok(serde_json::from_value(body).unwrap_or_default()),
+                        None => read_list(&body, "breakpoints"),
                     });
                 }
                 Pending::StackTrace(sender) => {
                     let _ = sender.send(match error {
                         Some(error) => Err(error),
-                        None => Ok(serde_json::from_value(body).unwrap_or_default()),
+                        None => read_list(&body, "stackFrames"),
                     });
                 }
                 Pending::Scopes(sender) => {
                     let _ = sender.send(match error {
                         Some(error) => Err(error),
-                        None => Ok(serde_json::from_value(body).unwrap_or_default()),
+                        None => read_list(&body, "scopes"),
                     });
                 }
                 Pending::Variables(sender) => {
                     let _ = sender.send(match error {
                         Some(error) => Err(error),
-                        None => Ok(serde_json::from_value(body).unwrap_or_default()),
+                        None => read_list(&body, "variables"),
                     });
                 }
             }
@@ -689,6 +689,26 @@ fn dispatch(
             }
         }
     }
+}
+
+/// Reads a list out of the body of an answer.
+///
+/// The protocol puts the list in a named field: the answer of
+/// `setBreakpoints` has `breakpoints`, the answer of `stackTrace` has
+/// `stackFrames`, the answer of `scopes` has `scopes`, and the answer of
+/// `variables` has `variables`.
+///
+/// A body that does not have the field is an error and not an empty list:
+/// an empty list and a wrong shape look the same, and only one of them is
+/// true.
+fn read_list<T: serde::de::DeserializeOwned>(
+    body: &Value,
+    name: &str,
+) -> Result<Vec<T>, DapError> {
+    let list = body.get(name).ok_or_else(|| {
+        DapError::Protocol(format!("the answer of the adapter has no `{name}` in it"))
+    })?;
+    serde_json::from_value(list.clone()).map_err(|error| DapError::Protocol(error.to_string()))
 }
 
 #[cfg(test)]
@@ -784,5 +804,31 @@ mod tests {
                 command: "runInTerminal".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn a_list_is_read_out_of_the_field_it_is_in() {
+        let body = json!({
+            "stackFrames": [{"id": 3, "name": "main", "line": 7}],
+            "totalFrames": 1,
+        });
+        let frames: Vec<StackFrame> = read_list(&body, "stackFrames").expect("the frames are read");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].name, "main");
+        assert_eq!(frames[0].line, Some(7));
+    }
+
+    #[test]
+    fn a_body_without_the_field_is_an_error_and_not_an_empty_list() {
+        let body = json!({ "totalFrames": 0 });
+        let frames: Result<Vec<StackFrame>, DapError> = read_list(&body, "stackFrames");
+        assert!(frames.is_err(), "the wrong shape must not look like an empty list");
+    }
+
+    #[test]
+    fn an_empty_list_is_an_empty_list() {
+        let body = json!({ "variables": [] });
+        let variables: Vec<Variable> = read_list(&body, "variables").expect("the variables are read");
+        assert!(variables.is_empty());
     }
 }
