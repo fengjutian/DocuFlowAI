@@ -640,6 +640,24 @@ mod tests {
     }
 
     #[test]
+    fn several_edits_are_one_change_of_the_document() {
+        let mut editor = Editor::new("one two three\n");
+        editor
+            .replace_edits(vec![
+                (TextOffset(0)..TextOffset(3), "1".to_owned()),
+                (TextOffset(8)..TextOffset(13), "3".to_owned()),
+            ])
+            .expect("the edits go in");
+
+        assert_eq!(editor.text(), "1 two 3\n");
+
+        // One undo takes the whole thing back: the edits are one change of
+        // the document, the way a formatter answers.
+        editor.undo().expect("the undo goes through");
+        assert_eq!(editor.text(), "one two three\n");
+    }
+
+    #[test]
     fn undo_and_redo_restore_text_and_selection() {
         let mut editor = Editor::new("");
         editor.insert("中文").unwrap();

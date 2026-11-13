@@ -126,6 +126,9 @@ pub struct Client {
     responses: Receiver<Result<Value, LspError>>,
     /// Where the answer of an ordinary request goes.
     response_sender: Sender<Result<Value, LspError>>,
+    formattings: Receiver<Result<Vec<TextEdit>, LspError>>,
+    /// Where the answer of a formatting request goes.
+    formatting_sender: Sender<Result<Vec<TextEdit>, LspError>>,
     running: Arc<AtomicBool>,
     /// Whether the handshake is done.
     ready: Arc<AtomicBool>,
@@ -163,8 +166,10 @@ impl Client {
         let (event_sender, events) = channel();
         let (completion_sender, completions) = channel();
         let (response_sender, responses) = channel();
+        let (formatting_sender, formattings) = channel();
         let client_completions = completion_sender.clone();
         let client_responses = response_sender.clone();
+        let client_formattings = formatting_sender.clone();
         let pending: Arc<Mutex<HashMap<i64, Pending>>> = Arc::new(Mutex::new(HashMap::new()));
         let next_id = Arc::new(Mutex::new(1));
         let running = Arc::new(AtomicBool::new(true));
@@ -216,6 +221,8 @@ impl Client {
             completion_sender: client_completions,
             responses,
             response_sender: client_responses,
+            formattings,
+            formatting_sender: client_formattings,
             running,
             ready,
             sync_kind,
@@ -369,6 +376,36 @@ impl Client {
         self.write(&message)
     }
 
+    /// Asks the server to format the document.
+    ///
+    /// The answer arrives later: it is in [`Client::drain_formattings`].
+    pub fn request_formatting(
+        &self,
+        uri: &str,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<(), LspError> {
+        let id = self.next_id();
+        self.pending
+            .lock()
+            .expect("the pending lock is not poisoned")
+            .insert(id, Pending::Formatting(self.formatting_sender.clone()));
+
+        let message = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "textDocument/formatting",
+            "params": {
+                "textDocument": TextDocumentIdentifier { uri: uri.to_owned() },
+                "options": {
+                    "tabSize": tab_size,
+                    "insertSpaces": insert_spaces,
+                },
+            },
+        });
+        self.write(&message)
+    }
+
     /// Asks the server something else.
     ///
     /// The answer arrives later: it is in [`Client::drain_responses`].
@@ -408,6 +445,12 @@ impl Client {
             .try_iter()
             .filter_map(|answer| answer.ok())
             .collect()
+    }
+
+    /// Returns the answers of the formatting requests that arrived since the
+    /// last call.
+    pub fn drain_formattings(&self) -> Vec<Result<Vec<TextEdit>, LspError>> {
+        self.formattings.try_iter().collect()
     }
 
     /// The next id of a request.
@@ -580,8 +623,14 @@ fn read_loop(
     // Fail every request that is still waiting, so callers do not hang.
     let mut pending = pending.lock().expect("the pending lock is not poisoned");
     for (_, entry) in pending.drain() {
-        if let Pending::Answer(sender) = entry {
-            let _ = sender.send(Err(LspError::Closed));
+        match entry {
+            Pending::Answer(sender) => {
+                let _ = sender.send(Err(LspError::Closed));
+            }
+            Pending::Formatting(sender) => {
+                let _ = sender.send(Err(LspError::Closed));
+            }
+            Pending::Completion(_) => {}
         }
     }
     let reason = {
@@ -657,6 +706,9 @@ fn dispatch(
                     if let Ok(value) = outcome {
                         let _ = completion.send(completion_list(value));
                     }
+                }
+                Pending::Formatting(sender) => {
+                    let _ = sender.send(outcome.and_then(text_edits));
                 }
                 Pending::Answer(sender) => {
                     let _ = sender.send(outcome);
@@ -737,4 +789,20 @@ fn completion_list(value: Value) -> CompletionList {
         is_incomplete: false,
         items: serde_json::from_value(value).unwrap_or_default(),
     }
+}
+
+/// The answer of a formatting request, in the editor's own shape.
+///
+/// The server answers with a list of edits, or with nothing at all when the
+/// document is already the way the server would lay it out. An answer that
+/// cannot be read is an error, not an empty list: a file that was not
+/// formatted and a file that was formatted into nothing are two different
+/// things.
+fn text_edits(value: Value) -> Result<Vec<TextEdit>, LspError> {
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_value(value).map_err(|error| LspError::Protocol(format!(
+        "the server answered with edits that could not be read: {error}"
+    )))
 }

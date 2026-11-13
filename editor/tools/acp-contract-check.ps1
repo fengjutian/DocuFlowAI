@@ -64,7 +64,7 @@ $failed = if ($result -and $result -match '(\d+) passed; (\d+) failed') {
 }
 
 $summary = @{
-    version = '0.5.0'
+    version = '0.6.0'
     endpointAvailable = ($skipped.Count -eq 0)
     passed = $passed
     failed = $failed

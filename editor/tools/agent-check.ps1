@@ -550,7 +550,7 @@ finally {
 
 $failed = @($script:checks | Where-Object { -not $_.ok })
 $summary = @{
-    version = '0.5.0'
+    version = '0.6.0'
     checks = $script:checks
     passed = $script:checks.Count - $failed.Count
     failed = $failed.Count

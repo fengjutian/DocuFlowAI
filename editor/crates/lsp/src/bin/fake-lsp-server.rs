@@ -6,7 +6,8 @@
 //! - `initialize` says the server wants the ranges that changed;
 //! - `textDocument/didOpen` and `textDocument/didChange` publish a
 //!   diagnostic that says how much text the server has;
-//! - `textDocument/completion` answers with two items.
+//! - `textDocument/completion` answers with two items;
+//! - `textDocument/formatting` answers with two edits of the document.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -77,6 +78,31 @@ fn handle(message: &Value, output: &mut impl Write, documents: &mut HashMap<Stri
                         { "label": "beta", "kind": 3, "detail": "fn beta()" }
                     ]
                 }
+            });
+            write(output, &answer);
+        }
+        (Some(id), "textDocument/formatting") => {
+            // Two edits, the way a formatter answers: one that replaces a
+            // piece of text and one that puts something in.
+            let answer = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": [
+                    {
+                        "range": {
+                            "start": { "line": 0, "character": 8 },
+                            "end": { "line": 0, "character": 9 }
+                        },
+                        "newText": ") {"
+                    },
+                    {
+                        "range": {
+                            "start": { "line": 0, "character": 12 },
+                            "end": { "line": 0, "character": 12 }
+                        },
+                        "newText": "\n"
+                    }
+                ]
             });
             write(output, &answer);
         }

@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use codeweaver_agent_acp::ToolStatus;
 use codeweaver_agent_ui::{ContextItem, HunkDecision};
 use codeweaver_editor_core::Editor;
-use codeweaver_lsp::{Client as LspClient, LspEvent, ServerConfig};
+use codeweaver_lsp::{Client as LspClient, LspEvent, ServerConfig, protocol::TextEdit};
 use codeweaver_render::{
     Color, FrameScene, Point, Rect, Renderer, RendererError, Size, TextFamily, TextStyle,
 };
@@ -138,6 +138,13 @@ pub struct NativeApplication {
     prompt: Option<Prompt>,
     /// The settings panel, when it is open.
     settings: Option<Settings>,
+    /// The formatting request that is on its way, and the version of the
+    /// text it is about.
+    ///
+    /// A request that is on its way is not sent again, and an answer that
+    /// comes back for a text that has changed since then is not put into the
+    /// buffer.
+    formatting: Option<u64>,
     /// The change the agent proposed for the file that is open, and the
     /// version of the buffer it was computed against.
     ///
@@ -274,6 +281,7 @@ impl NativeApplication {
             detector,
             prompt: None,
             settings: None,
+            formatting: None,
             pending_diff: None,
             selected_hunk: 0,
             selected_context: 0,
@@ -1346,6 +1354,34 @@ impl NativeApplication {
                 changed = true;
             }
         }
+
+        // The formatting answers are put into the buffer. The edits of one
+        // answer are one change of the document.
+        let formattings = match self.server.as_ref() {
+            Some(server) => server.drain_formattings(),
+            None => Vec::new(),
+        };
+        for answer in formattings {
+            match answer {
+                Ok(edits) => {
+                    // The answer is only about the text that was there when
+                    // it was asked for. A text that changed in the meantime
+                    // is a different text, and the edits do not fit it.
+                    let Some(sent_at) = self.formatting.take() else {
+                        continue;
+                    };
+                    if self.apply_formatting(edits, sent_at) {
+                        changed = true;
+                    }
+                }
+                Err(error) => {
+                    self.formatting = None;
+                    eprintln!("could not format the file: {error}");
+                    self.status = Some(format!("格式化失败：{error}"));
+                    changed = true;
+                }
+            }
+        }
         changed
     }
 
@@ -1654,6 +1690,100 @@ impl NativeApplication {
             }
             None => self.status = Some("没有语言服务器".to_owned()),
         }
+    }
+
+    /// Asks the server to format the file that is open.
+    ///
+    /// The answer comes later: it is put into the buffer by
+    /// [`Self::apply_formatting`], when the window collects what the server
+    /// has to say.
+    fn request_format(&mut self) {
+        if self.formatting.is_some() {
+            // A request is already on its way. Asking again would make the
+            // server work twice for one press of the key.
+            return;
+        }
+        let Some(uri) = self.panes[self.active].document_uri.clone() else {
+            self.status = Some("这个文件没有语言服务器，格式化不了".to_owned());
+            return;
+        };
+        let outcome = self
+            .server
+            .as_ref()
+            .map(|server| server.request_formatting(&uri, 4, true));
+        match outcome {
+            Some(Ok(())) => {
+                // The version is the version of the text the request is
+                // about: an answer that comes back for a text that has
+                // changed since then does not fit the text that is there
+                // now.
+                self.formatting = Some(self.panes[self.active].editor.version());
+                self.status = Some("正在格式化…".to_owned());
+            }
+            Some(Err(error)) => {
+                eprintln!("could not ask the server to format the file: {error}");
+                self.status = Some(format!("格式化请求失败：{error}"));
+            }
+            None => self.status = Some("没有语言服务器，格式化不了".to_owned()),
+        }
+    }
+
+    /// Puts the edits of a formatting answer into the buffer.
+    ///
+    /// The edits are one change of the document: they go in as one
+    /// transaction, so one undo takes the whole formatting back.
+    ///
+    /// `sent_at` is the version of the text the request was made about: an
+    /// answer for a text that has changed since then does not fit the text
+    /// that is there now, and it is not put in.
+    ///
+    /// Returns whether the text changed.
+    fn apply_formatting(&mut self, edits: Vec<TextEdit>, sent_at: u64) -> bool {
+        if sent_at != self.panes[self.active].editor.version() {
+            self.status = Some("文件在格式化期间变了，格式化结果没有用上".to_owned());
+            return false;
+        }
+        let Some(changes) =
+            lsp::formatting_changes(self.panes[self.active].editor.buffer(), &edits)
+        else {
+            self.status = Some("格式化结果对不上这个文件，没有改".to_owned());
+            return false;
+        };
+        if changes.is_empty() {
+            self.status = Some("这个文件已经排好了版".to_owned());
+            return false;
+        }
+        if let Err(error) = self.panes[self.active].editor.replace_edits(changes) {
+            eprintln!("could not put the formatting in: {error}");
+            self.status = Some(format!("格式化结果写不进去：{error}"));
+            return false;
+        }
+        // The tab now says that it has changes that are not on disk, and the
+        // server has to hear about the new text: its answers are about the
+        // text that is on screen and not about the text as the file was
+        // opened.
+        self.sync_dirty_flags();
+        self.tell_server_about_the_change();
+        self.status = Some("已格式化".to_owned());
+        true
+    }
+
+    /// Handles the key that asks the language server to format the file.
+    ///
+    /// Alt+Shift+F formats, the way it does in the other editors. Ctrl+Shift+F
+    /// is left for finding in files.
+    fn handle_format_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
+        if !(self.modifiers.alt_key() && self.modifiers.shift_key()) {
+            return false;
+        }
+        let Some(letter) = key_letter(key) else {
+            return false;
+        };
+        if !letter.eq_ignore_ascii_case(&'f') {
+            return false;
+        }
+        self.request_format();
+        true
     }
 
     /// Opens the find bar when the user asks for it.
@@ -2002,6 +2132,11 @@ impl ApplicationHandler for NativeApplication {
                 // The settings panel takes every key while it is open, and
                 // Ctrl+, opens it.
                 if self.handle_settings_key(&event.logical_key.as_ref()) {
+                    window.request_redraw();
+                    return;
+                }
+                // Alt+Shift+F asks the language server to format the file.
+                if self.handle_format_key(&event.logical_key.as_ref()) {
                     window.request_redraw();
                     return;
                 }
@@ -3782,6 +3917,91 @@ mod tests {
             "// edited\nfn main() {}\n",
             "a file without colours is still a file"
         );
+    }
+
+    #[test]
+    fn the_formatting_answer_goes_into_the_buffer() {
+        let path = scratch("format.rs");
+        fs::write(&path, "fn main( ){}\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(path.clone())).expect("the application starts");
+        let before = app.editor().version();
+        let edits = vec![TextEdit {
+            range: codeweaver_lsp::protocol::Range {
+                start: codeweaver_lsp::protocol::Position::new(0, 8),
+                end: codeweaver_lsp::protocol::Position::new(0, 11),
+            },
+            new_text: ") {".to_owned(),
+        }];
+
+        assert!(app.apply_formatting(edits, before), "the text changed");
+        assert_eq!(app.editor().text(), "fn main() {}\n");
+        assert_eq!(
+            app.editor().version(),
+            before + 1,
+            "the edits are one change of the document"
+        );
+        assert!(
+            app.status_line().contains('●'),
+            "the file has to be marked as changed, got {}",
+            app.status_line()
+        );
+    }
+
+    #[test]
+    fn a_formatting_answer_for_another_text_is_not_put_in() {
+        let path = scratch("format-stale.rs");
+        fs::write(&path, "fn main( ){}\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(path.clone())).expect("the application starts");
+        let before = app.editor().version();
+        let edits = vec![TextEdit {
+            range: codeweaver_lsp::protocol::Range {
+                start: codeweaver_lsp::protocol::Position::new(0, 8),
+                end: codeweaver_lsp::protocol::Position::new(0, 11),
+            },
+            new_text: ") {".to_owned(),
+        }];
+
+        // The answer is about a text that is not the text that is there.
+        assert!(!app.apply_formatting(edits, before + 1));
+        assert_eq!(app.editor().text(), "fn main( ){}\n", "the text is untouched");
+    }
+
+    #[test]
+    fn a_second_format_request_is_not_sent_while_one_is_on_its_way() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.formatting = Some(app.editor().version());
+
+        app.request_format();
+        assert!(
+            app.status.is_none(),
+            "the editor must not ask the server twice for one press of the key"
+        );
+    }
+
+    #[test]
+    fn the_format_key_says_when_there_is_no_server() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::ALT | ModifiersState::SHIFT;
+
+        assert!(app.handle_format_key(&character("f")));
+        assert!(
+            app.status
+                .as_ref()
+                .expect("the editor said something")
+                .contains("没有语言服务器"),
+            "the editor has to say why it cannot format"
+        );
+    }
+
+    #[test]
+    fn the_format_key_is_only_the_key_with_alt_and_shift() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::ALT;
+        assert!(!app.handle_format_key(&character("f")));
+        app.modifiers = ModifiersState::SHIFT;
+        assert!(!app.handle_format_key(&character("f")));
     }
 
     #[test]

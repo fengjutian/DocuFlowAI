@@ -137,3 +137,27 @@ fn the_completions_of_the_server_arrive() {
     assert_eq!(list.items[0].insert_text(), "alpha");
     assert_eq!(list.items[1].label, "beta");
 }
+
+#[test]
+fn the_edits_of_a_formatting_request_arrive() {
+    let client = client();
+    client
+        .did_open("file:///tmp/main.rs", "rust", 1, "fn main() {}\n")
+        .expect("the document opens");
+
+    client
+        .request_formatting("file:///tmp/main.rs", 4, true)
+        .expect("the request goes through");
+
+    let answer = wait_for(|| {
+        let mut answers = client.drain_formattings();
+        (!answers.is_empty()).then(|| answers.remove(0))
+    });
+    let edits = answer.expect("the server answered");
+    assert_eq!(edits.len(), 2);
+    assert_eq!(edits[0].new_text, ") {");
+    assert_eq!(edits[0].range.start, Position::new(0, 8));
+    assert_eq!(edits[0].range.end, Position::new(0, 9));
+    assert_eq!(edits[1].new_text, "\n");
+    assert_eq!(edits[1].range.start, Position::new(0, 12));
+}

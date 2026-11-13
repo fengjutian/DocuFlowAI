@@ -4,14 +4,15 @@
 //! is told about the document in the protocol's own terms: the places in a
 //! document are lines and columns counted in UTF-16 code units, not bytes.
 
+use std::ops::Range as TextRange;
 use std::path::{Path, PathBuf};
 
 use codeweaver_lsp::{
     ServerConfig, positions,
-    protocol::{Diagnostic, DiagnosticSeverity, Position, Range, TextChange},
+    protocol::{Diagnostic, DiagnosticSeverity, Position, Range, TextChange, TextEdit},
 };
 use codeweaver_syntax::Language;
-use codeweaver_text::{Buffer, BufferChange};
+use codeweaver_text::{Buffer, BufferChange, TextOffset};
 
 use crate::editor_view::{Mark, MarkSeverity};
 
@@ -100,6 +101,25 @@ pub fn marks_for(buffer: &Buffer, diagnostics: &[Diagnostic]) -> Vec<Mark> {
             })
         })
         .collect()
+}
+
+/// The edits of a formatting answer, as ranges of the buffer.
+///
+/// The places the server gives are in its own units, so they are worked out
+/// against the text that is there now. A place that is not in the document
+/// means the answer is about a different text, and it is not applied at all:
+/// a formatting that lands in the wrong place is worse than no formatting.
+pub fn formatting_changes(
+    buffer: &Buffer,
+    edits: &[TextEdit],
+) -> Option<Vec<(TextRange<TextOffset>, String)>> {
+    let mut changes = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let start = positions::offset_at(buffer, edit.range.start)?;
+        let end = positions::offset_at(buffer, edit.range.end)?;
+        changes.push((TextOffset(start)..TextOffset(end), edit.new_text.clone()));
+    }
+    Some(changes)
 }
 
 /// How bad a thing is, in the editor's own words.
