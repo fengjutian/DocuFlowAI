@@ -7,6 +7,8 @@ pub mod find;
 mod input;
 mod lsp;
 mod pane;
+mod paths;
+mod settings;
 mod shell;
 
 use std::{ops::Range, path::{Path, PathBuf}, sync::Arc, time::Duration};
@@ -31,12 +33,13 @@ use editor_view::{
 use find::{FindBar, FindField};
 use input::TextInputState;
 use pane::EditorPane;
+use settings::Settings;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
     event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key, ModifiersState, NamedKey},
+    keyboard::{Key, ModifiersState, NamedKey, NativeKey},
     window::{ImePurpose, Window, WindowAttributes, WindowId},
 };
 
@@ -133,6 +136,8 @@ pub struct NativeApplication {
     detector: ChangeDetector,
     /// The question the window is asking the user, if it is asking one.
     prompt: Option<Prompt>,
+    /// The settings panel, when it is open.
+    settings: Option<Settings>,
     /// The change the agent proposed for the file that is open, and the
     /// version of the buffer it was computed against.
     ///
@@ -268,6 +273,7 @@ impl NativeApplication {
             tree,
             detector,
             prompt: None,
+            settings: None,
             pending_diff: None,
             selected_hunk: 0,
             selected_context: 0,
@@ -385,6 +391,9 @@ impl NativeApplication {
         // The language server is told about the document that is now on
         // screen; it knows nothing about the ones that were closed.
         self.tell_server_about_the_new_document();
+        // The change waiting for the user is the one about the file that is
+        // now in front.
+        self.note_new_diff();
     }
 
     /// Closes a tab.
@@ -645,6 +654,81 @@ impl NativeApplication {
         true
     }
 
+    /// Opens the settings panel.
+    ///
+    /// The panel starts on the values that are in force now, so what the user
+    /// sees is what the editor is doing.
+    fn open_settings(&mut self) {
+        let policy = self.panes[self.active].policy;
+        self.settings = Some(Settings::new(policy));
+    }
+
+    /// Handles the keys of the settings panel.
+    ///
+    /// While the panel is open it takes every key: a setting that can be
+    /// changed by typing into the document is not a setting.
+    ///
+    /// Returns `true` when the key belonged to the panel, so the caller does
+    /// not also feed it to the editor.
+    fn handle_settings_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
+        if self.settings.is_none() {
+            // Ctrl+, opens the panel.
+            if self.modifiers.control_key() && is_comma(key) {
+                self.open_settings();
+                return true;
+            }
+            return false;
+        }
+
+        // The panel closes on Enter and on Escape.
+        if matches!(
+            key,
+            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape)
+        ) {
+            self.settings = None;
+            return true;
+        }
+
+        let Some(settings) = self.settings.as_mut() else {
+            return true;
+        };
+        let policy = match key {
+            Key::Named(NamedKey::ArrowUp) => {
+                settings.move_selection(-1);
+                None
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                settings.move_selection(1);
+                None
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                if settings.change_value(-1) {
+                    Some(settings.policy())
+                } else {
+                    None
+                }
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                if settings.change_value(1) {
+                    Some(settings.policy())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        // A new value is put in force at once: a setting that has to be
+        // confirmed before it counts is a setting nobody changes.
+        if let Some(policy) = policy {
+            self.set_highlight_policy(policy);
+            self.status = Some(format!(
+                "高亮上限：{} 字节 / {} 行",
+                policy.max_bytes, policy.max_lines
+            ));
+        }
+        true
+    }
+
     /// Reads the file of a tab again, throwing away the changes in the buffer.
     fn reload_tab(&mut self, tab: TabId) {
         let Some(index) = self.tabs.index_of(tab) else {
@@ -769,18 +853,50 @@ impl NativeApplication {
     /// because a moment later the buffer may have moved on and the baseline
     /// would be wrong.
     fn note_new_diff(&mut self) {
-        let Some(session) = self.agent.as_ref() else {
+        let open_paths = self.open_paths();
+
+        // The baseline of a change is the buffer as it is when the change
+        // arrives: that is the text the change is compared against when the
+        // user approves it. It is recorded once per file, for every file the
+        // change is about and that is open.
+        if let Some(session) = self.agent.as_mut() {
+            let mut baselines: Vec<(String, u64, String)> = Vec::new();
+            for proposal in session.panel().pending_diffs.iter() {
+                if proposal.base_version.is_some() {
+                    continue;
+                }
+                let Some(resolved) = paths::resolve_file(&proposal.path, &open_paths) else {
+                    continue;
+                };
+                let Some(index) = self.panes.iter().position(|pane| {
+                    pane.document
+                        .as_ref()
+                        .is_some_and(|document| document.display_path() == resolved)
+                }) else {
+                    continue;
+                };
+                let pane = &self.panes[index];
+                baselines.push((
+                    proposal.path.clone(),
+                    pane.editor.version(),
+                    pane.editor.text(),
+                ));
+            }
+            for (path, version, text) in baselines {
+                session.panel_mut().set_diff_base(&path, version, text);
+            }
+        }
+
+        // The change waiting for the user is the one about the file that is
+        // open.
+        let Some(path) = self.open_proposal() else {
             return;
         };
-        let Some(proposal) = session.panel().pending_diffs.last() else {
-            return;
-        };
-        let path = proposal.path.clone();
-        let already = self
+        if self
             .pending_diff
             .as_ref()
-            .is_some_and(|pending| pending.path == path);
-        if already {
+            .is_some_and(|pending| pending.path == path)
+        {
             return;
         }
         // The patch is read from the tool call the change came with.
@@ -892,12 +1008,40 @@ impl NativeApplication {
             .map(|document| document.display_path())
     }
 
+    /// The paths of the files that are open.
+    fn open_paths(&self) -> Vec<String> {
+        self.panes
+            .iter()
+            .filter_map(|pane| pane.document.as_ref())
+            .map(|document| document.display_path())
+            .collect()
+    }
+
+    /// The change the agent proposed for the file that is open.
+    ///
+    /// The agent names a file the way it sees it — relative to the project,
+    /// with forward slashes — while the editor knows it by the path it opened
+    /// it with. The two names are put together here, so that a change
+    /// proposed for `src/app.rs` is found for the file the editor has open.
+    fn open_proposal(&self) -> Option<String> {
+        let open = self.open_path()?;
+        let paths = self.open_paths();
+        let session = self.agent.as_ref()?;
+        let proposed: Vec<String> = session
+            .panel()
+            .pending_diffs
+            .iter()
+            .map(|proposal| proposal.path.clone())
+            .collect();
+        paths::proposal_for_open_file(&proposed, &open, &paths)
+    }
+
     /// Decides about one block of the proposed change.
     ///
     /// Returns whether there was a change to decide about: a key that means
     /// nothing when no change is waiting is left to the editor.
     fn decide_hunk(&mut self, index: usize, decision: HunkDecision) -> bool {
-        let Some(path) = self.open_path() else {
+        let Some(path) = self.open_proposal() else {
             return false;
         };
         let Some(session) = self.agent.as_mut() else {
@@ -915,7 +1059,7 @@ impl NativeApplication {
 
     /// Picks the block the next keys act on.
     fn select_hunk(&mut self, index: usize) -> bool {
-        let Some(path) = self.open_path() else {
+        let Some(path) = self.open_proposal() else {
             return false;
         };
         let Some(session) = self.agent.as_mut() else {
@@ -938,7 +1082,7 @@ impl NativeApplication {
 
     /// Decides about every block of the proposed change.
     fn decide_whole_file(&mut self, decision: HunkDecision) -> bool {
-        let Some(path) = self.open_path() else {
+        let Some(path) = self.open_proposal() else {
             return false;
         };
         let Some(session) = self.agent.as_mut() else {
@@ -954,13 +1098,21 @@ impl NativeApplication {
     /// Records the change the agent proposed for the file that is open.
     ///
     /// The version of the buffer at this moment is the baseline: it is what
-    /// the change is compared against when the user approves it.
+    /// the change is compared against when the user approves it. When the
+    /// panel already holds a baseline — it was recorded when the change
+    /// arrived — that one is used.
     fn note_pending_diff(&mut self, path: String, patch: String) {
         let Some(pane) = self.panes.get(self.active) else {
             return;
         };
-        let base_version = pane.editor.version();
-        let base_text = pane.editor.text();
+        let current_version = pane.editor.version();
+        let current_text = pane.editor.text();
+        let baseline = self
+            .agent
+            .as_ref()
+            .and_then(|session| session.panel().diff_for(&path))
+            .and_then(|proposal| Some((proposal.base_version?, proposal.base_text.clone()?)));
+        let (base_version, base_text) = baseline.unwrap_or((current_version, current_text));
         self.pending_diff = Some(PendingDiff {
             patch,
             base_version,
@@ -979,6 +1131,15 @@ impl NativeApplication {
         let Some(pending) = self.pending_diff.take() else {
             return;
         };
+        // A change is written into the file that is open. A change about
+        // another file waits for that file to come to the front.
+        let open = self.open_path();
+        let open_paths = self.open_paths();
+        if paths::resolve_file(&pending.path, &open_paths).as_deref() != open.as_deref() {
+            self.pending_diff = Some(pending);
+            self.status = Some("这个改动不属于当前打开的文件".to_owned());
+            return;
+        }
         let Some(session) = self.agent.as_mut() else {
             return;
         };
@@ -1022,6 +1183,8 @@ impl NativeApplication {
                 if pane.editor.replace_ranges(vec![range], &text).is_err() {
                     return;
                 }
+                // The tab now says that it has changes that are not on disk.
+                self.sync_dirty_flags();
                 format!("已应用 {hunks} 个变更块（+{added} -{removed}）")
             }
             diff_review::ApplyOutcome::DoesNotFit { line, expected, found, .. } => {
@@ -1078,6 +1241,8 @@ impl NativeApplication {
         if pane.editor.replace_ranges(vec![range], &text).is_err() {
             return true;
         }
+        // The tab now says that it has changes that are not on disk.
+        self.sync_dirty_flags();
 
         let message = format!("冲突已合并，写入 {path}");
         let session = self.agent.as_mut().expect("the session is there");
@@ -1325,10 +1490,7 @@ impl NativeApplication {
             return false;
         }
 
-        let Key::Character(character) = key else {
-            return false;
-        };
-        let Some(letter) = character.as_ref().chars().next() else {
+        let Some(letter) = key_letter(key) else {
             return false;
         };
         let letter = letter.to_ascii_lowercase();
@@ -1740,6 +1902,14 @@ impl ApplicationHandler for NativeApplication {
     /// diagnostics of a file that was opened would only show up when the
     /// user typed something.
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The agent answers on its own thread, so the window has to wake up
+        // from time to time to hear what it said. Without this, the panel
+        // stays as it was until the user happened to move the mouse.
+        if self.pump_agent()
+            && let Some(window) = self.window.as_ref()
+        {
+            window.request_redraw();
+        }
         if self.pump_lsp()
             && let Some(window) = self.window.as_ref()
         {
@@ -1826,6 +1996,12 @@ impl ApplicationHandler for NativeApplication {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 // While the window is asking a question, it takes every key.
                 if self.handle_prompt_key(&event.logical_key.as_ref()) {
+                    window.request_redraw();
+                    return;
+                }
+                // The settings panel takes every key while it is open, and
+                // Ctrl+, opens it.
+                if self.handle_settings_key(&event.logical_key.as_ref()) {
                     window.request_redraw();
                     return;
                 }
@@ -1958,19 +2134,14 @@ impl ApplicationHandler for NativeApplication {
             }
             WindowEvent::RedrawRequested => {
                 // The agent's output is collected once per frame, so a reply
-                // appears while the agent is still producing it.
-                if let Some(session) = self.agent.as_mut()
-                    && session.pump()
-                {
+                // appears while the agent is still producing it. Collecting it
+                // here is also what records the baseline of a change the
+                // agent proposes.
+                if self.pump_agent() {
                     window.request_redraw();
                 }
                 // The language server answers on its own thread, so its
                 // answers are collected the same way.
-                if self.pump_lsp() {
-                    window.request_redraw();
-                }
-                // The language server answers on its own thread, so its
-                // findings are collected here too.
                 if self.pump_lsp() {
                     window.request_redraw();
                 }
@@ -2024,6 +2195,7 @@ impl ApplicationHandler for NativeApplication {
                         active: self.active,
                         tree: self.tree.as_ref(),
                         prompt: prompt_text.as_deref(),
+                        settings: self.settings.as_ref(),
                         conflicts: conflict,
                     },
                 );
@@ -2048,6 +2220,26 @@ impl ApplicationHandler for NativeApplication {
     }
 }
 
+/// The letter a key stands for, when it stands for one.
+///
+/// A machine with a Chinese input method does not name the keys that are
+/// pressed with Ctrl and Alt: the layout has no letters for that
+/// combination, and the keys arrive unidentified. The virtual key code is the
+/// same on every layout, so the letter is taken from there. The shortcuts
+/// then work the same way wherever the editor runs.
+fn key_letter<T: AsRef<str>>(key: &Key<T>) -> Option<char> {
+    match key {
+        Key::Character(character) => character.as_ref().chars().next(),
+        Key::Unidentified(NativeKey::Windows(code)) => {
+            let letter = char::from_u32(u32::from(*code))?;
+            // Only the letters and the digits are shortcuts; the other codes
+            // are keys like Enter, which are named by the window.
+            letter.is_ascii_alphanumeric().then_some(letter)
+        }
+        _ => None,
+    }
+}
+
 /// The parts of the frame that are not the text body.
 struct Chrome<'a> {
     agent: Option<&'a AgentSession>,
@@ -2067,6 +2259,8 @@ struct Chrome<'a> {
     tree: Option<&'a FileTree>,
     /// The question the window is asking, if it is asking one.
     prompt: Option<&'a str>,
+    /// The settings panel, when it is open.
+    settings: Option<&'a Settings>,
     /// The conflicts between the buffer and a proposed change.
     conflicts: Option<ConflictView>,
 }
@@ -2104,6 +2298,20 @@ fn is_space<T: AsRef<str>>(key: &Key<T>) -> bool {
     }
 }
 
+/// Whether the key is the comma, whatever the keyboard layout says.
+///
+/// The comma opens the settings panel, and a machine with a Chinese input
+/// method does not name the keys that are pressed with Ctrl: the virtual key
+/// code is the same on every layout, so it is the second opinion.
+fn is_comma<T: AsRef<str>>(key: &Key<T>) -> bool {
+    match key {
+        Key::Character(character) => character.as_ref() == ",",
+        // VK_OEM_COMMA, the key the comma is on.
+        Key::Unidentified(NativeKey::Windows(code)) => *code == 0xBC,
+        _ => false,
+    }
+}
+
 fn build_scene(
     renderer: &mut Renderer,
     size: Size,
@@ -2116,6 +2324,16 @@ fn build_scene(
     let viewport = Rect::new(0.0, 0.0, size.width, size.height);
     let body = editor_body_rect(size);
     let mut scene = FrameScene::default();
+
+    // A panel that is drawn over the window hides what is under it.
+    //
+    // The renderer draws every rectangle first and every text after it, so a
+    // text that lies under the panel would be drawn *on* it. The window under
+    // the panel is therefore left out of the picture, not covered by it.
+    if let Some(settings) = chrome.settings {
+        push_settings(&mut scene, viewport, size, settings);
+        return scene;
+    }
 
     // The matches the find bar found, and the one it is on.
     let (matches, current_match) = match chrome.find {
@@ -2478,7 +2696,119 @@ fn push_prompt(scene: &mut FrameScene, viewport: Rect, size: Size, text: &str) {
     );
 }
 
-/// The place of the find bar in the corner of the editor body.
+/// Draws the settings panel.
+///
+/// The panel is drawn over everything else, because a setting that cannot be
+/// seen is a setting that cannot be changed.
+fn push_settings(scene: &mut FrameScene, viewport: Rect, size: Size, settings: &Settings) {
+    let rows = settings.rows();
+    let width = (size.width * 0.42).clamp(360.0, 560.0);
+    let height = 46.0 + rows.len() as f32 * 30.0 + 32.0;
+    let box_rect = Rect::new(
+        (size.width - width) / 2.0,
+        (size.height - height) / 2.0,
+        width,
+        height,
+    );
+    // The window behind the panel is dimmed, so the panel is the thing the
+    // eye goes to.
+    scene.push_quad(viewport, Color::rgb(0.02, 0.03, 0.05), viewport);
+    scene.push_quad(box_rect, Color::rgb(0.13, 0.15, 0.20), viewport);
+    scene.push_quad(
+        Rect::new(
+            box_rect.origin.x,
+            box_rect.origin.y,
+            box_rect.size.width,
+            3.0,
+        ),
+        Color::rgb(0.30, 0.58, 0.96),
+        viewport,
+    );
+    scene.push_text(
+        settings.title().to_owned(),
+        Rect::new(
+            box_rect.origin.x + 20.0,
+            box_rect.origin.y + 14.0,
+            (box_rect.size.width - 40.0).max(1.0),
+            24.0,
+        ),
+        TextStyle {
+            clip: viewport,
+            color: Color::rgb(0.90, 0.92, 0.96),
+            font_size: 16.0,
+            line_height: 22.0,
+            family: TextFamily::SansSerif,
+        },
+    );
+
+    // One line per setting: the name on the left, the value on the right.
+    let mut y = box_rect.origin.y + 48.0;
+    for row in &rows {
+        let color = if row.selected {
+            Color::rgb(0.95, 0.97, 1.00)
+        } else {
+            Color::rgb(0.60, 0.65, 0.74)
+        };
+        let title = if row.selected {
+            format!("› {}", row.title)
+        } else {
+            format!("  {}", row.title)
+        };
+        scene.push_text(
+            title,
+            Rect::new(
+                box_rect.origin.x + 20.0,
+                y,
+                (box_rect.size.width * 0.55).max(1.0),
+                26.0,
+            ),
+            TextStyle {
+                clip: viewport,
+                color,
+                font_size: 14.0,
+                line_height: 20.0,
+                family: TextFamily::SansSerif,
+            },
+        );
+        scene.push_text(
+            row.value.clone(),
+            Rect::new(
+                box_rect.origin.x + box_rect.size.width * 0.58,
+                y,
+                (box_rect.size.width * 0.38).max(1.0),
+                26.0,
+            ),
+            TextStyle {
+                clip: viewport,
+                color,
+                font_size: 14.0,
+                line_height: 20.0,
+                family: TextFamily::SansSerif,
+            },
+        );
+        y += 30.0;
+    }
+
+    // The keys the panel takes are written under it.
+    scene.push_text(
+        settings.hint().to_owned(),
+        Rect::new(
+            box_rect.origin.x + 20.0,
+            y + 2.0,
+            (box_rect.size.width - 40.0).max(1.0),
+            24.0,
+        ),
+        TextStyle {
+            clip: viewport,
+            color: Color::rgb(0.52, 0.57, 0.66),
+            font_size: 13.0,
+            line_height: 18.0,
+            family: TextFamily::SansSerif,
+        },
+    );
+}
+
+/// The place the find bar in the corner of the editor body.
 ///
 /// The bar is flush with the right edge of the body, so that the text it
 /// covers is exactly the text under it.
@@ -2992,6 +3322,27 @@ mod tests {
         Key::Character(text)
     }
 
+    /// A key that the window could not name, with the code of the key.
+    fn unnamed(code: u16) -> Key<&'static str> {
+        Key::Unidentified(NativeKey::Windows(code))
+    }
+
+    #[test]
+    fn a_key_that_carries_a_character_is_read_from_it() {
+        assert_eq!(key_letter(&character("a")), Some('a'));
+        assert_eq!(key_letter(&character("1")), Some('1'));
+        assert_eq!(key_letter(&named(NamedKey::Enter)), None);
+    }
+
+    #[test]
+    fn a_key_the_window_could_not_name_is_read_from_its_code() {
+        // A machine with a Chinese input method does not name the keys that
+        // are pressed with Ctrl and Alt. The shortcuts have to work there too.
+        assert_eq!(key_letter(&unnamed(0x41)), Some('A'));
+        assert_eq!(key_letter(&unnamed(0x31)), Some('1'));
+        assert_eq!(key_letter(&unnamed(0x0d)), None);
+    }
+
     /// A key that has a name, like Enter or Escape.
     fn named(key: NamedKey) -> Key<&'static str> {
         Key::Named(key)
@@ -3000,8 +3351,7 @@ mod tests {
     #[test]
     fn the_find_key_opens_the_find_bar() {
         let mut app = NativeApplication::new(None).expect("the application starts");
-        app.modifiers = ModifiersState::CONTROL;
-        assert!(app.handle_find_key(&character("f")));
+        app.modifiers = ModifiersState::CONTROL;        assert!(app.handle_find_key(&character("f")));
         assert!(app.find.is_some());
         // Ctrl+H replaces as well as finds.
         assert!(app.handle_find_key(&character("h")));
@@ -3459,5 +3809,86 @@ mod tests {
         app.activate_tab_at(point, &strip);
 
         assert_eq!(app.active, 0, "the tab that was clicked is in front");
+    }
+
+    #[test]
+    fn the_settings_panel_starts_on_the_values_in_force() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.set_highlight_policy(HighlightPolicy {
+            max_bytes: 500_000,
+            max_lines: 20_000,
+        });
+
+        app.modifiers = ModifiersState::CONTROL;
+        assert!(app.handle_settings_key(&character(",")));
+
+        let settings = app.settings.as_ref().expect("the panel is open");
+        assert_eq!(
+            settings.policy().max_bytes,
+            500_000,
+            "the panel shows the limit that is in force"
+        );
+        assert_eq!(settings.policy().max_lines, 20_000);
+    }
+
+    #[test]
+    fn the_settings_panel_changes_the_limit_at_once() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL;
+        assert!(app.handle_settings_key(&character(",")));
+
+        app.modifiers = ModifiersState::default();
+        assert!(app.handle_settings_key(&named(NamedKey::ArrowRight)));
+
+        assert_eq!(
+            app.panes[app.active].policy.max_bytes,
+            2_000_000,
+            "the new limit is in force at once"
+        );
+
+        // The panel closes on Enter.
+        assert!(app.handle_settings_key(&named(NamedKey::Enter)));
+        assert!(app.settings.is_none(), "the panel is closed");
+    }
+
+    #[test]
+    fn the_settings_panel_takes_every_key_while_it_is_open() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL;
+        assert!(app.handle_settings_key(&character(",")));
+
+        // A key that is not one of the panel's is swallowed by the panel.
+        assert!(app.handle_settings_key(&character("x")));
+        assert_eq!(app.editor().text(), "", "the text is not touched");
+        assert!(app.settings.is_some(), "the panel stays open");
+    }
+
+    #[test]
+    fn raising_the_limit_brings_the_colours_back() {
+        let directory = scratch_dir("raised");
+        let file = directory.join("file.rs");
+        fs::write(&file, "fn main() {}\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app_with_layout(&mut app);
+        app.pane_mut().set_policy(HighlightPolicy {
+            max_bytes: 1,
+            max_lines: 1,
+        });
+        app.pump_syntax();
+        assert!(app.panes[app.active].degraded, "the file is too big");
+
+        // The limit is raised again.
+        app.set_highlight_policy(HighlightPolicy::default());
+
+        assert!(wait_for_syntax(&mut app), "the highlighter answers again");
+        assert!(
+            !app.panes[app.active].degraded,
+            "the file is small enough to be coloured again"
+        );
+        assert!(
+            !app.panes[app.active].highlights.is_empty(),
+            "the text is coloured again"
+        );
     }
 }

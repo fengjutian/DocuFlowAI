@@ -77,7 +77,7 @@ pub fn apply_proposal(
 ) -> ApplyOutcome {
     let Some(file) = codeweaver_diff::parse_unified(patch)
         .into_iter()
-        .find(|file| file.path == proposal.path)
+        .find(|file| codeweaver_diff::same_file(&file.path, &proposal.path))
     else {
         return ApplyOutcome::DoesNotFit {
             hunk: 0,

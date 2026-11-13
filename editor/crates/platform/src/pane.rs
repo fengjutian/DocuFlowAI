@@ -115,6 +115,11 @@ impl EditorPane {
         }
         self.policy = policy;
         self.syntax.set_policy(policy);
+        // The highlighter is asked again about the text on screen. Without
+        // this, a file that was too big stays uncoloured even after the limit
+        // is raised: the pane remembers that it has already asked, and the
+        // question it remembers is about the limit that was in force then.
+        self.asked = None;
     }
 
     /// Whether the document has changes that are not on disk yet.

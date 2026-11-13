@@ -228,6 +228,33 @@ fn strip_prefix(path: &str) -> String {
         .to_owned()
 }
 
+/// Whether two names are the same file.
+///
+/// The agent names a file the way it sees it: relative to the project, with
+/// forward slashes. The editor knows the same file by the path it opened it
+/// with. They are the same file when the paths end the same way, so that a
+/// change proposed for `src/app.rs` finds the file the editor has open.
+pub fn same_file(left: &str, right: &str) -> bool {
+    let left = normalize_path(left);
+    let right = normalize_path(right);
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    left == right || left.ends_with(&format!("/{right}")) || right.ends_with(&format!("/{left}"))
+}
+
+/// A path as one name: no separator of its own, no case, no `./` in front.
+fn normalize_path(path: &str) -> String {
+    let mut text = path.trim().replace('\\', "/");
+    while let Some(rest) = text.strip_prefix("./") {
+        text = rest.to_owned();
+    }
+    while text.contains("//") {
+        text = text.replace("//", "/");
+    }
+    text.trim_matches('/').to_ascii_lowercase()
+}
+
 /// Applies the approved hunks of a patch to a text.
 ///
 /// A hunk that is not approved is left out; the text it covered stays as it
@@ -603,6 +630,24 @@ mod tests {
     fn the_path_of_a_patch_drops_the_prefix() {
         let patch = patch_of("--- a/deep/path.rs\n+++ b/deep/path.rs\n@@ -1,1 +1,1 @@\n a\n");
         assert_eq!(patch.path, "deep/path.rs");
+    }
+
+    #[test]
+    fn the_same_file_can_be_named_in_several_ways() {
+        assert!(same_file("src/app.rs", "src/app.rs"));
+        assert!(same_file("src/app.rs", "src\\app.rs"));
+        assert!(same_file("./src/app.rs", "src/app.rs"));
+        assert!(same_file("SRC/App.rs", "src/app.rs"));
+        assert!(same_file("src/app.rs", "D:\\project\\src\\app.rs"));
+        assert!(same_file("app.rs", "D:\\project\\src\\app.rs"));
+    }
+
+    #[test]
+    fn two_different_files_are_not_the_same_file() {
+        assert!(!same_file("src/app.rs", "src/other.rs"));
+        assert!(!same_file("src/app.rs", "app.rs/other.rs"));
+        assert!(!same_file("", "src/app.rs"));
+        assert!(!same_file("src/app.rs", ""));
     }
 
     #[test]

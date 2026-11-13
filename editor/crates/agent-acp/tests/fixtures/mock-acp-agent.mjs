@@ -6,7 +6,7 @@
 // one, so the test needs no Hermes runtime.
 //
 // Usage: node mock-acp-agent.js <scenario>
-//   scenarios: echo | tool | permission | slow
+//   scenarios: echo | tool | permission | slow | diff | context
 //
 // The repository root is taken from CODEWEAVER_REPO_ROOT, or derived from this
 // file's location.
@@ -88,6 +88,37 @@ function scriptedBackend(serverHandle) {
         // Long enough that the editor can cancel the turn before it ends.
         await new Promise(done => setTimeout(done, 60_000));
         return "cancelled";
+      }
+      if (scenario === "diff") {
+        // The agent proposes a change. It travels as the tool call's content,
+        // so the editor can show it and let the user decide; nothing is
+        // written here.
+        const patch = [
+          "--- a/fixture.txt",
+          "+++ b/fixture.txt",
+          "@@ -1,2 +1,3 @@",
+          " line one",
+          "-line two",
+          "+line two changed",
+          "+line three"
+        ].join("\n");
+        emit({
+          sessionUpdate: "tool_call",
+          toolCallId: "call-diff",
+          title: "request_diff",
+          kind: "edit",
+          status: "in_progress",
+          content: [{ type: "diff", path: "fixture.txt", patch }]
+        });
+        emit({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "proposed a change" } });
+        emit({ sessionUpdate: "tool_call_update", toolCallId: "call-diff", status: "completed" });
+        return "end_turn";
+      }
+      if (scenario === "context") {
+        // The endpoint renders the prompt's blocks: the instruction and the
+        // material the user attached.
+        emit({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `echo: ${text}` } });
+        return "end_turn";
       }
       emit({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: `echo: ${text}` } });
       return "end_turn";

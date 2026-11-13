@@ -15,7 +15,8 @@ use std::{
 };
 
 use codeweaver_agent_acp::{
-    Client, EndpointConfig, PermissionOutcome, SessionEvent, StopReason, ToolStatus,
+    Client, EndpointConfig, PermissionOutcome, PromptBlock, SessionEvent, StopReason, ToolCallContent,
+    ToolStatus,
 };
 
 /// The repository root, derived from this file's location.
@@ -237,6 +238,96 @@ fn answers_a_permission_request() {
     assert!(
         reported.contains("decision: allow"),
         "the endpoint did not receive the approval, got: {reported}"
+    );
+}
+
+#[test]
+fn a_proposed_change_reaches_the_editor_as_tool_content() {
+    let Some(client) = start("diff") else {
+        eprintln!("skipped: the ACP endpoint is not available on this machine");
+        return;
+    };
+
+    let session = client
+        .new_session(std::path::Path::new("C:\\repo"))
+        .expect("session/new is answered");
+    client
+        .start_prompt(&session.session_id, "change the file")
+        .expect("session/prompt is written");
+
+    let events = wait_for(&client, Duration::from_secs(20), |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::TurnCompleted { .. }))
+    });
+
+    let call = events.iter().find_map(|event| match event {
+        SessionEvent::ToolCall {
+            tool_call_id,
+            content,
+            ..
+        } if tool_call_id == "call-diff" => Some(content.clone()),
+        _ => None,
+    });
+    let content = call.expect("the proposed change reached the editor");
+    assert_eq!(content.len(), 1);
+    match &content[0] {
+        ToolCallContent::Diff { path, patch } => {
+            assert_eq!(path, "fixture.txt");
+            assert!(
+                patch.contains("@@ -1,2 +1,3 @@"),
+                "the patch is the unified diff the agent sent: {patch}"
+            );
+            assert!(patch.contains("+line three"));
+        }
+        other => panic!("the wrong content: {other:?}"),
+    }
+}
+
+#[test]
+fn the_context_the_user_chosen_travels_with_the_prompt() {
+    let Some(client) = start("context") else {
+        eprintln!("skipped: the ACP endpoint is not available on this machine");
+        return;
+    };
+
+    let session = client
+        .new_session(std::path::Path::new("C:\\repo"))
+        .expect("session/new is answered");
+    client
+        .start_prompt_blocks(
+            &session.session_id,
+            &[
+                PromptBlock::text("make this async"),
+                PromptBlock::resource("src/app.rs", "fn main() {}"),
+            ],
+        )
+        .expect("session/prompt is written");
+
+    let events = wait_for(&client, Duration::from_secs(20), |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::TurnCompleted { .. }))
+    });
+
+    let reported: String = events
+        .iter()
+        .filter_map(|event| match event {
+            SessionEvent::Message { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        reported.contains("make this async"),
+        "the instruction did not reach the endpoint: {reported}"
+    );
+    assert!(
+        reported.contains("src/app.rs"),
+        "the path of the context did not reach the endpoint: {reported}"
+    );
+    assert!(
+        reported.contains("fn main() {}"),
+        "the text of the context did not reach the endpoint: {reported}"
     );
 }
 

@@ -250,6 +250,9 @@ test("acp mapping: tool and terminal events map to stable update shapes", () => 
     sessionUpdate: "tool_call",
     toolCallId: "call-1",
     title: "search_code",
+    // The kind is what the editor keys its behaviour on: a tool that
+    // proposes a change is not a tool that reads a file.
+    kind: "other",
     status: "in_progress"
   });
 
