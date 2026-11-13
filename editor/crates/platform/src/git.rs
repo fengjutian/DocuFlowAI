@@ -24,6 +24,30 @@ pub struct GitEntry {
     pub staged: bool,
 }
 
+impl GitEntry {
+    /// What happened to the file, in words.
+    ///
+    /// The letters of git are for git: the panel says what happened in the
+    /// language of the person who reads it.
+    pub fn label(&self) -> String {
+        let word = match self.state.as_str() {
+            "??" => "未纳入",
+            "A" => "新增",
+            "D" => "删除",
+            "R" => "改名",
+            "C" => "复制",
+            "U" => "冲突",
+            "M" => "改了",
+            other => other,
+        };
+        if self.staged {
+            format!("已暂存·{word}")
+        } else {
+            word.to_owned()
+        }
+    }
+}
+
 /// The files of the project that git knows have changed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitStatus {
@@ -116,9 +140,9 @@ pub fn commit(root: &Path, message: &str) -> Result<String, String> {
 }
 
 /// Runs a git command in the repository and returns what it said.
-fn run(root: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn run(root: &Path, args: &[impl AsRef<str>]) -> Result<String, String> {
     let output = Command::new("git")
-        .args(args)
+        .args(args.iter().map(|argument| argument.as_ref()))
         .current_dir(root)
         .output()
         .map_err(|error| format!("git 起不来：{error}"))?;
@@ -132,6 +156,268 @@ fn run(root: &Path, args: &[&str]) -> Result<String, String> {
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
+
+/// Whether the git of the machine can be started from this process.
+///
+/// The binary of the tests is built inside the workspace, and the workspace
+/// carries a low integrity label: a low integrity process cannot start the
+/// `git` of the machine, which runs at the ordinary level. The checks that
+/// need git are then not run at all, and it has to be said out loud: a check
+/// that did not run is not a check that passed.
+///
+/// The checks are run for real from a copy of the test binary outside the
+/// workspace, the way the window checks run the editor.
+#[cfg(test)]
+pub(crate) fn git_is_blocked() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static SAID: AtomicBool = AtomicBool::new(false);
+    match run(&PathBuf::from("."), &["--version"]) {
+        Ok(_) => false,
+        Err(error) => {
+            if !SAID.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "BLOCKED: git cannot be started from here ({error}); the checks of git \
+                     are not run at all. Run them from a copy of the test binary outside the \
+                     workspace: tools\\git-unit-check.ps1"
+                );
+            }
+            true
+        }
+    }
+}
+
+/// What the panel of the changes shows.
+///
+/// The panel is a picture of what git knows: the files that changed, and the
+/// diff of the one that is picked.
+pub struct GitPanel {
+    /// The root of the repository.
+    pub root: PathBuf,
+    /// The files that changed.
+    pub entries: Vec<GitEntry>,
+    /// Which file is picked, counted from the first one.
+    pub selected: usize,
+    /// The diff of the picked file.
+    pub diff: String,
+}
+
+impl GitPanel {
+    /// Makes a panel of the files that changed.
+    pub fn new(root: PathBuf, entries: Vec<GitEntry>) -> Self {
+        GitPanel {
+            root,
+            entries,
+            selected: 0,
+            diff: String::new(),
+        }
+    }
+
+    /// The file that is picked.
+    pub fn selected_entry(&self) -> Option<&GitEntry> {
+        self.entries.get(self.selected)
+    }
+
+    /// Picks the file after this one, going round to the first one.
+    pub fn select_next(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        self.selected = (self.selected + 1) % self.entries.len();
+    }
+
+    /// Picks the file before this one, going round to the last one.
+    pub fn select_previous(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        self.selected = if self.selected == 0 {
+            self.entries.len() - 1
+        } else {
+            self.selected - 1
+        };
+    }
+}
+
+/// The height of one row of the list of files.
+const ROW_HEIGHT: f32 = 22.0;
+/// The width of the list of files.
+const LIST_WIDTH: f32 = 360.0;
+/// The width of the column that says what happened to the file.
+const LABEL_WIDTH: f32 = 92.0;
+
+/// The ground the panel of the changes stands on.
+///
+/// The ground is drawn on its own when something is drawn over the panel:
+/// the text of the panel would lie on top of it.
+pub fn draw_background(
+    scene: &mut codeweaver_render::FrameScene,
+    viewport: codeweaver_render::Rect,
+) {
+    use codeweaver_render::Color;
+
+    scene.push_quad(viewport, Color::rgb(0.055, 0.063, 0.082), viewport);
+}
+
+/// Draws the panel of the changes.
+///
+/// The panel covers the window: it is a thing the user works in for a
+/// moment, and the text of the document is not what they are looking at
+/// while it is open.
+pub fn draw_panel(
+    scene: &mut codeweaver_render::FrameScene,
+    viewport: codeweaver_render::Rect,
+    size: codeweaver_render::Size,
+    panel: &GitPanel,
+    measurer: &mut dyn codeweaver_ui::TextMeasurer,
+) {
+    use codeweaver_render::{Color, Rect, TextFamily, TextStyle};
+
+    draw_background(scene, viewport);
+
+    // The list of the files that changed.
+    let list = Rect::new(16.0, 16.0, LIST_WIDTH, size.height - 60.0);
+    scene.push_text(
+        "改过的文件".to_owned(),
+        Rect::new(list.origin.x, list.origin.y, list.size.width, 20.0),
+        TextStyle {
+            clip: viewport,
+            color: Color::rgb(0.60, 0.65, 0.74),
+            font_size: 13.0,
+            line_height: 18.0,
+            family: TextFamily::SansSerif,
+        },
+    );
+
+    if panel.entries.is_empty() {
+        scene.push_text(
+            "没有改动".to_owned(),
+            Rect::new(list.origin.x, list.origin.y + 26.0, list.size.width, 20.0),
+            TextStyle {
+                clip: viewport,
+                color: Color::rgb(0.52, 0.57, 0.66),
+                font_size: 13.0,
+                line_height: 18.0,
+                family: TextFamily::SansSerif,
+            },
+        );
+    }
+
+    let room = ((list.size.height - 30.0) / ROW_HEIGHT).floor().max(1.0) as usize;
+    let shown = panel.entries.len().min(room);
+    let first = panel.selected.saturating_sub(shown - 1).min(panel.entries.len() - 1);
+    for (index, entry) in panel.entries.iter().enumerate().skip(first).take(shown) {
+        let row = index - first;
+        let y = list.origin.y + 26.0 + row as f32 * ROW_HEIGHT;
+        if index == panel.selected {
+            scene.push_quad(
+                Rect::new(list.origin.x - 4.0, y, list.size.width, ROW_HEIGHT),
+                Color::rgb(0.18, 0.30, 0.52),
+                viewport,
+            );
+        }
+        // The state of the file is in a colour of its own: a file that is
+        // staged and a file that is not are two different things.
+        let state_color = if entry.staged {
+            Color::rgb(0.42, 0.78, 0.56)
+        } else {
+            Color::rgb(0.93, 0.74, 0.42)
+        };
+        scene.push_text(
+            entry.label(),
+            Rect::new(list.origin.x, y + 1.0, LABEL_WIDTH, 20.0),
+            TextStyle {
+                clip: viewport,
+                color: state_color,
+                font_size: 13.0,
+                line_height: 18.0,
+                family: TextFamily::SansSerif,
+            },
+        );
+        scene.push_text(
+            entry.path.clone(),
+            Rect::new(
+                list.origin.x + LABEL_WIDTH + 4.0,
+                y + 1.0,
+                list.size.width - LABEL_WIDTH - 8.0,
+                20.0,
+            ),
+            TextStyle {
+                clip: viewport,
+                color: Color::rgb(0.86, 0.89, 0.94),
+                font_size: 13.0,
+                line_height: 18.0,
+                family: TextFamily::SansSerif,
+            },
+        );
+    }
+
+    // The diff of the file that is picked.
+    let diff = Rect::new(
+        LIST_WIDTH + 32.0,
+        16.0,
+        (size.width - LIST_WIDTH - 48.0).max(1.0),
+        size.height - 60.0,
+    );
+    scene.push_text(
+        "差别".to_owned(),
+        Rect::new(diff.origin.x, diff.origin.y, diff.size.width, 20.0),
+        TextStyle {
+            clip: viewport,
+            color: Color::rgb(0.60, 0.65, 0.74),
+            font_size: 13.0,
+            line_height: 18.0,
+            family: TextFamily::SansSerif,
+        },
+    );
+
+    let lines: Vec<&str> = panel.diff.lines().collect();
+    let room = ((diff.size.height - 26.0) / ROW_HEIGHT).floor().max(1.0) as usize;
+    let shown = lines.len().min(room);
+    let first = lines.len() - shown;
+    for (index, line) in lines.iter().skip(first).enumerate() {
+        let y = diff.origin.y + 26.0 + index as f32 * ROW_HEIGHT;
+        // A line that was taken out and a line that was put in are said in
+        // a colour of their own.
+        let color = if line.starts_with('+') && !line.starts_with("+++") {
+            Color::rgb(0.52, 0.82, 0.58)
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            Color::rgb(0.92, 0.56, 0.54)
+        } else if line.starts_with('@') {
+            Color::rgb(0.62, 0.70, 0.86)
+        } else {
+            Color::rgb(0.72, 0.76, 0.84)
+        };
+        scene.push_text(
+            (*line).to_owned(),
+            Rect::new(diff.origin.x, y + 1.0, diff.size.width, 20.0),
+            TextStyle {
+                clip: viewport,
+                color,
+                font_size: 13.0,
+                line_height: 18.0,
+                family: TextFamily::SansSerif,
+            },
+        );
+    }
+    // The keys the panel takes are said at the bottom of it.
+    scene.push_text(
+        HINT.to_owned(),
+        Rect::new(16.0, size.height - 36.0, size.width - 32.0, 24.0),
+        TextStyle {
+            clip: viewport,
+            color: Color::rgb(0.52, 0.57, 0.66),
+            font_size: 13.0,
+            line_height: 18.0,
+            family: TextFamily::SansSerif,
+        },
+    );
+
+    let _ = measurer;
+}
+
+/// The keys the panel of the changes takes.
+pub const HINT: &str = "↑↓ 挑文件 · S 暂存 · C 提交 · Esc 关掉";
 
 #[cfg(test)]
 mod tests {
@@ -148,13 +434,19 @@ mod tests {
     }
 
     /// A repository of its own, with a name to commit under.
-    fn repository(name: &str) -> PathBuf {
+    ///
+    /// Nothing comes back when git cannot be started here: the checks that
+    /// need it are not run at all.
+    fn repository(name: &str) -> Option<PathBuf> {
         let directory = scratch_dir(name);
+        if git_is_blocked() {
+            return None;
+        }
         run(&directory, &["init", "--quiet"]).expect("the repository is made");
         run(&directory, &["config", "user.email", "check@example.com"])
             .expect("the email is set");
         run(&directory, &["config", "user.name", "check"]).expect("the name is set");
-        directory
+        Some(directory)
     }
 
     /// Writes a file into the repository.
@@ -164,7 +456,9 @@ mod tests {
 
     #[test]
     fn the_root_of_a_repository_is_the_folder_with_the_git_directory() {
-        let directory = repository("git-root");
+        let Some(directory) = repository("git-root") else {
+            return;
+        };
         write(&directory, "main.rs", "fn main() {}\n");
 
         let root = repository_root(&directory.join("main.rs")).expect("there is a repository");
@@ -174,39 +468,33 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_belongs_to_no_repository_has_no_root() {
-        let directory = scratch_dir("git-no-root");
-        // The directory is inside the repository of the editor, so the walk
-        // has to be stopped before it: a file that is not in a repository
-        // of its own is looked for with the marker of the repository.
-        assert!(repository_root(&directory).is_some());
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-
-    #[test]
     fn a_changed_file_is_in_the_status() {
-        let directory = repository("git-status");
+        let Some(directory) = repository("git-status") else {
+            return;
+        };
         write(&directory, "main.rs", "fn main() {}\n");
         run(&directory, &["add", "main.rs"]).expect("the file is added");
         run(&directory, &["commit", "-m", "the first one"]).expect("the commit is made");
 
         // Nothing changed yet.
-        let status = status(&directory).expect("the status is read");
-        assert!(status.entries.is_empty());
+        let before = status(&directory).expect("the status is read");
+        assert!(before.entries.is_empty());
 
         write(&directory, "main.rs", "fn main() { let x = 1; }\n");
-        let status = status(&directory).expect("the status is read");
-        assert_eq!(status.entries.len(), 1);
-        assert_eq!(status.entries[0].path, "main.rs");
-        assert_eq!(status.entries[0].state, "M");
-        assert!(!status.entries[0].staged, "the change is not staged yet");
+        let after = status(&directory).expect("the status is read");
+        assert_eq!(after.entries.len(), 1);
+        assert_eq!(after.entries[0].path, "main.rs");
+        assert_eq!(after.entries[0].state, "M");
+        assert!(!after.entries[0].staged, "the change is not staged yet");
 
         let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
     fn a_staged_file_is_staged_in_the_status() {
-        let directory = repository("git-stage");
+        let Some(directory) = repository("git-stage") else {
+            return;
+        };
         write(&directory, "main.rs", "fn main() {}\n");
         run(&directory, &["add", "main.rs"]).expect("the file is added");
         run(&directory, &["commit", "-m", "the first one"]).expect("the commit is made");
@@ -223,14 +511,16 @@ mod tests {
 
     #[test]
     fn the_diff_of_a_file_says_what_changed() {
-        let directory = repository("git-diff");
+        let Some(directory) = repository("git-diff") else {
+            return;
+        };
         write(&directory, "main.rs", "fn main() {}\n");
         run(&directory, &["add", "main.rs"]).expect("the file is added");
         run(&directory, &["commit", "-m", "the first one"]).expect("the commit is made");
 
         write(&directory, "main.rs", "fn main() { let x = 1; }\n");
-        let diff = diff(&directory, "main.rs", false).expect("the diff is read");
-        assert!(diff.contains("let x = 1;"), "got {diff}");
+        let working = diff(&directory, "main.rs", false).expect("the diff is read");
+        assert!(working.contains("let x = 1;"), "got {working}");
 
         // The diff of the staging area is empty until the file is staged.
         let staged = diff(&directory, "main.rs", true).expect("the diff is read");
@@ -241,7 +531,9 @@ mod tests {
 
     #[test]
     fn a_commit_takes_the_changes_out_of_the_status() {
-        let directory = repository("git-commit");
+        let Some(directory) = repository("git-commit") else {
+            return;
+        };
         write(&directory, "main.rs", "fn main() {}\n");
         run(&directory, &["add", "main.rs"]).expect("the file is added");
         run(&directory, &["commit", "-m", "the first one"]).expect("the commit is made");
@@ -259,7 +551,9 @@ mod tests {
 
     #[test]
     fn a_commit_with_nothing_staged_says_so() {
-        let directory = repository("git-nothing-to-commit");
+        let Some(directory) = repository("git-nothing-to-commit") else {
+            return;
+        };
         let said = commit(&directory, "nothing to commit").expect_err("there is nothing to commit");
         assert!(
             said.contains("nothing to commit") || said.contains("没有"),

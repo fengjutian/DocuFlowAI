@@ -67,6 +67,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\
 ## 环境约束（Windows / PowerShell 5.1）
 
 - 仓库目录带 **Low 完整性标签** → 在仓库里构建出的二进制以低完整性运行，**起不了 Medium 完整性的 `node.exe`（os error 5）**。验收脚本因此把编辑器复制到 `%LOCALAPPDATA%\CodeWeaver\check` 再运行。
+- 同一条约束管着 **`git.exe`**（`D:\Program Files\Git\cmd`，Medium 完整性）：仓库里的二进制（含 `cargo test` 的测试二进制）起不了它。因此凡是要真跑 `git` 的单元检查，都得把测试二进制复制到 `%LOCALAPPDATA%` 之外再跑（见 `editor/tools/git-unit-check.ps1`）；`cargo test` 里那组检查会整组跳过并打印 `BLOCKED:`——**跳过不算通过**。
 - 本机 `rust-analyzer` 是 rustup 代理且组件未装在默认工具链，代理报「Unknown binary」；可用二进制在 `%USERPROFILE%\.rustup\toolchains\1.98.1-x86_64-pc-windows-msvc\bin\rust-analyzer.exe`，用编辑器的 `--lsp <program>` 点名它。
 - 验收用的工程必须自带空 `[workspace]` 表，并放在工作区之外，否则 `cargo locate-project` 会报「believes it's in a workspace when it's not」。
 - PowerShell 5.1：不支持 `&&` / `||`，不要用 `/dev/null`、heredoc、`sed -i`；写文件用 `[System.IO.File]::WriteAllText($p, $s, [Text.UTF8Encoding]::new($false))` 防 BOM，临时 `.ps1` 含中文必须存成 UTF-8 **BOM**（否则按 GBK 解析）。

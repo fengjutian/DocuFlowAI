@@ -20,6 +20,11 @@ pub struct RenameBox {
     caret: usize,
     /// The byte offset where the name starts in the document.
     start: usize,
+    /// What the box is asking for, when it is not a name.
+    ///
+    /// A box that asks for a name says so by itself; a box that asks for
+    /// something else says what that is.
+    title: Option<String>,
 }
 
 impl RenameBox {
@@ -35,6 +40,29 @@ impl RenameBox {
             original,
             caret,
             start,
+            title: None,
+        }
+    }
+
+    /// Opens a box that asks for a text that is not a name.
+    ///
+    /// The message of a commit is such a text: the box is the same one, it
+    /// just asks for something else.
+    pub fn message(title: impl Into<String>) -> Self {
+        RenameBox {
+            original: String::new(),
+            current: String::new(),
+            caret: 0,
+            start: 0,
+            title: Some(title.into()),
+        }
+    }
+
+    /// What the box is asking for, in words.
+    pub fn title(&self) -> String {
+        match self.title.as_ref() {
+            Some(title) => title.clone(),
+            None => format!("把 {} 改名为", self.original()),
         }
     }
 

@@ -2,7 +2,7 @@
 
 文档号：`V0.6.0`  
 产品版本：`0.6.0`  
-状态：进行中（DF-0604 / DF-0605 实现完成，待统一回归）
+状态：进行中（DF-0602 / DF-0604 / DF-0605 实现完成，待统一回归）
 更新日期：2026-11-13
 
 ## 1. 本期结论
@@ -18,7 +18,7 @@ V0.5.0 把编辑器与 Agent 之间接成了一条闭环：用户挑上下文 �
 3. **LSP 格式化、重命名、代码操作**（DF-0603 / DF-0604 / DF-0605）：语言服务器会的事，编辑器里按一下键就能用。
 4. **最小 DAP 调试能力**（DF-0606）：断点、单步、看变量。
 
-本期先落第三块：**DF-0603 LSP 格式化**、**DF-0604 LSP 重命名**、**DF-0605 LSP 代码操作**——语言服务器会的事，在编辑器里按一下键就能用；格式化与重命中的改动都是**一次**事务，撤销一次整体回退。
+本期先落第三块与第二块：**DF-0603 LSP 格式化**、**DF-0604 LSP 重命名**、**DF-0605 LSP 代码操作**——语言服务器会的事，在编辑器里按一下键就能用；格式化与重命中的改动都是**一次**事务，撤销一次整体回退。加上 **DF-0602 Git 改动面板**（`Ctrl+Shift+G` 打开：改了什么、差在哪、暂存、提交，都看得见、点得动）。
 
 ## 2. 当前完成度
 
@@ -30,7 +30,7 @@ V0.5.0 把编辑器与 Agent 之间接成了一条闭环：用户挑上下文 �
 | 标签与会话 | 标签模型、多标签、脏状态、关闭确认 | 会话恢复、最近项目 | 可用 |
 | 语言能力 | 语法高亮（后台）、LSP 补全与诊断、LSP 格式化、LSP 重命名、LSP 代码操作 | 按范围格式化、onType 格式化、重命名预备（prepareRename） | 可用 |
 | Agent | ACP 客户端、面板、审批、流式输出、上下文选择、Diff 按块批准、应用到缓冲区、冲突合并、轨迹 | 语义冲突判断（靠构建与测试发现） | 可用 |
-| 开发工具 | 任务运行器（`Ctrl+Shift+B` 跑构建，输出流进下方面板） | Git、终端交互、DAP（本期计划） | 基础可用 |
+| 开发工具 | 任务运行器（`Ctrl+Shift+B` 跑构建，输出流进下方面板）、Git 改动面板（`Ctrl+Shift+G` 看状态与 diff、`S` 暂存、`C` 提交） | 终端交互、DAP（本期计划） | 基础可用 |
 
 ## 3. V0.6.0 开发项
 
@@ -47,7 +47,7 @@ V0.5.0 把编辑器与 Agent 之间接成了一条闭环：用户挑上下文 �
 - 输出面板可以关掉（`Esc`），关掉不影响任务继续跑。
 - 任务的进程模型：另起的子进程，输出走管道，编辑器退出时任务被停掉。
 
-### DF-0602 Git 状态、Diff、暂存与提交（进行中）
+### DF-0602 Git 状态、Diff、暂存与提交（进行中：实现完成，窗口验收待跑）
 
 改了什么、暂存什么、提交什么，都看得见、点得动。用**命令行 `git`**（机器上有 git 就够，不引第三方库），工程根目录由打开的文件往上找 `.git` 决定。
 
@@ -142,6 +142,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\format-check.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\rename-check.ps1
 # 窗口级证据：构建任务的输出流进了下方面板
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\task-check.ps1
+# 窗口级证据：改动面板列出了改过的文件、显示 diff、S 暂存、C 提交
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\git-check.ps1
+# 单元级证据：git 模块的检查要在工作区之外跑（低完整性进程起不了 git）
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\git-unit-check.ps1
 ```
 
 ### 6.2 实测结果
@@ -156,6 +160,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\task-check.ps1
 
 另外，验收用的工程必须有自己的 workspace：`cargo locate-project` 会在工程落在别的 workspace 里时报「believes it's in a workspace when it's not」，因此工程放在工作区之外，并带一张空的 `[workspace]` 表。
 
+**Git 也受同一条约束管**：`git.exe` 装在 `D:\Program Files\Git\cmd`，是中等完整性，而工作区里构建出来的二进制（包括 `cargo test` 的测试二进制）是低完整性，低完整性进程**起不了**它（`CreateProcess` 报 os error 5）。因此：
+
+- 单元测试里的 git 检查**在 `cargo test` 里不会真的跑**：它们先试一次 `git --version`，起不来就把这一组检查整组跳过，并打印一行 `BLOCKED:` 说明为什么没跑。跳过不是通过——所以真正的证据由 `tools\git-unit-check.ps1` 给：它把测试二进制复制到 `%LOCALAPPDATA%\CodeWeaver\check` 再跑，那里是普通完整性，git 跑得起来。
+- 窗口级脚本里的编辑器本来就是复制到工作区之外再跑的，所以改动面板里的 git 跑得起来；脚本用的仓库也放在工作区之外。
+
 ### 6.4 待跑的验收（开发期间攒下，统一回归时一起跑）
 
 开发阶段只跑不影响桌面的检查（`cargo test`、`npm test`）。下面这些是**窗口级**的：它们会杀编辑器进程、抢键盘焦点、往系统里注入按键，跑之前先确认手头没事，而且**必须串行**（每个脚本开头都 `Stop-Process -Name codeweaver-editor`）。
@@ -165,6 +174,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\task-check.ps1
 | `tools\format-check.ps1` | 真实 rust-analyzer 排版 → 正文像素变化；脏标记出现；一次撤销整体回退 | 上一轮已过 4/4，本轮待重跑 |
 | `tools\rename-check.ps1` | `F2` 改名 → 打开的文件被改、没打开的文件写进了磁盘、一次撤销整体回退 | 新写，**未跑** |
 | `tools\task-check.ps1` | `Ctrl+Shift+B` 跑构建 → 输出面板画出来了、面板里有输出、`Esc` 关掉 | 新写，**未跑** |
+| `tools\git-check.ps1` | `Ctrl+Shift+G` 打开改动面板 → 面板盖住窗口、列出改过的文件、显示 diff、`S` 暂存（git 也这么说）、`C` 问提交说明并真的提交、`Esc` 关掉 | 新写，**未跑** |
+| `tools\git-unit-check.ps1` | git 模块的单元检查（10 项：状态、diff、暂存、提交、面板接线）——在工作区之外跑，因为低完整性进程起不了 `git` | 新写，**未跑** |
 | `tools\settings-check.ps1` | 设置面板 5 项 | 上一轮已过 5/5，本轮待重跑 |
 | `tools\agent-check.ps1` | Agent 面板 6 项 | 上一轮已过 6/6，本轮待重跑 |
 | `tools\workbench-check.ps1` | 工作台 4 项 | 上一轮已过 4/4，本轮待重跑 |
@@ -174,20 +185,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\task-check.ps1
 还欠着的窗口级证据：
 
 - **DF-0605 代码操作没有窗口脚本**：得证明「`Alt+Enter` 真的列出了操作、挑一个之后文件真的改了」。脚本要写（计划里用真实 rust-analyzer 的 quick fix）。
-- **DF-0602 Git 面板没有窗口脚本**：得证明「面板列出了改过的文件、diff 显示出来了、`S` 暂存之后状态变了、`C` 提交之后状态里没有它了」。
+- **DF-0602 Git 面板的窗口脚本已写、未跑**：`tools\git-check.ps1` 要证明「面板列出了改过的文件、diff 显示出来了、`S` 暂存之后状态变了、`C` 提交之后状态里没有它了」。git 模块自己的单元检查也**在 `cargo test` 里跑不起来**（低完整性起不了 `git`，见 §6.3），要由 `tools\git-unit-check.ps1` 在工作区之外跑。
 - **DF-0601 任务运行器的失败路径没有窗口证据**：现在只有单元测试（退出码 3 的任务状态是 `Finished(3)`），窗口里要看见「失败了，退出码 3」。
 - **跨文件的重命名与代码操作只验了一个方向**：现在的脚本验的是「没打开的文件被写进磁盘」；还要验「另一个**已打开**的标签页也被改了」。
 
 非窗口级的（本地跑，不抢桌面）：
 
-- `cargo test --workspace`（本轮 378 项全过）、`cargo clippy --workspace --all-targets`（本轮 0 告警）。
+- `cargo test --workspace`（本轮 378 项全过；DF-0602 新加的 10 项 git 检查在这条命令里**会跳过**并打印 `BLOCKED`，因为低完整性起不了 `git`——真正的证据由 `tools\git-unit-check.ps1` 给）、`cargo clippy --workspace --all-targets`（本轮 0 告警）。
 - `cd codeweaver-hermes-lab; npm test`（运行时与 ACP 端点，本轮待跑）。
 - `cd codeweaver-workspace; npm run build`（控制台前端与 Tauri 外壳，本轮待跑）。
 
 ## 7. 本期结转
 
 - 任务运行器现在只跑**构建任务**（`Ctrl+Shift+B`，命令由工程的清单决定）。要跑任意命令需要一个输入框和命令历史；要做真正的交互式终端还需要伪终端（PTY），Windows 上没有 POSIX 那套现成的东西。任务运行器的进程模型已经定了（另起子进程、输出走管道、编辑器退出时任务被停掉），这两件是往上加东西。
-- 终端与任务运行器（DF-0601）之外的开发工具：Git（DF-0602）要定下用哪一层：命令行 `git` 还是库。命令行更省事但依赖机器上有 git，库更可控但要处理凭据；本期先不做。
+- Git（DF-0602）已经定下用**命令行 `git`**（机器上有 git 就够，不引第三方库），代价是低完整性进程起不了 `git`（见 §6.3）。还没做的是：暂存区里挑文件（现在只暂存选中那一个）、取消暂存（`git restore --staged`）、在面板里看某一次提交（`git log`）、分支与远端（`git branch`、fetch/push）。
 - 调试（DF-0606）牵扯 DAP 协议、线程状态、变量视图，本期只把位置留着。
 - 格式化现在只接了 `textDocument/formatting`；按范围格式化（只排一段）与 `onType` 格式化留到后面。
 - 重命名与代码操作共用一条「服务器改文件」的管道：一次事务落进缓冲区，没开着的文件写到磁盘。**写到磁盘的那部分撤销不回来**——这是与 VS Code 一样的取舍，但要说清楚。

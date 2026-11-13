@@ -5,6 +5,7 @@ mod context;
 mod diff_review;
 pub mod editor_view;
 pub mod find;
+mod git;
 mod input;
 mod lsp;
 mod pane;
@@ -38,6 +39,7 @@ use editor_view::{
     BodyOverlay, EditorView, FindOverlay, LINE_HEIGHT, MarkSeverity, RendererMeasurer,
 };
 use find::{FindBar, FindField};
+use git::GitPanel;
 use input::TextInputState;
 use pane::EditorPane;
 use rename::RenameBox;
@@ -156,6 +158,10 @@ pub struct NativeApplication {
     task_title: String,
     /// Whether the output panel of the task is open.
     task_panel: bool,
+    /// The panel of the changes of the repository, when it is open.
+    git: Option<GitPanel>,
+    /// The box that asks for the message of a commit, when it is open.
+    commit_box: Option<RenameBox>,
     /// The tabs that are open.
     tabs: TabBar,
     /// The pane of every tab, in the order of the tabs.
@@ -356,6 +362,8 @@ impl NativeApplication {
             task_output: TaskOutput::default(),
             task_title: String::new(),
             task_panel: false,
+            git: None,
+            commit_box: None,
             tabs,
             panes,
             active: 0,
@@ -2739,6 +2747,226 @@ impl NativeApplication {
         self.renderer = Some(renderer);
         Ok(())
     }
+
+    /// Opens the panel that shows what git knows about the files.
+    ///
+    /// The file that is open decides which repository is meant: the root of
+    /// the repository is the folder that holds the `.git` directory.
+    fn open_git_panel(&mut self) {
+        // Only one thing at a time: the box that asks for a new name and the
+        // find bar give up their place to the panel of the changes.
+        self.rename_box = None;
+        self.find = None;
+        let Some(path) = self.panes[self.active]
+            .document
+            .as_ref()
+            .map(|document| document.path().to_path_buf())
+        else {
+            self.status = Some("这个文件不在任何工程里".to_owned());
+            return;
+        };
+        let Some(root) = git::repository_root(&path) else {
+            self.status = Some("这个文件不在 git 仓库里".to_owned());
+            return;
+        };
+        match self.load_git_panel(&root) {
+            Ok(panel) => {
+                let count = panel.entries.len();
+                self.git = Some(panel);
+                self.status = Some(format!("改动面板打开了（{count} 个文件）"));
+            }
+            Err(error) => {
+                eprintln!("could not ask git about the files: {error}");
+                self.status = Some(format!("git 问不了：{error}"));
+            }
+        }
+    }
+
+    /// Reads what git knows and puts it in the panel.
+    fn load_git_panel(&mut self, root: &Path) -> Result<GitPanel, String> {
+        let status = git::status(root)?;
+        let mut panel = GitPanel::new(root.to_path_buf(), status.entries);
+        self.load_git_diff(&mut panel)?;
+        Ok(panel)
+    }
+
+    /// Reads the diff of the file that is picked.
+    fn load_git_diff(&mut self, panel: &mut GitPanel) -> Result<(), String> {
+        let Some(entry) = panel.selected_entry() else {
+            panel.diff.clear();
+            return Ok(());
+        };
+        panel.diff = git::diff(&panel.root, &entry.path, entry.staged)?;
+        Ok(())
+    }
+
+    /// Handles the keys of the panel of the changes.
+    ///
+    /// Ctrl+Shift+G opens the panel. While the panel is open it takes every
+    /// key: nothing may happen behind it that the user cannot see.
+    fn handle_git_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
+        // The box that asks for the message of a commit takes every key
+        // while it is open.
+        if self.commit_box.is_some() {
+            return self.handle_commit_box_key(key, text);
+        }
+
+        // The panel is not open: Ctrl+Shift+G opens it.
+        if self.git.is_none() {
+            if !(self.modifiers.control_key() && self.modifiers.shift_key()) {
+                return false;
+            }
+            let Some(letter) = key_letter(key) else {
+                return false;
+            };
+            if !letter.eq_ignore_ascii_case(&'g') {
+                return false;
+            }
+            self.open_git_panel();
+            return true;
+        }
+
+        // The panel is open: it takes every key.
+        let Some(mut panel) = self.git.take() else {
+            return false;
+        };
+        // Whether the diff of the file that is picked is read again.
+        let mut reread = true;
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.status = Some("关掉了改动面板".to_owned());
+                // The panel goes away and is not put back.
+                return true;
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                panel.select_next();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                panel.select_previous();
+            }
+            Key::Character(character) if !self.modifiers.control_key() => {
+                let character = character.as_ref();
+                let letter = character
+                    .chars()
+                    .next()
+                    .map(|letter| letter.to_ascii_lowercase());
+                match letter {
+                    Some('s') => {
+                        // The file is staged, and the panel says so at once:
+                        // staging is something a person has to see.
+                        let picked = panel.selected_entry().map(|entry| entry.path.clone());
+                        let Some(path) = picked else {
+                            self.status = Some("没有文件可以暂存".to_owned());
+                            return true;
+                        };
+                        let root = panel.root.clone();
+                        match git::stage(&root, &path) {
+                            Ok(()) => match self.load_git_panel(&root) {
+                                Ok(fresh) => {
+                                    panel = fresh;
+                                    reread = false;
+                                    self.status = Some(format!("暂存了 {path}"));
+                                }
+                                Err(error) => {
+                                    self.status =
+                                        Some(format!("暂存了 {path}，但改动读不了：{error}"));
+                                }
+                            },
+                            Err(error) => {
+                                self.status = Some(format!("暂存不了：{error}"));
+                            }
+                        }
+                    }
+                    Some('c') => {
+                        self.commit_box = Some(RenameBox::message("提交说明"));
+                        self.status = Some("写提交说明，回车确认，Esc 取消".to_owned());
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        // The diff of the file that is picked is read again.
+        if reread
+            && let Err(error) = self.load_git_diff(&mut panel)
+        {
+            self.status = Some(format!("差别读不了：{error}"));
+        }
+        self.git = Some(panel);
+        true
+    }
+
+    /// Gives a key to the box that asks for the message of a commit.
+    ///
+    /// The box is a thing of its own: a key that means nothing to it is
+    /// swallowed, so that the editor behind it never sees it.
+    fn handle_commit_box_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
+        let Some(mut commit) = self.commit_box.take() else {
+            return false;
+        };
+        // Whether the box stays open.
+        let mut keep = true;
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.status = Some("取消了提交".to_owned());
+                keep = false;
+            }
+            Key::Named(NamedKey::Enter) => {
+                keep = false;
+                self.commit_staged(commit.text());
+            }
+            Key::Named(NamedKey::Backspace) => commit.backspace(),
+            Key::Named(NamedKey::Delete) => commit.delete(),
+            Key::Named(NamedKey::ArrowLeft) => commit.left(),
+            Key::Named(NamedKey::ArrowRight) => commit.right(),
+            Key::Named(NamedKey::Home) => commit.home(),
+            Key::Named(NamedKey::End) => commit.end(),
+            Key::Character(character) if !self.modifiers.control_key() => {
+                let character = character.as_ref();
+                if character.chars().any(char::is_control) {
+                    // The key did not produce text of its own; the text of the
+                    // event is what the user typed.
+                    if let Some(typed) = text.filter(|typed| !typed.chars().any(char::is_control)) {
+                        commit.type_text(typed);
+                    }
+                } else {
+                    commit.type_text(character);
+                }
+            }
+            _ => {}
+        }
+        if keep {
+            self.commit_box = Some(commit);
+        }
+        true
+    }
+
+    /// Commits what is in the staging area.
+    fn commit_staged(&mut self, message: &str) {
+        let message = message.trim();
+        if message.is_empty() {
+            self.status = Some("提交说明不能是空的".to_owned());
+            return;
+        }
+        let Some(panel) = self.git.as_ref() else {
+            self.status = Some("改动面板没有打开，不知道往哪儿提交".to_owned());
+            return;
+        };
+        let root = panel.root.clone();
+        match git::commit(&root, message) {
+            Ok(said) => match self.load_git_panel(&root) {
+                Ok(fresh) => {
+                    self.git = Some(fresh);
+                    self.status = Some(format!("提交了：{said}"));
+                }
+                Err(error) => {
+                    self.git = None;
+                    self.status = Some(format!("提交了，但改动读不了：{error}"));
+                }
+            },
+            Err(error) => self.status = Some(format!("提交没成：{error}")),
+        }
+    }
 }
 
 impl ApplicationHandler for NativeApplication {
@@ -2865,6 +3093,12 @@ impl ApplicationHandler for NativeApplication {
                 // The settings panel takes every key while it is open, and
                 // Ctrl+, opens it.
                 if self.handle_settings_key(&event.logical_key.as_ref()) {
+                    window.request_redraw();
+                    return;
+                }
+                // Ctrl+Shift+G opens the panel of the changes. While the
+                // panel is open it takes every key.
+                if self.handle_git_key(&event.logical_key.as_ref(), event.text.as_deref()) {
                     window.request_redraw();
                     return;
                 }
@@ -3101,6 +3335,8 @@ impl ApplicationHandler for NativeApplication {
                         tree: self.tree.as_ref(),
                         prompt: prompt_text.as_deref(),
                         settings: self.settings.as_ref(),
+                        git: self.git.as_ref(),
+                        commit: self.commit_box.as_ref(),
                         conflicts: conflict,
                     },
                 );
@@ -3172,6 +3408,10 @@ struct Chrome<'a> {
     prompt: Option<&'a str>,
     /// The settings panel, when it is open.
     settings: Option<&'a Settings>,
+    /// The panel of the changes of the repository, when it is open.
+    git: Option<&'a GitPanel>,
+    /// The box that asks for the message of a commit, when it is open.
+    commit: Option<&'a RenameBox>,
     /// The conflicts between the buffer and a proposed change.
     conflicts: Option<ConflictView>,
 }
@@ -3264,6 +3504,22 @@ fn build_scene(
     // the panel is therefore left out of the picture, not covered by it.
     if let Some(settings) = chrome.settings {
         push_settings(&mut scene, viewport, size, settings);
+        return scene;
+    }
+
+    // The panel of the changes covers the window, the way the settings do.
+    if let Some(panel) = chrome.git {
+        let mut ui_measurer = RendererMeasurer::new(renderer, TextFamily::SansSerif);
+        if chrome.commit.is_some() {
+            // Only the ground of the panel is drawn while the message of the
+            // commit is being written: the text of the panel would lie on
+            // top of the box.
+            git::draw_background(&mut scene, viewport);
+        } else {
+            git::draw_panel(&mut scene, viewport, size, panel, &mut ui_measurer);
+        }
+        // The box that asks for the message of the commit floats over it.
+        push_rename_box(&mut scene, size, body, chrome.commit, &mut ui_measurer);
         return scene;
     }
 
@@ -3956,7 +4212,7 @@ fn push_rename_box(
     );
 
     // The name that is being renamed, in a quieter colour.
-    let label = format!("把 {} 改名为", rename.original());
+    let label = rename.title();
     let label_width = measurer.measure(&label, 13.0).width;
     scene.push_text(
         label,
@@ -5614,5 +5870,110 @@ mod tests {
             !app.panes[app.active].highlights.is_empty(),
             "the text is coloured again"
         );
+    }
+
+    /// A repository with a file in it that the editor can open.
+    ///
+    /// The file is not one that a language server wants: these checks are
+    /// about git and not about the server.
+    ///
+    /// Nothing comes back when git cannot be started here: the checks that
+    /// need it are not run at all.
+    fn git_project(name: &str) -> Option<(PathBuf, PathBuf)> {
+        if git::git_is_blocked() {
+            return None;
+        }
+        let directory = scratch_dir(name);
+        let file = directory.join("notes.txt");
+        fs::write(&file, "the first line\n").expect("the file is written");
+        git::run(&directory, &["init", "--quiet"]).expect("the repository is made");
+        git::run(&directory, &["config", "user.email", "check@example.com"])
+            .expect("the email is set");
+        git::run(&directory, &["config", "user.name", "check"]).expect("the name is set");
+        git::run(&directory, &["add", "notes.txt"]).expect("the file is added");
+        git::run(&directory, &["commit", "-m", "the first one"]).expect("the commit is made");
+        Some((directory, file))
+    }
+
+    #[test]
+    fn the_git_panel_opens_and_shows_what_changed() {
+        let Some((_, file)) = git_project("git-panel") else {
+            return;
+        };
+        fs::write(&file, "the second line\n").expect("the file is changed");
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.open_git_panel();
+
+        let panel = app.git.as_ref().expect("the panel is open");
+        assert_eq!(panel.entries.len(), 1, "the changed file is in the panel");
+        assert_eq!(panel.entries[0].path, "notes.txt");
+        assert!(!panel.entries[0].staged, "the change is not staged yet");
+        assert!(
+            panel.diff.contains("the second line"),
+            "the difference is in the panel: {}",
+            panel.diff
+        );
+    }
+
+    #[test]
+    fn the_letter_s_stages_the_file_that_is_picked() {
+        let Some((_, file)) = git_project("git-stage-key") else {
+            return;
+        };
+        fs::write(&file, "the second line\n").expect("the file is changed");
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.open_git_panel();
+        assert!(app.handle_git_key(&character("s"), None));
+
+        let panel = app.git.as_ref().expect("the panel is still open");
+        assert!(panel.entries[0].staged, "the change is staged");
+    }
+
+    #[test]
+    fn the_panel_commits_what_was_staged() {
+        let Some((directory, file)) = git_project("git-commit-key") else {
+            return;
+        };
+        fs::write(&file, "the second line\n").expect("the file is changed");
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.open_git_panel();
+        app.handle_git_key(&character("s"), None);
+        // C opens the box that asks for the message of the commit.
+        app.handle_git_key(&character("c"), None);
+        assert!(app.commit_box.is_some(), "the box asks for the message");
+
+        app.handle_git_key(&character("o"), None);
+        app.handle_git_key(&character("k"), None);
+        app.handle_git_key(&named(NamedKey::Enter), None);
+
+        assert!(app.commit_box.is_none(), "the box is closed");
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("提交了"), "got {status}");
+        let panel = app.git.as_ref().expect("the panel is still open");
+        assert!(panel.entries.is_empty(), "got {:?}", panel.entries);
+
+        // The commit is really in the repository.
+        let said = git::run(&directory, &["log", "--oneline"]).expect("the log is read");
+        assert!(said.contains("ok"), "got {said}");
+    }
+
+    #[test]
+    fn an_empty_message_is_not_committed() {
+        let Some((_, file)) = git_project("git-empty-message") else {
+            return;
+        };
+        fs::write(&file, "the second line\n").expect("the file is changed");
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.open_git_panel();
+        app.handle_git_key(&character("s"), None);
+        app.handle_git_key(&character("c"), None);
+        app.handle_git_key(&named(NamedKey::Enter), None);
+
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("不能是空的"), "got {status}");
     }
 }
