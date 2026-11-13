@@ -274,6 +274,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codeweaver-dap"
+version = "0.6.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "codeweaver-diff"
 version = "0.6.0"
 
