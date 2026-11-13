@@ -520,8 +520,8 @@ mod tests {
     }
 
     /// A key that is a letter.
-    fn character(letter: &str) -> Key<&str> {
-        Key::Character(letter.to_owned().into())
+    fn character(letter: &str) -> Key<&'_ str> {
+        Key::Character(letter)
     }
 
     /// A key that is named.
