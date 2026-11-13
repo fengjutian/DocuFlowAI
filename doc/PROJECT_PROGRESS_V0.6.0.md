@@ -47,9 +47,19 @@ V0.5.0 把编辑器与 Agent 之间接成了一条闭环：用户挑上下文 �
 - 输出面板可以关掉（`Esc`），关掉不影响任务继续跑。
 - 任务的进程模型：另起的子进程，输出走管道，编辑器退出时任务被停掉。
 
-### DF-0602 Git 状态、Diff、暂存与提交（计划）
+### DF-0602 Git 状态、Diff、暂存与提交（进行中）
 
-改了什么、暂存什么、提交什么，都看得见、点得动。本期先不做，理由见 §8。
+改了什么、暂存什么、提交什么，都看得见、点得动。用**命令行 `git`**（机器上有 git 就够，不引第三方库），工程根目录由打开的文件往上找 `.git` 决定。
+
+验收标准：
+
+- `Ctrl+Shift+G` 打开「改动」面板：面板列出 git 知道改过的文件（`git status --porcelain`），每一个标着它的状态（改了 / 新增 / 没纳入版本管理 / 已暂存）。
+- 选中一个文件时，面板把它的 diff（`git diff`）显示出来；已暂存的文件显示暂存区的那份（`git diff --cached`）。
+- `S` 把选中的文件暂存起来（`git add`），面板立刻按新的状态重画——暂存这件事看得见，不靠猜。
+- `C` 打开一个输入框写提交说明，回车后提交（`git commit -m`）；说明是空的时编辑器**明说**不能提交。
+- 没有 git、没有仓库、命令失败时，编辑器在状态栏**明说**原因，不静默什么都不发生。
+- 面板可以用 `Esc` 关掉；关掉不影响工程本身。
+- git 模块的单元测试在一个真的临时仓库里跑：改一个文件 → 状态里有它 → 暂存 → 状态变了 → 提交 → 提交真的成了。
 
 ### DF-0603 LSP 格式化（进行中）
 
@@ -145,6 +155,34 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\task-check.ps1
 语言服务器还有一处环境事实：本机的 `rust-analyzer` 是 rustup 的代理，而 `rust-analyzer` 组件**没有装在默认工具链里**，代理直接报「Unknown binary」。真正可用的二进制在 1.98.1 工具链下（`%USERPROFILE%\.rustup\toolchains\1.98.1-x86_64-pc-windows-msvc\bin\rust-analyzer.exe`），`rustfmt` 与它在一起。编辑器本来就有 `--lsp <program>`，验收脚本用它点名这个二进制——这是环境绕行，不是产品逻辑的改动。
 
 另外，验收用的工程必须有自己的 workspace：`cargo locate-project` 会在工程落在别的 workspace 里时报「believes it's in a workspace when it's not」，因此工程放在工作区之外，并带一张空的 `[workspace]` 表。
+
+### 6.4 待跑的验收（开发期间攒下，统一回归时一起跑）
+
+开发阶段只跑不影响桌面的检查（`cargo test`、`npm test`）。下面这些是**窗口级**的：它们会杀编辑器进程、抢键盘焦点、往系统里注入按键，跑之前先确认手头没事，而且**必须串行**（每个脚本开头都 `Stop-Process -Name codeweaver-editor`）。
+
+| 脚本 | 证明什么 | 状态 |
+|---|---|---|
+| `tools\format-check.ps1` | 真实 rust-analyzer 排版 → 正文像素变化；脏标记出现；一次撤销整体回退 | 上一轮已过 4/4，本轮待重跑 |
+| `tools\rename-check.ps1` | `F2` 改名 → 打开的文件被改、没打开的文件写进了磁盘、一次撤销整体回退 | 新写，**未跑** |
+| `tools\task-check.ps1` | `Ctrl+Shift+B` 跑构建 → 输出面板画出来了、面板里有输出、`Esc` 关掉 | 新写，**未跑** |
+| `tools\settings-check.ps1` | 设置面板 5 项 | 上一轮已过 5/5，本轮待重跑 |
+| `tools\agent-check.ps1` | Agent 面板 6 项 | 上一轮已过 6/6，本轮待重跑 |
+| `tools\workbench-check.ps1` | 工作台 4 项 | 上一轮已过 4/4，本轮待重跑 |
+| `tools\window-check.ps1` | 窗口 7 项观察 | 上一轮已过，本轮待重跑 |
+| `tools\acp-contract-check.ps1` | ACP 契约 7 项（真实端点） | 上一轮已过 7/7，本轮待重跑 |
+
+还欠着的窗口级证据：
+
+- **DF-0605 代码操作没有窗口脚本**：得证明「`Alt+Enter` 真的列出了操作、挑一个之后文件真的改了」。脚本要写（计划里用真实 rust-analyzer 的 quick fix）。
+- **DF-0602 Git 面板没有窗口脚本**：得证明「面板列出了改过的文件、diff 显示出来了、`S` 暂存之后状态变了、`C` 提交之后状态里没有它了」。
+- **DF-0601 任务运行器的失败路径没有窗口证据**：现在只有单元测试（退出码 3 的任务状态是 `Finished(3)`），窗口里要看见「失败了，退出码 3」。
+- **跨文件的重命名与代码操作只验了一个方向**：现在的脚本验的是「没打开的文件被写进磁盘」；还要验「另一个**已打开**的标签页也被改了」。
+
+非窗口级的（本地跑，不抢桌面）：
+
+- `cargo test --workspace`（本轮 378 项全过）、`cargo clippy --workspace --all-targets`（本轮 0 告警）。
+- `cd codeweaver-hermes-lab; npm test`（运行时与 ACP 端点，本轮待跑）。
+- `cd codeweaver-workspace; npm run build`（控制台前端与 Tauri 外壳，本轮待跑）。
 
 ## 7. 本期结转
 
