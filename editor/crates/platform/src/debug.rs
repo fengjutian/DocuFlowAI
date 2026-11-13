@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use codeweaver_dap::protocol::Variable;
 use codeweaver_dap::{AdapterConfig, Client, DapError};
+use codeweaver_text::{Anchor, Buffer};
 
 /// The height of the panel of the debugger.
 pub const DEBUG_PANEL_HEIGHT: f32 = 220.0;
@@ -60,9 +61,16 @@ pub enum DebugStep {
 ///
 /// The breakpoints belong to the files and not to the session: they are
 /// there whether a session is running or not.
+///
+/// Every breakpoint of an open file also has a *place*: an anchor in the
+/// buffer of that file. The anchor follows the text, so a breakpoint that
+/// was above a line that was added moves down with the text it is on. A
+/// breakpoint that kept its number would be on the wrong line.
 #[derive(Clone, Debug, Default)]
 pub struct Breakpoints {
     files: BTreeMap<String, BTreeSet<u32>>,
+    /// The place of every breakpoint, by the file and the line it is on.
+    places: BTreeMap<String, BTreeMap<u32, Anchor>>,
 }
 
 impl Breakpoints {
@@ -107,6 +115,72 @@ impl Breakpoints {
     /// Whether there are no breakpoints at all.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Remembers where the breakpoint of a line is.
+    ///
+    /// The place is an anchor in the buffer of the file: it follows the text
+    /// when the file changes.
+    pub fn remember(&mut self, uri: &str, line: u32, anchor: Anchor) {
+        self.places
+            .entry(uri.to_owned())
+            .or_default()
+            .insert(line, anchor);
+    }
+
+    /// Forgets the place of the breakpoint of a line.
+    ///
+    /// The anchor is given back so that the buffer of the file can let it
+    /// go.
+    pub fn forget(&mut self, uri: &str, line: u32) -> Option<Anchor> {
+        let places = self.places.get_mut(uri)?;
+        let anchor = places.remove(&line);
+        if places.is_empty() {
+            self.places.remove(uri);
+        }
+        anchor
+    }
+
+    /// Forgets the places of the breakpoints of a file.
+    ///
+    /// The anchors of a file that was closed died with its buffer; when the
+    /// file is opened again, its breakpoints get new ones.
+    pub fn forget_the_places(&mut self, uri: &str) {
+        self.places.remove(uri);
+    }
+
+    /// Moves the breakpoints of a file to the lines the text is on now.
+    ///
+    /// Returns whether a breakpoint moved.
+    pub fn follow(&mut self, uri: &str, buffer: &Buffer) -> bool {
+        let Some(places) = self.places.remove(uri) else {
+            // No breakpoint of this file follows the text.
+            return false;
+        };
+        // The lines that are not tracked stay where they are: a breakpoint of
+        // a file that is not open has no text to follow.
+        let mut lines = self.files.get(uri).cloned().unwrap_or_default();
+        let mut moved = false;
+        let mut next = BTreeMap::new();
+        for (line, anchor) in &places {
+            // The anchor knows where the text is; the line is where that
+            // text is.
+            let now = match buffer.resolve_anchor(anchor) {
+                Some(offset) => buffer.line_of_offset(offset.as_usize()) as u32 + 1,
+                // The anchor is gone: the line the breakpoint was on is the
+                // best that is left of it.
+                None => *line,
+            };
+            if now != *line {
+                moved = true;
+                lines.remove(line);
+                lines.insert(now);
+            }
+            next.insert(now, *anchor);
+        }
+        self.files.insert(uri.to_owned(), lines);
+        self.places.insert(uri.to_owned(), next);
+        moved
     }
 }
 
@@ -319,6 +393,90 @@ pub fn draw_panel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codeweaver_text::{Bias, TextEdit, TextOffset, Transaction};
+
+    /// A buffer with three lines, and the place of the third one.
+    fn buffer_of_three_lines() -> (Buffer, Anchor) {
+        let mut buffer = Buffer::new("one\ntwo\nthree\n");
+        let offset = buffer.line_range(2).start;
+        let anchor = buffer.anchor(offset, Bias::Right);
+        (buffer, anchor)
+    }
+
+    /// Puts a line at the top of the text.
+    fn put_a_line_above(buffer: &mut Buffer, text: &str) {
+        let version = buffer.version();
+        buffer
+            .apply(Transaction::new(
+                version,
+                vec![TextEdit::new(TextOffset(0)..TextOffset(0), text)],
+            ))
+            .expect("the edit fits");
+    }
+
+    #[test]
+    fn a_breakpoint_follows_the_text_that_is_above_it() {
+        let (mut buffer, anchor) = buffer_of_three_lines();
+        let mut breakpoints = Breakpoints::default();
+        breakpoints.toggle("file:///main.rs", 3);
+        breakpoints.remember("file:///main.rs", 3, anchor);
+
+        put_a_line_above(&mut buffer, "zero\n");
+
+        assert!(
+            breakpoints.follow("file:///main.rs", &buffer),
+            "the breakpoint moved"
+        );
+        assert_eq!(breakpoints.lines_of("file:///main.rs"), vec![4]);
+    }
+
+    #[test]
+    fn a_breakpoint_stays_when_the_text_below_it_changes() {
+        let (mut buffer, anchor) = buffer_of_three_lines();
+        let mut breakpoints = Breakpoints::default();
+        breakpoints.toggle("file:///main.rs", 3);
+        breakpoints.remember("file:///main.rs", 3, anchor);
+
+        // A line is put at the end of the text.
+        let version = buffer.version();
+        let end = buffer.len();
+        buffer
+            .apply(Transaction::new(
+                version,
+                vec![TextEdit::new(end..end, "four\n")],
+            ))
+            .expect("the edit fits");
+
+        assert!(
+            !breakpoints.follow("file:///main.rs", &buffer),
+            "the breakpoint did not move"
+        );
+        assert_eq!(breakpoints.lines_of("file:///main.rs"), vec![3]);
+    }
+
+    #[test]
+    fn a_breakpoint_of_a_file_that_is_not_open_stays_where_it_is() {
+        let (buffer, _anchor) = buffer_of_three_lines();
+        let mut breakpoints = Breakpoints::default();
+        breakpoints.toggle("file:///main.rs", 3);
+
+        assert!(!breakpoints.follow("file:///main.rs", &buffer));
+        assert_eq!(breakpoints.lines_of("file:///main.rs"), vec![3]);
+    }
+
+    #[test]
+    fn the_place_of_a_breakpoint_is_forgotten_when_it_is_taken_away() {
+        let (_buffer, anchor) = buffer_of_three_lines();
+        let mut breakpoints = Breakpoints::default();
+        breakpoints.toggle("file:///main.rs", 3);
+        breakpoints.remember("file:///main.rs", 3, anchor);
+
+        assert!(breakpoints.forget("file:///main.rs", 3).is_some());
+        assert!(
+            breakpoints.forget("file:///main.rs", 3).is_none(),
+            "there is no place left"
+        );
+    }
 
     #[test]
     fn a_breakpoint_is_put_on_a_line_and_taken_away_again() {

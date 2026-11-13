@@ -33,7 +33,7 @@ use codeweaver_render::{
     Color, FrameScene, Point, Rect, Renderer, RendererError, Size, TextFamily, TextStyle,
 };
 use codeweaver_syntax::{Highlight, Language};
-use codeweaver_text::TextOffset;
+use codeweaver_text::{Bias, TextOffset};
 use codeweaver_ui::TextMeasurer;
 use codeweaver_workspace::{
     ChangeDetector, Document, ExternalChange, FileTree, SearchHit, Workspace,
@@ -522,9 +522,36 @@ impl NativeApplication {
             self.detector.watch(document.path(), document.fingerprint());
         }
         self.panes.push(pane);
+        // The breakpoints of the file follow its text again: the anchors of
+        // the closed file died with its buffer.
+        self.track_the_breakpoints_of_the_pane(self.panes.len() - 1);
         self.show_tree_of(path);
         self.activate_tab(index);
         true
+    }
+
+    /// Gives the breakpoints of a file new places.
+    ///
+    /// The anchors of a file that was closed died with its buffer; when the
+    /// file is opened again, its breakpoints get new ones, and they follow
+    /// the text from then on.
+    fn track_the_breakpoints_of_the_pane(&mut self, pane: usize) {
+        let Some(uri) = self.uri_of_a_pane(pane) else {
+            return;
+        };
+        let lines = self.breakpoints.lines_of(&uri);
+        self.breakpoints.forget_the_places(&uri);
+        for line in lines {
+            let anchor = {
+                let editor = &mut self.panes[pane].editor;
+                let offset = editor
+                    .buffer()
+                    .line_range(line.saturating_sub(1) as usize)
+                    .start;
+                editor.buffer_mut().anchor(offset, Bias::Right)
+            };
+            self.breakpoints.remember(&uri, line, anchor);
+        }
     }
 
     /// Brings a tab to the front.
@@ -3064,7 +3091,16 @@ impl NativeApplication {
 
     /// The address of the file that is on screen.
     fn uri_of_the_open_file(&self) -> Option<String> {
-        let path = self.panes[self.active]
+        self.uri_of_a_pane(self.active)
+    }
+
+    /// The address of the file of a tab.
+    ///
+    /// The address comes from the path of the file and not from the language
+    /// server: a file that has no server still has an address, and a
+    /// breakpoint can be put on it.
+    fn uri_of_a_pane(&self, pane: usize) -> Option<String> {
+        let path = self.panes[pane]
             .document
             .as_ref()
             .map(|document| document.path().to_path_buf())?;
@@ -3080,11 +3116,15 @@ impl NativeApplication {
         let caret = self.panes[self.active].editor.caret().0;
         let line = self.panes[self.active].editor.buffer().line_of_offset(caret) + 1;
         if self.breakpoints.toggle(&uri, line as u32) {
+            // The place of the breakpoint is remembered, so that it follows
+            // the text when the file changes above it.
+            self.remember_the_place_of_the_breakpoint(&uri, line as u32);
             self.status = Some(format!(
                 "第 {line} 行有了断点（{} 个）",
                 self.breakpoints.len()
             ));
         } else {
+            self.forget_the_place_of_the_breakpoint(&uri, line as u32);
             let count = self.breakpoints.len();
             self.status = Some(if count == 0 {
                 "断点都撤了".to_owned()
@@ -3092,6 +3132,82 @@ impl NativeApplication {
                 format!("第 {line} 行的断点撤了（{count} 个）")
             });
         }
+        // The adapter has to hear about it: a breakpoint it does not know
+        // about is a breakpoint that does not stop the program.
+        self.tell_the_adapter_about_the_breakpoints(&uri);
+    }
+
+    /// Remembers where the breakpoint of a line is.
+    ///
+    /// The place is an anchor in the buffer of the file: it follows the text
+    /// when the file changes.
+    fn remember_the_place_of_the_breakpoint(&mut self, uri: &str, line: u32) {
+        let anchor = {
+            let editor = &mut self.panes[self.active].editor;
+            let offset = editor
+                .buffer()
+                .line_range(line.saturating_sub(1) as usize)
+                .start;
+            editor.buffer_mut().anchor(offset, Bias::Right)
+        };
+        self.breakpoints.remember(uri, line, anchor);
+    }
+
+    /// Forgets where the breakpoint of a line was.
+    fn forget_the_place_of_the_breakpoint(&mut self, uri: &str, line: u32) {
+        if let Some(anchor) = self.breakpoints.forget(uri, line) {
+            self.panes[self.active]
+                .editor
+                .buffer_mut()
+                .release_anchor(&anchor);
+        }
+    }
+
+    /// Tells the adapter where the breakpoints of a file are.
+    ///
+    /// The adapter only stops the program where it was told to: a breakpoint
+    /// it does not know about is a breakpoint that does not stop anything.
+    fn tell_the_adapter_about_the_breakpoints(&mut self, uri: &str) {
+        if self.debug.is_none() {
+            return;
+        }
+        let lines = self.breakpoints.lines_of(uri);
+        if let Some(debug) = self.debug.as_mut()
+            && let Err(error) = debug.client.set_breakpoints(uri, &lines)
+        {
+            eprintln!("could not tell the adapter about the breakpoints: {error}");
+        }
+    }
+
+    /// Moves the breakpoints of the open files to the lines the text is on.
+    ///
+    /// A breakpoint that was above a line that was added is on the line the
+    /// text is on now: a breakpoint that kept its number would be on the
+    /// wrong line.
+    fn follow_the_breakpoints(&mut self) {
+        for pane in 0..self.panes.len() {
+            self.follow_the_breakpoints_of(pane);
+        }
+    }
+
+    /// Moves the breakpoints of one file to the lines the text is on now.
+    ///
+    /// Returns whether a breakpoint moved.
+    fn follow_the_breakpoints_of(&mut self, pane: usize) -> bool {
+        let Some(uri) = self.uri_of_a_pane(pane) else {
+            return false;
+        };
+        let moved = {
+            let Self { panes, breakpoints, .. } = self;
+            let buffer = panes[pane].editor.buffer();
+            breakpoints.follow(&uri, buffer)
+        };
+        if !moved {
+            return false;
+        }
+        // The adapter has to hear about the new lines.
+        self.tell_the_adapter_about_the_breakpoints(&uri);
+        true
     }
 
     /// Starts a debug session.
@@ -3809,6 +3925,9 @@ impl ApplicationHandler for NativeApplication {
                 window.request_redraw();
             }
             WindowEvent::RedrawRequested => {
+                // The breakpoints follow the text: a breakpoint that was above
+                // a line that was added is on the line the text is on now.
+                self.follow_the_breakpoints();
                 // The agent's output is collected once per frame, so a reply
                 // appears while the agent is still producing it. Collecting it
                 // here is also what records the baseline of a change the
@@ -5493,6 +5612,83 @@ mod tests {
             expected,
             "the caret is on the line that was found"
         );
+    }
+
+    #[test]
+    fn a_breakpoint_follows_the_line_that_was_added_above_it() {
+        let directory = scratch_dir("breakpoint-follows");
+        let file = directory.join("notes.txt");
+        fs::write(&file, "one\ntwo\nthree\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        let uri = app.uri_of_the_open_file().expect("the file has an address");
+        // The caret is on the third line.
+        app.pane_mut().editor.set_carets(&[TextOffset(8)]);
+        app.toggle_breakpoint();
+        assert_eq!(app.breakpoints.lines_of(&uri), vec![3]);
+
+        // A line is put above the breakpoint.
+        app.pane_mut().editor.set_carets(&[TextOffset(0)]);
+        app.pane_mut()
+            .editor
+            .insert("zero\n")
+            .expect("the text fits");
+        app.follow_the_breakpoints();
+
+        assert_eq!(
+            app.breakpoints.lines_of(&uri),
+            vec![4],
+            "the breakpoint is on the line the text is on now"
+        );
+    }
+
+    #[test]
+    fn the_place_of_a_breakpoint_is_released_when_it_is_taken_away() {
+        let directory = scratch_dir("breakpoint-released");
+        let file = directory.join("notes.txt");
+        fs::write(&file, "one\ntwo\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.pane_mut().editor.set_carets(&[TextOffset(4)]);
+        app.toggle_breakpoint();
+        let with = app.pane_mut().editor.buffer().anchor_count();
+
+        app.toggle_breakpoint();
+        let without = app.pane_mut().editor.buffer().anchor_count();
+
+        assert_eq!(
+            without + 1,
+            with,
+            "the place of the breakpoint was let go"
+        );
+    }
+
+    #[test]
+    fn the_breakpoints_of_a_file_that_is_opened_again_follow_the_text() {
+        let directory = scratch_dir("breakpoint-reopened");
+        let file = directory.join("notes.txt");
+        fs::write(&file, "one\ntwo\nthree\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file.clone())).expect("the application starts");
+        let uri = app.uri_of_the_open_file().expect("the file has an address");
+        app.pane_mut().editor.set_carets(&[TextOffset(8)]);
+        app.toggle_breakpoint();
+
+        // The file is closed and opened again: the places of the breakpoints
+        // died with the buffer of the closed file.
+        app.close_tab(0);
+        app.open_file(&file);
+        assert_eq!(app.breakpoints.lines_of(&uri), vec![3]);
+
+        // A line is put above the breakpoint.
+        app.pane_mut().editor.set_carets(&[TextOffset(0)]);
+        app.pane_mut()
+            .editor
+            .insert("zero\n")
+            .expect("the text fits");
+        app.follow_the_breakpoints();
+
+        assert_eq!(app.breakpoints.lines_of(&uri), vec![4]);
     }
 
     /// A directory of scratch files for the checks that need more than one.

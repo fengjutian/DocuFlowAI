@@ -13,11 +13,13 @@
 #
 # 1. F9 puts a breakpoint on the line of the caret, and the breakpoint is
 #    drawn in the margin of the text.
-# 2. F5 starts the debug session, and the panel of the debugger is drawn at
+# 2. A line that is put above the breakpoint moves the breakpoint with it: the
+#    breakpoint follows the text it is on, and the undo takes it back.
+# 3. F5 starts the debug session, and the panel of the debugger is drawn at
 #    the bottom of the window.
-# 3. The variables of the frame the program is stopped in are in the panel:
+# 4. The variables of the frame the program is stopped in are in the panel:
 #    the name, the type and the value of every variable.
-# 4. F10 walks one line, and the program stops again with its variables.
+# 5. F10 walks one line, and the program stops again with its variables.
 #
 # The keys are injected into the system, the way a keyboard would, because the
 # window reads the state of the modifiers from the keyboard itself.
@@ -36,6 +38,8 @@ $run = Join-Path $env:LOCALAPPDATA 'CodeWeaver\check'
 $project = Join-Path $run 'debug-project'
 $source = Join-Path $project 'main.rs'
 $shotBreakpoint = Join-Path $logs 'debug-breakpoint.png'
+$shotMoved = Join-Path $logs 'debug-moved.png'
+$shotUndone = Join-Path $logs 'debug-undone.png'
 $shotStopped = Join-Path $logs 'debug-stopped.png'
 $shotStepped = Join-Path $logs 'debug-stepped.png'
 $report = Join-Path $logs 'debug-check.json'
@@ -104,7 +108,10 @@ $SWP_SHOWWINDOW = 0x0040
 
 # The keys the check presses.
 $VK_SHIFT = 0x10
+$VK_CONTROL = 0x11
 $VK_ESCAPE = 0x1B
+$VK_RETURN = 0x0D
+$VK_Z = 0x5A
 $VK_F5 = 0x74
 $VK_F9 = 0x78
 $VK_F10 = 0x79
@@ -190,6 +197,24 @@ function To-Screen([double]$logical) {
 function To-Physical([double]$value) {
     if ($scriptIsAware) { return $value }
     return $value * $script:Factor
+}
+
+# Presses a key with modifiers.
+function Send-Chord([int[]]$modifiers, [int]$virtualKey) {
+    $sequence = @()
+    foreach ($modifier in $modifiers) {
+        $sequence += ,@($modifier, $false)
+    }
+    $sequence += ,@($virtualKey, $false)
+    $sequence += ,@($virtualKey, $true)
+    for ($i = $modifiers.Length - 1; $i -ge 0; $i--) {
+        $sequence += ,@($modifiers[$i], $true)
+    }
+    foreach ($step in $sequence) {
+        $flags = if ($step[1]) { 2 } else { 0 }
+        [Win32]::keybd_event([byte]$step[0], 0, [uint32]$flags, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 60
+    }
 }
 
 # Presses a key that has no modifier.
@@ -360,6 +385,29 @@ try {
         Write-Host "pixels of the breakpoint in the margin: $dot"
         Check 'the breakpoint is drawn in the margin' ($dot -gt 10) "$dot pixels of the breakpoint"
 
+        # A line that is put above the breakpoint moves the breakpoint with it.
+        $previous = Focus-Editor $handle
+        Send-Key $VK_RETURN
+        Start-Sleep -Seconds 2
+
+        $movedShot = Save-Window $handle $shotMoved
+        Write-Host "saved $shotMoved"
+        $below = Count-In $movedShot (To-Screen $BREAKPOINT_X) (To-Screen ($BREAKPOINT_Y + 22)) (To-Screen 20) (To-Screen 20) $BREAKPOINT_RGB 14
+        $above = Count-In $movedShot (To-Screen $BREAKPOINT_X) (To-Screen $BREAKPOINT_Y) (To-Screen 20) (To-Screen 20) $BREAKPOINT_RGB 14
+        Write-Host "pixels of the breakpoint: $below on the line below, $above on the line above"
+        Check 'the breakpoint follows the text above it' ($below -gt 10 -and $above -lt 10) "$below pixels below, $above pixels above"
+
+        # The undo takes the line away, and the breakpoint goes back with it.
+        $previous = Focus-Editor $handle
+        Send-Chord @($VK_CONTROL) $VK_Z
+        Start-Sleep -Seconds 2
+
+        $undoneShot = Save-Window $handle $shotUndone
+        Write-Host "saved $shotUndone"
+        $back = Count-In $undoneShot (To-Screen $BREAKPOINT_X) (To-Screen $BREAKPOINT_Y) (To-Screen 20) (To-Screen 20) $BREAKPOINT_RGB 14
+        Write-Host "pixels of the breakpoint after the undo: $back"
+        Check 'the breakpoint goes back with the undo' ($back -gt 10) "$back pixels of the breakpoint"
+
         # F5 starts the debug session.
         $previous = Focus-Editor $handle
         Send-Key $VK_F5
@@ -403,12 +451,15 @@ try {
             project = $project
             pixels = @{
                 breakpoint = $dot
+                breakpointBelow = $below
+                breakpointAbove = $above
+                breakpointAfterUndo = $back
                 ground = $ground
                 variables = $variables
                 output = $said
                 variablesAfterStep = $stepped
             }
-            shots = @($shotBreakpoint, $shotStopped, $shotStepped)
+            shots = @($shotBreakpoint, $shotMoved, $shotUndone, $shotStopped, $shotStepped)
         }
         [System.IO.File]::WriteAllText($report, ($result | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
         Write-Host "saved $report"
