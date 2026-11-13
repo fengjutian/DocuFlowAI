@@ -18,7 +18,7 @@ mod settings;
 mod shell;
 mod task;
 
-use std::{ops::Range, path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{ops::Range, path::{Path, PathBuf}, sync::Arc, time::{Duration, Instant}};
 
 use anyhow::{Context, Result};
 use codeweaver_agent_acp::ToolStatus;
@@ -184,6 +184,11 @@ pub struct NativeApplication {
     breakpoint_condition: Option<CommandBox>,
     /// The box that asks for an expression to be worked out, when it is open.
     debug_expression: Option<CommandBox>,
+    /// The frame of the stack that was clicked on last, and when.
+    ///
+    /// Two clicks in a row on the same frame are a double click: they mean
+    /// "take me to that place in the code".
+    last_frame_click: Option<(usize, Instant)>,
     /// The line the box that asks for a condition is about.
     breakpoint_condition_line: Option<u32>,
     /// The tabs that are open.
@@ -418,6 +423,7 @@ impl NativeApplication {
             breakpoints: Breakpoints::default(),
             breakpoint_condition: None,
             debug_expression: None,
+            last_frame_click: None,
             breakpoint_condition_line: None,
             tabs,
             panes,
@@ -1741,6 +1747,9 @@ impl NativeApplication {
     /// are shown are the ones of the frame that is picked, and an
     /// expression is asked about in it.
     ///
+    /// Two clicks in a row on the same frame take the person to the place of
+    /// that frame in the code.
+    ///
     /// Returns whether the click was on a frame: a click that was not is
     /// none of the panel's business.
     fn press_the_debug_panel(&mut self, cursor: Point, size: Size) -> bool {
@@ -1759,6 +1768,16 @@ impl NativeApplication {
         let Some(index) = debug::frame_at(cursor, size, frames) else {
             return false;
         };
+        // Two clicks in a row on the same frame are a double click.
+        let now = Instant::now();
+        let twice = self.last_frame_click.is_some_and(|(last, at)| {
+            last == index && now.duration_since(at) < Duration::from_millis(500)
+        });
+        self.last_frame_click = Some((index, now));
+        if twice {
+            self.jump_to_the_frame(index);
+            return true;
+        }
         let Some(debug) = self.debug.as_mut() else {
             return false;
         };
@@ -1766,6 +1785,46 @@ impl NativeApplication {
             self.status = Some(format!("挑了第 {} 帧", index + 1));
         }
         true
+    }
+
+    /// Takes the person to the place of a frame in the code.
+    ///
+    /// The file of the frame is opened and the caret is put on the line the
+    /// frame is on: that is where the program is.
+    fn jump_to_the_frame(&mut self, index: usize) {
+        let Some(debug) = self.debug.as_ref() else {
+            return;
+        };
+        let Some(frame) = debug.frames.get(index) else {
+            return;
+        };
+        let Some((path, line)) = debug::place_of(frame) else {
+            // The adapter did not say where the program is: the editor says
+            // so instead of doing nothing.
+            self.status = Some("这一帧没有位置，跳不了".to_owned());
+            return;
+        };
+        if !self.open_file(&path) {
+            // The file could not be opened: the reason was said already.
+            return;
+        }
+        let pane = &mut self.panes[self.active];
+        let offset = pane.editor.buffer().line_range(line.saturating_sub(1) as usize).start;
+        pane.editor.set_carets(&[offset]);
+        // The line of the frame is scrolled into the picture: a place that
+        // is not on the screen is not a place.
+        let scale_factor = self
+            .window
+            .as_ref()
+            .map(|window| window.scale_factor())
+            .unwrap_or(1.0);
+        self.keep_caret_visible(scale_factor);
+        self.status = Some(format!(
+            "跳到 {} 的第 {line} 行",
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string())
+        ));
     }
 
     /// Handles the mouse moving while a drag is in progress.
@@ -2716,6 +2775,24 @@ impl NativeApplication {
         let mut handled = true;
         // Whether the bar stays open.
         let mut keep = true;
+        // Alt+C turns the case sensitivity on and off.
+        //
+        // The key may have no name on a layout with a Chinese input method,
+        // so the letter is taken from the virtual key code. Nothing else is
+        // written into the bar while Alt is held.
+        if self.modifiers.alt_key()
+            && let Some(letter) = key_letter(key)
+        {
+            if letter.eq_ignore_ascii_case(&'c') {
+                find.toggle_case_sensitive(&self.panes[self.active].editor);
+                let count = find.match_count();
+                self.status = Some(format!("{count} 处匹配"));
+            }
+            if keep {
+                self.find = Some(find);
+            }
+            return true;
+        }
         match key {
             Key::Named(NamedKey::Escape) => {
                 // The bar closes and the editor takes the keyboard back.
@@ -2947,8 +3024,17 @@ impl NativeApplication {
         Ok(panel)
     }
 
-    /// Reads the diff of the file that is picked.
+    /// Reads the diff of the file that is picked, or of the commit that is
+    /// picked.
     fn load_git_diff(&mut self, panel: &mut GitPanel) -> Result<(), String> {
+        if panel.is_showing_commits() {
+            let Some(commit) = panel.selected_commit() else {
+                panel.diff.clear();
+                return Ok(());
+            };
+            panel.diff = git::show(&panel.root, &commit.id)?;
+            return Ok(());
+        }
         let Some(entry) = panel.selected_entry() else {
             panel.diff.clear();
             return Ok(());
@@ -3008,9 +3094,17 @@ impl NativeApplication {
         let mut reread = true;
         match key {
             Key::Named(NamedKey::Escape) => {
-                self.status = Some("关掉了改动面板".to_owned());
-                // The panel goes away and is not put back.
-                return true;
+                if panel.is_showing_commits() {
+                    // The commits are a page of the panel: the escape key
+                    // goes back to the files, and does not close the panel.
+                    panel.showing_commits = false;
+                    panel.selected = 0;
+                    self.status = Some("回到改过的文件".to_owned());
+                } else {
+                    self.status = Some("关掉了改动面板".to_owned());
+                    // The panel goes away and is not put back.
+                    return true;
+                }
             }
             Key::Named(NamedKey::ArrowDown) => {
                 panel.select_next();
@@ -3024,10 +3118,16 @@ impl NativeApplication {
                     .chars()
                     .next()
                     .map(|letter| letter.to_ascii_lowercase());
+                // The panel is showing the commits: the files are not
+                // touched from here, only the commits are looked at.
+                let showing_commits = panel.is_showing_commits();
                 match letter {
                     Some('s') => {
                         // The file is staged, and the panel says so at once:
                         // staging is something a person has to see.
+                        if showing_commits {
+                            return true;
+                        }
                         let picked = panel.selected_entry().map(|entry| entry.path.clone());
                         let Some(path) = picked else {
                             self.status = Some("没有文件可以暂存".to_owned());
@@ -3052,8 +3152,62 @@ impl NativeApplication {
                         }
                     }
                     Some('c') => {
+                        if showing_commits {
+                            return true;
+                        }
                         self.commit_box = Some(RenameBox::message("提交说明"));
                         self.status = Some("写提交说明，回车确认，Esc 取消".to_owned());
+                    }
+                    Some('u') => {
+                        // The file goes out of the staging area: the file
+                        // itself is not touched, only the index is.
+                        if showing_commits {
+                            return true;
+                        }
+                        let Some(entry) = panel.selected_entry() else {
+                            self.status = Some("没有文件可以取消暂存".to_owned());
+                            return true;
+                        };
+                        let path = entry.path.clone();
+                        let staged = entry.staged;
+                        if !staged {
+                            self.status = Some(format!("{path} 没有暂存"));
+                            return true;
+                        }
+                        let root = panel.root.clone();
+                        match git::unstage(&root, &path) {
+                            Ok(()) => match self.load_git_panel(&root) {
+                                Ok(fresh) => {
+                                    panel = fresh;
+                                    reread = false;
+                                    self.status = Some(format!("取消暂存 {path}"));
+                                }
+                                Err(error) => {
+                                    self.status =
+                                        Some(format!("取消暂存了 {path}，但改动读不了：{error}"));
+                                }
+                            },
+                            Err(error) => {
+                                self.status = Some(format!("取消暂存不了：{error}"));
+                            }
+                        }
+                    }
+                    Some('l') => {
+                        // The commits of the repository: the panel becomes a
+                        // page of them.
+                        let root = panel.root.clone();
+                        match git::commits(&root, 30) {
+                            Ok(commits) => {
+                                let count = commits.len();
+                                panel.commits = commits;
+                                panel.showing_commits = true;
+                                panel.selected = 0;
+                                self.status = Some(format!("{count} 个提交"));
+                            }
+                            Err(error) => {
+                                self.status = Some(format!("提交记录读不了：{error}"));
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -3095,6 +3249,9 @@ impl NativeApplication {
             Key::Named(NamedKey::ArrowRight) => commit.right(),
             Key::Named(NamedKey::Home) => commit.home(),
             Key::Named(NamedKey::End) => commit.end(),
+            // The window system names the space bar instead of making it a
+            // character: without this arm no message could have a word in it.
+            Key::Named(NamedKey::Space) => commit.type_text(" "),
             Key::Character(character) if !self.modifiers.control_key() => {
                 let character = character.as_ref();
                 if character.chars().any(char::is_control) {
@@ -4102,7 +4259,12 @@ impl NativeApplication {
             return false;
         };
 
-        match panel.handle_key(key, text, self.modifiers.control_key()) {
+        match panel.handle_key(
+            key,
+            text,
+            self.modifiers.control_key(),
+            self.modifiers.alt_key(),
+        ) {
             SearchCommand::None => {}
             SearchCommand::Close => {
                 self.status = Some("关掉了查找面板".to_owned());
@@ -4189,6 +4351,10 @@ impl NativeApplication {
         let Some(panel) = self.search.as_ref() else {
             return (0, 0, 0);
         };
+        // The rules of the search are the rules of the replacement: the
+        // places that are replaced are the places that were shown.
+        let case_sensitive = panel.is_case_sensitive();
+        let whole_word = panel.is_whole_word();
         // The files that were found, in the order they were found.
         let mut files: Vec<PathBuf> = Vec::new();
         for hit in panel.hits() {
@@ -4201,7 +4367,7 @@ impl NativeApplication {
         let mut skipped = 0;
         for path in files {
             let uri = codeweaver_lsp::protocol::file_uri(&path);
-            match self.replace_in_a_file(&uri, needle, replacement) {
+            match self.replace_in_a_file(&uri, needle, replacement, case_sensitive, whole_word) {
                 Ok(places) if places > 0 => {
                     changed_files += 1;
                     changed_places += places;
@@ -4226,6 +4392,8 @@ impl NativeApplication {
         uri: &str,
         needle: &str,
         replacement: &str,
+        case_sensitive: bool,
+        whole_word: bool,
     ) -> Result<usize, String> {
         // The places are found in the text as it is now.
         let (text, index): (String, Option<usize>) = match self.pane_of_a_file(uri) {
@@ -4240,7 +4408,9 @@ impl NativeApplication {
                 (document.saved_text().to_owned(), None)
             }
         };
-        let Some(places) = codeweaver_workspace::search::places_of(&text, needle, false) else {
+        let Some(places) =
+            codeweaver_workspace::search::places_of(&text, needle, case_sensitive, whole_word)
+        else {
             return Err("这个文件里有折叠后长度不一样的大小写字母，没敢改".to_owned());
         };
         if places.is_empty() {
@@ -5619,7 +5789,7 @@ fn push_find_bar(
         18.0,
     );
     scene.push_text(
-        "Enter 下一个 · Shift+Enter 上一个 · Tab 切换 · Alt+Enter 全选匹配",
+        "Enter 下一个 · Shift+Enter 上一个 · Tab 切换 · Alt+Enter 全选匹配 · Alt+C 大小写",
         hints,
         TextStyle {
             clip: viewport,
@@ -8056,6 +8226,102 @@ mod tests {
 
         let status = app.status.clone().unwrap_or_default();
         assert!(status.contains("不能是空的"), "got {status}");
+    }
+
+    #[test]
+    fn the_space_bar_goes_into_the_message_of_the_commit() {
+        let Some((_, file)) = git_project("git-commit-space") else {
+            return;
+        };
+        fs::write(&file, "the second line\n").expect("the file is changed");
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.open_git_panel();
+        app.handle_git_key(&character("s"), None);
+        app.handle_git_key(&character("c"), None);
+        assert!(app.commit_box.is_some(), "the box asks for the message");
+
+        // The window system names the space bar: without it no message could
+        // have a word in it.
+        app.handle_git_key(&named(NamedKey::Space), None);
+        app.handle_git_key(&character("o"), None);
+        app.handle_git_key(&character("k"), None);
+
+        let typed = app
+            .commit_box
+            .as_ref()
+            .expect("the box is open")
+            .text()
+            .to_owned();
+        assert_eq!(typed, " ok");
+    }
+
+    #[test]
+    fn the_letter_u_takes_the_file_out_of_the_staging_area() {
+        let Some((_, file)) = git_project("git-unstage-key") else {
+            return;
+        };
+        fs::write(&file, "the second line\n").expect("the file is changed");
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.open_git_panel();
+        app.handle_git_key(&character("s"), None);
+        let panel = app.git.as_ref().expect("the panel is still open");
+        assert!(panel.entries[0].staged, "the change is staged");
+
+        assert!(app.handle_git_key(&character("u"), None));
+
+        let panel = app.git.as_ref().expect("the panel is still open");
+        assert_eq!(panel.entries.len(), 1, "the file is still there");
+        assert!(
+            !panel.entries[0].staged,
+            "the change is not staged any more"
+        );
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("取消暂存"), "got {status}");
+    }
+
+    #[test]
+    fn the_letter_u_says_so_when_there_is_nothing_to_unstage() {
+        let Some((_, file)) = git_project("git-unstage-nothing") else {
+            return;
+        };
+        fs::write(&file, "the second line\n").expect("the file is changed");
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.open_git_panel();
+        assert!(app.handle_git_key(&character("u"), None));
+
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("没有暂存"), "got {status}");
+    }
+
+    #[test]
+    fn the_letter_l_shows_the_commits_of_the_repository() {
+        let Some((_, file)) = git_project("git-log-key") else {
+            return;
+        };
+        fs::write(&file, "the second line\n").expect("the file is changed");
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.open_git_panel();
+        assert!(app.handle_git_key(&character("l"), None));
+
+        let panel = app.git.as_ref().expect("the panel is still open");
+        assert!(panel.is_showing_commits(), "the commits are shown");
+        assert_eq!(panel.commits.len(), 1, "there is one commit");
+        assert_eq!(panel.commits[0].message, "the first one");
+        assert!(
+            panel.diff.contains("the first line"),
+            "what the commit changed is shown: {}",
+            panel.diff
+        );
+
+        // The escape key goes back to the files, and the panel stays open.
+        assert!(app.handle_git_key(&named(NamedKey::Escape), None));
+        let panel = app.git.as_ref().expect("the panel is still open");
+        assert!(!panel.is_showing_commits(), "the files are shown again");
+        assert_eq!(panel.entries.len(), 1, "the changed file is still there");
     }
 
     #[test]

@@ -195,6 +195,15 @@ fn the_stack_of_the_stopped_program_is_known() {
     assert_eq!(frames[0].line, Some(7));
     assert_eq!(frames[1].name, "helper");
     assert_eq!(frames[2].name, "outer");
+    // The caller is in another file: the editor has to be able to open the
+    // file of a frame.
+    assert_eq!(
+        frames[1]
+            .source
+            .as_ref()
+            .and_then(|source| source.path.as_deref()),
+        Some("file:///tmp/helper.rs")
+    );
     // Every frame has a number of its own: the variables are asked for by
     // it.
     assert_ne!(frames[0].id, frames[1].id);

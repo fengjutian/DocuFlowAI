@@ -27,6 +27,8 @@
 # 8. The stack of the program is in the panel, and a click on a frame of it
 #    picks that frame: the mark of the frame that is picked moves to the
 #    frame that was clicked on.
+# 9. A double click on a frame takes the person to the place of that frame
+#    in the code: the file of the frame is opened and it is on the screen.
 #
 # The keys are injected into the system, the way a keyboard would, because the
 # window reads the state of the modifiers from the keyboard itself.
@@ -44,12 +46,14 @@ $logs = Join-Path $root '.dev-logs'
 $run = Join-Path $env:LOCALAPPDATA 'CodeWeaver\check'
 $project = Join-Path $run 'debug-project'
 $source = Join-Path $project 'main.rs'
+$helper = Join-Path $project 'helper.rs'
 $shotBreakpoint = Join-Path $logs 'debug-breakpoint.png'
 $shotConditional = Join-Path $logs 'debug-conditional.png'
 $shotMoved = Join-Path $logs 'debug-moved.png'
 $shotUndone = Join-Path $logs 'debug-undone.png'
 $shotStopped = Join-Path $logs 'debug-stopped.png'
 $shotPicked = Join-Path $logs 'debug-picked.png'
+$shotJumped = Join-Path $logs 'debug-jumped.png'
 $shotStepped = Join-Path $logs 'debug-stepped.png'
 $shotEvaluated = Join-Path $logs 'debug-evaluated.png'
 $report = Join-Path $logs 'debug-check.json'
@@ -147,6 +151,10 @@ $VARIABLE_RGB = To-Bytes @(0.82, 0.86, 0.92)
 $OUTPUT_RGB = To-Bytes @(0.62, 0.67, 0.76)
 $FRAME_RGB = To-Bytes @(0.74, 0.80, 0.70)
 $MARKER_RGB = To-Bytes @(0.30, 0.58, 0.96)
+# The colour of the text inside quotes. It is a colour of its own, so the
+# string in the file of the frame is the proof that this file is on the
+# screen.
+$STRING_RGB = To-Bytes @(0.68, 0.82, 0.42)
 
 # The places of the panel, in the pixels of the window.
 #
@@ -170,6 +178,12 @@ $FRAME_Y = 580
 $VARIABLE_X = 328
 $VARIABLE_Y = 580
 $OUTPUT_Y = 634
+
+# The first row of the text of the document, where the string of the file of
+# the frame is drawn.
+$BODY_X = 236
+$BODY_Y = 78
+$BODY_WIDTH = 540
 
 # The flags of the mouse of Windows.
 $MOUSEEVENTF_LEFTDOWN = 0x0002
@@ -216,6 +230,13 @@ New-Item -ItemType Directory -Force -Path $project | Out-Null
 [System.IO.File]::WriteAllText(
     $source,
     "fn main() {`n    let count = 3;`n    let name = `"greeting`";`n    println!(`"{name} {count}`");`n}`n",
+    (New-Object System.Text.UTF8Encoding($false)))
+# The file the second frame of the stack is in. The adapter says the caller
+# is in this file, and the string in it is the proof that this file is the
+# one on the screen: a string is drawn in a colour of its own.
+[System.IO.File]::WriteAllText(
+    $helper,
+    "fn helper() -> i32 { let label = `"the second frame of the stack`"; 42 }`n",
     (New-Object System.Text.UTF8Encoding($false)))
 Write-Output "the file that is opened: $source"
 
@@ -298,6 +319,24 @@ function Click-At([IntPtr]$handle, [double]$x, [double]$y) {
     [Win32]::mouse_event($MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
     Start-Sleep -Milliseconds 120
     [Win32]::mouse_event($MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 600
+    [Win32]::SetCursorPos(10, 10) | Out-Null
+    Start-Sleep -Milliseconds 300
+}
+
+function Double-Click-At([IntPtr]$handle, [double]$x, [double]$y) {
+    $where = New-Object Win32+POINT
+    $where.X = To-Screen $x
+    $where.Y = To-Screen $y
+    [Win32]::ClientToScreen($handle, [ref]$where) | Out-Null
+    [Win32]::SetCursorPos($where.X, $where.Y) | Out-Null
+    Start-Sleep -Milliseconds 200
+    for ($click = 0; $click -lt 2; $click++) {
+        [Win32]::mouse_event($MOUSEEVENTF_LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 40
+        [Win32]::mouse_event($MOUSEEVENTF_LEFTUP, 0, 0, 0, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 60
+    }
     Start-Sleep -Milliseconds 600
     [Win32]::SetCursorPos(10, 10) | Out-Null
     Start-Sleep -Milliseconds 300
@@ -556,6 +595,21 @@ try {
         Check 'a click picks the frame that was clicked on' ($markedSecond -gt 5 -and $markedFirst -lt 5) `
             "$markedSecond pixels on the second frame, $markedFirst on the first one"
 
+        # A double click on the frame takes the person to the place of that
+        # frame in the code: the file of the frame is opened.
+        $before = Count-In $pickedShot (To-Screen $BODY_X) (To-Screen $BODY_Y) (To-Screen $BODY_WIDTH) (To-Screen 22) $STRING_RGB 16
+        Write-Host "pixels of the string of the file that is on the screen: $before"
+        $previous = Focus-Editor $handle
+        Double-Click-At $handle 40 ($FRAME_Y + 18)
+        Start-Sleep -Seconds 3
+
+        $jumpedShot = Save-Window $handle $shotJumped
+        Write-Host "saved $shotJumped"
+        $after = Count-In $jumpedShot (To-Screen $BODY_X) (To-Screen $BODY_Y) (To-Screen $BODY_WIDTH) (To-Screen 22) $STRING_RGB 16
+        Write-Host "pixels of the string of the file that is on the screen: $before before, $after after the double click"
+        Check 'a double click opens the file of the frame' ($after -gt 15 -and $before -lt 15) `
+            "$after pixels of the string after, $before before"
+
         # The frame that is picked is the top one again: the program stops
         # at the same place, and the stack is read again.
         $previous = Focus-Editor $handle
@@ -602,10 +656,12 @@ try {
                 marker = $marked
                 markerAfterClick = $markedSecond
                 markerBeforeClick = $markedFirst
+                stringBeforeJump = $before
+                stringAfterJump = $after
                 variablesAfterStep = $stepped
                 outputAfterEvaluation = $evaluated
             }
-            shots = @($shotBreakpoint, $shotConditional, $shotMoved, $shotUndone, $shotStopped, $shotPicked, $shotStepped, $shotEvaluated)
+            shots = @($shotBreakpoint, $shotConditional, $shotMoved, $shotUndone, $shotStopped, $shotPicked, $shotJumped, $shotStepped, $shotEvaluated)
         }
         [System.IO.File]::WriteAllText($report, ($result | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
         Write-Host "saved $report"

@@ -165,6 +165,10 @@ impl RenameBox {
             Key::Named(NamedKey::ArrowRight) => self.right(),
             Key::Named(NamedKey::Home) => self.home(),
             Key::Named(NamedKey::End) => self.end(),
+            // The window system names the space bar instead of making it a
+            // character: without this arm the space would fall through to
+            // the document behind the box.
+            Key::Named(NamedKey::Space) => self.type_text(" "),
             Key::Character(character) if !control => {
                 let character = character.as_ref();
                 if character.chars().any(char::is_control) {
@@ -360,5 +364,15 @@ mod tests {
         box_.backspace();
         assert_eq!(box_.text(), "ab");
         assert_eq!(box_.caret(), 1);
+    }
+
+    #[test]
+    fn the_space_bar_goes_into_the_box() {
+        let mut box_ = RenameBox::new("value", 0);
+        // The window system names the space bar: it is not a character, and
+        // the box has to take it anyway.
+        assert!(box_.handle_key(&Key::<&str>::Named(NamedKey::Space), None, false));
+        assert_eq!(box_.text(), "value ");
+        assert_eq!(box_.caret(), 6);
     }
 }

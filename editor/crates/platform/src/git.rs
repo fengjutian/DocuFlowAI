@@ -119,6 +119,15 @@ pub fn diff(root: &Path, path: &str, staged: bool) -> Result<String, String> {
     run(root, &args)
 }
 
+/// One commit of the repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitCommit {
+    /// The number that names the commit.
+    pub id: String,
+    /// The message of the commit.
+    pub message: String,
+}
+
 /// Puts the changes of one file into the staging area.
 pub fn stage(root: &Path, path: &str) -> Result<(), String> {
     run(
@@ -126,6 +135,73 @@ pub fn stage(root: &Path, path: &str) -> Result<(), String> {
         &["add".to_owned(), "--".to_owned(), path.to_owned()],
     )
     .map(|_| ())
+}
+
+/// Takes the changes of one file out of the staging area.
+///
+/// The file itself is not touched: only the index is, so the file goes back
+/// to being a change that is not staged.
+///
+/// `git restore` needs git 2.23; the older way of saying the same thing is
+/// the reset, and it is tried when the restore is refused.
+pub fn unstage(root: &Path, path: &str) -> Result<(), String> {
+    let restored = run(
+        root,
+        &[
+            "restore".to_owned(),
+            "--staged".to_owned(),
+            "--".to_owned(),
+            path.to_owned(),
+        ],
+    );
+    match restored {
+        Ok(_) => Ok(()),
+        Err(_) => run(
+            root,
+            &[
+                "reset".to_owned(),
+                "-q".to_owned(),
+                "HEAD".to_owned(),
+                "--".to_owned(),
+                path.to_owned(),
+            ],
+        )
+        .map(|_| ()),
+    }
+}
+
+/// The commits of the repository, the newest first.
+///
+/// The number that names the commit and the message of it are what is
+/// wanted; the rest of what git says is not shown.
+pub fn commits(root: &Path, count: usize) -> Result<Vec<GitCommit>, String> {
+    let output = run(
+        root,
+        &[
+            "log".to_owned(),
+            "--format=%h %s".to_owned(),
+            format!("-n {count}"),
+        ],
+    )?;
+    let mut commits = Vec::new();
+    for line in output.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        // The number of the commit and its message are separated by a space.
+        let (id, message) = match line.split_once(' ') {
+            Some((id, message)) => (id.to_owned(), message.to_owned()),
+            None => (line.to_owned(), String::new()),
+        };
+        commits.push(GitCommit { id, message });
+    }
+    Ok(commits)
+}
+
+/// What one commit changed.
+pub fn show(root: &Path, id: &str) -> Result<String, String> {
+    run(root, &["show".to_owned(), id.to_owned()])
 }
 
 /// Commits what is in the staging area.
@@ -200,6 +276,10 @@ pub struct GitPanel {
     pub selected: usize,
     /// The diff of the picked file.
     pub diff: String,
+    /// The commits of the repository, the newest first.
+    pub commits: Vec<GitCommit>,
+    /// Whether the panel is showing the commits instead of the files.
+    pub showing_commits: bool,
 }
 
 impl GitPanel {
@@ -210,6 +290,8 @@ impl GitPanel {
             entries,
             selected: 0,
             diff: String::new(),
+            commits: Vec::new(),
+            showing_commits: false,
         }
     }
 
@@ -218,21 +300,56 @@ impl GitPanel {
         self.entries.get(self.selected)
     }
 
-    /// Picks the file after this one, going round to the first one.
-    pub fn select_next(&mut self) {
-        if self.entries.is_empty() {
-            return;
-        }
-        self.selected = (self.selected + 1) % self.entries.len();
+    /// The commit that is picked.
+    pub fn selected_commit(&self) -> Option<&GitCommit> {
+        self.commits.get(self.selected)
     }
 
-    /// Picks the file before this one, going round to the last one.
+    /// Which one is picked, counted from the first one.
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    /// Whether the panel is showing the commits instead of the files.
+    pub fn is_showing_commits(&self) -> bool {
+        self.showing_commits
+    }
+
+    /// The keys the panel takes, said at the bottom of it.
+    pub fn hint(&self) -> &'static str {
+        if self.showing_commits {
+            COMMIT_HINT
+        } else {
+            HINT
+        }
+    }
+
+    /// How many things there are to pick from.
+    fn count(&self) -> usize {
+        if self.showing_commits {
+            self.commits.len()
+        } else {
+            self.entries.len()
+        }
+    }
+
+    /// Picks the one after this one, going round to the first one.
+    pub fn select_next(&mut self) {
+        let count = self.count();
+        if count == 0 {
+            return;
+        }
+        self.selected = (self.selected + 1) % count;
+    }
+
+    /// Picks the one before this one, going round to the last one.
     pub fn select_previous(&mut self) {
-        if self.entries.is_empty() {
+        let count = self.count();
+        if count == 0 {
             return;
         }
         self.selected = if self.selected == 0 {
-            self.entries.len() - 1
+            count - 1
         } else {
             self.selected - 1
         };
@@ -245,6 +362,8 @@ const ROW_HEIGHT: f32 = 22.0;
 const LIST_WIDTH: f32 = 360.0;
 /// The width of the column that says what happened to the file.
 const LABEL_WIDTH: f32 = 92.0;
+/// The width of the column that says which commit it is.
+const COMMIT_ID_WIDTH: f32 = 72.0;
 
 /// The ground the panel of the changes stands on.
 ///
@@ -275,10 +394,14 @@ pub fn draw_panel(
 
     draw_background(scene, viewport);
 
-    // The list of the files that changed.
+    // The list of the files that changed, or of the commits.
     let list = Rect::new(16.0, 16.0, LIST_WIDTH, size.height - 60.0);
     scene.push_text(
-        "改过的文件".to_owned(),
+        if panel.is_showing_commits() {
+            "最近的提交".to_owned()
+        } else {
+            "改过的文件".to_owned()
+        },
         Rect::new(list.origin.x, list.origin.y, list.size.width, 20.0),
         TextStyle {
             clip: viewport,
@@ -289,7 +412,19 @@ pub fn draw_panel(
         },
     );
 
-    if panel.entries.is_empty() {
+    if panel.is_showing_commits() && panel.commits.is_empty() {
+        scene.push_text(
+            "还没有提交".to_owned(),
+            Rect::new(list.origin.x, list.origin.y + 26.0, list.size.width, 20.0),
+            TextStyle {
+                clip: viewport,
+                color: Color::rgb(0.52, 0.57, 0.66),
+                font_size: 13.0,
+                line_height: 18.0,
+                family: TextFamily::SansSerif,
+            },
+        );
+    } else if !panel.is_showing_commits() && panel.entries.is_empty() {
         scene.push_text(
             "没有改动".to_owned(),
             Rect::new(list.origin.x, list.origin.y + 26.0, list.size.width, 20.0),
@@ -304,52 +439,103 @@ pub fn draw_panel(
     }
 
     let room = ((list.size.height - 30.0) / ROW_HEIGHT).floor().max(1.0) as usize;
-    let shown = panel.entries.len().min(room);
-    let first = panel.selected.saturating_sub(shown - 1).min(panel.entries.len() - 1);
-    for (index, entry) in panel.entries.iter().enumerate().skip(first).take(shown) {
-        let row = index - first;
-        let y = list.origin.y + 26.0 + row as f32 * ROW_HEIGHT;
-        if index == panel.selected {
-            scene.push_quad(
-                Rect::new(list.origin.x - 4.0, y, list.size.width, ROW_HEIGHT),
-                Color::rgb(0.18, 0.30, 0.52),
-                viewport,
+    if panel.is_showing_commits() {
+        // The commits, the newest first.
+        let shown = panel.commits.len().min(room);
+        let first = panel
+            .selected()
+            .saturating_sub(shown - 1)
+            .min(panel.commits.len().saturating_sub(1));
+        for (index, commit) in panel.commits.iter().enumerate().skip(first).take(shown) {
+            let row = index - first;
+            let y = list.origin.y + 26.0 + row as f32 * ROW_HEIGHT;
+            if index == panel.selected() {
+                scene.push_quad(
+                    Rect::new(list.origin.x - 4.0, y, list.size.width, ROW_HEIGHT),
+                    Color::rgb(0.18, 0.30, 0.52),
+                    viewport,
+                );
+            }
+            // The number that names the commit, in a colour of its own.
+            scene.push_text(
+                commit.id.clone(),
+                Rect::new(list.origin.x, y + 1.0, COMMIT_ID_WIDTH, 20.0),
+                TextStyle {
+                    clip: viewport,
+                    color: Color::rgb(0.42, 0.78, 0.56),
+                    font_size: 13.0,
+                    line_height: 18.0,
+                    family: TextFamily::SansSerif,
+                },
+            );
+            scene.push_text(
+                commit.message.clone(),
+                Rect::new(
+                    list.origin.x + COMMIT_ID_WIDTH + 4.0,
+                    y + 1.0,
+                    (list.size.width - COMMIT_ID_WIDTH - 8.0).max(1.0),
+                    20.0,
+                ),
+                TextStyle {
+                    clip: viewport,
+                    color: Color::rgb(0.86, 0.89, 0.94),
+                    font_size: 13.0,
+                    line_height: 18.0,
+                    family: TextFamily::SansSerif,
+                },
             );
         }
-        // The state of the file is in a colour of its own: a file that is
-        // staged and a file that is not are two different things.
-        let state_color = if entry.staged {
-            Color::rgb(0.42, 0.78, 0.56)
-        } else {
-            Color::rgb(0.93, 0.74, 0.42)
-        };
-        scene.push_text(
-            entry.label(),
-            Rect::new(list.origin.x, y + 1.0, LABEL_WIDTH, 20.0),
-            TextStyle {
-                clip: viewport,
-                color: state_color,
-                font_size: 13.0,
-                line_height: 18.0,
-                family: TextFamily::SansSerif,
-            },
-        );
-        scene.push_text(
-            entry.path.clone(),
-            Rect::new(
-                list.origin.x + LABEL_WIDTH + 4.0,
-                y + 1.0,
-                list.size.width - LABEL_WIDTH - 8.0,
-                20.0,
-            ),
-            TextStyle {
-                clip: viewport,
-                color: Color::rgb(0.86, 0.89, 0.94),
-                font_size: 13.0,
-                line_height: 18.0,
-                family: TextFamily::SansSerif,
-            },
-        );
+    } else {
+        let shown = panel.entries.len().min(room);
+        let first = panel
+            .selected()
+            .saturating_sub(shown - 1)
+            .min(panel.entries.len().saturating_sub(1));
+        for (index, entry) in panel.entries.iter().enumerate().skip(first).take(shown) {
+            let row = index - first;
+            let y = list.origin.y + 26.0 + row as f32 * ROW_HEIGHT;
+            if index == panel.selected() {
+                scene.push_quad(
+                    Rect::new(list.origin.x - 4.0, y, list.size.width, ROW_HEIGHT),
+                    Color::rgb(0.18, 0.30, 0.52),
+                    viewport,
+                );
+            }
+            // The state of the file is in a colour of its own: a file that is
+            // staged and a file that is not are two different things.
+            let state_color = if entry.staged {
+                Color::rgb(0.42, 0.78, 0.56)
+            } else {
+                Color::rgb(0.93, 0.74, 0.42)
+            };
+            scene.push_text(
+                entry.label(),
+                Rect::new(list.origin.x, y + 1.0, LABEL_WIDTH, 20.0),
+                TextStyle {
+                    clip: viewport,
+                    color: state_color,
+                    font_size: 13.0,
+                    line_height: 18.0,
+                    family: TextFamily::SansSerif,
+                },
+            );
+            scene.push_text(
+                entry.path.clone(),
+                Rect::new(
+                    list.origin.x + LABEL_WIDTH + 4.0,
+                    y + 1.0,
+                    list.size.width - LABEL_WIDTH - 8.0,
+                    20.0,
+                ),
+                TextStyle {
+                    clip: viewport,
+                    color: Color::rgb(0.86, 0.89, 0.94),
+                    font_size: 13.0,
+                    line_height: 18.0,
+                    family: TextFamily::SansSerif,
+                },
+            );
+        }
     }
 
     // The diff of the file that is picked.
@@ -402,7 +588,7 @@ pub fn draw_panel(
     }
     // The keys the panel takes are said at the bottom of it.
     scene.push_text(
-        HINT.to_owned(),
+        panel.hint().to_owned(),
         Rect::new(16.0, size.height - 36.0, size.width - 32.0, 24.0),
         TextStyle {
             clip: viewport,
@@ -417,7 +603,10 @@ pub fn draw_panel(
 }
 
 /// The keys the panel of the changes takes.
-pub const HINT: &str = "↑↓ 挑文件 · S 暂存 · C 提交 · Esc 关掉";
+pub const HINT: &str = "↑↓ 挑文件 · S 暂存 · U 取消暂存 · C 提交 · L 提交记录 · Esc 关掉";
+
+/// The keys the panel takes when it is showing the commits.
+pub const COMMIT_HINT: &str = "↑↓ 挑提交 · Esc 回到改过的文件";
 
 #[cfg(test)]
 mod tests {
@@ -561,5 +750,106 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_staged_file_can_be_taken_out_of_the_staging_area() {
+        let Some(directory) = repository("git-unstage") else {
+            return;
+        };
+        write(&directory, "main.rs", "fn main() {}\n");
+        run(&directory, &["add", "main.rs"]).expect("the file is added");
+        run(&directory, &["commit", "-m", "the first one"]).expect("the commit is made");
+
+        write(&directory, "main.rs", "fn main() { let x = 1; }\n");
+        stage(&directory, "main.rs").expect("the file is staged");
+        assert!(status(&directory).expect("the status is read").entries[0].staged);
+
+        unstage(&directory, "main.rs").expect("the file is taken out of the staging area");
+
+        let status = status(&directory).expect("the status is read");
+        assert_eq!(status.entries.len(), 1, "the file is still there");
+        assert!(
+            !status.entries[0].staged,
+            "the change is not staged any more"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_commits_of_the_repository_are_known() {
+        let Some(directory) = repository("git-log") else {
+            return;
+        };
+        write(&directory, "main.rs", "fn main() {}\n");
+        run(&directory, &["add", "main.rs"]).expect("the file is added");
+        run(&directory, &["commit", "-m", "the first one"]).expect("the commit is made");
+
+        let commits = commits(&directory, 10).expect("the commits are read");
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].message, "the first one");
+        assert!(!commits[0].id.is_empty(), "the commit has a number");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn what_a_commit_changed_is_known() {
+        let Some(directory) = repository("git-show") else {
+            return;
+        };
+        write(&directory, "main.rs", "fn main() {}\n");
+        run(&directory, &["add", "main.rs"]).expect("the file is added");
+        run(&directory, &["commit", "-m", "the first one"]).expect("the commit is made");
+
+        write(&directory, "main.rs", "fn main() { let x = 1; }\n");
+        run(&directory, &["add", "main.rs"]).expect("the file is added");
+        run(&directory, &["commit", "-m", "the second one"]).expect("the commit is made");
+
+        let commits = commits(&directory, 10).expect("the commits are read");
+        let newest = commits.first().expect("there is a commit");
+        assert_eq!(newest.message, "the second one", "the newest is first");
+
+        let shown = show(&directory, &newest.id).expect("the commit is shown");
+        assert!(shown.contains("let x = 1;"), "got {shown}");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_panel_picks_the_commits_when_it_is_showing_them() {
+        let panel = GitPanel::new(
+            PathBuf::from("C:\\project"),
+            vec![GitEntry {
+                path: "main.rs".to_owned(),
+                state: "M".to_owned(),
+                staged: false,
+            }],
+        );
+        assert!(!panel.is_showing_commits());
+        assert_eq!(panel.hint(), HINT);
+
+        let mut panel = panel;
+        panel.showing_commits = true;
+        panel.commits = vec![
+            GitCommit {
+                id: "abc1234".to_owned(),
+                message: "the first one".to_owned(),
+            },
+            GitCommit {
+                id: "def5678".to_owned(),
+                message: "the second one".to_owned(),
+            },
+        ];
+        assert!(panel.is_showing_commits());
+        assert_eq!(panel.hint(), COMMIT_HINT);
+        assert_eq!(panel.selected_commit().map(|commit| commit.id.as_str()), Some("abc1234"));
+
+        // The picking walks the commits, not the files.
+        panel.select_next();
+        assert_eq!(panel.selected_commit().map(|commit| commit.id.as_str()), Some("def5678"));
+        panel.select_next();
+        assert_eq!(panel.selected_commit().map(|commit| commit.id.as_str()), Some("abc1234"));
     }
 }

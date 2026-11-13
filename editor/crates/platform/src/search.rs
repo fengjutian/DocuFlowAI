@@ -20,6 +20,7 @@ use codeweaver_workspace::search::{search, SearchHit, SearchOptions, SearchResul
 use winit::keyboard::{Key, NamedKey};
 
 use crate::rename::RenameBox;
+use crate::key_letter;
 
 /// The place of the box, from the left of the window.
 const BOX_LEFT: f32 = 16.0;
@@ -40,12 +41,18 @@ const ROW_HEIGHT: f32 = 22.0;
 /// The width of the column that says where the place is.
 const PLACE_WIDTH: f32 = 300.0;
 
+/// The width of one button that turns a rule on and off.
+const TOGGLE_WIDTH: f32 = 34.0;
+/// The gap between the buttons.
+const TOGGLE_GAP: f32 = 6.0;
+
 /// The keys the panel takes.
-pub const HINT: &str = "↑↓ 挑结果 · Enter 打开 · Tab 换地方 · Esc 关掉";
+pub const HINT: &str =
+    "↑↓ 挑结果 · Enter 打开 · Tab 换地方 · Alt+C 大小写 · Alt+W 全字 · Esc 关掉";
 
 /// The keys the panel takes, when it replaces as well as finds.
 pub const REPLACE_HINT: &str =
-    "↑↓ 挑结果 · Enter 打开 · Tab 换地方 · 替换那一栏回车全换 · Esc 关掉";
+    "↑↓ 挑结果 · Enter 打开 · Tab 换地方 · Alt+C 大小写 · Alt+W 全字 · 替换那一栏回车全换 · Esc 关掉";
 
 /// Where the focus of the panel is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,6 +93,15 @@ pub struct SearchPanel {
     replace: RenameBox,
     /// Whether the panel replaces as well as finds.
     replacing: bool,
+    /// Whether the case of the letters counts.
+    ///
+    /// It does not count by default: the person who looks for `needle` is
+    /// looking for `Needle` too.
+    case_sensitive: bool,
+    /// Whether the text has to be a whole word.
+    ///
+    /// It does not have to be by default: `cat` is found in `catalog` too.
+    whole_word: bool,
     /// The root of the project that is searched.
     root: PathBuf,
     /// The places the text was found.
@@ -130,6 +146,8 @@ impl SearchPanel {
             box_,
             replace: RenameBox::message("替换"),
             replacing,
+            case_sensitive: false,
+            whole_word: false,
             root,
             hits: Vec::new(),
             selected: 0,
@@ -157,6 +175,60 @@ impl SearchPanel {
     /// Whether the panel replaces as well as finds.
     pub fn is_replacing(&self) -> bool {
         self.replacing
+    }
+
+    /// Whether the case of the letters counts.
+    pub fn is_case_sensitive(&self) -> bool {
+        self.case_sensitive
+    }
+
+    /// Whether the text has to be a whole word.
+    pub fn is_whole_word(&self) -> bool {
+        self.whole_word
+    }
+
+    /// Turns the case sensitivity on or off, and looks for the text again.
+    ///
+    /// The search runs again: the places that were found with the other rule
+    /// are not the places of this one.
+    pub fn toggle_case_sensitive(&mut self) {
+        self.case_sensitive = !self.case_sensitive;
+        self.look_again();
+    }
+
+    /// Turns the whole word rule on or off, and looks for the text again.
+    pub fn toggle_whole_word(&mut self) {
+        self.whole_word = !self.whole_word;
+        self.look_again();
+    }
+
+    /// Looks for the text again, when there is text to look for.
+    ///
+    /// The rule is remembered even when there is nothing to look for: the
+    /// next search uses it.
+    fn look_again(&mut self) {
+        if self.box_.text().trim().is_empty() {
+            return;
+        }
+        self.start_search();
+    }
+
+    /// What the rules of the search are, in words.
+    ///
+    /// The rules that are in force are said out loud: a search that finds
+    /// less than the person expects is because of a rule they did not see.
+    fn rules_of(&self) -> String {
+        let mut rules = Vec::new();
+        if self.case_sensitive {
+            rules.push("区分大小写");
+        }
+        if self.whole_word {
+            rules.push("全字");
+        }
+        if rules.is_empty() {
+            return String::new();
+        }
+        format!("（{}）", rules.join(" · "))
     }
 
     /// The keys the panel takes, said at the bottom of it.
@@ -277,8 +349,13 @@ impl SearchPanel {
         self.status = format!("正在找 {needle}…");
         // The thread is left to finish on its own: the panel may be gone by
         // then, and the answer is dropped then.
+        let options = SearchOptions {
+            case_sensitive: self.case_sensitive,
+            whole_word: self.whole_word,
+            ..SearchOptions::default()
+        };
         std::thread::spawn(move || {
-            let results = search(&root, &needle, SearchOptions::default());
+            let results = search(&root, &needle, options);
             let _ = sender.send(results);
         });
         self.answers = Some(answers);
@@ -305,12 +382,13 @@ impl SearchPanel {
         self.running = false;
         self.hits = results.hits;
         self.selected = 0;
+        let rules = self.rules_of();
         self.status = if results.truncated {
-            format!("找到 {} 处（太多了，只看前面这些）", self.hits.len())
+            format!("找到 {} 处（太多了，只看前面这些）{rules}", self.hits.len())
         } else if self.hits.is_empty() {
-            "没有找到".to_owned()
+            format!("没有找到{rules}")
         } else {
-            format!("在 {} 个文件里找到 {} 处", results.files, self.hits.len())
+            format!("在 {} 个文件里找到 {} 处{rules}", results.files, self.hits.len())
         };
         true
     }
@@ -324,7 +402,24 @@ impl SearchPanel {
         key: &Key<T>,
         text: Option<&str>,
         control: bool,
+        alt: bool,
     ) -> SearchCommand {
+        // The rules of the search have their own keys: Alt+C for the case
+        // and Alt+W for the whole word.
+        //
+        // Nothing else is written into the box while Alt is held: a word
+        // that is typed with Alt held is not a word the person is looking
+        // for.
+        if alt {
+            if let Some(letter) = key_letter(key) {
+                if letter.eq_ignore_ascii_case(&'c') {
+                    self.toggle_case_sensitive();
+                } else if letter.eq_ignore_ascii_case(&'w') {
+                    self.toggle_whole_word();
+                }
+            }
+            return SearchCommand::None;
+        }
         match key {
             Key::Named(NamedKey::Escape) => return SearchCommand::Close,
             Key::Named(NamedKey::Tab) => {
@@ -528,6 +623,78 @@ fn draw_box(
     }
 }
 
+/// Draws one of the buttons that turn a rule of the search on and off.
+///
+/// The button that is on is drawn in the colour of the caret: the person
+/// has to see which rules are in force.
+fn draw_toggle(
+    scene: &mut FrameScene,
+    viewport: Rect,
+    place: Rect,
+    label: &str,
+    on: bool,
+    measurer: &mut dyn TextMeasurer,
+) {
+    scene.push_quad(place, Color::rgb(0.10, 0.12, 0.16), viewport);
+    let border = if on {
+        Color::rgb(0.30, 0.58, 0.96)
+    } else {
+        Color::rgb(0.22, 0.25, 0.31)
+    };
+    scene.push_quad(
+        Rect::new(place.origin.x, place.origin.y, place.size.width, 2.0),
+        border,
+        viewport,
+    );
+    scene.push_quad(
+        Rect::new(
+            place.origin.x,
+            place.origin.y + place.size.height - 2.0,
+            place.size.width,
+            2.0,
+        ),
+        border,
+        viewport,
+    );
+    scene.push_quad(
+        Rect::new(place.origin.x, place.origin.y, 2.0, place.size.height),
+        border,
+        viewport,
+    );
+    scene.push_quad(
+        Rect::new(
+            place.origin.x + place.size.width - 2.0,
+            place.origin.y,
+            2.0,
+            place.size.height,
+        ),
+        border,
+        viewport,
+    );
+
+    let width = measurer.measure(label, 13.0).width;
+    scene.push_text(
+        label.to_owned(),
+        Rect::new(
+            place.origin.x + (place.size.width - width) / 2.0,
+            place.origin.y + 11.0,
+            width + 2.0,
+            20.0,
+        ),
+        TextStyle {
+            clip: place,
+            color: if on {
+                Color::rgb(0.86, 0.89, 0.94)
+            } else {
+                Color::rgb(0.45, 0.50, 0.58)
+            },
+            font_size: 13.0,
+            line_height: 18.0,
+            family: TextFamily::SansSerif,
+        },
+    );
+}
+
 /// Draws the panel of the search.
 pub fn draw_panel(
     scene: &mut FrameScene,
@@ -550,6 +717,30 @@ pub fn draw_panel(
             text: panel.needle(),
             focused: panel.focus() == SearchFocus::Input,
         },
+        measurer,
+    );
+
+    // The buttons that turn the rules of the search on and off.
+    let toggles = BOX_LEFT + width + 8.0;
+    draw_toggle(
+        scene,
+        viewport,
+        Rect::new(toggles, BOX_TOP, TOGGLE_WIDTH, BOX_HEIGHT),
+        "Aa",
+        panel.is_case_sensitive(),
+        measurer,
+    );
+    draw_toggle(
+        scene,
+        viewport,
+        Rect::new(
+            toggles + TOGGLE_WIDTH + TOGGLE_GAP,
+            BOX_TOP,
+            TOGGLE_WIDTH,
+            BOX_HEIGHT,
+        ),
+        "Ab",
+        panel.is_whole_word(),
         measurer,
     );
 
@@ -721,11 +912,11 @@ mod tests {
     #[test]
     fn the_tab_key_moves_to_the_replacement_when_the_panel_replaces() {
         let mut panel = SearchPanel::with_replace(PathBuf::from("C:\\project"), "");
-        panel.handle_key(&named(NamedKey::Tab), None, false);
+        panel.handle_key(&named(NamedKey::Tab), None, false, false);
         assert_eq!(panel.focus(), SearchFocus::Results);
-        panel.handle_key(&named(NamedKey::Tab), None, false);
+        panel.handle_key(&named(NamedKey::Tab), None, false, false);
         assert_eq!(panel.focus(), SearchFocus::Replace);
-        panel.handle_key(&named(NamedKey::Tab), None, false);
+        panel.handle_key(&named(NamedKey::Tab), None, false, false);
         assert_eq!(panel.focus(), SearchFocus::Input);
     }
 
@@ -733,11 +924,11 @@ mod tests {
     fn what_is_typed_in_the_replacement_stays_in_the_replacement() {
         let mut panel = SearchPanel::with_replace(PathBuf::from("C:\\project"), "needle");
         // The tab key twice: the text, the places, the replacement.
-        panel.handle_key(&named(NamedKey::Tab), None, false);
-        panel.handle_key(&named(NamedKey::Tab), None, false);
+        panel.handle_key(&named(NamedKey::Tab), None, false, false);
+        panel.handle_key(&named(NamedKey::Tab), None, false, false);
         assert_eq!(panel.focus(), SearchFocus::Replace);
 
-        panel.handle_key(&character("p"), Some("p"), false);
+        panel.handle_key(&character("p"), Some("p"), false, false);
         assert_eq!(panel.replacement(), "p");
         assert_eq!(panel.needle(), "needle", "the text that is looked for is not touched");
     }
@@ -745,12 +936,12 @@ mod tests {
     #[test]
     fn there_is_nothing_to_replace_when_nothing_was_found() {
         let mut panel = SearchPanel::with_replace(PathBuf::from("C:\\project"), "needle");
-        panel.handle_key(&named(NamedKey::Tab), None, false);
-        panel.handle_key(&named(NamedKey::Tab), None, false);
-        panel.handle_key(&character("p"), Some("p"), false);
+        panel.handle_key(&named(NamedKey::Tab), None, false, false);
+        panel.handle_key(&named(NamedKey::Tab), None, false, false);
+        panel.handle_key(&character("p"), Some("p"), false, false);
 
         assert_eq!(
-            panel.handle_key(&named(NamedKey::Enter), None, false),
+            panel.handle_key(&named(NamedKey::Enter), None, false, false),
             SearchCommand::None
         );
         assert!(
@@ -764,7 +955,7 @@ mod tests {
     fn typing_goes_into_the_text_that_is_looked_for() {
         let mut panel = SearchPanel::new(PathBuf::from("C:\\project"), "");
         assert_eq!(
-            panel.handle_key(&character("n"), Some("n"), false),
+            panel.handle_key(&character("n"), Some("n"), false, false),
             SearchCommand::None
         );
         assert_eq!(panel.needle(), "n");
@@ -775,7 +966,7 @@ mod tests {
     fn the_escape_key_closes_the_panel() {
         let mut panel = SearchPanel::new(PathBuf::from("C:\\project"), "");
         assert_eq!(
-            panel.handle_key(&named(NamedKey::Escape), None, false),
+            panel.handle_key(&named(NamedKey::Escape), None, false, false),
             SearchCommand::Close
         );
     }
@@ -783,9 +974,9 @@ mod tests {
     #[test]
     fn the_tab_key_moves_between_the_text_and_the_places() {
         let mut panel = SearchPanel::new(PathBuf::from("C:\\project"), "");
-        panel.handle_key(&named(NamedKey::Tab), None, false);
+        panel.handle_key(&named(NamedKey::Tab), None, false, false);
         assert_eq!(panel.focus(), SearchFocus::Results);
-        panel.handle_key(&named(NamedKey::Tab), None, false);
+        panel.handle_key(&named(NamedKey::Tab), None, false, false);
         assert_eq!(panel.focus(), SearchFocus::Input);
     }
 
@@ -843,6 +1034,82 @@ mod tests {
         assert_eq!(panel.status(), "要找的文字不能是空的");
     }
 
+    /// Waits for the search of the panel to finish.
+    fn wait_for_the_search(panel: &mut SearchPanel) {
+        for _ in 0..200 {
+            if panel.pump() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("the search did not finish in time");
+    }
+
+    #[test]
+    fn the_case_of_the_letters_can_be_asked_for() {
+        let root = scratch("search-panel-counts-the-case");
+        fs::write(root.join("a.txt"), "The Needle\nthe needle\n").unwrap();
+
+        let mut panel = SearchPanel::new(root.clone(), "needle");
+        panel.start_search();
+        wait_for_the_search(&mut panel);
+        assert_eq!(panel.hits().len(), 2, "the case does not count by default");
+
+        panel.toggle_case_sensitive();
+        wait_for_the_search(&mut panel);
+        assert_eq!(panel.hits().len(), 1, "only the exact case is found");
+        assert_eq!(panel.hits()[0].text, "the needle");
+    }
+
+    #[test]
+    fn the_text_can_be_asked_to_be_a_whole_word() {
+        let root = scratch("search-panel-finds-the-whole-word");
+        fs::write(root.join("a.txt"), "the cat sat\nthe catalog is here\n").unwrap();
+
+        let mut panel = SearchPanel::new(root.clone(), "cat");
+        panel.start_search();
+        wait_for_the_search(&mut panel);
+        assert_eq!(panel.hits().len(), 2);
+
+        panel.toggle_whole_word();
+        wait_for_the_search(&mut panel);
+        assert_eq!(panel.hits().len(), 1, "only the whole word is found");
+        assert_eq!(panel.hits()[0].text, "the cat sat");
+    }
+
+    #[test]
+    fn the_alt_c_key_turns_the_case_rule_on() {
+        let mut panel = SearchPanel::new(PathBuf::from("C:\\project"), "needle");
+        assert!(!panel.is_case_sensitive());
+
+        panel.handle_key(&character("c"), None, false, true);
+
+        assert!(panel.is_case_sensitive());
+    }
+
+    #[test]
+    fn the_alt_w_key_turns_the_whole_word_rule_on() {
+        let mut panel = SearchPanel::new(PathBuf::from("C:\\project"), "needle");
+        assert!(!panel.is_whole_word());
+
+        panel.handle_key(&character("w"), None, false, true);
+
+        assert!(panel.is_whole_word());
+    }
+
+    #[test]
+    fn the_rules_that_are_in_force_are_said_out_loud() {
+        let mut panel = SearchPanel::new(PathBuf::from("C:\\project"), "needle");
+        panel.toggle_case_sensitive();
+        wait_for_the_search(&mut panel);
+        panel.toggle_whole_word();
+        wait_for_the_search(&mut panel);
+
+        let rules = panel.status();
+        assert!(rules.contains("区分大小写"), "the status says: {rules}");
+        assert!(rules.contains("全字"), "the status says: {rules}");
+    }
+
     #[test]
     fn the_places_are_picked_one_after_the_other() {
         let root = scratch("search-panel-picks-the-places");
@@ -885,7 +1152,7 @@ mod tests {
 
         // The focus is on the text first: the enter key starts the search.
         panel.focus = SearchFocus::Results;
-        match panel.handle_key(&named(NamedKey::Enter), None, false) {
+        match panel.handle_key(&named(NamedKey::Enter), None, false, false) {
             SearchCommand::Open(hit) => {
                 assert_eq!(hit.path, root.join("a.txt"));
                 assert_eq!(hit.line, 1);

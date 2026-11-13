@@ -9,6 +9,7 @@
 //! frame, the way the output of the agent and of a task is read.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use codeweaver_dap::protocol::{StackFrame, Variable};
 use codeweaver_dap::{AdapterConfig, Client, DapError};
@@ -424,6 +425,26 @@ impl Debugger {
     }
 }
 
+/// The file and the line a frame is in.
+///
+/// The adapter may say the file as an address (`file:///C:/work/main.rs`) or
+/// as a path (`C:\work\main.rs`): both are understood, because the editor
+/// has to be able to open the file of a frame.
+///
+/// There is no place to go to when the frame has no file or no line: the
+/// adapter did not say where the program is.
+pub fn place_of(frame: &StackFrame) -> Option<(PathBuf, u32)> {
+    let source = frame.source.as_ref()?;
+    let said = source.path.as_deref()?;
+    let path = if said.starts_with("file://") {
+        codeweaver_lsp::protocol::uri_to_path(said)?
+    } else {
+        PathBuf::from(said)
+    };
+    let line = frame.line?;
+    Some((path, line))
+}
+
 /// Whether the answer of the adapter is about the frame that is on the
 /// screen.
 ///
@@ -545,7 +566,7 @@ pub fn draw_panel(
     if panel.state == DebugState::Stopped {
         // The stack of the program.
         scene.push_text(
-            "调用栈",
+            "调用栈 · 双击跳到源码",
             Rect::new(
                 rect.origin.x + STACK_LEFT,
                 rect.origin.y + HEADING_TOP,
@@ -984,6 +1005,46 @@ mod tests {
         let frames = a_stack_of_three_frames();
         assert!(pick_frame(&frames, 3).is_none());
         assert!(pick_frame(&frames, 99).is_none());
+    }
+
+    #[test]
+    fn the_place_of_a_frame_is_its_file_and_its_line() {
+        let frames = a_stack_of_three_frames();
+
+        let (path, line) = place_of(&frames[0]).expect("the frame has a place");
+        assert_eq!(path, PathBuf::from("/work/main.rs"));
+        assert_eq!(line, 12);
+    }
+
+    #[test]
+    fn a_frame_that_says_a_path_and_not_an_address_has_a_place_too() {
+        let frame = StackFrame {
+            id: 5,
+            name: "main".to_owned(),
+            line: Some(3),
+            column: None,
+            source: Some(codeweaver_dap::protocol::Source {
+                path: Some("C:\\work\\main.rs".to_owned()),
+                name: None,
+            }),
+        };
+
+        let (path, line) = place_of(&frame).expect("the frame has a place");
+        assert_eq!(path, PathBuf::from("C:\\work\\main.rs"));
+        assert_eq!(line, 3);
+    }
+
+    #[test]
+    fn a_frame_without_a_file_or_a_line_has_no_place() {
+        let mut frame = a_stack_of_three_frames()[0].clone();
+        assert!(place_of(&frame).is_some());
+
+        frame.source = None;
+        assert!(place_of(&frame).is_none(), "no file, no place");
+
+        let mut frame = a_stack_of_three_frames()[0].clone();
+        frame.line = None;
+        assert!(place_of(&frame).is_none(), "no line, no place");
     }
 
     #[test]

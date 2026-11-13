@@ -234,14 +234,22 @@ impl FindBar {
     }
 
     /// What the bar shows about the search: "3/12", or that nothing was found.
+    ///
+    /// The rule that is in force is said as well: a search that finds less
+    /// than the person expects is because of a rule they did not see.
     pub fn status(&self) -> String {
         if self.query.is_empty() {
             return String::new();
         }
+        let rule = if self.case_sensitive {
+            "（区分大小写）"
+        } else {
+            ""
+        };
         if self.matches.is_empty() {
-            return "无结果".to_owned();
+            return format!("无结果{rule}");
         }
-        format!("{}/{}", self.current + 1, self.matches.len())
+        format!("{}/{}{}", self.current + 1, self.matches.len(), rule)
     }
 }
 
@@ -373,5 +381,20 @@ mod tests {
         assert_eq!(find.status(), "1/2");
         find.type_text(&editor, "zzz");
         assert_eq!(find.status(), "无结果");
+    }
+
+    #[test]
+    fn the_status_says_when_the_case_counts() {
+        let mut editor = editor_with("One ONE one", 0);
+        let mut find = FindBar::new();
+        find.open(&mut editor, false);
+        find.type_text(&editor, "one");
+        find.toggle_case_sensitive(&editor);
+
+        assert!(
+            find.status().contains("区分大小写"),
+            "the status says: {}",
+            find.status()
+        );
     }
 }

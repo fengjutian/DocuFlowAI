@@ -130,14 +130,18 @@ impl Adapter {
                 let path = self.path.clone().unwrap_or_else(|| "main.rs".to_owned());
                 // The stack has more than one frame: the editor shows the
                 // whole stack, and the person may pick any frame of it.
+                //
+                // The second frame is in another file of the same project:
+                // the editor has to be able to open the file of a frame.
+                let caller = caller_path(&path);
                 let frames = [
-                    (1, "main", line),
-                    (2, "helper", line.saturating_sub(1).max(1)),
-                    (3, "outer", line.saturating_sub(2).max(1)),
+                    (1, "main", line, path.clone()),
+                    (2, "helper", line.saturating_sub(1).max(1), caller),
+                    (3, "outer", line.saturating_sub(2).max(1), path.clone()),
                 ];
                 let stack: Vec<Value> = frames
                     .iter()
-                    .map(|(id, name, line)| {
+                    .map(|(id, name, line, path)| {
                         json!({
                             "id": id,
                             "name": name,
@@ -362,6 +366,18 @@ fn breakpoint_conditions(message: &Value) -> BTreeMap<u32, String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The file of the caller of a frame.
+///
+/// The caller is in another file of the same project: the editor has to be
+/// able to open the file of a frame, and a file that is not there says
+/// nothing about the stack.
+fn caller_path(path: &str) -> String {
+    match path.rsplit_once('/') {
+        Some((folder, _)) => format!("{folder}/helper.rs"),
+        None => "helper.rs".to_owned(),
+    }
 }
 
 /// Writes one message to the output.

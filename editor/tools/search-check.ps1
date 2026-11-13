@@ -19,6 +19,8 @@
 # 6. Ctrl+Shift+H opens the panel to replace as well as to find: the box of
 #    the replacement is there, and what is written in it replaces what was
 #    found, in the files that are open and in the files that are not.
+# 7. Alt+C turns the rule of the case on: the button that turns it on is
+#    drawn in another colour, and the panel says which rule is in force.
 #
 # The keys are injected into the system, the way a keyboard would, because the
 # window reads the state of the modifiers from the keyboard itself.
@@ -37,6 +39,7 @@ $project = Join-Path $run 'search-project'
 $source = Join-Path $project 'notes.txt'
 $shotPanel = Join-Path $logs 'search-panel.png'
 $shotFound = Join-Path $logs 'search-found.png'
+$shotCase = Join-Path $logs 'search-case.png'
 $shotOpened = Join-Path $logs 'search-opened.png'
 $shotEmpty = Join-Path $logs 'search-empty.png'
 $shotReplace = Join-Path $logs 'search-replace.png'
@@ -108,12 +111,14 @@ $SWP_SHOWWINDOW = 0x0040
 # The keys the check presses.
 $VK_SHIFT = 0x10
 $VK_CONTROL = 0x11
+$VK_ALT = 0x12
 $VK_ESCAPE = 0x1B
 $VK_RETURN = 0x0D
 $VK_BACK = 0x08
 $VK_TAB = 0x09
 $VK_F = 0x46
 $VK_H = 0x48
+$VK_C = 0x43
 
 function To-Srgb([double]$value) {
     if ($value -le 0.0031308) { return $value * 12.92 }
@@ -131,6 +136,9 @@ $PLACE_RGB = To-Bytes @(0.62, 0.70, 0.86)
 $BODY_RGB = To-Bytes @(0.075, 0.086, 0.11)
 $STATUS_RGB = To-Bytes @(0.55, 0.60, 0.70)
 $BOX_RGB = To-Bytes @(0.10, 0.12, 0.16)
+# The colour of a button that is on. The button that turns the case of the
+# letters on and off is drawn in this colour when it is on.
+$ACCENT_RGB = To-Bytes @(0.30, 0.58, 0.96)
 
 # The places of the panel and of the window, in the pixels of the window.
 #
@@ -141,6 +149,12 @@ $BOX_X = 16
 $BOX_Y = 16
 $BOX_WIDTH = 640
 $BOX_HEIGHT = 40
+# The buttons that turn the rules of the search on and off, next to the box
+# the word is written in.
+$TOGGLE_X = 664
+$TOGGLE_Y = 16
+$TOGGLE_WIDTH = 34
+$TOGGLE_HEIGHT = 40
 $LIST_X = 16
 $LIST_Y = 90
 $LIST_WIDTH = 1120
@@ -195,6 +209,9 @@ $utf8 = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($source, "the first line`nthe needle is here`n", $utf8)
 [System.IO.File]::WriteAllText((Join-Path $project 'other\notes2.txt'), "the needle is over here`n", $utf8)
 [System.IO.File]::WriteAllText((Join-Path $project 'target\built.txt'), "the hiddenonly is here`n", $utf8)
+# The word with another case: the rule of the case decides whether this
+# file is found or not.
+[System.IO.File]::WriteAllText((Join-Path $project 'case.txt'), "the Needle is here`n", $utf8)
 # The manifest of the project pins where the search starts: without it the
 # editor would walk up the folders looking for the project of the file, and
 # the search would cover the whole home folder of the machine.
@@ -454,6 +471,21 @@ try {
         Write-Host "pixels of the places that were found: $places"
         Check 'the places of the word are listed' ($places -gt 40) "$places pixels of the places"
 
+        # Alt+C turns the rule of the case on: the button that turns it on
+        # is drawn in the colour of the caret when it is on.
+        $caseOff = Count-In $found (To-Screen $TOGGLE_X) (To-Screen $TOGGLE_Y) (To-Screen $TOGGLE_WIDTH) (To-Screen $TOGGLE_HEIGHT) $ACCENT_RGB 14
+        Write-Host "pixels of the button of the case: $caseOff before"
+        $previous = Focus-Editor $handle
+        Send-Chord @($VK_ALT) $VK_C
+        Start-Sleep -Seconds 4
+
+        $caseShot = Save-Window $handle $shotCase
+        Write-Host "saved $shotCase"
+        $caseOn = Count-In $caseShot (To-Screen $TOGGLE_X) (To-Screen $TOGGLE_Y) (To-Screen $TOGGLE_WIDTH) (To-Screen $TOGGLE_HEIGHT) $ACCENT_RGB 14
+        Write-Host "pixels of the button of the case: $caseOff before, $caseOn after"
+        Check 'the rule of the case can be turned on' ($caseOn -gt 20 -and $caseOff -lt 5) `
+            "$caseOn pixels after, $caseOff before"
+
         # The enter key opens the place that is picked.
         $previous = Focus-Editor $handle
         Send-Key $VK_RETURN
@@ -556,6 +588,8 @@ try {
                 ground = $ground
                 word = $typed
                 places = $places
+                caseButtonBefore = $caseOff
+                caseButtonAfter = $caseOn
                 groundAfterOpen = $openedGround
                 document = $document
                 status = $said
@@ -565,7 +599,7 @@ try {
                 documentAfterUndo = $undone
             }
             replaced = $onDisk
-            shots = @($shotPanel, $shotFound, $shotOpened, $shotEmpty, $shotReplace, $shotUndone)
+            shots = @($shotPanel, $shotFound, $shotCase, $shotOpened, $shotEmpty, $shotReplace, $shotUndone)
         }
         [System.IO.File]::WriteAllText($report, ($result | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
         Write-Host "saved $report"

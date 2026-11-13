@@ -54,6 +54,12 @@ pub struct SearchHit {
 pub struct SearchOptions {
     /// Whether the case of the letters counts.
     pub case_sensitive: bool,
+    /// Whether the text has to be a whole word.
+    ///
+    /// The text is a whole word when the letters around it are not part of
+    /// a word: `cat` is a word in `the cat sat` and in `cat`, but not in
+    /// `catalog`.
+    pub whole_word: bool,
     /// The most places that are collected.
     pub max_hits: usize,
 }
@@ -62,6 +68,7 @@ impl Default for SearchOptions {
     fn default() -> Self {
         SearchOptions {
             case_sensitive: false,
+            whole_word: false,
             max_hits: MAX_HITS,
         }
     }
@@ -101,7 +108,7 @@ fn walk(root: &Path, needle: &str, options: SearchOptions) -> SearchResults {
     if needle.is_empty() {
         return results;
     }
-    let matcher = Matcher::new(needle, options.case_sensitive);
+    let matcher = Matcher::new(needle, options.case_sensitive, options.whole_word);
     let ignored = tree::ignored_directories();
 
     let mut directories = vec![root.to_path_buf()];
@@ -161,38 +168,88 @@ struct Matcher {
     lower: String,
     /// Whether the case of the letters counts.
     case_sensitive: bool,
+    /// Whether the text has to be a whole word.
+    whole_word: bool,
 }
 
 impl Matcher {
     /// Makes a matcher for the given text.
-    fn new(needle: &str, case_sensitive: bool) -> Self {
+    fn new(needle: &str, case_sensitive: bool, whole_word: bool) -> Self {
         Matcher {
             needle: needle.to_owned(),
             lower: needle.to_lowercase(),
             case_sensitive,
+            whole_word,
         }
     }
 
     /// Whether the line holds the text.
     fn finds(&self, line: &str) -> bool {
         if self.case_sensitive {
-            line.contains(&self.needle)
+            self.holds_the_text(line, &self.needle)
         } else {
-            line.to_lowercase().contains(&self.lower)
+            // The line is folded before it is looked at: the text that is
+            // searched for is the folded one, and the whole word is judged
+            // in it too.
+            let folded = line.to_lowercase();
+            self.holds_the_text(&folded, &self.lower)
         }
     }
+
+    /// Whether the text holds the needle as a whole word.
+    fn holds_the_text(&self, line: &str, needle: &str) -> bool {
+        if !self.whole_word {
+            return line.contains(needle);
+        }
+        let mut from = 0;
+        while let Some(index) = line[from..].find(needle) {
+            let start = from + index;
+            let end = start + needle.len();
+            if is_whole_word(line, start, end) {
+                return true;
+            }
+            // The matches do not overlap: the next one starts where this
+            // one ended.
+            from = end;
+        }
+        false
+    }
+}
+
+/// Whether the character is part of a word.
+///
+/// A word is a run of letters, digits and underscores. Everything else — a
+/// space, a dot, a bracket — stands between two words.
+fn is_word_char(character: char) -> bool {
+    character.is_alphanumeric() || character == '_'
+}
+
+/// Whether the text between `start` and `end` is a whole word.
+///
+/// It is a whole word when the characters around it are not part of a word:
+/// `cat` is a word in `the cat sat` and in `cat`, but not in `catalog`.
+fn is_whole_word(text: &str, start: usize, end: usize) -> bool {
+    let before = text[..start].chars().next_back();
+    let after = text[end..].chars().next();
+    !before.is_some_and(is_word_char) && !after.is_some_and(is_word_char)
 }
 
 /// The places of the text in a text, as byte ranges.
 ///
 /// The rules are the ones of the search: the case of the letters does not
-/// count unless it is asked for.
+/// count unless it is asked for, and the text has to be a whole word when
+/// that is asked for.
 ///
 /// A text whose lower case is not the same length as the text itself has no
 /// places: the places in the lower case would not be the places in the text,
 /// and a change in the wrong place is worse than no change at all. That is
 /// what the `None` says.
-pub fn places_of(text: &str, needle: &str, case_sensitive: bool) -> Option<Vec<(usize, usize)>> {
+pub fn places_of(
+    text: &str,
+    needle: &str,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> Option<Vec<(usize, usize)>> {
     if needle.is_empty() {
         return Some(Vec::new());
     }
@@ -201,11 +258,11 @@ pub fn places_of(text: &str, needle: &str, case_sensitive: bool) -> Option<Vec<(
             .match_indices(needle)
             .map(|(index, _)| (index, index + needle.len()))
             .collect();
-        return Some(places);
+        return Some(keep_the_whole_words(text, places, whole_word));
     }
     let lower_needle = needle.to_lowercase();
     let lower_text = text.to_lowercase();
-    if lower_text.len() != text.len() {
+    if lower_text.len() != text.len() || lower_needle.len() != needle.len() {
         // Some letter of this text is longer when it is folded: the places
         // in the folded text are not the places in the text.
         return None;
@@ -214,7 +271,26 @@ pub fn places_of(text: &str, needle: &str, case_sensitive: bool) -> Option<Vec<(
         .match_indices(&lower_needle)
         .map(|(index, _)| (index, index + needle.len()))
         .collect();
-    Some(places)
+    Some(keep_the_whole_words(&lower_text, places, whole_word))
+}
+
+/// Keeps the places that are whole words.
+///
+/// The places are judged in the text they were found in: that text is the
+/// folded one when the case does not count, and the fold does not change
+/// whether a letter is part of a word.
+fn keep_the_whole_words(
+    text: &str,
+    places: Vec<(usize, usize)>,
+    whole_word: bool,
+) -> Vec<(usize, usize)> {
+    if !whole_word {
+        return places;
+    }
+    places
+        .into_iter()
+        .filter(|(start, end)| is_whole_word(text, *start, *end))
+        .collect()
 }
 
 /// Whether the bytes are a file of pictures and other things that are not text.
@@ -420,7 +496,7 @@ mod tests {
     #[test]
     fn the_places_of_the_text_are_its_own_places() {
         let text = "the needle is here and the needle is there";
-        let places = places_of(text, "needle", true).expect("the text can be looked at");
+        let places = places_of(text, "needle", true, false).expect("the text can be looked at");
         assert_eq!(places.len(), 2);
         assert_eq!(&text[places[0].0..places[0].1], "needle");
         assert_eq!(&text[places[1].0..places[1].1], "needle");
@@ -431,7 +507,7 @@ mod tests {
     #[test]
     fn the_case_of_the_letters_does_not_count_when_it_is_not_asked_for() {
         let text = "Needle and needle";
-        let places = places_of(text, "needle", false).expect("the text can be looked at");
+        let places = places_of(text, "needle", false, false).expect("the text can be looked at");
         assert_eq!(places.len(), 2);
         assert_eq!(&text[places[0].0..places[0].1], "Needle");
     }
@@ -441,14 +517,81 @@ mod tests {
         // The lower case of this letter is longer than the letter itself:
         // the places in the folded text are not the places in the text.
         let text = "\u{0130}needle";
-        assert!(places_of(text, "needle", false).is_none());
+        assert!(places_of(text, "needle", false, false).is_none());
         // The exact case is safe.
-        assert!(places_of(text, "needle", true).is_some());
+        assert!(places_of(text, "needle", true, false).is_some());
     }
 
     #[test]
     fn there_are_no_places_in_an_empty_text() {
-        let places = places_of("anything", "", true).expect("the text can be looked at");
+        let places = places_of("anything", "", true, false).expect("the text can be looked at");
         assert!(places.is_empty());
+    }
+
+    #[test]
+    fn the_text_has_to_be_a_whole_word_when_it_is_asked_for() {
+        let text = "cat and catalog and cat.";
+        let places = places_of(text, "cat", true, true).expect("the text can be looked at");
+        assert_eq!(places.len(), 2);
+        assert_eq!(&text[places[0].0..places[0].1], "cat");
+        assert_eq!(&text[places[1].0..places[1].1], "cat");
+        // The word inside "catalog" is not a whole word.
+        assert!(!text[places[0].0..places[0].1].contains("catalog"));
+    }
+
+    #[test]
+    fn a_letter_next_to_the_text_makes_it_not_a_whole_word() {
+        let text = "cats";
+        let places = places_of(text, "cat", true, true).expect("the text can be looked at");
+        assert!(places.is_empty(), "got {places:?}");
+        // Without the whole word rule it is found.
+        let places = places_of(text, "cat", true, false).expect("the text can be looked at");
+        assert_eq!(places.len(), 1);
+    }
+
+    #[test]
+    fn the_whole_word_is_judged_in_the_folded_text() {
+        let text = "Cat and catalog";
+        let places = places_of(text, "cat", false, true).expect("the text can be looked at");
+        assert_eq!(places.len(), 1);
+        assert_eq!(&text[places[0].0..places[0].1], "Cat");
+    }
+
+    #[test]
+    fn the_search_finds_the_text_as_a_whole_word_when_it_is_asked_for() {
+        let root = scratch("search-finds-the-whole-word");
+        write_file(&root.join("a.txt"), "the cat sat\nthe catalog is here\n");
+
+        let results = search(&root, "cat", SearchOptions::default());
+        assert_eq!(results.hits.len(), 2, "without the rule both lines are found");
+
+        let results = search(
+            &root,
+            "cat",
+            SearchOptions {
+                whole_word: true,
+                ..SearchOptions::default()
+            },
+        );
+        assert_eq!(results.hits.len(), 1, "only the whole word is found");
+        assert_eq!(results.hits[0].text, "the cat sat");
+    }
+
+    #[test]
+    fn the_search_counts_the_case_when_it_is_asked_for() {
+        let root = scratch("search-counts-the-case-in-the-words");
+        write_file(&root.join("a.txt"), "the Cat sat\nthe cat sat\n");
+
+        let results = search(
+            &root,
+            "cat",
+            SearchOptions {
+                case_sensitive: true,
+                ..SearchOptions::default()
+            },
+        );
+
+        assert_eq!(results.hits.len(), 1);
+        assert_eq!(results.hits[0].text, "the cat sat");
     }
 }

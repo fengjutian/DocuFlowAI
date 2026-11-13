@@ -15,10 +15,17 @@
 #    shows the difference of the file.
 # 3. The letter S stages the file that is picked, and the panel says so at
 #    once: the file is in a colour of its own, and git agrees.
-# 4. The letter C opens the box that asks for the message of the commit, and
+# 4. The letter U takes the file out of the staging area again, and git
+#    agrees: the file is a change that is not staged any more.
+# 5. The letter C opens the box that asks for the message of the commit, and
 #    what is written in it is committed: git has the commit, and the panel
-#    does not list the file any more.
-# 5. The escape key closes the panel, and the editor is there again.
+#    does not list the file any more. The message has a space in it: the
+#    space bar has to reach the box.
+# 6. The letter L shows the commits of the repository: the number that names
+#    the commit and its message, and what the commit changed.
+# 7. The arrow keys pick another commit, and the escape key goes back to the
+#    changed files without closing the panel.
+# 8. The escape key closes the panel, and the editor is there again.
 #
 # The keys are injected into the system, the way a keyboard would, because the
 # window reads the state of the modifiers from the keyboard itself.
@@ -37,8 +44,12 @@ $project = Join-Path $run 'git-project'
 $source = Join-Path $project 'notes.txt'
 $shotPanel = Join-Path $logs 'git-panel.png'
 $shotStaged = Join-Path $logs 'git-staged.png'
+$shotUnstaged = Join-Path $logs 'git-unstaged.png'
 $shotBox = Join-Path $logs 'git-box.png'
 $shotCommitted = Join-Path $logs 'git-committed.png'
+$shotCommits = Join-Path $logs 'git-commits.png'
+$shotOlder = Join-Path $logs 'git-older-commit.png'
+$shotFiles = Join-Path $logs 'git-files-again.png'
 $shotClosed = Join-Path $logs 'git-closed.png'
 $report = Join-Path $logs 'git-check.json'
 
@@ -109,11 +120,20 @@ $VK_SHIFT = 0x10
 $VK_CONTROL = 0x11
 $VK_ESCAPE = 0x1B
 $VK_RETURN = 0x0D
+$VK_SPACE = 0x20
+$VK_DOWN = 0x28
 $VK_S = 0x53
 $VK_C = 0x43
+$VK_D = 0x44
+$VK_E = 0x45
 $VK_G = 0x47
+$VK_H = 0x48
 $VK_K = 0x4B
+$VK_L = 0x4C
+$VK_N = 0x4E
 $VK_O = 0x4F
+$VK_T = 0x54
+$VK_U = 0x55
 
 function To-Srgb([double]$value) {
     if ($value -le 0.0031308) { return $value * 12.92 }
@@ -132,6 +152,9 @@ $NEW_RGB = To-Bytes @(0.93, 0.74, 0.42)
 $STAGED_RGB = To-Bytes @(0.42, 0.78, 0.56)
 $ADDED_RGB = To-Bytes @(0.52, 0.82, 0.58)
 $BOX_RGB = To-Bytes @(0.10, 0.12, 0.16)
+# The number that names a commit is in a colour of its own, the same green
+# as the state of a staged file.
+$COMMIT_ID_RGB = To-Bytes @(0.42, 0.78, 0.56)
 
 # The places of the panel, in the pixels of the window.
 #
@@ -148,6 +171,12 @@ $BOX_X = 244
 $BOX_Y = 86
 $BOX_WIDTH = 380
 $BOX_HEIGHT = 40
+# The column that says which commit it is, and the message beside it.
+$COMMIT_ID_WIDTH = 72
+$MESSAGE_X = 92
+$MESSAGE_WIDTH = 280
+# The second row of the list.
+$SECOND_ROW_Y = 64
 
 if (-not (Test-Path $exe)) {
     throw "the editor is not built; run 'cargo build -p codeweaver-editor' first"
@@ -408,6 +437,10 @@ try {
         $boxTop = To-Screen $BOX_Y
         $boxWidth = To-Screen $BOX_WIDTH
         $boxHeight = To-Screen $BOX_HEIGHT
+        $commitIdWidth = To-Screen $COMMIT_ID_WIDTH
+        $messageLeft = To-Screen $MESSAGE_X
+        $messageWidth = To-Screen $MESSAGE_WIDTH
+        $secondRowTop = To-Screen $SECOND_ROW_Y
 
         $ground = Count-In $panel 0 0 $panel.Width $panel.Height $GROUND_RGB 4
         Write-Host "pixels of the ground of the panel: $ground"
@@ -440,6 +473,30 @@ try {
         Write-Host "git says: $said"
         Check 'git knows that the file is staged' ($said -match '^M') "git says: $said"
 
+        # The letter U takes the file out of the staging area again.
+        $previous = Focus-Editor $handle
+        Send-Key $VK_U
+        Start-Sleep -Seconds 3
+
+        $unstagedShot = Save-Window $handle $shotUnstaged
+        Write-Host "saved $shotUnstaged"
+        $unstaged = Count-In $unstagedShot $listLeft $rowTop $labelWidth $rowHeight $NEW_RGB 14
+        Write-Host "pixels of the state of a file that is not staged: $unstaged"
+        Check 'the letter U takes the file out of the staging area' ($unstaged -gt 20) "$unstaged pixels of the state"
+
+        $said = git -C $project status --porcelain
+        Write-Host "git says: $said"
+        Check 'git knows that the file is not staged any more' ($said -match '^ M') "git says: $said"
+
+        # The file is staged again, so that the commit can be made.
+        $previous = Focus-Editor $handle
+        Send-Key $VK_S
+        Start-Sleep -Seconds 3
+
+        $said = git -C $project status --porcelain
+        Write-Host "git says: $said"
+        Check 'the letter S stages the file again' ($said -match '^M') "git says: $said"
+
         # The letter C opens the box that asks for the message of the commit.
         $previous = Focus-Editor $handle
         Send-Key $VK_C
@@ -452,9 +509,24 @@ try {
         Check 'the letter C asks for the message of the commit' ($box -gt 500) "$box pixels of the box"
 
         # The message is written and the commit is made.
+        #
+        # The message has a space in it: the space bar has to reach the box
+        # that asks for the message.
         $previous = Focus-Editor $handle
+        Send-Key $VK_T
+        Send-Key $VK_H
+        Send-Key $VK_E
+        Send-Key $VK_SPACE
+        Send-Key $VK_S
+        Send-Key $VK_E
+        Send-Key $VK_C
         Send-Key $VK_O
-        Send-Key $VK_K
+        Send-Key $VK_N
+        Send-Key $VK_D
+        Send-Key $VK_SPACE
+        Send-Key $VK_O
+        Send-Key $VK_N
+        Send-Key $VK_E
         Send-Key $VK_RETURN
         Start-Sleep -Seconds 3
 
@@ -466,7 +538,53 @@ try {
 
         $log = git -C $project log --oneline
         Write-Host "git log: $log"
-        Check 'the commit is really made' (($log -split "`n").Count -eq 2 -and ($log -match 'ok')) "git log: $log"
+        Check 'the commit is really made' (($log -split "`n").Count -eq 2 -and ($log -match 'second')) "git log: $log"
+
+        # The letter L shows the commits of the repository.
+        $previous = Focus-Editor $handle
+        Send-Key $VK_L
+        Start-Sleep -Seconds 3
+
+        $commitsShot = Save-Window $handle $shotCommits
+        Write-Host "saved $shotCommits"
+        $number = Count-In $commitsShot $listLeft $rowTop $commitIdWidth $rowHeight $COMMIT_ID_RGB 14
+        Write-Host "pixels of the number of the commit: $number"
+        Check 'the panel shows the number of the commit' ($number -gt 20) "$number pixels of the number"
+
+        $message = Count-In $commitsShot $messageLeft $rowTop $messageWidth $rowHeight $PATH_RGB 14
+        Write-Host "pixels of the message of the commit: $message"
+        Check 'the panel shows the message of the commit' ($message -gt 20) "$message pixels of the message"
+
+        $shown = Count-In $commitsShot $diffLeft $rowTop ($commitsShot.Width - $diffLeft) (To-Screen 400) $ADDED_RGB 14
+        Write-Host "pixels of what the commit changed: $shown"
+        Check 'the panel shows what the commit changed' ($shown -gt 20) "$shown pixels of the difference"
+
+        # The arrow keys pick another commit.
+        $previous = Focus-Editor $handle
+        Send-Key $VK_DOWN
+        Start-Sleep -Seconds 3
+
+        $olderShot = Save-Window $handle $shotOlder
+        Write-Host "saved $shotOlder"
+        $older = Count-In $olderShot $messageLeft $secondRowTop $messageWidth $rowHeight $PATH_RGB 14
+        Write-Host "pixels of the message of the older commit: $older"
+        Check 'the arrow keys pick another commit' ($older -gt 20) "$older pixels of the message"
+
+        # The escape key goes back to the changed files, and the panel stays
+        # open: the commits are a page of the panel, not the panel itself.
+        $previous = Focus-Editor $handle
+        Send-Key $VK_ESCAPE
+        Start-Sleep -Seconds 3
+
+        $filesShot = Save-Window $handle $shotFiles
+        Write-Host "saved $shotFiles"
+        $stillGround = Count-In $filesShot 0 0 $filesShot.Width $filesShot.Height $GROUND_RGB 4
+        Write-Host "pixels of the ground after the escape in the commits: $stillGround"
+        Check 'the escape key in the commits keeps the panel open' ($stillGround -gt 100000) "$stillGround pixels of the ground"
+
+        $gone = Count-In $filesShot $listLeft $rowTop $commitIdWidth $rowHeight $COMMIT_ID_RGB 14
+        Write-Host "pixels of the number of the commit after the escape: $gone"
+        Check 'the escape key goes back to the changed files' ($gone -lt 10) "$gone pixels of the number"
 
         # The escape key closes the panel.
         $previous = Focus-Editor $handle
@@ -488,11 +606,18 @@ try {
                 state = $new
                 difference = $added
                 staged = $staged
+                unstaged = $unstaged
                 box = $box
                 pathAfterCommit = $left
+                commitNumber = $number
+                commitMessage = $message
+                commitDifference = $shown
+                olderCommitMessage = $older
+                groundAfterEscapeInCommits = $stillGround
+                commitNumberAfterEscape = $gone
                 groundAfterEscape = $closedGround
             }
-            shots = @($shotPanel, $shotStaged, $shotBox, $shotCommitted, $shotClosed)
+            shots = @($shotPanel, $shotStaged, $shotUnstaged, $shotBox, $shotCommitted, $shotCommits, $shotOlder, $shotFiles, $shotClosed)
         }
         [System.IO.File]::WriteAllText($report, ($result | ConvertTo-Json -Depth 6), (New-Object System.Text.UTF8Encoding($false)))
         Write-Host "saved $report"
