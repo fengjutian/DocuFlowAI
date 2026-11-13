@@ -37,7 +37,7 @@ use crate::{
     framing::{FrameReader, serialize},
     protocol::{
         CompletionList, Diagnostic, Position, TextChange, TextDocumentIdentifier, TextDocumentItem,
-        TextDocumentSyncKind, VersionedTextDocumentIdentifier,
+        TextDocumentSyncKind, TextEdit, VersionedTextDocumentIdentifier,
     },
 };
 
@@ -98,6 +98,9 @@ enum Pending {
     /// A completion is not a JSON-RPC result but a list of items, so it has
     /// its own way in.
     Completion(Sender<CompletionList>),
+    /// A formatting answer is a list of edits, and it has to be told apart
+    /// from the answers of the other requests.
+    Formatting(Sender<Result<Vec<TextEdit>, LspError>>),
 }
 
 /// The document that was opened before the handshake was done.

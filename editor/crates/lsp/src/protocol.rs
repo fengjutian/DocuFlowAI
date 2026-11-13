@@ -32,6 +32,20 @@ pub struct Range {
     pub end: Position,
 }
 
+/// One edit of the text of a document.
+///
+/// The server answers a formatting request with a list of these: each one
+/// replaces a range with a text, and the whole list is one change of the
+/// document.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextEdit {
+    /// The part of the document that is replaced.
+    pub range: Range,
+    /// The text that takes its place.
+    #[serde(rename = "newText")]
+    pub new_text: String,
+}
+
 /// How bad a diagnostic is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "u8", into = "u8")]
