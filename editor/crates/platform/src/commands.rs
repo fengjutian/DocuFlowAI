@@ -317,6 +317,7 @@ pub fn default_registry() -> CommandRegistry {
         command("workbench.commandPalette", "命令面板", "视图", "ctrl+shift+p", When::Always),
         command("workbench.settings", "打开设置", "文件", "ctrl+,", When::Always),
         command("workbench.save", "保存文件", "文件", "ctrl+s", When::HasFile),
+        command("workbench.closeTab", "关闭标签页", "文件", "ctrl+w", When::HasFile),
         command("editor.format", "格式化文档", "编辑", "alt+shift+f", When::HasFile),
         command("editor.rename", "重命名", "编辑", "f2", When::HasNameAtCaret),
         command("editor.codeAction", "代码操作", "编辑", "alt+enter", When::HasFile),

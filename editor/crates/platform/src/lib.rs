@@ -1983,19 +1983,6 @@ impl NativeApplication {
         }
 
         match letter {
-            // Ctrl+M starts a turn with the buffer's text as the prompt.
-            'm' => {
-                self.start_agent_turn();
-                true
-            }
-            // Ctrl+S saves the open file.
-            's' => {
-                if let Some(tab) = self.tabs.active().map(|tab| tab.id) {
-                    self.save_tab(tab);
-                    self.sync_dirty_flags();
-                }
-                true
-            }
             // Ctrl+W closes the tab that is in front.
             'w' => {
                 self.request_close(self.active);
@@ -2168,34 +2155,6 @@ impl NativeApplication {
         true
     }
 
-    /// Handles the key that asks the language server to format the file.
-    ///
-    /// Alt+Shift+F formats, the way it does in the other editors. Ctrl+Shift+F
-    /// is left for finding in files.
-    fn handle_format_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
-        if !(self.modifiers.alt_key() && self.modifiers.shift_key()) {
-            return false;
-        }
-        let Some(letter) = key_letter(key) else {
-            return false;
-        };
-        if !letter.eq_ignore_ascii_case(&'f') {
-            return false;
-        }
-        self.request_format();
-        true
-    }
-
-    /// Handles the key that asks to rename the thing at the caret.
-    ///
-    /// F2 renames, the way it does in the other editors.
-    fn handle_rename_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
-        if !matches!(key, Key::Named(NamedKey::F2)) {
-            return false;
-        }
-        self.open_rename_box();
-        true
-    }
     /// Handles the key that asks the language server what it offers to do
     /// about the place of the caret.
     ///
@@ -2354,8 +2313,8 @@ impl NativeApplication {
 
     /// Handles the keys of the task.
     ///
-    /// Ctrl+Shift+B builds the project, the way it does in the other
-    /// editors. Esc closes the output panel; the task keeps running.
+    /// Esc closes the output panel; the task keeps running. Ctrl+Shift+B is
+    /// the key of a command, and the command route builds the project.
     fn handle_task_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
         if self.task_panel && matches!(key, Key::Named(NamedKey::Escape)) {
             if self.terminal_input.is_some() {
@@ -2368,17 +2327,7 @@ impl NativeApplication {
             }
             return true;
         }
-        if !(self.modifiers.control_key() && self.modifiers.shift_key()) {
-            return false;
-        }
-        let Some(letter) = key_letter(key) else {
-            return false;
-        };
-        if !letter.eq_ignore_ascii_case(&'b') {
-            return false;
-        }
-        self.start_build_task();
-        true
+        false
     }
 
     /// Starts the build task of the project the open file belongs to.
@@ -2766,7 +2715,8 @@ impl NativeApplication {
 
     /// Opens the find bar when the user asks for it.
     ///
-    /// Ctrl+F finds, Ctrl+H finds and replaces.
+    /// Ctrl+H finds and replaces in the file that is open. Ctrl+F is the
+    /// key of a command, and the command route opens the bar.
     fn handle_find_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
         if !self.modifiers.control_key() {
             return false;
@@ -2780,10 +2730,6 @@ impl NativeApplication {
             .next()
             .map(|letter| letter.to_ascii_lowercase());
         match letter {
-            Some('f') => {
-                self.open_find(false);
-                true
-            }
             Some('h') => {
                 self.open_find(true);
                 true
@@ -3449,18 +3395,6 @@ impl NativeApplication {
     /// breakpoint takes it, and it takes it before this.
     fn handle_debug_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
         match key {
-            Key::Named(NamedKey::F9) => {
-                self.toggle_breakpoint();
-                true
-            }
-            Key::Named(NamedKey::F5) => {
-                self.start_debug_session();
-                true
-            }
-            Key::Named(NamedKey::F8) => {
-                self.stop_debug_session();
-                true
-            }
             Key::Named(NamedKey::F10) => {
                 self.step_debug(DebugStep::Over);
                 true
@@ -4037,6 +3971,31 @@ impl NativeApplication {
         }
     }
 
+    /// Runs the command whose key was pressed.
+    ///
+    /// The key route does not know the commands one by one: it asks the
+    /// registry which command wants this key, and the command runs.
+    fn run_the_command_of_the_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
+        // A panel that is open takes every key: the key does not belong to
+        // the editor then.
+        if self.a_modal_is_open() {
+            return false;
+        }
+        let pressed = commands::PressedKey {
+            letter: key_letter(key),
+            name: key_name(key),
+            ctrl: self.modifiers.control_key(),
+            alt: self.modifiers.alt_key(),
+            shift: self.modifiers.shift_key(),
+            cmd: false,
+        };
+        let Some(command) = self.commands.by_key(&pressed) else {
+            return false;
+        };
+        let id = command.id.clone();
+        self.run_named_command(&id)
+    }
+
     /// Runs the command with that id.
     ///
     /// The panel of the commands and the keys both come here: a command is
@@ -4063,10 +4022,11 @@ impl NativeApplication {
                     self.sync_dirty_flags();
                 }
             }
+            "workbench.closeTab" => self.request_close(self.active),
             "editor.format" => self.request_format(),
             "editor.rename" => self.open_rename_box(),
             "editor.codeAction" => self.request_code_action(),
-            "editor.find" => self.open_find_with(""),
+            "editor.find" => self.open_find(false),
             "search.findInFiles" => self.open_search_panel(false),
             "search.replaceInFiles" => self.open_search_panel(true),
             "terminal.toggle" => self.open_terminal(),
@@ -4841,19 +4801,16 @@ impl ApplicationHandler for NativeApplication {
                     window.request_redraw();
                     return;
                 }
-                // Alt+Shift+F asks the language server to format the file.
-                if self.handle_format_key(&event.logical_key.as_ref()) {
-                    window.request_redraw();
-                    return;
-                }
-                // F2 asks to rename the thing at the caret.
-                if self.handle_rename_key(&event.logical_key.as_ref()) {
-                    window.request_redraw();
-                    return;
-                }
                 // Alt+Enter asks the server what it offers to do about the
                 // place of the caret.
                 if self.handle_action_key(&event.logical_key.as_ref()) {
+                    window.request_redraw();
+                    return;
+                }
+                // The key may be the key of a command of the editor. The
+                // route does not know the commands one by one: it asks the
+                // registry.
+                if self.run_the_command_of_the_key(&event.logical_key.as_ref()) {
                     window.request_redraw();
                     return;
                 }
@@ -5161,6 +5118,44 @@ fn key_letter<T: AsRef<str>>(key: &Key<T>) -> Option<char> {
         }
         _ => None,
     }
+}
+
+/// The name of a key that has one, written the way the commands write it.
+///
+/// `F9` is `f9`, `Enter` is `enter`: the name is the same in the command
+/// table and in the key that was pressed, so the two can be compared.
+fn key_name<T: AsRef<str>>(key: &Key<T>) -> Option<String> {
+    let Key::Named(named) = key else {
+        return None;
+    };
+    let name = match named {
+        NamedKey::Enter => "enter",
+        NamedKey::Escape => "escape",
+        NamedKey::Tab => "tab",
+        NamedKey::Space => "space",
+        NamedKey::Backspace => "backspace",
+        NamedKey::Delete => "delete",
+        NamedKey::Home => "home",
+        NamedKey::End => "end",
+        NamedKey::ArrowUp => "arrowup",
+        NamedKey::ArrowDown => "arrowdown",
+        NamedKey::ArrowLeft => "arrowleft",
+        NamedKey::ArrowRight => "arrowright",
+        NamedKey::F1 => "f1",
+        NamedKey::F2 => "f2",
+        NamedKey::F3 => "f3",
+        NamedKey::F4 => "f4",
+        NamedKey::F5 => "f5",
+        NamedKey::F6 => "f6",
+        NamedKey::F7 => "f7",
+        NamedKey::F8 => "f8",
+        NamedKey::F9 => "f9",
+        NamedKey::F10 => "f10",
+        NamedKey::F11 => "f11",
+        NamedKey::F12 => "f12",
+        _ => return None,
+    };
+    Some(name.to_owned())
 }
 
 /// The parts of the frame that are not the text body.
