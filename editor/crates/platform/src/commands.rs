@@ -206,6 +206,11 @@ impl Command {
         self.when = when;
         self
     }
+
+    /// The key of the command the way a person reads it, when it has one.
+    pub fn key_text(&self) -> Option<String> {
+        self.keybinding.as_ref().map(Keybinding::text)
+    }
 }
 
 /// Two commands that want the same key.
@@ -275,6 +280,21 @@ impl CommandRegistry {
                     .as_ref()
                     .is_some_and(|keybinding| keybinding.matches(pressed))
             })
+    }
+
+    /// Gives a command another key.
+    ///
+    /// A command that is not there is **refused**: the person asked for a
+    /// command by its name, and a name that is not there is a mistake that
+    /// has to be said out loud rather than swallowed.
+    pub fn rebind(&mut self, id: &str, keybinding: Keybinding) -> Result<(), String> {
+        match self.commands.iter_mut().find(|command| command.id == id) {
+            Some(command) => {
+                command.keybinding = Some(keybinding);
+                Ok(())
+            }
+            None => Err(format!("没有叫 {id} 的命令")),
+        }
     }
 
     /// The commands that want the same key.

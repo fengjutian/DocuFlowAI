@@ -13,6 +13,7 @@ pub mod editor_view;
 pub mod find;
 mod git;
 mod input;
+mod keybindings;
 mod lsp;
 mod pane;
 mod paths;
@@ -48,7 +49,7 @@ use codeweaver_workbench::{close_decision, CloseDecision, Tab, TabBar, TabId};
 use code_action::ActionPopup;
 use command::CommandBox;
 use command_palette::{CommandPalette, PaletteCommand};
-use commands::{CommandRegistry, Context as CommandContext, When};
+use commands::{CommandRegistry, Keybinding, Context as CommandContext, When};
 use completion::CompletionPopup;
 use debug::{BreakpointMark, Breakpoints, DebugPanel, DebugState, DebugStep, Debugger};
 use developer::{DeveloperCommand, DeveloperPanel, Line as DeveloperLine};
@@ -62,7 +63,7 @@ use input::TextInputState;
 use pane::EditorPane;
 use rename::RenameBox;
 use search::{SearchCommand, SearchPanel};
-use settings::Settings;
+use settings::{KeyRow, Settings};
 use task::{Task, TaskOutput, TaskPanel, TaskState};
 use winit::{
     application::ApplicationHandler,
@@ -409,6 +410,13 @@ impl NativeApplication {
         let dev_log = dev_log.map(DevLog::open);
         let dev = dev_log.is_some();
         let workspace = Workspace::detached();
+        // The keys a person changed live in a file next to the project. The
+        // root of the project is the folder of the file that is opened, which
+        // is the same folder the tree of files shows.
+        let project_root = path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .map(Path::to_path_buf);
         let mut tabs = TabBar::new();
         let mut panes: Vec<EditorPane> = Vec::new();
         let mut server = None;
@@ -462,7 +470,15 @@ impl NativeApplication {
             panes[0].server_version = Some(panes[0].editor.version());
         }
 
-        let commands = commands::default_registry();
+        let mut commands = commands::default_registry();
+        // The keys in the file of the user and the file of the project are
+        // put over the ones the editor was built with, before anything is
+        // read from the registry: what the editor starts with is what the
+        // person asked for.
+        let changes = keybindings::load(project_root.as_deref());
+        let mut keybinding_errors = changes.errors.clone();
+        keybinding_errors.extend(keybindings::apply(&mut commands, &changes.bindings));
+        let keybindings_changed = changes.bindings.len();
         // Two commands that want one key is a mistake that is said out loud:
         // the person has to know which one of them the key really runs.
         let conflict = commands
@@ -476,6 +492,20 @@ impl NativeApplication {
                     conflict.keybinding.text()
                 )
             });
+        // What the editor could not make of the file is said as well: a file
+        // that is half applied is a file the person cannot trust.
+        let status = conflict.or_else(|| {
+            keybinding_errors.first().map(|first| {
+                if keybinding_errors.len() > 1 {
+                    format!(
+                        "{first}（键位文件里还有 {} 处不对）",
+                        keybinding_errors.len() - 1
+                    )
+                } else {
+                    first.clone()
+                }
+            })
+        });
 
         let mut application = NativeApplication {
             window: None,
@@ -485,7 +515,7 @@ impl NativeApplication {
             agent: None,
             agent_error: None,
             workspace,
-            status: conflict,
+            status,
             endpoint: None,
             cursor: None,
             find: None,
@@ -549,6 +579,14 @@ impl NativeApplication {
             }
             if let Some(conflict) = application.status.clone() {
                 application.note(&conflict);
+            }
+            if keybindings_changed > 0 {
+                application.note(&format!(
+                    "键位文件：{keybindings_changed} 条改动已生效"
+                ));
+            }
+            for error in &keybinding_errors {
+                application.note(error);
             }
         }
         Ok(application)
@@ -1006,7 +1044,20 @@ impl NativeApplication {
     /// sees is what the editor is doing.
     fn open_settings(&mut self) {
         let policy = self.panes[self.active].policy;
-        self.settings = Some(Settings::new(policy));
+        self.settings = Some(Settings::with_keys(policy, self.command_keys()));
+    }
+
+    /// The key each command has now, for the panel of the settings.
+    fn command_keys(&self) -> Vec<KeyRow> {
+        self.commands
+            .all()
+            .iter()
+            .map(|command| KeyRow {
+                command: command.id.clone(),
+                title: format!("{} · {}", command.category, command.title),
+                key: command.key_text().unwrap_or_default(),
+            })
+            .collect()
     }
 
     /// Handles the keys of the settings panel.
@@ -1026,12 +1077,29 @@ impl NativeApplication {
             return false;
         }
 
-        // The panel closes on Enter and on Escape.
-        if matches!(
-            key,
-            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Escape)
-        ) {
+        // While the panel is waiting for a key, the next key is the answer:
+        // a key that is given to a command is not a key of the panel.
+        if self.settings.as_ref().is_some_and(Settings::recording) {
+            return self.take_the_new_key(key);
+        }
+
+        // The panel closes on Escape, and on Enter when the row is not one of
+        // the keys: a key row waits for the key that is to replace its own.
+        if matches!(key, Key::Named(NamedKey::Escape)) {
             self.settings = None;
+            return true;
+        }
+        if matches!(key, Key::Named(NamedKey::Enter)) {
+            let recording = self
+                .settings
+                .as_mut()
+                .map(Settings::begin_recording)
+                .unwrap_or(false);
+            if recording {
+                self.status = Some("按新的键，Esc 取消".to_owned());
+            } else {
+                self.settings = None;
+            }
             return true;
         }
 
@@ -1072,6 +1140,67 @@ impl NativeApplication {
                 policy.max_bytes, policy.max_lines
             ));
         }
+        true
+    }
+
+    /// Gives the picked command the key that was just pressed.
+    ///
+    /// A key that cannot be read and a command that is not there are said out
+    /// loud: the panel does not close on a change it could not make. A key
+    /// that two commands want is said out loud as well, but it is still the
+    /// key of the command that was picked — the last one to ask wins, the way
+    /// it does in a file.
+    fn take_the_new_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
+        if matches!(key, Key::Named(NamedKey::Escape)) {
+            if let Some(settings) = self.settings.as_mut() {
+                settings.cancel_recording();
+            }
+            self.status = Some("没有改键位".to_owned());
+            return true;
+        }
+        // A modifier on its own is not a key: the panel keeps waiting for
+        // one that is.
+        let Some(text) = keybinding_text(self.modifiers, key) else {
+            return true;
+        };
+        let Some(row) = self
+            .settings
+            .as_ref()
+            .and_then(Settings::selected_key)
+            .cloned()
+        else {
+            return true;
+        };
+        let binding = match Keybinding::parse(&text) {
+            Ok(binding) => binding,
+            Err(said) => {
+                self.status = Some(format!("{said}；这个键没有用上"));
+                return true;
+            }
+        };
+        let written = binding.text();
+        if let Err(said) = self.commands.rebind(&row.command, binding) {
+            self.status = Some(said);
+            if let Some(settings) = self.settings.as_mut() {
+                settings.cancel_recording();
+            }
+            return true;
+        }
+        let conflict = self
+            .commands
+            .conflicts()
+            .into_iter()
+            .find(|conflict| conflict.first == row.command || conflict.second == row.command);
+        if let Some(settings) = self.settings.as_mut() {
+            settings.set_key(&row.command, &written);
+        }
+        self.status = Some(match conflict {
+            Some(conflict) => format!(
+                "{} 和 {} 都要 {}：按下的这个键会先给排在前面的一条",
+                conflict.first, conflict.second, written
+            ),
+            None => format!("{} 的键位改成 {written}", row.title),
+        });
         true
     }
 
@@ -5425,6 +5554,29 @@ fn key_name<T: AsRef<str>>(key: &Key<T>) -> Option<String> {
     Some(name.to_owned())
 }
 
+/// The key that was pressed, written the way the commands write it.
+///
+/// `Ctrl+Shift+P` is `ctrl+shift+p`. A modifier on its own is not a key: it
+/// says nothing back, and the panel that waits for a key keeps waiting.
+fn keybinding_text<T: AsRef<str>>(modifiers: ModifiersState, key: &Key<T>) -> Option<String> {
+    let base = match key_letter(key) {
+        Some(letter) => letter.to_lowercase().to_string(),
+        None => key_name(key)?,
+    };
+    let mut text = String::new();
+    if modifiers.control_key() {
+        text.push_str("ctrl+");
+    }
+    if modifiers.alt_key() {
+        text.push_str("alt+");
+    }
+    if modifiers.shift_key() {
+        text.push_str("shift+");
+    }
+    text.push_str(&base);
+    Some(text)
+}
+
 /// The parts of the frame that are not the text body.
 struct Chrome<'a> {
     agent: Option<&'a AgentSession>,
@@ -6044,7 +6196,7 @@ fn push_prompt(scene: &mut FrameScene, viewport: Rect, size: Size, text: &str) {
 /// The panel is drawn over everything else, because a setting that cannot be
 /// seen is a setting that cannot be changed.
 fn push_settings(scene: &mut FrameScene, viewport: Rect, size: Size, settings: &Settings) {
-    let rows = settings.rows();
+    let rows = settings.visible_rows();
     let width = (size.width * 0.42).clamp(360.0, 560.0);
     let height = 46.0 + rows.len() as f32 * 30.0 + 32.0;
     let box_rect = Rect::new(
@@ -9077,5 +9229,111 @@ mod tests {
         // document behind it must not see it.
         assert!(app.handle_developer_key(&character("x"), 1.0));
         assert!(app.developer.is_some(), "the panel stays open");
+    }
+
+    #[test]
+    fn the_settings_panel_lists_the_keys_of_the_commands() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.open_settings();
+        let settings = app.settings.as_ref().expect("the panel is open");
+        let rows = settings.all_rows();
+        assert!(rows.len() > 2, "the settings and the keys are there");
+        assert!(
+            rows.iter().any(|row| row.title.contains("格式化文档")),
+            "a command is listed with its group"
+        );
+        assert!(
+            rows.iter().any(|row| row.value.contains("Alt+Shift+F")),
+            "the key of the command is there"
+        );
+        assert!(
+            rows.iter().any(|row| row.value.contains("Ctrl+Shift+P")),
+            "the key of the palette is there"
+        );
+    }
+
+    #[test]
+    fn a_key_is_given_to_a_command_in_the_settings_panel() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.open_settings();
+        let index = app
+            .settings
+            .as_ref()
+            .expect("the panel is open")
+            .all_rows()
+            .iter()
+            .position(|row| row.title.contains("格式化文档"))
+            .expect("the command is listed");
+        for _ in 0..index {
+            app.handle_settings_key(&named(NamedKey::ArrowDown));
+        }
+        // Enter waits for the new key.
+        app.handle_settings_key(&named(NamedKey::Enter));
+        assert!(
+            app.settings.as_ref().expect("the panel is open").recording(),
+            "the panel waits for a key"
+        );
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::ALT;
+        assert!(app.handle_settings_key(&character("k")));
+        app.modifiers = ModifiersState::default();
+
+        let pressed = commands::PressedKey {
+            letter: Some('k'),
+            ctrl: true,
+            alt: true,
+            ..commands::PressedKey::default()
+        };
+        assert_eq!(
+            app.commands.by_key(&pressed).map(|command| command.id.as_str()),
+            Some("editor.format"),
+            "the command has the new key"
+        );
+        let said = app.status.clone().expect("the editor says what it did");
+        assert!(said.contains("Ctrl+Alt+K"), "got {said}");
+        assert!(
+            !app.settings.as_ref().expect("the panel is open").recording(),
+            "the panel has its answer"
+        );
+    }
+
+    #[test]
+    fn the_keys_of_the_file_are_in_force_when_the_editor_starts() {
+        let directory = scratch_dir("keybindings-start");
+        let file = directory.join("notes.txt");
+        fs::write(&file, "the first line\n").expect("the file is written");
+        fs::write(
+            directory.join("keybindings.json"),
+            r#"[{ "key": "ctrl+alt+j", "command": "editor.find" }]"#,
+        )
+        .expect("the file of the keys is written");
+
+        let app = NativeApplication::new(Some(file)).expect("the application starts");
+        let pressed = commands::PressedKey {
+            letter: Some('j'),
+            ctrl: true,
+            alt: true,
+            ..commands::PressedKey::default()
+        };
+        assert_eq!(
+            app.commands.by_key(&pressed).map(|command| command.id.as_str()),
+            Some("editor.find"),
+            "the file of the keys is in force"
+        );
+    }
+
+    #[test]
+    fn a_file_of_keys_that_names_a_command_that_is_not_there_is_said_out_loud() {
+        let directory = scratch_dir("keybindings-wrong");
+        let file = directory.join("notes.txt");
+        fs::write(&file, "the first line\n").expect("the file is written");
+        fs::write(
+            directory.join("keybindings.json"),
+            r#"[{ "key": "ctrl+alt+j", "command": "editor.noSuchCommand" }]"#,
+        )
+        .expect("the file of the keys is written");
+
+        let app = NativeApplication::new(Some(file)).expect("the application starts");
+        let said = app.status.clone().expect("the editor says what is wrong");
+        assert!(said.contains("editor.noSuchCommand"), "got {said}");
     }
 }
