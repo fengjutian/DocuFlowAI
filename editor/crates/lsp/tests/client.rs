@@ -203,6 +203,23 @@ fn the_edits_of_a_rename_request_arrive() {
 }
 
 #[test]
+fn range_formatting_sends_the_selection() {
+    let client = client();
+    let range = codeweaver_lsp::protocol::Range {
+        start: Position::new(1, 2),
+        end: Position::new(3, 4),
+    };
+    client
+        .request_range_formatting("file:///tmp/main.rs", range, 4, true)
+        .expect("the request goes through");
+    let edits = wait_for(|| client.drain_formattings().into_iter().next())
+        .expect("the server answered");
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].range.start, Position::new(1, 2));
+    assert_eq!(edits[0].range.end, Position::new(3, 4));
+}
+
+#[test]
 fn the_edits_of_a_formatting_request_arrive() {
     let client = client();
     client

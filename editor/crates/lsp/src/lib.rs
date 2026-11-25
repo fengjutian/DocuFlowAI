@@ -413,13 +413,33 @@ impl Client {
         tab_size: u32,
         insert_spaces: bool,
     ) -> Result<(), LspError> {
+        self.request_format(uri, tab_size, insert_spaces, None)
+    }
+
+    pub fn request_range_formatting(
+        &self,
+        uri: &str,
+        range: protocol::Range,
+        tab_size: u32,
+        insert_spaces: bool,
+    ) -> Result<(), LspError> {
+        self.request_format(uri, tab_size, insert_spaces, Some(range))
+    }
+
+    fn request_format(
+        &self,
+        uri: &str,
+        tab_size: u32,
+        insert_spaces: bool,
+        range: Option<protocol::Range>,
+    ) -> Result<(), LspError> {
         let id = self.next_id();
         self.pending
             .lock()
             .expect("the pending lock is not poisoned")
             .insert(id, Pending::Formatting(self.formatting_sender.clone()));
 
-        let message = json!({
+        let mut message = json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "textDocument/formatting",
@@ -431,6 +451,10 @@ impl Client {
                 },
             },
         });
+        if let Some(range) = range {
+            message["method"] = json!("textDocument/rangeFormatting");
+            message["params"]["range"] = json!(range);
+        }
         self.write(&message)
     }
 

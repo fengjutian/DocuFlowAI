@@ -267,7 +267,7 @@ pub fn draw(
     // The commands.
     for (index, row) in rows.iter().take(VISIBLE).enumerate() {
         let y = panel.origin.y + PADDING + HEADER_HEIGHT + index as f32 * ITEM_HEIGHT;
-        if index == palette.selected() {
+        if index == palette.selected {
             scene.push_quad(
                 Rect::new(panel.origin.x, y, panel.size.width, ITEM_HEIGHT),
                 Color::rgb(0.18, 0.30, 0.52),
@@ -354,7 +354,7 @@ mod tests {
         let palette = CommandPalette::open(&registry(), &Context::default());
         let titles: Vec<&str> = palette
             .rows()
-            .iter()
+            .into_iter()
             .map(|row| row.command.title.as_str())
             .collect();
         assert_eq!(titles, vec!["格式化文档", "重命名", "打开终端"]);
@@ -391,7 +391,7 @@ mod tests {
         let palette = CommandPalette::open(&registry(), &Context::default());
         let rename = palette
             .rows()
-            .iter()
+            .into_iter()
             .find(|row| row.command.id == "editor.rename")
             .expect("the command is listed");
         assert!(!rename.enabled, "there is no name at the caret");
@@ -400,8 +400,8 @@ mod tests {
     #[test]
     fn the_enter_key_runs_the_command_that_is_picked() {
         let mut palette = CommandPalette::open(&registry(), &Context::default());
-        palette.handle_key(&Key::Named(NamedKey::ArrowDown), None, false);
-        let command = palette.handle_key(&Key::Named(NamedKey::Enter), None, false);
+        palette.handle_key(&Key::<&str>::Named(NamedKey::ArrowDown), None, false);
+        let command = palette.handle_key(&Key::<&str>::Named(NamedKey::Enter), None, false);
         assert_eq!(command, PaletteCommand::Run("editor.rename".to_owned()));
     }
 
@@ -409,7 +409,7 @@ mod tests {
     fn the_escape_key_closes_the_panel() {
         let mut palette = CommandPalette::open(&registry(), &Context::default());
         assert_eq!(
-            palette.handle_key(&Key::Named(NamedKey::Escape), None, false),
+            palette.handle_key(&Key::<&str>::Named(NamedKey::Escape), None, false),
             PaletteCommand::Close
         );
     }

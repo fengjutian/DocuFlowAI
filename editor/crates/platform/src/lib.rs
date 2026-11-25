@@ -46,7 +46,7 @@ use codeweaver_workbench::{close_decision, CloseDecision, Tab, TabBar, TabId};
 use code_action::ActionPopup;
 use command::CommandBox;
 use command_palette::{CommandPalette, PaletteCommand};
-use commands::{CommandRegistry, Context, When};
+use commands::{CommandRegistry, Context as CommandContext, When};
 use completion::CompletionPopup;
 use debug::{BreakpointMark, Breakpoints, DebugPanel, DebugState, DebugStep, Debugger};
 use editor_view::{
@@ -2093,10 +2093,24 @@ impl NativeApplication {
             self.status = Some("这个文件没有语言服务器，格式化不了".to_owned());
             return;
         };
-        let outcome = self
-            .server
-            .as_ref()
-            .map(|server| server.request_formatting(&uri, 4, true));
+        let editor = &self.panes[self.active].editor;
+        let buffer = editor.buffer();
+        let selection = editor.selection().range(buffer);
+        let outcome = self.server.as_ref().map(|server| {
+            if selection.is_empty() {
+                server.request_formatting(&uri, 4, true)
+            } else {
+                server.request_range_formatting(
+                    &uri,
+                    codeweaver_lsp::protocol::Range {
+                        start: lsp::position_of(buffer, selection.start.0),
+                        end: lsp::position_of(buffer, selection.end.0),
+                    },
+                    4,
+                    true,
+                )
+            }
+        });
         match outcome {
             Some(Ok(())) => {
                 // The version is the version of the text the request is
@@ -3066,6 +3080,7 @@ impl NativeApplication {
     fn a_modal_is_open(&self) -> bool {
         self.rename_box.is_some()
             || self.command_box.is_some()
+            || self.palette.is_some()
             || self.search.is_some()
             || self.breakpoint_condition.is_some()
             || self.debug_expression.is_some()
@@ -3952,13 +3967,14 @@ impl NativeApplication {
         changed
     }
 
-    /// Handles the keys of the box that asks for a command.
+    /// Handles the keys of the panel that lists the commands.
     ///
-    /// Ctrl+Shift+P opens the box. While the box is open it takes every
-    /// key: a command that is typed into the document is not a command.
-    fn handle_command_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
-        let Some(mut box_) = self.command_box.take() else {
-            // The box is not open: Ctrl+Shift+P opens it.
+    /// Ctrl+Shift+P opens it, the way VS Code opens its own. While the panel
+    /// is open it takes every key: a command that is typed into the document
+    /// is not a command.
+    fn handle_palette_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
+        let Some(mut palette) = self.palette.take() else {
+            // The panel is not open: Ctrl+Shift+P opens it.
             // A panel that takes every key does not open over another one.
             if self.a_modal_is_open() {
                 return false;
@@ -3970,6 +3986,127 @@ impl NativeApplication {
                 return false;
             };
             if !letter.eq_ignore_ascii_case(&'p') {
+                return false;
+            }
+            // Only one panel at a time: the box that asks for a new name gives
+            // up its place.
+            self.rename_box = None;
+            self.command_box = None;
+            self.take_the_keyboard_from_the_terminal();
+            let context = self.command_context();
+            self.palette = Some(CommandPalette::open(&self.commands, &context));
+            self.status = Some("写几个字找命令，上下键挑，回车就跑，Esc 取消".to_owned());
+            return true;
+        };
+
+        let command = palette.handle_key(key, text, self.modifiers.control_key());
+        match command {
+            PaletteCommand::None => {}
+            PaletteCommand::Close => {
+                self.status = Some("关掉了命令面板".to_owned());
+                return true;
+            }
+            PaletteCommand::Run(id) => {
+                // The panel goes away when the command runs: the command may
+                // open a panel of its own.
+                self.run_named_command(&id);
+                return true;
+            }
+        }
+        self.palette = Some(palette);
+        true
+    }
+
+    /// What the commands may ask about.
+    ///
+    /// The editor tells the registry what is true right now; the registry
+    /// says which commands that lets it run.
+    fn command_context(&self) -> CommandContext {
+        let pane = &self.panes[self.active];
+        let has_name_at_caret = rename::word_at_caret(pane.editor.buffer(), pane.editor.caret().0)
+            .is_some();
+        let has_repository = pane
+            .document
+            .as_ref()
+            .and_then(|document| git::repository_root(document.path()))
+            .is_some();
+        CommandContext {
+            has_file: pane.document.is_some(),
+            has_name_at_caret,
+            has_repository,
+        }
+    }
+
+    /// Runs the command with that id.
+    ///
+    /// The panel of the commands and the keys both come here: a command is
+    /// run the same way either way.
+    fn run_named_command(&mut self, id: &str) -> bool {
+        let context = self.command_context();
+        if !self.commands.is_enabled(id, &context) {
+            self.status = Some(match self.commands.get(id).map(|command| command.when) {
+                Some(When::HasFile) => "没有打开的文件，这条命令用不了".to_owned(),
+                Some(When::HasNameAtCaret) => "光标处没有名字，这条命令用不了".to_owned(),
+                Some(When::HasRepository) => "这个文件不在仓库里，这条命令用不了".to_owned(),
+                _ => format!("命令 {id} 现在用不了"),
+            });
+            return false;
+        }
+        match id {
+            "workbench.commandPalette" => {
+                self.status = Some("关掉了命令面板".to_owned());
+            }
+            "workbench.settings" => self.open_settings(),
+            "workbench.save" => {
+                if let Some(tab) = self.tabs.active().map(|tab| tab.id) {
+                    self.save_tab(tab);
+                    self.sync_dirty_flags();
+                }
+            }
+            "editor.format" => self.request_format(),
+            "editor.rename" => self.open_rename_box(),
+            "editor.codeAction" => self.request_code_action(),
+            "editor.find" => self.open_find_with(""),
+            "search.findInFiles" => self.open_search_panel(false),
+            "search.replaceInFiles" => self.open_search_panel(true),
+            "terminal.toggle" => self.open_terminal(),
+            "terminal.runCommand" => {
+                self.command_box = Some(CommandBox::new());
+                self.status = Some("写命令，回车就跑，Esc 取消".to_owned());
+            }
+            "task.build" => self.start_build_task(),
+            "git.showChanges" => self.open_git_panel(),
+            "debug.toggleBreakpoint" => self.toggle_breakpoint(),
+            "debug.start" => self.start_debug_session(),
+            "debug.stop" => self.stop_debug_session(),
+            "debug.evaluate" => self.ask_for_an_expression(),
+            "agent.startTurn" => self.start_agent_turn(),
+            other => {
+                self.status = Some(format!("命令 {other} 还不知道怎么跑"));
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Handles the keys of the box that asks for a command.
+    ///
+    /// Ctrl+Shift+U opens the box. While the box is open it takes every
+    /// key: a command that is typed into the document is not a command.
+    fn handle_command_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
+        let Some(mut box_) = self.command_box.take() else {
+            // The box is not open: Ctrl+Shift+U opens it.
+            // A panel that takes every key does not open over another one.
+            if self.a_modal_is_open() {
+                return false;
+            }
+            if !(self.modifiers.control_key() && self.modifiers.shift_key()) {
+                return false;
+            }
+            let Some(letter) = key_letter(key) else {
+                return false;
+            };
+            if !letter.eq_ignore_ascii_case(&'u') {
                 return false;
             }
             // Only one box at a time: the box that asks for a new name gives
@@ -4979,6 +5116,7 @@ impl ApplicationHandler for NativeApplication {
                         condition: self.breakpoint_condition.as_ref().map(|box_| box_.field()),
                         expression: self.debug_expression.as_ref().map(|box_| box_.field()),
                         search: self.search.as_ref(),
+                        palette: self.palette.as_ref(),
                         debug: debug_panel,
                         breakpoints: &breakpoints,
                         conflicts: conflict,
@@ -5064,6 +5202,8 @@ struct Chrome<'a> {
     expression: Option<&'a RenameBox>,
     /// The panel that finds text in the files, when it is open.
     search: Option<&'a SearchPanel>,
+    /// The panel that lists the commands, when it is open.
+    palette: Option<&'a CommandPalette>,
     /// The panel of the debugger, when there is a session.
     debug: Option<DebugPanel<'a>>,
     /// The lines of the breakpoints of the file that is on screen.
@@ -5163,6 +5303,14 @@ fn build_scene(
     // the panel is therefore left out of the picture, not covered by it.
     if let Some(settings) = chrome.settings {
         push_settings(&mut scene, viewport, size, settings);
+        return scene;
+    }
+
+    // The panel that lists the commands covers the window, the way the
+    // settings do.
+    if let Some(palette) = chrome.palette {
+        let mut ui_measurer = RendererMeasurer::new(renderer, TextFamily::SansSerif);
+        command_palette::draw(&mut scene, viewport, palette, &mut ui_measurer);
         return scene;
     }
 

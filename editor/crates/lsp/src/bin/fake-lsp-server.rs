@@ -81,6 +81,13 @@ fn handle(message: &Value, output: &mut impl Write, documents: &mut HashMap<Stri
             });
             write(output, &answer);
         }
+        (Some(id), "textDocument/rangeFormatting") => {
+            write(output, &json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": [{ "range": message["params"]["range"], "newText": "formatted" }],
+            }));
+        }
         (Some(id), "textDocument/formatting") => {
             // Two edits, the way a formatter answers: one that replaces a
             // piece of text and one that puts something in.
