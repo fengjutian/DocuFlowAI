@@ -49,3 +49,18 @@ pub(crate) fn scratch_project(name: &str) -> PathBuf {
         .expect("the manifest of the scratch project can be written");
     directory
 }
+
+/// A project of its own that has nothing to build.
+///
+/// The editor looks for the project a file belongs to by walking up until it
+/// finds a manifest, and the build command is the one that manifest says. A
+/// folder with a `pyproject.toml` is a project (the editor finds it) that
+/// this editor cannot build (it has no build command), which is the one case
+/// a check needs to see: the editor has to say that there is nothing to run
+/// instead of starting a build.
+pub(crate) fn scratch_project_without_build(name: &str) -> PathBuf {
+    let directory = scratch_dir(name);
+    fs::write(directory.join("pyproject.toml"), "[project]\nname = \"scratch\"\n")
+        .expect("the manifest of the scratch project can be written");
+    directory
+}

@@ -95,11 +95,15 @@ impl Keybinding {
             return false;
         }
         if let Some(letter) = pressed.letter {
-            return self
-                .key
-                .chars()
-                .next()
-                .is_some_and(|key| key.eq_ignore_ascii_case(&letter));
+            // A letter is only the key of a binding that names one letter.
+            // `f2` is the F2 key: the letter `f` is not it, and a binding
+            // that names one letter must be that letter and no more.
+            let mut named = self.key.chars();
+            let first = named.next();
+            if named.next().is_some() {
+                return false;
+            }
+            return first.is_some_and(|key| key.eq_ignore_ascii_case(&letter));
         }
         match pressed.name.as_deref() {
             Some(name) => self.key == name,
@@ -404,6 +408,24 @@ mod tests {
             ..PressedKey::default()
         };
         assert!(!binding.matches(&pressed), "the shift key was not held");
+    }
+
+    #[test]
+    fn a_binding_that_names_a_key_is_not_the_letter_of_that_key() {
+        // `f2` is the F2 key. The letter `f` is another key, and a binding
+        // that names one letter must not match the first letter of another.
+        let binding = Keybinding::parse("f2").expect("the key is read");
+        let pressed = PressedKey {
+            letter: Some('f'),
+            ..PressedKey::default()
+        };
+        assert!(!binding.matches(&pressed), "F2 is not the letter F");
+
+        let pressed = PressedKey {
+            name: Some("f2".to_owned()),
+            ..PressedKey::default()
+        };
+        assert!(binding.matches(&pressed), "F2 is F2");
     }
 
     #[test]

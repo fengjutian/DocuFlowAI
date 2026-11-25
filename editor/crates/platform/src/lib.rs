@@ -3917,6 +3917,27 @@ impl NativeApplication {
         changed
     }
 
+    /// Opens the panel that lists the commands.
+    ///
+    /// The panel is the one the person writes a few letters into to find a
+    /// command. It is opened by Ctrl+Shift+P and by the command of its own
+    /// in the panel, the way VS Code opens its own.
+    fn open_palette(&mut self) {
+        // Only one panel at a time: the box that asks for a new name and the
+        // box that asks for a command give up their place.
+        self.rename_box = None;
+        self.command_box = None;
+        self.take_the_keyboard_from_the_terminal();
+        let context = self.command_context();
+        let palette = CommandPalette::open(&self.commands, &context);
+        self.status = Some(if palette.is_empty() {
+            "这个编辑器还没有命令".to_owned()
+        } else {
+            "写几个字找命令，上下键挑，回车就跑，Esc 取消".to_owned()
+        });
+        self.palette = Some(palette);
+    }
+
     /// Handles the keys of the panel that lists the commands.
     ///
     /// Ctrl+Shift+P opens it, the way VS Code opens its own. While the panel
@@ -3938,19 +3959,7 @@ impl NativeApplication {
             if !letter.eq_ignore_ascii_case(&'p') {
                 return false;
             }
-            // Only one panel at a time: the box that asks for a new name gives
-            // up its place.
-            self.rename_box = None;
-            self.command_box = None;
-            self.take_the_keyboard_from_the_terminal();
-            let context = self.command_context();
-            let palette = CommandPalette::open(&self.commands, &context);
-            self.status = Some(if palette.is_empty() {
-                "这个编辑器还没有命令".to_owned()
-            } else {
-                "写几个字找命令，上下键挑，回车就跑，Esc 取消".to_owned()
-            });
-            self.palette = Some(palette);
+            self.open_palette();
             return true;
         };
 
@@ -4034,7 +4043,8 @@ impl NativeApplication {
         }
         match id {
             "workbench.commandPalette" => {
-                self.status = Some("关掉了命令面板".to_owned());
+                // The command of the panel opens the panel again.
+                self.open_palette();
             }
             "workbench.settings" => self.open_settings(),
             "workbench.save" => {
@@ -6422,7 +6432,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    use crate::testing::{scratch, scratch_dir, scratch_project};
+    use crate::testing::{scratch, scratch_dir, scratch_project, scratch_project_without_build};
     use codeweaver_lsp::protocol::CodeAction;
     use codeweaver_text::TextOffset;
     use codeweaver_ui::MonospaceMeasurer;
@@ -6603,7 +6613,8 @@ mod tests {
         let mut app = NativeApplication::new(None).expect("the application starts");
         app.editor_mut().load_text(text);
         app.modifiers = ModifiersState::CONTROL;
-        app.handle_find_key(&character("f"));
+        // Ctrl+F is the key of a command: the command route opens the bar.
+        app.run_the_command_of_the_key(&character("f"));
         app.modifiers = ModifiersState::default();
         app
     }
@@ -6642,7 +6653,9 @@ mod tests {
     #[test]
     fn the_find_key_opens_the_find_bar() {
         let mut app = NativeApplication::new(None).expect("the application starts");
-        app.modifiers = ModifiersState::CONTROL;        assert!(app.handle_find_key(&character("f")));
+        // Ctrl+F is the key of a command: the command route opens the bar.
+        app.modifiers = ModifiersState::CONTROL;
+        assert!(app.run_the_command_of_the_key(&character("f")));
         assert!(app.find.is_some());
         // Ctrl+H replaces as well as finds.
         assert!(app.handle_find_key(&character("h")));
@@ -7711,7 +7724,10 @@ mod tests {
 
     #[test]
     fn the_format_key_says_when_there_is_no_server() {
-        let mut app = NativeApplication::new(None).expect("the application starts");
+        // Formatting is a command of a file: a file has to be open for it.
+        let path = scratch("format.txt");
+        fs::write(&path, "let value = 1;\n").unwrap();
+        let mut app = NativeApplication::new(Some(path)).expect("the application starts");
         app.modifiers = ModifiersState::ALT | ModifiersState::SHIFT;
 
         assert!(app.run_the_command_of_the_key(&character("f")));
@@ -8055,11 +8071,14 @@ mod tests {
 
     #[test]
     fn the_build_key_says_when_there_is_nothing_to_build() {
-        // A file that belongs to no project has nothing to build.
-        let mut app = NativeApplication::new(None).expect("the application starts");
+        // A project that has no build command has nothing to build.
+        let directory = scratch_project_without_build("build-nothing");
+        let file = directory.join("main.py");
+        fs::write(&file, "print(1)\n").unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
         app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
 
-        assert!(app.handle_task_key(&character("b")));
+        assert!(app.run_the_command_of_the_key(&character("b")));
         assert!(
             app.status
                 .as_ref()
@@ -8073,7 +8092,9 @@ mod tests {
     #[test]
     fn a_second_task_is_not_started_while_one_is_running() {
         let directory = scratch_dir("task-second");
-        let mut app = NativeApplication::new(None).expect("the application starts");
+        let file = directory.join("notes.txt");
+        fs::write(&file, "notes\n").unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
         app.task = Some(
             Task::start(
                 "cmd",
@@ -8084,7 +8105,7 @@ mod tests {
         );
         app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
 
-        assert!(app.handle_task_key(&character("b")));
+        assert!(app.run_the_command_of_the_key(&character("b")));
         assert!(
             app.status
                 .as_ref()
@@ -8096,12 +8117,20 @@ mod tests {
 
     #[test]
     fn the_build_key_is_only_control_and_shift_with_b() {
-        let mut app = NativeApplication::new(None).expect("the application starts");
-        assert!(!app.handle_task_key(&character("b")));
+        let directory = scratch_project_without_build("build-key");
+        let file = directory.join("main.py");
+        fs::write(&file, "print(1)\n").unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+
+        // Without the modifiers the key is not the key of the command.
+        assert!(!app.run_the_command_of_the_key(&character("b")));
         app.modifiers = ModifiersState::CONTROL;
-        assert!(!app.handle_task_key(&character("b")));
+        assert!(!app.run_the_command_of_the_key(&character("b")));
+        // With them the command runs: the editor looks for the build command.
         app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
-        assert!(!app.handle_task_key(&character("a")));
+        assert!(app.run_the_command_of_the_key(&character("b")));
+        // But only with the `b`.
+        assert!(!app.run_the_command_of_the_key(&character("a")));
     }
 
     #[test]
@@ -8551,8 +8580,9 @@ mod tests {
     #[test]
     fn the_command_box_asks_for_a_command_and_remembers_it() {
         let mut app = NativeApplication::new(None).expect("the application starts");
+        // Ctrl+Shift+U is the key of the command that asks for a command.
         app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
-        assert!(app.handle_command_key(&character("p"), None));
+        assert!(app.run_the_command_of_the_key(&character("u")));
         assert!(app.command_box.is_some(), "the box asks for a command");
         app.modifiers = ModifiersState::default();
 
@@ -8578,7 +8608,7 @@ mod tests {
         // The next time the box opens, the command is there: the up key
         // walks the history.
         app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
-        assert!(app.handle_command_key(&character("p"), None));
+        assert!(app.run_the_command_of_the_key(&character("u")));
         app.modifiers = ModifiersState::default();
         app.handle_command_key(&named(NamedKey::ArrowUp), None);
         let typed = app
@@ -8594,7 +8624,7 @@ mod tests {
     fn a_command_that_is_not_written_is_not_run() {
         let mut app = NativeApplication::new(None).expect("the application starts");
         app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
-        assert!(app.handle_command_key(&character("p"), None));
+        assert!(app.run_the_command_of_the_key(&character("u")));
         app.modifiers = ModifiersState::default();
 
         app.handle_command_key(&named(NamedKey::Enter), None);
@@ -8607,7 +8637,7 @@ mod tests {
     fn the_command_box_takes_every_key_while_it_is_open() {
         let mut app = NativeApplication::new(None).expect("the application starts");
         app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
-        assert!(app.handle_command_key(&character("p"), None));
+        assert!(app.run_the_command_of_the_key(&character("u")));
         app.modifiers = ModifiersState::default();
 
         // A key that is not the box's is swallowed by the box: the document
@@ -8615,5 +8645,61 @@ mod tests {
         assert!(app.handle_command_key(&character("x"), None));
         assert_eq!(app.editor().text(), "", "the text is not touched");
         assert!(app.command_box.is_some(), "the box stays open");
+    }
+
+    #[test]
+    fn the_palette_key_opens_the_panel_of_the_commands() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(app.handle_palette_key(&character("p"), None));
+        let palette = app.palette.as_ref().expect("the panel is open");
+        assert!(!palette.is_empty(), "the editor has commands to show");
+
+        // The keys go to the panel while it is open.
+        app.modifiers = ModifiersState::default();
+        assert!(app.handle_palette_key(&character("x"), Some("x")));
+        let palette = app.palette.as_ref().expect("the panel is open");
+        assert_eq!(palette.input().text(), "x");
+    }
+
+    #[test]
+    fn a_command_that_is_picked_in_the_panel_runs() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(app.handle_palette_key(&character("p"), None));
+        app.modifiers = ModifiersState::default();
+
+        // Write the name of the command that opens the settings.
+        for letter in ["s", "e", "t", "t"] {
+            app.handle_palette_key(&character(letter), Some(letter));
+        }
+        let palette = app.palette.as_ref().expect("the panel is open");
+        assert_eq!(palette.rows().len(), 1, "only one command is left");
+
+        // Enter runs it: the settings panel opens.
+        app.handle_palette_key(&named(NamedKey::Enter), None);
+        assert!(app.palette.is_none(), "the panel of the commands is closed");
+        assert!(app.settings.is_some(), "the command ran");
+    }
+
+    #[test]
+    fn the_escape_key_closes_the_panel_of_the_commands() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(app.handle_palette_key(&character("p"), None));
+        app.modifiers = ModifiersState::default();
+
+        assert!(app.handle_palette_key(&named(NamedKey::Escape), None));
+        assert!(app.palette.is_none(), "the panel is closed");
+    }
+
+    #[test]
+    fn a_command_that_needs_something_it_does_not_have_says_why() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        // No file is open: the commands that need one cannot be used.
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(!app.run_the_command_of_the_key(&character("b")));
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("没有打开的文件"), "got {status}");
     }
 }

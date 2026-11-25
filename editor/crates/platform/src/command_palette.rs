@@ -357,7 +357,9 @@ mod tests {
             .into_iter()
             .map(|row| row.command.title.as_str())
             .collect();
-        assert_eq!(titles, vec!["格式化文档", "重命名", "打开终端"]);
+        // The commands are shown in groups: the group comes first, and the
+        // title inside the group.
+        assert_eq!(titles, vec!["打开终端", "格式化文档", "重命名"]);
     }
 
     #[test]
@@ -400,9 +402,11 @@ mod tests {
     #[test]
     fn the_enter_key_runs_the_command_that_is_picked() {
         let mut palette = CommandPalette::open(&registry(), &Context::default());
+        // The first command of the list is picked: the down key takes the
+        // next one.
         palette.handle_key(&Key::<&str>::Named(NamedKey::ArrowDown), None, false);
         let command = palette.handle_key(&Key::<&str>::Named(NamedKey::Enter), None, false);
-        assert_eq!(command, PaletteCommand::Run("editor.rename".to_owned()));
+        assert_eq!(command, PaletteCommand::Run("editor.format".to_owned()));
     }
 
     #[test]
