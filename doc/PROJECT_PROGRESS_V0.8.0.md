@@ -2,7 +2,7 @@
 
 文档号：`V0.8.0`  
 产品版本：`0.8.0`  
-状态：进行中（DF-0801 缩略图滑块实现中；DF-0802 起计划）  
+状态：进行中（DF-0801 缩略图滑块已实现，窗口级验收待跑；DF-0802 起计划）  
 更新日期：2026-11-25
 
 ---
@@ -23,6 +23,10 @@ V0.7.0 把编辑器的**外壳**换成了 VS Code 的样子：命令注册表、
 
 本期做前四件（DF-0801 ~ DF-0804），后三件留在后面。
 
+**第一轮做完的是 DF-0801 缩略图滑块**：正文右边多了一条 90 px 宽的窄条，画的是**整个文件**（不是屏幕上那几行），屏幕上看到的那一段画得更亮并带上下边线（滑块），点它正文跳到那一段——光标不动（地图是「找地方」用的，不是「挪光标」用的）。它是一个**密度图**：每一像素行取落进这一行的最宽行画一条，条的宽度正比于那行的字符数；VS Code 画的是字母，我们画的是形状——整文件逐字渲染的代价太高，而找位置要的是形状。地图按 **buffer 版本**缓存：数每行有多少字符不便宜，改一个字才重算一次，每帧只画条子。中文按**字符**算不算字节（一个汉字是三个字节、一个字）。短文件**不拉伸**——地图只占条子顶部，下面是死区，点它不跳（跟 VS Code 一个路子）；长文件行高不到 1 px 时才挤满整条。
+
+新组件 `crates/platform/src/minimap.rs`（9 个单测），不认识 `NativeApplication`；窗口布局照旧只有一份（`layout::WindowLayout` 里多一块 `minimap`，正文相应窄 102 px）。
+
 ## 2. 当前完成度
 
 | 模块 | 已完成 | 仍缺失 | 判断 |
@@ -36,11 +40,11 @@ V0.7.0 把编辑器的**外壳**换成了 VS Code 的样子：命令注册表、
 | Agent | ACP 客户端、面板、审批、流式输出、上下文选择、Diff 按块批准、轨迹 | 语义冲突判断 | 可用 |
 | 开发工具 | 任务运行器、交互式终端、Git 面板、全局搜索与替换 | 真伪终端（PTY）、终端多标签、分支与远端 | 基础可用 |
 | 外壳与命令（V0.7.0） | 命令注册表、命令面板、活动栏与侧边栏分区、行号槽、底部状态栏、键位可改、开发模式 | 窗口级验收（统一回归那轮） | 可用 |
-| **编辑体验**（本期） | 缩略图滑块（DF-0801）实现中 | 面包屑、文件图标、缩放、分屏、多光标补齐、工作区文件 | 进行中 |
+| **编辑体验**（本期） | 缩略图滑块（DF-0801）已实现 | 面包屑、文件图标、缩放、分屏、多光标补齐、工作区文件 | 进行中 |
 
 ## 3. V0.8.0 开发项
 
-### DF-0801 缩略图滑块（minimap）（进行中）
+### DF-0801 缩略图滑块（minimap）（已实现，窗口级验收待跑）
 
 正文右边一条窄条，画出**整个文件的样子**，并标出现在看到的是哪一段。
 
@@ -53,6 +57,13 @@ V0.7.0 把编辑器的**外壳**换成了 VS Code 的样子：命令注册表、
 - **大文件不卡**：地图是**按文档版本缓存**的（改一个字才重算一次），每一帧只画条子，不重新数整个文件。
 - **组件拆分**：地图是 `crates/platform/src/minimap.rs`，不认识 `NativeApplication`；窗口布局照旧只有一份（`layout::WindowLayout` 里多一块 `minimap`）。
 - 单元测试覆盖：地图的行宽、可见段的位置、布局里地图与正文不重叠；窗口级验收脚本证明：窄条真的画出来了、滑块跟着滚动走。
+
+实现落点：
+
+- `crates/platform/src/minimap.rs`：`Minimap::of(buffer)` 按行数字符宽度建图（用 `buffer.slice_from` 数 UTF-8 首字节，不复制文本）、`geometry()`（短文件不拉伸、行高 ≤2 px；长文件挤进整条）、`line_at()`（点地图换算行号，短文件下方空白区不算）、`draw()`（每像素行取落入其中的最宽行，屏幕上那段更亮 + 上下边线）。9 个单测。
+- `crates/platform/src/layout.rs`：`WindowLayout` 增 `minimap: Rect`，正文右边让出 90+12 px。
+- `crates/platform/src/editor_view.rs`：`EditorView` 增 `minimap` 缓存（按 buffer version 重建）+ `minimap()`。
+- `crates/platform/src/lib.rs`：`build_scene` 画地图；`press_minimap()` 点地图跳行（光标不动）；两个集成测试（点地图跳到那一段、文本变了地图重建）。
 
 ### DF-0802 面包屑（计划）
 
@@ -119,10 +130,15 @@ cd codeweaver-workspace; npm run build
 
 | 检查 | 命令 | 结果 |
 |---|---|---|
-| 编辑器全量单元测试 | `cargo test --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --no-fail-fast` | 待回填 |
-| 编辑器静态检查 | `cargo clippy --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --all-targets` | 待回填 |
-| 编辑器构建 | `cargo build --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml -p codeweaver-editor` | 待回填 |
-| 窗口级验收 | — | 未跑（会抢桌面，留给统一回归那一轮） |
+| 编辑器全量单元测试 | `cargo test --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --no-fail-fast` | **665 项全过，0 失败**（其中 platform 363 项，本轮 +11） |
+| 编辑器静态检查 | `cargo clippy --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --all-targets` | **0 告警**，exit 0 |
+| 编辑器构建 | `cargo build --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml -p codeweaver-editor` | **成功**，`editor/Cargo.toml` 版本 = `0.8.0` |
+| git 模块单元检查（工作区之外跑） | `powershell -NoProfile -ExecutionPolicy Bypass -File editor\tools\git-unit-check.ps1` | **12 项全过，0 失败**（在 `cargo test` 里这组会整组跳过并打印 `BLOCKED:`——跳过不算通过） |
+| 运行时测试 | `cd codeweaver-hermes-lab; npm test` | **689 项，688 过 / 1 跳过 / 0 失败**，exit 0 |
+| 控制台构建 | `cd codeweaver-workspace; npm run build` | **成功**（`tsc && vite build`，10.88 s） |
+| 窗口级验收 | `editor\tools\minimap-check.ps1`（本轮新写） | **未跑**：脚本会抢桌面（杀进程、抢焦点、注入按键），留给统一回归那一轮。本轮只做了静态解析校验：**0 解析错误、无 BOM、无非 ASCII 字节** |
+
+已写但未跑的窗口级脚本（连同 V0.7.0/V0.6.0 留下的十四个）都还没有窗口证据：外壳（活动栏、行号槽、状态栏）与本期的缩略图**一次都没在窗口里看过**。
 
 ### 6.3 环境约束（影响验收怎么跑）
 
@@ -130,10 +146,12 @@ cd codeweaver-workspace; npm run build
 
 ### 6.4 待跑的验收
 
-- V0.7.0 与 V0.6.0 留下来的窗口级脚本（`activity-bar`/`command-palette`/`format`/`rename`/`task`/`command`/`git`/`debug`/`search`/`terminal`）都还没跑；本期的缩略图也要一个窗口级脚本（窄条在不在、滑块跟不跟滚动、点它跳不跳），随统一回归补齐。
+- V0.7.0 与 V0.6.0 留下来的窗口级脚本（`activity-bar`/`command-palette`/`format`/`rename`/`task`/`command`/`git`/`debug`/`search`/`terminal`）都还没跑；本期的缩略图也补了一个 `minimap-check.ps1`（4 项检查：窄条画出来了、条子画出来了、可见段更亮、点下半张地图视图跟过去），随统一回归补齐。
+- 本轮写完的 `minimap-check.ps1` 与 `activity-bar-check.ps1` 都只做了**静态**校验（PowerShell 解析 0 错误、无 BOM、无非 ASCII 字节），没有运行——运行会抢桌面。
 
 ## 7. 本期结转
 
-- **窗口级的证据仍然空着**：V0.6.0 与 V0.7.0 留下的十四个脚本一次都没跑（会抢桌面），统一回归那一轮跑全套。
-- **调试只对着假适配器验过**：真适配器（debugpy）一次都没碰过。
+- **窗口级的证据仍然空着**：V0.6.0 与 V0.7.0 留下的十四个脚本，加上本轮新写的 `activity-bar-check.ps1` 与 `minimap-check.ps1`，一次都没跑（会抢桌面），统一回归那一轮跑全套。
+- **调试仍只对着假适配器验过**：真适配器（debugpy）一次都没碰过。
 - **缩放（DF-0804）要动常量**：`editor_view::FONT_SIZE` 与 `LINE_HEIGHT` 现在是常量，不是状态；缩放要把它们变成「跟着设置走」的东西，涉及布局与命中测试，是本期最难的一件。
+- **下一轮自然接 DF-0802 面包屑**：它跟缩略图共用「窗口布局只有一份」这条规矩——面包屑占正文上方一条，横跨正文宽度。
