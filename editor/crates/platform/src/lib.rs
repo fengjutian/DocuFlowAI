@@ -45,6 +45,8 @@ use codeweaver_workspace::{
 use codeweaver_workbench::{close_decision, CloseDecision, Tab, TabBar, TabId};
 use code_action::ActionPopup;
 use command::CommandBox;
+use command_palette::{CommandPalette, PaletteCommand};
+use commands::{CommandRegistry, Context, When};
 use completion::CompletionPopup;
 use debug::{BreakpointMark, Breakpoints, DebugPanel, DebugState, DebugStep, Debugger};
 use editor_view::{
@@ -446,7 +448,7 @@ impl NativeApplication {
             formatting: None,
             rename_box: None,
             command_box: None,
-            commands: default_commands(),
+            commands: commands::default_registry(),
             palette: None,
             command_history: Vec::new(),
             terminal_input: None,
@@ -4642,6 +4644,12 @@ impl ApplicationHandler for NativeApplication {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 // While the window is asking a question, it takes every key.
                 if self.handle_prompt_key(&event.logical_key.as_ref()) {
+                    window.request_redraw();
+                    return;
+                }
+                // The panel that lists the commands takes every key while it
+                // is open.
+                if self.handle_palette_key(&event.logical_key.as_ref(), event.text.as_deref()) {
                     window.request_redraw();
                     return;
                 }
