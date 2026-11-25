@@ -1,6 +1,8 @@
 mod agent;
 mod code_action;
 mod command;
+mod command_palette;
+mod commands;
 mod completion;
 mod context;
 mod debug;
@@ -218,6 +220,13 @@ pub struct NativeApplication {
     rename_box: Option<RenameBox>,
     /// The box that asks for a command, when it is open.
     command_box: Option<CommandBox>,
+    /// The commands of the editor.
+    ///
+    /// They are registered once: everything that asks "which command does
+    /// this key run?" or "what can be done here?" asks them.
+    commands: CommandRegistry,
+    /// The panel that lists the commands, when it is open.
+    palette: Option<CommandPalette>,
     /// The commands that were run before.
     ///
     /// They are kept in the order they were run, the newest last.
@@ -437,6 +446,8 @@ impl NativeApplication {
             formatting: None,
             rename_box: None,
             command_box: None,
+            commands: default_commands(),
+            palette: None,
             command_history: Vec::new(),
             terminal_input: None,
             terminal_has_focus: false,
