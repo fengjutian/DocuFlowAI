@@ -10,7 +10,7 @@ use codeweaver_platform::{HighlightPolicy, NativeApplication};
 /// ```text
 /// codeweaver-editor [file] [--find <text>] [--lsp <program>] [--complete]
 ///                    [--highlight-limit <bytes>] [--highlight-lines <lines>]
-///                    [--dap <program>] [--dap-arg <arg>]
+///                    [--dap <program>] [--dap-arg <arg>] [--dev]
 /// ```
 ///
 /// With a path, the file is opened into the buffer; without one, the editor
@@ -26,6 +26,12 @@ use codeweaver_platform::{HighlightPolicy, NativeApplication};
 /// With `--highlight-limit` and `--highlight-lines`, the sizes at which the
 /// editor stops colouring a file are set. A file that is over the limit is
 /// still edited and saved; it only loses its colours.
+///
+/// With `--dev`, the editor is in development mode: what it says about
+/// itself is written into `.dev-logs/editor.log` in the folder the editor
+/// was started in, and `Ctrl+Shift+D` opens the developer panel, which shows
+/// that log, the commands of the editor and the state of the language
+/// server.
 fn main() -> Result<()> {
     let mut path: Option<PathBuf> = None;
     let mut query: Option<String> = None;
@@ -33,6 +39,7 @@ fn main() -> Result<()> {
     let mut adapter: Option<String> = None;
     let mut adapter_args: Vec<String> = Vec::new();
     let mut complete = false;
+    let mut dev = false;
     let mut limit_bytes: Option<usize> = None;
     let mut limit_lines: Option<usize> = None;
     let mut args = std::env::args_os().skip(1);
@@ -50,6 +57,8 @@ fn main() -> Result<()> {
             }
         } else if argument == "--complete" {
             complete = true;
+        } else if argument == "--dev" {
+            dev = true;
         } else if argument == "--highlight-limit" {
             limit_bytes = args
                 .next()
@@ -65,9 +74,17 @@ fn main() -> Result<()> {
         }
     }
 
-    let mut application = match server {
-        Some(server) => NativeApplication::with_language_server(path, server)?,
-        None => NativeApplication::new(path)?,
+    let mut application = match (dev, server) {
+        (true, Some(server)) => NativeApplication::in_development_mode_with_language_server(
+            path,
+            server,
+            codeweaver_platform::dev_log_path(),
+        )?,
+        (true, None) => {
+            NativeApplication::in_development_mode(path, codeweaver_platform::dev_log_path())?
+        }
+        (false, Some(server)) => NativeApplication::with_language_server(path, server)?,
+        (false, None) => NativeApplication::new(path)?,
     };
     if let Some(program) = adapter {
         application.set_debug_adapter(AdapterConfig::new(program, adapter_args));

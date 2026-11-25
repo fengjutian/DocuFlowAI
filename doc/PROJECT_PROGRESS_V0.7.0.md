@@ -155,8 +155,14 @@ V0.6.0 把编辑器从「能读能高亮能补全能跑 Agent」推到了「像�
 ```powershell
 cargo test --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace
 cargo clippy --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --all-targets
+cargo build --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml -p codeweaver-editor
+# 单元级证据：git 模块的检查要在工作区之外跑（低完整性进程起不了 git）
+powershell -NoProfile -ExecutionPolicy Bypass -File editor\tools\git-unit-check.ps1
 # 窗口级证据：Ctrl+Shift+P 真的列出命令、挑一个真的执行了
 powershell -NoProfile -ExecutionPolicy Bypass -File editor\tools\command-palette-check.ps1
+# 运行时与控制台（版本号跟着文档号走，两边都要对）
+cd codeweaver-hermes-lab; npm test
+cd codeweaver-workspace; npm run build
 ```
 
 ### 6.2 实测结果
@@ -165,9 +171,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File editor\tools\command-palette
 
 | 检查 | 命令 | 结果 |
 |---|---|---|
-| 编辑器全量单元测试 | `cargo test --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --no-fail-fast` | **全绿**，EXIT 0（platform 库 271 项全过；全工作区无失败项） |
+| 编辑器全量单元测试 | `cargo test --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --no-fail-fast` | **全绿**，EXIT 0（platform 库 272 项全过；全工作区无失败项） |
 | 编辑器静态检查 | `cargo clippy --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --all-targets` | **0 告警**，EXIT 0 |
+| 编辑器构建 | `cargo build --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml -p codeweaver-editor` | 成功（`codeweaver-editor v0.7.0`），EXIT 0 |
 | git 模块单元检查（工作区之外） | `powershell -NoProfile -ExecutionPolicy Bypass -File editor\tools\git-unit-check.ps1` | **12 项，12 过**，EXIT 0，**无 `BLOCKED:`** |
+| 运行时与 ACP 端点 | `cd codeweaver-hermes-lab; npm test` | 689 项，688 过 / 1 跳过 / 0 失败，EXIT 0 |
+| 控制台前端 | `cd codeweaver-workspace; npm run build` | 成功（tsc + vite），EXIT 0 |
 | 窗口级验收 | `editor\tools\*.ps1` | **本轮一次都没跑**（会抢桌面，留给统一回归那一轮） |
 
 **这一轮收口挖出来的两个真缺陷（都已修，都有回归测试钉住）**
@@ -178,12 +187,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File editor\tools\command-palette
 **为了把命令系统接通而改的键位（取舍）**
 
 - `Ctrl+Shift+P` 从「运行任意命令」变成**命令面板**（跟 VS Code 一致）；跑命令挪到 `Ctrl+Shift+U`，命令面板里有一条「运行命令…」。
-- 跟着改的还有 `Ctrl+F`（查找）、`Ctrl+Shift+B`（构建）、`F9`/`F5`/`F8`（调试）、`Alt+Shift+F`（格式化）、`F2`（重命名）、`Ctrl+Shift+E`（求值）、`Ctrl+M`（交给 Agent）——这些键位原先写死在各自的 handler 里，现在统一从注册表查。**原来的键位没变**，只是换了走法。
+- 跟着改的还有 `Ctrl+F`（查找）、`Ctrl+Shift+B`（构建）、`F9`/`F5`/`F8`（调试）、`Alt+Shift+F`（格式化）、`F2`（重命名）、`Ctrl+Shift+E`（求值）、`Ctrl+S`（保存）、`Ctrl+W`（关标签页）、`Ctrl+M`（交给 Agent）——这些键位原先写死在各自的 handler 里，现在统一从注册表查。**原来的键位没变**，只是换了走法。
+- `Ctrl+W` 原来在 Agent 那一臂里（跟 `Ctrl+.` 取消本轮放在一起），现在归命令表管；「关闭标签页」这条命令的启用条件是「总是」——没有打开文件时也能关掉那个空标签页。
 - `tools\command-check.ps1` 里的 `Ctrl+Shift+P` 改成 `Ctrl+Shift+U`（命令框换了键）。
 
 **顺带修掉的验收脚本里的一个错**
 
-窗口级脚本里，**方块颜色**要按 sRGB 换算（显卡把颜色写进屏幕时做了转换），**文字颜色**不用换算。`command-check.ps1` 拿文字的办法去数方块（`BOX_RGB`/`PANEL_RGB` 用了原值），数出来永远是 0——那个脚本还没跑过，所以没人发现。已改成用换算后的值。**同一类错还留在 `git-check.ps1` 与 `search-check.ps1` 里**（`BOX_RGB` 等），它们也还没跑过，统一回归那一轮之前要改。
+窗口级脚本里，**方块颜色**要按 sRGB 换算（显卡把颜色写进屏幕时做了转换），**文字颜色**不用换算。`command-check.ps1`、`git-check.ps1`、`search-check.ps1`、`terminal-check.ps1`、`task-check.ps1`、`debug-check.ps1` 拿文字的办法去数方块（`BOX_RGB`/`PANEL_RGB`/`GROUND_RGB`/`CARET_RGB`/`BREAKPOINT_RGB` 等用了原值），数出来永远是 0——那些脚本还没跑过，所以没人发现。已逐个对着画图代码改成换算后的值（方块用 `To-Pixel`，文字仍用 `To-Bytes`）。`window-check.ps1` 与 `workbench-check.ps1` 本来就是对的。
 
 
 ### 6.3 环境约束（影响验收怎么跑）
@@ -193,13 +203,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File editor\tools\command-palette
 ### 6.4 待跑的验收
 
 - `editor\tools\command-palette-check.ps1`：**已写，未跑**——证明「`Ctrl+Shift+P` 真的开了面板」「命令真的列出来了」「写几个字列表真的收窄了」「`Esc` 关掉面板、正文回来」「挑一个之后它真的执行了（设置面板出现了）」。共 9 项检查。
-- V0.6.0 留下来的窗口级脚本（`format`/`rename`/`task`/`command`/`git`/`debug`/`search`/`terminal`）在统一回归那一轮一起跑；`command-check.ps1` 的命令框键位已改成 `Ctrl+Shift+U`。
-- **跑之前先修 `git-check.ps1` 与 `search-check.ps1` 里的颜色换算**（§6.2 最后一条）：它们数方块颜色时用了没换算的值，数出来永远是 0。
+- V0.6.0 留下来的窗口级脚本（`format`/`rename`/`task`/`command`/`git`/`debug`/`search`/`terminal`）在统一回归那一轮一起跑；`command-check.ps1` 的命令框键位已改成 `Ctrl+Shift+U`，六个脚本里数方块颜色的换算已改对（§6.2 最后一条）。
 
 ## 7. 本期结转
 
 - **V0.6.0 的窗口级证据仍然空着**：十四���脚本本轮一次都没跑（会抢桌面）。V0.7.0 完成后统一跑一轮，把数字回填 V0.6.0 §6.2。
 - **调试只对着假适配器验过**：DAP 协议层已经修好（`variablesReference` 的名字原来漏了），但真适配器（`debugpy`）一次都没碰过——这是 6 项调试功能的唯一真证据。
 - **命令系统只是第一步**：注册表立起来之后，活动栏、菜单、状态栏提示、键位设置都从它取；再往上是扩展生态（V0.9.0）。
-- **窗口级脚本还没跑过**：V0.7.0 的 `command-palette-check.ps1` 与 V0.6.0 留下来的十三个脚本**一次都没跑**（会抢桌面）。统一回归那一轮要跑全套，并且**先修 `git-check.ps1` 与 `search-check.ps1` 里数方块颜色的换算**（§6.2 最后一条）——不然那两个脚本数出来永远是 0。
+- **窗口级脚本还没跑过**：V0.7.0 的 `command-palette-check.ps1` 与 V0.6.0 留下来的十三个脚本**一次都没跑**（会抢桌面）。统一回归那一轮要跑全套；颜色换算的那几处已经改对了，但**阈值与位置仍然没有实测过**——第一轮跑可能会暴露脚本本身的问题（跟 `format-check.ps1` 当初那样）。
 - **「跑命令」的键位变了**：`Ctrl+Shift+P` 从「运行命令」变成「命令面板」，跑命令挪到 `Ctrl+Shift+U`——这是跟 VS Code 对齐的取舍，旧的键位不再管用，命令面板里有一条「运行命令…」兜着。

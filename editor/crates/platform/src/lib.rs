@@ -6,6 +6,8 @@ mod commands;
 mod completion;
 mod context;
 mod debug;
+mod developer;
+mod devlog;
 mod diff_review;
 pub mod editor_view;
 pub mod find;
@@ -49,6 +51,8 @@ use command_palette::{CommandPalette, PaletteCommand};
 use commands::{CommandRegistry, Context as CommandContext, When};
 use completion::CompletionPopup;
 use debug::{BreakpointMark, Breakpoints, DebugPanel, DebugState, DebugStep, Debugger};
+use developer::{DeveloperCommand, DeveloperPanel, Line as DeveloperLine};
+use devlog::DevLog;
 use editor_view::{
     BodyOverlay, EditorView, FindOverlay, LINE_HEIGHT, MarkSeverity, RendererMeasurer,
 };
@@ -229,6 +233,17 @@ pub struct NativeApplication {
     commands: CommandRegistry,
     /// The panel that lists the commands, when it is open.
     palette: Option<CommandPalette>,
+    /// Whether the editor was started in development mode.
+    ///
+    /// In development mode the editor writes what it says about itself into
+    /// a file, so that a run nobody watched can still be read afterwards.
+    dev: bool,
+    /// The log of this run, when the editor is in development mode.
+    dev_log: Option<DevLog>,
+    /// The panel that shows what the editor is doing inside, when it is open.
+    developer: Option<DeveloperPanel>,
+    /// The status that was written to the log, so that it is written once.
+    logged_status: Option<String>,
     /// The commands that were run before.
     ///
     /// They are kept in the order they were run, the newest last.
@@ -336,10 +351,20 @@ struct PendingDiff {
     path: String,
 }
 
+/// Where the log of a development run is written.
+///
+/// The log belongs to the folder the editor was started in: that is the
+/// folder of the project when the editor is started from it, and the log of
+/// a run is then next to the code that run was about.
+pub fn dev_log_path() -> PathBuf {
+    let folder = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    folder.join(".dev-logs").join("editor.log")
+}
+
 impl NativeApplication {
     /// Creates the application, opening `path` when one is given.
     pub fn new(path: Option<PathBuf>) -> Result<Self> {
-        Self::build(path, None)
+        Self::build(path, None, None)
     }
 
     /// Creates the application with a language server of the caller's
@@ -348,12 +373,41 @@ impl NativeApplication {
     /// Without this, the server of the language of the file is used: the
     /// editor knows `rust-analyzer` and `gopls`, but nothing else.
     pub fn with_language_server(path: Option<PathBuf>, server: ServerConfig) -> Result<Self> {
-        Self::build(path, Some(server))
+        Self::build(path, Some(server), None)
+    }
+
+    /// Creates the application in development mode.
+    ///
+    /// In development mode the editor writes what it says about itself into
+    /// a file, and the developer panel shows that file, the commands of the
+    /// editor and the state of the language server.
+    ///
+    /// The log belongs to this run: it is emptied when the editor starts.
+    pub fn in_development_mode(path: Option<PathBuf>, log: PathBuf) -> Result<Self> {
+        Self::build(path, None, Some(log))
+    }
+
+    /// Creates the application in development mode, with a language server of
+    /// the caller's choosing.
+    pub fn in_development_mode_with_language_server(
+        path: Option<PathBuf>,
+        server: ServerConfig,
+        log: PathBuf,
+    ) -> Result<Self> {
+        Self::build(path, Some(server), Some(log))
     }
 
     /// Creates the application, with the language server to use when it is
     /// given.
-    fn build(path: Option<PathBuf>, server_config: Option<ServerConfig>) -> Result<Self> {
+    fn build(
+        path: Option<PathBuf>,
+        server_config: Option<ServerConfig>,
+        dev_log: Option<PathBuf>,
+    ) -> Result<Self> {
+        // The log is opened before anything else happens, so that what
+        // happens while the editor starts is in it too.
+        let dev_log = dev_log.map(DevLog::open);
+        let dev = dev_log.is_some();
         let workspace = Workspace::detached();
         let mut tabs = TabBar::new();
         let mut panes: Vec<EditorPane> = Vec::new();
@@ -423,7 +477,7 @@ impl NativeApplication {
                 )
             });
 
-        let application = NativeApplication {
+        let mut application = NativeApplication {
             window: None,
             renderer: None,
             input: TextInputState::default(),
@@ -465,6 +519,10 @@ impl NativeApplication {
             command_box: None,
             commands,
             palette: None,
+            dev,
+            dev_log,
+            developer: None,
+            logged_status: None,
             command_history: Vec::new(),
             terminal_input: None,
             terminal_has_focus: false,
@@ -477,7 +535,53 @@ impl NativeApplication {
             selected_context: 0,
             conflicts: None,
         };
+
+        // What happened while the editor started is in the log too: a run
+        // that failed to start is the run one wants to read about most.
+        if application.dev_log.is_some() {
+            let opened = match application.panes[application.active].document.as_ref() {
+                Some(document) => format!("打开了 {}", document.path().display()),
+                None => "没有打开文件".to_owned(),
+            };
+            application.note(&format!("开发模式启动，{opened}"));
+            if application.server.is_some() {
+                application.note("语言服务器起来了");
+            }
+            if let Some(conflict) = application.status.clone() {
+                application.note(&conflict);
+            }
+        }
         Ok(application)
+    }
+
+    /// Writes one line into the log of this run.
+    ///
+    /// Without the development mode there is no log, and the line goes
+    /// nowhere: the editor does not write files behind the person's back.
+    fn note(&mut self, line: &str) {
+        if let Some(log) = self.dev_log.as_mut() {
+            log.write(line);
+        }
+    }
+
+    /// Writes the status into the log, when the status has changed.
+    ///
+    /// The status line is where the editor says what it did, so it is the
+    /// one thing the log has to have. It is written once per change: the
+    /// status is looked at on every frame, and a log that says the same
+    /// thing sixty times a second says nothing.
+    fn log_the_status_if_it_changed(&mut self) {
+        if self.dev_log.is_none() {
+            return;
+        }
+        let Some(status) = self.status.clone() else {
+            return;
+        };
+        if self.logged_status.as_deref() == Some(status.as_str()) {
+            return;
+        }
+        self.logged_status = Some(status.clone());
+        self.note(&status);
     }
 
     /// The pane that is on screen.
@@ -1999,11 +2103,6 @@ impl NativeApplication {
         }
 
         match letter {
-            // Ctrl+W closes the tab that is in front.
-            'w' => {
-                self.request_close(self.active);
-                true
-            }
             // Ctrl+. cancels the running turn.
             '.' => {
                 if let Some(session) = self.agent.as_mut()
@@ -3043,6 +3142,7 @@ impl NativeApplication {
         self.rename_box.is_some()
             || self.command_box.is_some()
             || self.palette.is_some()
+            || self.developer.is_some()
             || self.search.is_some()
             || self.breakpoint_condition.is_some()
             || self.debug_expression.is_some()
@@ -3981,12 +4081,142 @@ impl NativeApplication {
         true
     }
 
+    /// Opens the panel that shows what the editor is doing inside.
+    ///
+    /// The panel is a modal: it covers the window, the way the settings
+    /// panel does, and it takes the keys while it is open.
+    fn open_developer_panel(&mut self) {
+        // Only one panel at a time: the panel that lists the commands and
+        // the settings panel give up their place.
+        self.palette = None;
+        self.settings = None;
+        self.developer = Some(DeveloperPanel::new());
+        self.status = Some("开发者面板：↑↓ 翻页，Esc 关掉".to_owned());
+    }
+
+    /// Handles the keys of the developer panel.
+    fn handle_developer_key<T: AsRef<str>>(&mut self, key: &Key<T>, scale_factor: f64) -> bool {
+        let Some(mut panel) = self.developer.take() else {
+            return false;
+        };
+        let lines = self.developer_lines();
+        let visible = developer::visible_rows(self.window_size(scale_factor));
+        match panel.handle_key(key, lines.len(), visible) {
+            DeveloperCommand::None => {}
+            DeveloperCommand::Close => {
+                self.status = Some("关掉了开发者面板".to_owned());
+                return true;
+            }
+        }
+        self.developer = Some(panel);
+        true
+    }
+
+    /// The lines the developer panel shows.
+    ///
+    /// The panel says what the editor is made of: the commands and their
+    /// keys, whether two of them want the same key, what the language server
+    /// and the agent are doing, and what the log says.
+    fn developer_lines(&self) -> Vec<DeveloperLine> {
+        let mut lines = Vec::new();
+
+        lines.push(DeveloperLine::section("开发模式"));
+        if self.dev {
+            lines.push(DeveloperLine::good("开着".to_owned()));
+        } else {
+            lines.push(DeveloperLine::warning(
+                "没有以开发模式启动（加 --dev 再来）".to_owned(),
+            ));
+        }
+        match self.dev_log.as_ref() {
+            Some(log) => {
+                lines.push(DeveloperLine::text(format!(
+                    "日志：{}",
+                    log.path().display()
+                )));
+                if log.is_writing() {
+                    lines.push(DeveloperLine::good("日志在写".to_owned()));
+                } else {
+                    lines.push(DeveloperLine::warning(
+                        log.problem().unwrap_or("日志没有在写").to_owned(),
+                    ));
+                }
+            }
+            None => lines.push(DeveloperLine::text("没有日志".to_owned())),
+        }
+
+        lines.push(DeveloperLine::section("语言服务器"));
+        lines.push(match self.server.as_ref() {
+            Some(_) => DeveloperLine::good("连着".to_owned()),
+            None => DeveloperLine::text("没有连着".to_owned()),
+        });
+
+        lines.push(DeveloperLine::section("Agent"));
+        lines.push(match self.agent.as_ref() {
+            Some(_) => DeveloperLine::good("在".to_owned()),
+            None => match self.agent_error.as_ref() {
+                Some(error) => DeveloperLine::warning(format!("不可用：{error}")),
+                None => DeveloperLine::text("没有连".to_owned()),
+            },
+        });
+
+        lines.push(DeveloperLine::section(format!(
+            "命令（{} 条）",
+            self.commands.all().len()
+        )));
+        for command in self.commands.all() {
+            let key = command
+                .keybinding
+                .as_ref()
+                .map(|keybinding| keybinding.text())
+                .unwrap_or_default();
+            let when = match command.when {
+                When::Always => String::new(),
+                When::HasFile => "要文件".to_owned(),
+                When::HasNameAtCaret => "要名字".to_owned(),
+                When::HasRepository => "要仓库".to_owned(),
+            };
+            lines.push(DeveloperLine::text(format!(
+                "{:<28} {:<16} {:<12} {}",
+                command.id, command.title, key, when
+            )));
+        }
+
+        lines.push(DeveloperLine::section("键位冲突"));
+        let conflicts = self.commands.conflicts();
+        if conflicts.is_empty() {
+            lines.push(DeveloperLine::good("没有两条命令要同一个键".to_owned()));
+        } else {
+            for conflict in conflicts {
+                lines.push(DeveloperLine::warning(format!(
+                    "{} 和 {} 都要 {}",
+                    conflict.first, conflict.second, conflict.keybinding.text()
+                )));
+            }
+        }
+
+        lines.push(DeveloperLine::section("日志"));
+        match self.dev_log.as_ref() {
+            Some(log) => {
+                let tail = log.last(30);
+                if tail.is_empty() {
+                    lines.push(DeveloperLine::text("还没有话说".to_owned()));
+                }
+                for line in tail {
+                    lines.push(DeveloperLine::text(line.to_owned()));
+                }
+            }
+            None => lines.push(DeveloperLine::text("没有日志".to_owned())),
+        }
+
+        lines
+    }
+
     /// What the commands may ask about.
     ///
     /// The editor tells the registry what is true right now; the registry
     /// says which commands that lets it run.
-    fn command_context(&self) -> CommandContext {
-        let pane = &self.panes[self.active];
+    fn command_context(&self) -> CommandContext {        let pane = &self.panes[self.active];
         let has_name_at_caret = rename::word_at_caret(pane.editor.buffer(), pane.editor.caret().0)
             .is_some();
         let has_repository = pane
@@ -4046,6 +4276,7 @@ impl NativeApplication {
                 // The command of the panel opens the panel again.
                 self.open_palette();
             }
+            "workbench.developerPanel" => self.open_developer_panel(),
             "workbench.settings" => self.open_settings(),
             "workbench.save" => {
                 if let Some(tab) = self.tabs.active().map(|tab| tab.id) {
@@ -4765,6 +4996,11 @@ impl ApplicationHandler for NativeApplication {
                     window.request_redraw();
                     return;
                 }
+                // The developer panel takes every key while it is open.
+                if self.handle_developer_key(&event.logical_key.as_ref(), window.scale_factor()) {
+                    window.request_redraw();
+                    return;
+                }
                 // The settings panel takes every key while it is open, and
                 // Ctrl+, opens it.
                 if self.handle_settings_key(&event.logical_key.as_ref()) {
@@ -5003,8 +5239,14 @@ impl ApplicationHandler for NativeApplication {
                 if self.poll_disk() {
                     window.request_redraw();
                 }
+                // What the editor says about itself goes into the log of the
+                // run, once per change.
+                self.log_the_status_if_it_changed();
                 // The status line is read before the renderer is borrowed.
                 let status_line = self.status_line();
+                // The lines of the developer panel are read before the
+                // renderer is borrowed as well.
+                let developer_lines = self.developer.as_ref().map(|_| self.developer_lines());
                 // The output of the task is read before the renderer is
                 // borrowed as well.
                 let task_panel = self.task_panel.then(|| TaskPanel {
@@ -5089,6 +5331,8 @@ impl ApplicationHandler for NativeApplication {
                         expression: self.debug_expression.as_ref().map(|box_| box_.field()),
                         search: self.search.as_ref(),
                         palette: self.palette.as_ref(),
+                        developer: self.developer.as_ref(),
+                        developer_lines: developer_lines.as_deref().unwrap_or(&[]),
                         debug: debug_panel,
                         breakpoints: &breakpoints,
                         conflicts: conflict,
@@ -5214,6 +5458,10 @@ struct Chrome<'a> {
     search: Option<&'a SearchPanel>,
     /// The panel that lists the commands, when it is open.
     palette: Option<&'a CommandPalette>,
+    /// The panel that shows what the editor is doing inside, when it is open.
+    developer: Option<&'a DeveloperPanel>,
+    /// The lines of that panel, as they are drawn.
+    developer_lines: &'a [DeveloperLine],
     /// The panel of the debugger, when there is a session.
     debug: Option<DebugPanel<'a>>,
     /// The lines of the breakpoints of the file that is on screen.
@@ -5313,6 +5561,13 @@ fn build_scene(
     // the panel is therefore left out of the picture, not covered by it.
     if let Some(settings) = chrome.settings {
         push_settings(&mut scene, viewport, size, settings);
+        return scene;
+    }
+
+    // The panel that shows what the editor is doing inside covers the
+    // window, the way the settings do.
+    if let Some(panel) = chrome.developer {
+        developer::draw(&mut scene, viewport, size, panel, chrome.developer_lines);
         return scene;
     }
 
@@ -8650,6 +8905,24 @@ mod tests {
     }
 
     #[test]
+    fn the_close_tab_key_closes_the_tab_that_is_in_front() {
+        let directory = scratch_dir("close-tab");
+        let first = directory.join("one.txt");
+        let second = directory.join("two.txt");
+        fs::write(&first, "one\n").unwrap();
+        fs::write(&second, "two\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(first)).expect("the application starts");
+        app.open_file(&second);
+        assert_eq!(app.tabs.len(), 2, "two tabs are open");
+
+        // Ctrl+W is the key of the command that closes the tab.
+        app.modifiers = ModifiersState::CONTROL;
+        assert!(app.run_the_command_of_the_key(&character("w")));
+        assert_eq!(app.tabs.len(), 1, "the tab in front is closed");
+    }
+
+    #[test]
     fn the_palette_key_opens_the_panel_of_the_commands() {
         let mut app = NativeApplication::new(None).expect("the application starts");
         app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
@@ -8703,5 +8976,98 @@ mod tests {
         assert!(!app.run_the_command_of_the_key(&character("b")));
         let status = app.status.clone().unwrap_or_default();
         assert!(status.contains("没有打开的文件"), "got {status}");
+    }
+
+    /// An application in development mode, with its log in a folder of its
+    /// own.
+    fn app_in_development_mode(name: &str) -> (NativeApplication, PathBuf) {
+        let directory = scratch_dir(name);
+        let log = directory.join("editor.log");
+        let app = NativeApplication::in_development_mode(None, log.clone())
+            .expect("the application starts");
+        (app, log)
+    }
+
+    #[test]
+    fn the_development_mode_writes_what_the_editor_says() {
+        let (mut app, log) = app_in_development_mode("dev-mode-log");
+        app.status = Some("编辑器说了一句话".to_owned());
+        app.log_the_status_if_it_changed();
+
+        let text = fs::read_to_string(&log).expect("the log is read");
+        assert!(text.contains("编辑器说了一句话"), "got {text}");
+    }
+
+    #[test]
+    fn the_status_is_written_to_the_log_once_per_change() {
+        let (mut app, log) = app_in_development_mode("dev-mode-once");
+        app.status = Some("一句话".to_owned());
+        app.log_the_status_if_it_changed();
+        app.log_the_status_if_it_changed();
+        app.log_the_status_if_it_changed();
+
+        let text = fs::read_to_string(&log).expect("the log is read");
+        assert_eq!(text.matches("一句话").count(), 1, "got {text}");
+    }
+
+    #[test]
+    fn an_editor_that_is_not_in_development_mode_writes_no_log() {
+        let app = NativeApplication::new(None).expect("the application starts");
+        assert!(app.dev_log.is_none(), "there is no log without the mode");
+        assert!(!app.dev, "the editor is not in development mode");
+    }
+
+    #[test]
+    fn the_developer_key_opens_the_panel_that_shows_the_inside() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(app.run_the_command_of_the_key(&character("d")));
+        assert!(app.developer.is_some(), "the panel is open");
+    }
+
+    #[test]
+    fn the_developer_panel_says_what_the_editor_is_made_of() {
+        let app = NativeApplication::new(None).expect("the application starts");
+        let lines = app.developer_lines();
+        let text: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+        assert!(
+            text.iter().any(|line| line.contains("editor.format")),
+            "the commands are listed: {text:?}"
+        );
+        assert!(
+            text.iter().any(|line| line.contains("键位冲突")),
+            "the conflicts are named: {text:?}"
+        );
+    }
+
+    #[test]
+    fn the_developer_panel_says_that_the_editor_is_not_in_development_mode() {
+        let app = NativeApplication::new(None).expect("the application starts");
+        let lines = app.developer_lines();
+        let text: Vec<&str> = lines.iter().map(|line| line.text.as_str()).collect();
+        assert!(
+            text.iter().any(|line| line.contains("没有以开发模式启动")),
+            "the panel says why: {text:?}"
+        );
+    }
+
+    #[test]
+    fn the_escape_key_closes_the_developer_panel() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(app.run_the_command_of_the_key(&character("d")));
+        assert!(app.handle_developer_key(&named(NamedKey::Escape), 1.0));
+        assert!(app.developer.is_none(), "the panel is closed");
+    }
+
+    #[test]
+    fn a_panel_that_is_open_takes_every_key() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(app.run_the_command_of_the_key(&character("d")));
+        // A key that is not the panel's is swallowed by the panel: the
+        // document behind it must not see it.
+        assert!(app.handle_developer_key(&character("x"), 1.0));
+        assert!(app.developer.is_some(), "the panel stays open");
     }
 }

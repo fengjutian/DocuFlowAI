@@ -77,6 +77,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\
 - 同一条约束管着 **`git.exe`**（`D:\Program Files\Git\cmd`，Medium 完整性）：仓库里的二进制（含 `cargo test` 的测试二进制）起不了它。因此凡是要真跑 `git` 的单元检查，都得把测试二进制复制到 `%LOCALAPPDATA%` 之外再跑（见 `editor/tools/git-unit-check.ps1`）；`cargo test` 里那组检查会整组跳过并打印 `BLOCKED:`——**跳过不算通过**。
 - 本机 `rust-analyzer` 是 rustup 代理且组件未装在默认工具链，代理报「Unknown binary」；可用二进制在 `%USERPROFILE%\.rustup\toolchains\1.98.1-x86_64-pc-windows-msvc\bin\rust-analyzer.exe`，用编辑器的 `--lsp <program>` 点名它。
 - 验收用的工程必须自带空 `[workspace]` 表，并放在工作区之外，否则 `cargo locate-project` 会报「believes it's in a workspace when it's not」。
+- **窗口级脚本里数颜色：方块要 sRGB 换算，文字不用。** 显卡把颜色写进 sRGB 屏幕时方块过了转换（`To-Screen`/`To-Pixel`），文字那一遍没过（`To-Bytes`）。拿文字的办法去数方块，数出来永远是 0；六个脚本（`command`/`git`/`search`/`terminal`/`task`/`debug`）曾都踩过这一脚，已改对。新写脚本照着 `tools/command-palette-check.ps1` 的 `To-Pixel`/`To-Bytes` 区分。
 - PowerShell 5.1：不支持 `&&` / `||`，不要用 `/dev/null`、heredoc、`sed -i`；写文件用 `[System.IO.File]::WriteAllText($p, $s, [Text.UTF8Encoding]::new($false))` 防 BOM，临时 `.ps1` 含中文必须存成 UTF-8 **BOM**（否则按 GBK 解析）。
 
 ## Git
