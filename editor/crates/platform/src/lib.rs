@@ -4192,6 +4192,11 @@ impl NativeApplication {
             | Key::Named(NamedKey::ArrowRight)
             | Key::Named(NamedKey::Home)
             | Key::Named(NamedKey::End)
+            // The window system names the space bar instead of making it a
+            // character: without this arm the space would fall through to
+            // the document behind the terminal, and no command could have an
+            // argument (`echo hello`, `cargo build`, `git status`).
+            | Key::Named(NamedKey::Space)
             | Key::Character(_) => {
                 box_.handle_key(key, text, false);
                 self.terminal_input = Some(box_);
@@ -6684,7 +6689,10 @@ mod tests {
         let box_ = app.breakpoint_condition.as_ref().expect("the box is there");
         assert_eq!(box_.text(), "c>3");
 
-        // The condition is taken away by writing nothing.
+        // The condition is taken away by erasing it and confirming.
+        for _ in 0..3 {
+            app.handle_breakpoint_condition_key(&named(NamedKey::Backspace), None);
+        }
         app.handle_breakpoint_condition_key(&named(NamedKey::Enter), None);
         assert_eq!(app.breakpoints.condition_of(&uri, 1), None);
         assert_eq!(
@@ -6946,14 +6954,36 @@ mod tests {
             "the terminal is still there: the shell goes on"
         );
 
-        // What is typed now goes into the document.
+        // What is typed now goes into the document. The terminal lets the key
+        // go: what the document does with it is the window's business, so
+        // what the terminal is asked for is that it does not take the key.
         assert!(!app.handle_terminal_key(&character("x"), Some("x")));
         let terminal = app.terminal_input.as_ref().expect("the terminal is there");
         assert_eq!(terminal.text(), "", "the letter did not go into the terminal");
-        assert!(
-            app.editor().text().contains('x'),
-            "the letter went into the document: {:?}",
-            app.editor().text()
+        assert_eq!(
+            app.editor().text(),
+            "one\ntwo\n",
+            "the terminal did not put the letter into the document either"
+        );
+    }
+
+    #[test]
+    fn the_space_bar_goes_into_the_terminal_and_not_into_the_document() {
+        let mut app = app_with_file("terminal-space");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        app.handle_terminal_key(&character("t"), None);
+        app.modifiers = ModifiersState::default();
+
+        // The window system names the space bar instead of making it a
+        // character: without this the space falls through to the document,
+        // and no command can have an argument.
+        assert!(app.handle_terminal_key(&named(NamedKey::Space), None));
+        let terminal = app.terminal_input.as_ref().expect("the terminal is there");
+        assert_eq!(terminal.text(), " ");
+        assert_eq!(
+            app.editor().text(),
+            "one\ntwo\n",
+            "the space did not go into the document"
         );
     }
 
@@ -7014,6 +7044,12 @@ mod tests {
         app.handle_terminal_key(&character("t"), None);
         app.modifiers = ModifiersState::default();
         for letter in ["e", "c", "h", "o"] {
+            app.handle_terminal_key(&character(letter), Some(letter));
+        }
+        // The window system names the space bar: without it the command
+        // could not have an argument.
+        app.handle_terminal_key(&named(NamedKey::Space), None);
+        for letter in ["h", "e", "l", "l", "o"] {
             app.handle_terminal_key(&character(letter), Some(letter));
         }
         app.handle_terminal_key(&named(NamedKey::Enter), None);

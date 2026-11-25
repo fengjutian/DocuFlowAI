@@ -451,9 +451,13 @@ pub fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     // The host is empty for a local file; a host that is not empty is a
     // remote file, which the editor does not open.
-    let rest = rest.strip_prefix('/')?;
-    // A Windows path begins with a drive letter, which the URI writes after
-    // a slash: `file:///C:/code`. The slash is not part of the path.
+    if !rest.starts_with('/') {
+        return None;
+    }
+    // The path begins with the root: `file:///work/main.rs` is the path
+    // `/work/main.rs`. A Windows path begins with a drive letter, which the
+    // URI writes after the root slash: `file:///C:/code`. That slash is not
+    // part of the path.
     let rest = match rest.strip_prefix('/') {
         Some(rest) if is_drive_letter(rest) => rest,
         _ => rest,

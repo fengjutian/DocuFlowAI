@@ -111,7 +111,11 @@ pub struct Scope {
     /// The name of the group.
     pub name: String,
     /// The number the variables of the group are asked for by.
-    #[serde(default)]
+    ///
+    /// The protocol writes the number as `variablesReference`: without that
+    /// name the number is read as zero, and the editor asks the adapter for
+    /// the variables of a group that does not exist.
+    #[serde(rename = "variablesReference", default)]
     pub variables_reference: i64,
     /// Whether the variables of the group are expensive to ask for.
     #[serde(default)]
@@ -130,7 +134,7 @@ pub struct Variable {
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub type_: Option<String>,
     /// The number the children of the variable are asked for by.
-    #[serde(default)]
+    #[serde(rename = "variablesReference", default)]
     pub variables_reference: i64,
 }
 
@@ -147,7 +151,7 @@ pub struct EvaluateResult {
     #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
     pub type_: Option<String>,
     /// The number the children of the value are asked for by.
-    #[serde(default)]
+    #[serde(rename = "variablesReference", default)]
     pub variables_reference: i64,
 }
 

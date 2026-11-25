@@ -223,7 +223,13 @@ pub(crate) fn run(root: &Path, args: &[impl AsRef<str>]) -> Result<String, Strin
         .output()
         .map_err(|error| format!("git 起不来：{error}"))?;
     if !output.status.success() {
+        // Git says why it failed in either of the two streams: `git commit`
+        // writes "nothing to commit" to the output, and other commands write
+        // their complaint to the error. The person has to be told which one
+        // it was, so both are read.
         let said = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let out = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let said = if said.is_empty() { out } else { said };
         return Err(if said.is_empty() {
             format!("git 失败了（退出码 {:?}）", output.status.code())
         } else {
