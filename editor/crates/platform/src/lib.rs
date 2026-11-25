@@ -614,6 +614,14 @@ impl NativeApplication {
             .context("native event loop failed")
     }
 
+    /// Whether the editor is in development mode.
+    ///
+    /// In development mode the editor writes what it says about itself into
+    /// a file, so that a run nobody watched can still be read afterwards.
+    pub fn is_development_mode(&self) -> bool {
+        self.dev
+    }
+
     /// The editor's buffer.
     pub fn editor(&self) -> &Editor {
         &self.panes[self.active].editor

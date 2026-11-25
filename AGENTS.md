@@ -30,6 +30,9 @@ cd codeweaver-workspace; npm run build
 
 # 本地全栈（后端 + 控制台）
 python scripts/dev.py --runtime pi
+
+# 编辑器（开发模式：日志进 .dev-logs\editor.log，Ctrl+Shift+D 开开发者面板）
+D:\github\DocuFlowAI\editor\target\debug\codeweaver-editor.exe <文件> --dev
 ```
 
 窗口级验收脚本（`editor/tools/*.ps1`）**必须串行跑**：每个脚本开头都会 `Stop-Process -Name codeweaver-editor`，并行会互相杀掉对方的窗口。

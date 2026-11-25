@@ -38,7 +38,7 @@ V0.6.0 把编辑器从「能读能高亮能补全能跑 Agent」推到了「像�
 | 调试 | DAP 客户端、断点、单步、变量、条件断点、表达式求值、调用栈、跳源码 | 命中次数、多线程、调试控制台、**真适配器未验** | 最小可用 |
 | Agent | ACP 客户端、面板、审批、流式输出、上下文选择、Diff 按块批准、轨迹 | 语义冲突判断 | 可用 |
 | 开发工具 | 任务运行器、交互式终端、Git 面板、全局搜索与替换 | 真伪终端（PTY）、终端多标签 | 基础可用 |
-| **外壳与命令**（本期） | 命令注册表（DF-0701）、命令面板（DF-0702）——自动化测试全绿，窗口级脚本已写未跑 | 活动栏（DF-0703）、键位可改（DF-0704） | 进行中 |
+| **外壳与命令**（本期） | 命令注册表（DF-0701）、命令面板（DF-0702）、开发模式（DF-0707）——自动化测试全绿，窗口级脚本已写未跑 | 活动栏（DF-0703）、键位可改（DF-0704） | 进行中 |
 
 ## 3. V0.7.0 开发项
 
@@ -103,6 +103,26 @@ V0.6.0 把编辑器从「能读能高亮能补全能跑 Agent」推到了「像�
 - 命令面板里每一行都写着命令现在的键位。
 - 单元测试覆盖：键位文件的解析、写错时的说法、覆盖之后注册表查出来的键位变了。
 
+### DF-0707 开发模式（已实现）
+
+编辑器自己带一个开发开关：以 `--dev` 启动时，它把「自己说了什么」写进文件，并在一块面板里把内部摊开。
+
+验收标准：
+
+- **`--dev` 开关在命令行上**：`codeweaver-editor <文件> --dev`。
+- **日志落盘**：编辑器说的每一句（状态栏上的那些话）都写进 `.dev-logs\editor.log`（在编辑器启动的那个目录里），每行前面写着「这是启动后第几秒」。**日志只属于这一次运行**——启动时清空，读到的就是这次运行发生的事，不是两次的混账。
+- **日志文件开不了也不拦人**：写不进去的时候编辑器**明说**（面板里写「日志没有在写」和原因），窗口照开——一个没有的日志比一个开不了的编辑器好。
+- **开发者面板**（`Ctrl+Shift+D`，命令 `workbench.developerPanel`）：一块盖住窗口的面板，上面写着——
+  - 开发模式开没开、日志文件在哪、日志有没有在写；
+  - 语言服务器连着没有、Agent 在不在；
+  - **命令表**：每一条命令的 id、标题、键位、什么时候能用；
+  - **键位冲突**：哪两条命令要同一个键（没有就写「没有」）；
+  - **日志尾部**：最近 30 行。
+- **面板可以翻**：`↑↓` 翻一行、`PgUp`/`PgDn` 翻一页、`Esc` 关掉。面板开着的时候它自己吃键（后面的正文看不到那些键）。
+- **不是开发模式时也有这个面板**：面板会说「没有以开发模式启动（加 --dev 再来）」，而不是什么都不发生。
+- 组件拆分：日志是 `crates/platform/src/devlog.rs`，面板是 `crates/platform/src/developer.rs`，两个都不认识 `NativeApplication`。
+- 单元测试覆盖：日志写进文件、文件属于一次运行、写不了时说原因、面板滚动不越界、命令行开关传到编辑器；**窗口级行为未验**（面板长什么样、日志在真实运行里长什么样，要等统一回归那轮的窗口级脚本）。
+
 ### DF-0705 LSP 按范围格式化（进行中）
 
 - 有选区时，格式化快捷键和命令面板发送选区范围；无选区时执行整篇格式化。
@@ -156,6 +176,8 @@ V0.6.0 把编辑器从「能读能高亮能补全能跑 Agent」推到了「像�
 cargo test --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace
 cargo clippy --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --all-targets
 cargo build --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml -p codeweaver-editor
+# 开发模式：编辑器说的每一句都进 .dev-logs\editor.log，Ctrl+Shift+D 打开开发者面板
+D:\github\DocuFlowAI\editor\target\debug\codeweaver-editor.exe <文件> --dev
 # 单元级证据：git 模块的检查要在工作区之外跑（低完整性进程起不了 git）
 powershell -NoProfile -ExecutionPolicy Bypass -File editor\tools\git-unit-check.ps1
 # 窗口级证据：Ctrl+Shift+P 真的列出命令、挑一个真的执行了
@@ -171,7 +193,7 @@ cd codeweaver-workspace; npm run build
 
 | 检查 | 命令 | 结果 |
 |---|---|---|
-| 编辑器全量单元测试 | `cargo test --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --no-fail-fast` | **全绿**，EXIT 0（platform 库 272 项全过；全工作区无失败项） |
+| 编辑器全量单元测试 | `cargo test --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --no-fail-fast` | **全绿**，EXIT 0（**596 项，596 过，0 失败**；其中 platform 库 294 项、命令行解析 9 项） |
 | 编辑器静态检查 | `cargo clippy --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --all-targets` | **0 告警**，EXIT 0 |
 | 编辑器构建 | `cargo build --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml -p codeweaver-editor` | 成功（`codeweaver-editor v0.7.0`），EXIT 0 |
 | git 模块单元检查（工作区之外） | `powershell -NoProfile -ExecutionPolicy Bypass -File editor\tools\git-unit-check.ps1` | **12 项，12 过**，EXIT 0，**无 `BLOCKED:`** |
@@ -210,5 +232,5 @@ cd codeweaver-workspace; npm run build
 - **V0.6.0 的窗口级证据仍然空着**：十四���脚本本轮一次都没跑（会抢桌面）。V0.7.0 完成后统一跑一轮，把数字回填 V0.6.0 §6.2。
 - **调试只对着假适配器验过**：DAP 协议层已经修好（`variablesReference` 的名字原来漏了），但真适配器（`debugpy`）一次都没碰过——这是 6 项调试功能的唯一真证据。
 - **命令系统只是第一步**：注册表立起来之后，活动栏、菜单、状态栏提示、键位设置都从它取；再往上是扩展生态（V0.9.0）。
-- **窗口级脚本还没跑过**：V0.7.0 的 `command-palette-check.ps1` 与 V0.6.0 留下来的十三个脚本**一次都没跑**（会抢桌面）。统一回归那一轮要跑全套；颜色换算的那几处已经改对了，但**阈值与位置仍然没有实测过**——第一轮跑可能会暴露脚本本身的问题（跟 `format-check.ps1` 当初那样）。
+- **窗口级脚本还没跑过**：V0.7.0 的 `command-palette-check.ps1` 与 V0.6.0 留下来的十三个脚本**一次都没跑**（会抢桌面）。统一回归那一轮要跑全套；颜色换算的那几处已经改对了，但**阈值与位置仍然没有实测过**——第一轮跑可能会暴露脚本本身的问题（跟 `format-check.ps1` 当初那样）。**开发模式（DF-0707）的面板长什么样、日志在真实运行里长什么样，同样没在窗口里看过。**
 - **「跑命令」的键位变了**：`Ctrl+Shift+P` 从「运行命令」变成「命令面板」，跑命令挪到 `Ctrl+Shift+U`——这是跟 VS Code 对齐的取舍，旧的键位不再管用，命令面板里有一条「运行命令…」兜着。
