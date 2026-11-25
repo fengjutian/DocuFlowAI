@@ -142,16 +142,26 @@ function To-Srgb([double]$value) {
 function To-Bytes([double[]]$value) {
     return @($value | ForEach-Object { [int][Math]::Round($_ * 255) })
 }
+# The colour of a block of colour on the screen. A block goes through the
+# conversion that turns the colour of the code into the colour of the screen;
+# the text does not.
+function To-Pixel([double[]]$value) {
+    return @($value | ForEach-Object { [int][Math]::Round((To-Srgb $_) * 255) })
+}
 # The ground of the panel, the colour of the path of a file, the colour of
 # the state of a file that is not staged and of one that is, the colour of a
 # line that was put in, and the colour of the box that asks for the message
 # of the commit.
-$GROUND_RGB = To-Bytes @(0.055, 0.063, 0.082)
+#
+# The ground of the panel and the ground of the box are blocks of colour. The
+# path, the state, the lines of the diff and the number of a commit are text,
+# and the text is drawn in the colour the code writes.
+$GROUND_RGB = To-Pixel @(0.055, 0.063, 0.082)
 $PATH_RGB = To-Bytes @(0.86, 0.89, 0.94)
 $NEW_RGB = To-Bytes @(0.93, 0.74, 0.42)
 $STAGED_RGB = To-Bytes @(0.42, 0.78, 0.56)
 $ADDED_RGB = To-Bytes @(0.52, 0.82, 0.58)
-$BOX_RGB = To-Bytes @(0.10, 0.12, 0.16)
+$BOX_RGB = To-Pixel @(0.10, 0.12, 0.16)
 # The number that names a commit is in a colour of its own, the same green
 # as the state of a staged file.
 $COMMIT_ID_RGB = To-Bytes @(0.42, 0.78, 0.56)

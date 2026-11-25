@@ -112,16 +112,22 @@ function To-Srgb([double]$value) {
 function To-Bytes([double[]]$value) {
     return @($value | ForEach-Object { [int][Math]::Round($_ * 255) })
 }
+# The colour of a block of colour on the screen. A block goes through the
+# conversion that turns the colour of the code into the colour of the screen;
+# the text does not.
+function To-Pixel([double[]]$value) {
+    return @($value | ForEach-Object { [int][Math]::Round((To-Srgb $_) * 255) })
+}
 
 # The colours of the terminal.
 #
-# The ground of the panel, the colour of what the shell said, the colour of
-# the line that is being typed, the caret in that line, and the colour of the
-# text of the document.
-$PANEL_RGB = To-Bytes @(0.055, 0.063, 0.082)
+# The ground of the panel and the caret are blocks of colour. What the shell
+# said, the line that is being typed and the text of the document are text,
+# and the text is drawn in the colour the code writes.
+$PANEL_RGB = To-Pixel @(0.055, 0.063, 0.082)
 $OUTPUT_RGB = To-Bytes @(0.78, 0.81, 0.87)
 $TYPED_RGB = To-Bytes @(0.86, 0.89, 0.94)
-$CARET_RGB = To-Bytes @(0.30, 0.58, 0.96)
+$CARET_RGB = To-Pixel @(0.30, 0.58, 0.96)
 $BODY_RGB = To-Bytes @(0.88, 0.90, 0.94)
 
 # The places of the terminal, counted from the bottom of the window.

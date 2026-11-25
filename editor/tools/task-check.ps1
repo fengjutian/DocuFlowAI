@@ -109,8 +109,17 @@ function To-Srgb([double]$value) {
 function To-Bytes([double[]]$value) {
     return @($value | ForEach-Object { [int][Math]::Round($_ * 255) })
 }
+# The colour of a block of colour on the screen. A block goes through the
+# conversion that turns the colour of the code into the colour of the screen;
+# the text does not.
+function To-Pixel([double[]]$value) {
+    return @($value | ForEach-Object { [int][Math]::Round((To-Srgb $_) * 255) })
+}
 # The colour of the output panel, and the colour of the text in it.
-$PANEL_RGB = To-Bytes @(0.055, 0.063, 0.082)
+#
+# The ground of the panel is a block of colour; the text in it is drawn in the
+# colour the code writes.
+$PANEL_RGB = To-Pixel @(0.055, 0.063, 0.082)
 $TEXT_RGB = To-Bytes @(0.78, 0.81, 0.87)
 
 if (-not (Test-Path $exe)) {

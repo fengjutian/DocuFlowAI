@@ -127,18 +127,28 @@ function To-Srgb([double]$value) {
 function To-Bytes([double[]]$value) {
     return @($value | ForEach-Object { [int][Math]::Round($_ * 255) })
 }
+# The colour of a block of colour on the screen. A block goes through the
+# conversion that turns the colour of the code into the colour of the screen;
+# the text does not.
+function To-Pixel([double[]]$value) {
+    return @($value | ForEach-Object { [int][Math]::Round((To-Srgb $_) * 255) })
+}
 # The ground of the panel, the colour of the text in the box, the colour of
 # the place of a result, the colour of the text of the document and the colour
 # of the status line.
-$GROUND_RGB = To-Bytes @(0.055, 0.063, 0.082)
+#
+# The ground of the panel, the ground of the document, the ground of the box
+# and the line of the button are blocks of colour. The text is drawn in the
+# colour the code writes.
+$GROUND_RGB = To-Pixel @(0.055, 0.063, 0.082)
 $TYPED_RGB = To-Bytes @(0.86, 0.89, 0.94)
 $PLACE_RGB = To-Bytes @(0.62, 0.70, 0.86)
-$BODY_RGB = To-Bytes @(0.075, 0.086, 0.11)
+$BODY_RGB = To-Pixel @(0.075, 0.086, 0.11)
 $STATUS_RGB = To-Bytes @(0.55, 0.60, 0.70)
-$BOX_RGB = To-Bytes @(0.10, 0.12, 0.16)
+$BOX_RGB = To-Pixel @(0.10, 0.12, 0.16)
 # The colour of a button that is on. The button that turns the case of the
 # letters on and off is drawn in this colour when it is on.
-$ACCENT_RGB = To-Bytes @(0.30, 0.58, 0.96)
+$ACCENT_RGB = To-Pixel @(0.30, 0.58, 0.96)
 
 # The places of the panel and of the window, in the pixels of the window.
 #

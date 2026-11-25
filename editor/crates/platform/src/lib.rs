@@ -4701,6 +4701,8 @@ impl ApplicationHandler for NativeApplication {
                             commit.type_text(&text);
                         } else if let Some(command) = self.command_box.as_mut() {
                             command.type_text(&text);
+                        } else if let Some(palette) = self.palette.as_mut() {
+                            palette.type_text(&text);
                         } else if let Some(condition) = self.breakpoint_condition.as_mut() {
                             condition.type_text(&text);
                         } else if let Some(expression) = self.debug_expression.as_mut() {
@@ -4802,8 +4804,8 @@ impl ApplicationHandler for NativeApplication {
                     window.request_redraw();
                     return;
                 }
-                // Ctrl+Shift+P opens the box that asks for a command. While
-                // the box is open it takes every key.
+                // The box that asks for a command takes every key while it is
+                // open. It is opened by the command route (Ctrl+Shift+U).
                 if self.handle_command_key(&event.logical_key.as_ref(), event.text.as_deref()) {
                     window.request_redraw();
                     return;

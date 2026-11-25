@@ -6,7 +6,7 @@
 #
 # What the check proves, in the window and not in a unit test:
 #
-# 1. Ctrl+Shift+P opens the box that asks for a command.
+# 1. Ctrl+Shift+U opens the box that asks for a command.
 # 2. The command that is typed goes into the box, not into the document.
 # 3. Enter runs it, and what it said is in the output panel.
 # 4. The command is kept: the next time the box opens, the up key brings it
@@ -99,7 +99,7 @@ $VK_SHIFT = 0x10
 $VK_CONTROL = 0x11
 $VK_RETURN = 0x0D
 $VK_UP = 0x26
-$VK_P = 0x50
+$VK_U = 0x55
 
 function To-Srgb([double]$value) {
     if ($value -le 0.0031308) { return $value * 12.92 }
@@ -108,11 +108,20 @@ function To-Srgb([double]$value) {
 function To-Bytes([double[]]$value) {
     return @($value | ForEach-Object { [int][Math]::Round($_ * 255) })
 }
+# The colour of a block of colour on the screen. A block goes through the
+# conversion that turns the colour of the code into the colour of the screen;
+# the text does not.
+function To-Pixel([double[]]$value) {
+    return @($value | ForEach-Object { [int][Math]::Round((To-Srgb $_) * 255) })
+}
 # The ground of the box, the colour of the text in it, the ground of the
 # output panel, and the colour of the text in the panel.
-$BOX_RGB = To-Bytes @(0.10, 0.12, 0.16)
+#
+# The ground of the box and the ground of the output panel are blocks of
+# colour. The text in them is drawn in the colour the code writes.
+$BOX_RGB = To-Pixel @(0.10, 0.12, 0.16)
 $TYPED_RGB = To-Bytes @(0.86, 0.89, 0.94)
-$PANEL_RGB = To-Bytes @(0.055, 0.063, 0.082)
+$PANEL_RGB = To-Pixel @(0.055, 0.063, 0.082)
 $OUTPUT_RGB = To-Bytes @(0.78, 0.81, 0.87)
 
 # The places of the box, in the pixels of the window.
@@ -377,9 +386,9 @@ try {
         $previous = Focus-Editor $handle
         Start-Sleep -Seconds 2
 
-        # Ctrl+Shift+P opens the box that asks for a command.
+        # Ctrl+Shift+U opens the box that asks for a command.
         $previous = Focus-Editor $handle
-        Send-Chord @($VK_CONTROL, $VK_SHIFT) $VK_P
+        Send-Chord @($VK_CONTROL, $VK_SHIFT) $VK_U
         Start-Sleep -Seconds 2
 
         $boxShot = Save-Window $handle $shotBox
@@ -422,7 +431,7 @@ try {
         # The command is kept: the next time the box opens, the up key
         # brings it back.
         $previous = Focus-Editor $handle
-        Send-Chord @($VK_CONTROL, $VK_SHIFT) $VK_P
+        Send-Chord @($VK_CONTROL, $VK_SHIFT) $VK_U
         Start-Sleep -Seconds 2
         $previous = Focus-Editor $handle
         Send-Key $VK_UP

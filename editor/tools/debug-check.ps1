@@ -139,18 +139,28 @@ function To-Srgb([double]$value) {
 function To-Bytes([double[]]$value) {
     return @($value | ForEach-Object { [int][Math]::Round($_ * 255) })
 }
+# The colour of a block of colour on the screen. A block goes through the
+# conversion that turns the colour of the code into the colour of the screen;
+# the text does not.
+function To-Pixel([double[]]$value) {
+    return @($value | ForEach-Object { [int][Math]::Round((To-Srgb $_) * 255) })
+}
 # The ground of the panel of the debugger, the colour of the breakpoint in
 # the margin, the colour of a breakpoint with a condition, the colour of the
 # text of a variable, the colour of what the adapter said, the colour of the
 # text of a frame of the stack, and the colour of the mark of the frame that
 # is picked.
-$GROUND_RGB = To-Bytes @(0.055, 0.063, 0.082)
-$BREAKPOINT_RGB = To-Bytes @(0.90, 0.35, 0.35)
-$CONDITIONAL_RGB = To-Bytes @(0.95, 0.68, 0.25)
+#
+# The ground of the panel, the dot of a breakpoint and the mark of the picked
+# frame are blocks of colour. The rest is text, and the text is drawn in the
+# colour the code writes.
+$GROUND_RGB = To-Pixel @(0.055, 0.063, 0.082)
+$BREAKPOINT_RGB = To-Pixel @(0.90, 0.35, 0.35)
+$CONDITIONAL_RGB = To-Pixel @(0.95, 0.68, 0.25)
 $VARIABLE_RGB = To-Bytes @(0.82, 0.86, 0.92)
 $OUTPUT_RGB = To-Bytes @(0.62, 0.67, 0.76)
 $FRAME_RGB = To-Bytes @(0.74, 0.80, 0.70)
-$MARKER_RGB = To-Bytes @(0.30, 0.58, 0.96)
+$MARKER_RGB = To-Pixel @(0.30, 0.58, 0.96)
 # The colour of the text inside quotes. It is a colour of its own, so the
 # string in the file of the frame is the proof that this file is on the
 # screen.

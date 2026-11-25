@@ -108,6 +108,17 @@ impl CommandPalette {
         &self.input
     }
 
+    /// Puts composed text into the box.
+    ///
+    /// A machine with a Chinese input method does not send the letters one by
+    /// one: it sends the text that was composed. The text goes into the box
+    /// of the panel, the way it goes into the other boxes of the editor, and
+    /// the list follows it.
+    pub fn type_text(&mut self, text: &str) {
+        self.input.type_text(text);
+        self.filter();
+    }
+
     /// Whether the panel has any command to show.
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
