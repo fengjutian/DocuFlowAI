@@ -4284,7 +4284,8 @@ impl NativeApplication {
                 return true;
             }
             SearchCommand::ReplaceAll { needle, replacement } => {
-                let (files, places, skipped) = self.replace_in_the_files(&needle, &replacement);
+                let (files, places, skipped) =
+                    self.replace_in_the_files(&panel, &needle, &replacement);
                 // The files that are open are dirty now, and the server has to
                 // hear about the new text.
                 self.sync_dirty_flags();
@@ -4354,12 +4355,14 @@ impl NativeApplication {
     ///
     /// Returns how many files were changed, how many places were replaced,
     /// and how many files were left alone.
-    fn replace_in_the_files(&mut self, needle: &str, replacement: &str) -> (usize, usize, usize) {
-        let Some(panel) = self.search.as_ref() else {
-            return (0, 0, 0);
-        };
-        // The rules of the search are the rules of the replacement: the
-        // places that are replaced are the places that were shown.
+    fn replace_in_the_files(
+        &mut self,
+        panel: &SearchPanel,
+        needle: &str,
+        replacement: &str,
+    ) -> (usize, usize, usize) {
+        // The panel is given, not looked for: the one that asks for the
+        // replacement holds the panel in its own hands while it does so.
         let case_sensitive = panel.is_case_sensitive();
         let whole_word = panel.is_whole_word();
         // The files that were found, in the order they were found.
@@ -6846,13 +6849,38 @@ mod tests {
         fs::write(&file, "the needle is here\n").unwrap();
 
         let mut app = NativeApplication::new(Some(file)).expect("the application starts");
-        // The file does not hold the text any more: the search found it, but
-        // the file changed after that.
-        let (files, places, skipped) = app.replace_in_the_files("needle", "pin");
-        assert_eq!(files, 0);
+        // The search finds the text.
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        app.handle_search_key(&character("f"), None);
+        app.modifiers = ModifiersState::default();
+        for letter in ["n", "e", "e", "d", "l", "e"] {
+            app.handle_search_key(&character(letter), Some(letter));
+        }
+        app.handle_search_key(&named(NamedKey::Enter), None);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while app
+            .search
+            .as_ref()
+            .is_some_and(|panel| panel.is_running())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the search did not finish"
+            );
+            app.pump_search();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // The file changes after the search: it does not hold the text any
+        // more, and the replacement leaves it alone rather than change it in
+        // the wrong place.
+        app.editor_mut().load_text("something else\n");
+        let panel = app.search.take().expect("the panel is open");
+        let (files, places, skipped) = app.replace_in_the_files(&panel, "needle", "pin");
+        assert_eq!(files, 0, "the file that changed was not changed");
         assert_eq!(places, 0);
-        assert_eq!(skipped, 0, "there was no file to change at all");
-        assert_eq!(app.editor().text(), "the needle is here\n");
+        assert_eq!(skipped, 1, "the file that changed was left alone");
+        assert_eq!(app.editor().text(), "something else\n");
     }
 
     #[test]

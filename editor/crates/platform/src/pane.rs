@@ -52,7 +52,10 @@ pub struct EditorPane {
     pub errors: usize,
     /// How many of the marks are warnings.
     pub warnings: usize,
-    /// The URI of the document, as the language server knows it.
+    /// The URI of the document.
+    ///
+    /// It is known from the moment the file is opened: whether a file is
+    /// open is a question about the file, not about the language server.
     pub document_uri: Option<String>,
     /// The version the language server was told about.
     pub server_version: Option<u64>,
@@ -87,6 +90,9 @@ impl EditorPane {
     /// A pane for a file that was opened.
     pub fn opened(tab: TabId, document: Document, language: Option<Language>) -> Self {
         let editor = Editor::new(document.saved_text());
+        // The document has its address from the start: the editor has to know
+        // which files are open even when no language server is running.
+        let document_uri = Some(codeweaver_lsp::protocol::file_uri(document.path()));
         EditorPane {
             tab,
             editor,
@@ -99,7 +105,7 @@ impl EditorPane {
             marks: Vec::new(),
             errors: 0,
             warnings: 0,
-            document_uri: None,
+            document_uri,
             server_version: None,
             asked: None,
         }
