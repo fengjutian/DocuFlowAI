@@ -408,7 +408,22 @@ impl NativeApplication {
             panes[0].server_version = Some(panes[0].editor.version());
         }
 
-        Ok(NativeApplication {
+        let commands = commands::default_registry();
+        // Two commands that want one key is a mistake that is said out loud:
+        // the person has to know which one of them the key really runs.
+        let conflict = commands
+            .conflicts()
+            .first()
+            .map(|conflict| {
+                format!(
+                    "命令 {} 和 {} 都要 {} 这个键",
+                    conflict.first,
+                    conflict.second,
+                    conflict.keybinding.text()
+                )
+            });
+
+        let application = NativeApplication {
             window: None,
             renderer: None,
             input: TextInputState::default(),
@@ -416,7 +431,7 @@ impl NativeApplication {
             agent: None,
             agent_error: None,
             workspace,
-            status: None,
+            status: conflict,
             endpoint: None,
             cursor: None,
             find: None,
@@ -448,7 +463,7 @@ impl NativeApplication {
             formatting: None,
             rename_box: None,
             command_box: None,
-            commands: commands::default_registry(),
+            commands,
             palette: None,
             command_history: Vec::new(),
             terminal_input: None,
@@ -461,7 +476,8 @@ impl NativeApplication {
             selected_hunk: 0,
             selected_context: 0,
             conflicts: None,
-        })
+        };
+        Ok(application)
     }
 
     /// The pane that is on screen.
@@ -3928,8 +3944,13 @@ impl NativeApplication {
             self.command_box = None;
             self.take_the_keyboard_from_the_terminal();
             let context = self.command_context();
-            self.palette = Some(CommandPalette::open(&self.commands, &context));
-            self.status = Some("写几个字找命令，上下键挑，回车就跑，Esc 取消".to_owned());
+            let palette = CommandPalette::open(&self.commands, &context);
+            self.status = Some(if palette.is_empty() {
+                "这个编辑器还没有命令".to_owned()
+            } else {
+                "写几个字找命令，上下键挑，回车就跑，Esc 取消".to_owned()
+            });
+            self.palette = Some(palette);
             return true;
         };
 
@@ -4051,31 +4072,13 @@ impl NativeApplication {
 
     /// Handles the keys of the box that asks for a command.
     ///
-    /// Ctrl+Shift+U opens the box. While the box is open it takes every
-    /// key: a command that is typed into the document is not a command.
+    /// The box is opened by the command route (Ctrl+Shift+U). While it is
+    /// open it takes every key: a command that is typed into the document is
+    /// not a command.
     fn handle_command_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
         let Some(mut box_) = self.command_box.take() else {
-            // The box is not open: Ctrl+Shift+U opens it.
-            // A panel that takes every key does not open over another one.
-            if self.a_modal_is_open() {
-                return false;
-            }
-            if !(self.modifiers.control_key() && self.modifiers.shift_key()) {
-                return false;
-            }
-            let Some(letter) = key_letter(key) else {
-                return false;
-            };
-            if !letter.eq_ignore_ascii_case(&'u') {
-                return false;
-            }
-            // Only one box at a time: the box that asks for a new name gives
-            // up its place.
-            self.rename_box = None;
-            self.take_the_keyboard_from_the_terminal();
-            self.command_box = Some(CommandBox::new());
-            self.status = Some("写命令，回车就跑，Esc 取消".to_owned());
-            return true;
+            // The box is not open: the command route opens it.
+            return false;
         };
 
         // Whether the box stays open.
@@ -7711,7 +7714,7 @@ mod tests {
         let mut app = NativeApplication::new(None).expect("the application starts");
         app.modifiers = ModifiersState::ALT | ModifiersState::SHIFT;
 
-        assert!(app.handle_format_key(&character("f")));
+        assert!(app.run_the_command_of_the_key(&character("f")));
         assert!(
             app.status
                 .as_ref()
@@ -7725,9 +7728,9 @@ mod tests {
     fn the_format_key_is_only_the_key_with_alt_and_shift() {
         let mut app = NativeApplication::new(None).expect("the application starts");
         app.modifiers = ModifiersState::ALT;
-        assert!(!app.handle_format_key(&character("f")));
+        assert!(!app.run_the_command_of_the_key(&character("f")));
         app.modifiers = ModifiersState::SHIFT;
-        assert!(!app.handle_format_key(&character("f")));
+        assert!(!app.run_the_command_of_the_key(&character("f")));
     }
 
     /// The edits of a rename, in the shape the server answers in.
@@ -7891,8 +7894,10 @@ mod tests {
     fn the_rename_key_says_when_there_is_no_server() {
         let mut app = NativeApplication::new(None).expect("the application starts");
         app.editor_mut().load_text("let value = 1;\n");
+        // The caret is in a name, so the command can be used at all.
+        app.pane_mut().editor.set_carets(&[TextOffset(5)]);
 
-        assert!(app.handle_rename_key(&named(NamedKey::F2)));
+        assert!(app.run_the_command_of_the_key(&named(NamedKey::F2)));
         assert!(
             app.status
                 .as_ref()
@@ -7909,8 +7914,8 @@ mod tests {
     #[test]
     fn the_rename_key_is_only_the_f2_key() {
         let mut app = NativeApplication::new(None).expect("the application starts");
-        assert!(!app.handle_rename_key(&character("f")));
-        assert!(!app.handle_rename_key(&named(NamedKey::Enter)));
+        assert!(!app.run_the_command_of_the_key(&character("f")));
+        assert!(!app.run_the_command_of_the_key(&named(NamedKey::Enter)));
     }
 
     #[test]
