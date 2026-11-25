@@ -48,7 +48,7 @@ const TOGGLE_GAP: f32 = 6.0;
 
 /// The keys the panel takes.
 pub const HINT: &str =
-    "↑↓ 挑结果 · Enter 打开 · Tab 换地方 · Alt+C 大小写 · Alt+W 全字 · Esc 关掉";
+    "↑↓ 挑结果 · Enter 确认 · Tab 换焦点 · Alt+C 大小写 · Alt+W 全字 · Alt+R 正则 · Alt+P 路径 · Esc 关闭";
 
 /// The keys the panel takes, when it replaces as well as finds.
 pub const REPLACE_HINT: &str =
@@ -63,6 +63,7 @@ pub enum SearchFocus {
     Results,
     /// The text that replaces what was found is being written.
     Replace,
+    Path,
 }
 
 /// What the panel wants the window to do.
@@ -102,6 +103,9 @@ pub struct SearchPanel {
     ///
     /// It does not have to be by default: `cat` is found in `catalog` too.
     whole_word: bool,
+    regex: bool,
+    show_path: bool,
+    path: RenameBox,
     /// The root of the project that is searched.
     root: PathBuf,
     /// The places the text was found.
@@ -148,6 +152,9 @@ impl SearchPanel {
             replacing,
             case_sensitive: false,
             whole_word: false,
+            regex: false,
+            show_path: false,
+            path: RenameBox::message("路径包含"),
             root,
             hits: Vec::new(),
             selected: 0,
@@ -225,6 +232,9 @@ impl SearchPanel {
         if self.whole_word {
             rules.push("全字");
         }
+        if self.regex {
+            rules.push("正则");
+        }
         if rules.is_empty() {
             return String::new();
         }
@@ -257,6 +267,7 @@ impl SearchPanel {
     pub fn type_text(&mut self, text: &str) {
         match self.focus {
             SearchFocus::Replace => self.replace.type_text(text),
+            SearchFocus::Path => self.path.type_text(text),
             _ => self.box_.type_text(text),
         }
     }
@@ -265,6 +276,7 @@ impl SearchPanel {
     fn focused(&mut self) -> &mut RenameBox {
         match self.focus {
             SearchFocus::Replace => &mut self.replace,
+            SearchFocus::Path => &mut self.path,
             _ => &mut self.box_,
         }
     }
@@ -352,6 +364,8 @@ impl SearchPanel {
         let options = SearchOptions {
             case_sensitive: self.case_sensitive,
             whole_word: self.whole_word,
+            regex: self.regex,
+            path_filter: if self.show_path { self.path.text().trim().to_owned() } else { String::new() },
             ..SearchOptions::default()
         };
         std::thread::spawn(move || {
@@ -383,7 +397,9 @@ impl SearchPanel {
         self.hits = results.hits;
         self.selected = 0;
         let rules = self.rules_of();
-        self.status = if results.truncated {
+        self.status = if let Some(error) = results.error {
+            format!("正则表达式无效：{}", error.lines().last().unwrap_or(&error))
+        } else if results.truncated {
             format!("找到 {} 处（太多了，只看前面这些）{rules}", self.hits.len())
         } else if self.hits.is_empty() {
             format!("没有找到{rules}")
@@ -416,6 +432,15 @@ impl SearchPanel {
                     self.toggle_case_sensitive();
                 } else if letter.eq_ignore_ascii_case(&'w') {
                     self.toggle_whole_word();
+                } else if !self.replacing && letter.eq_ignore_ascii_case(&'r') {
+                    self.regex = !self.regex;
+                    self.look_again();
+                } else if !self.replacing && letter.eq_ignore_ascii_case(&'p') {
+                    self.show_path = !self.show_path;
+                    self.focus = if self.show_path { SearchFocus::Path } else { SearchFocus::Input };
+                    if !self.show_path {
+                        self.look_again();
+                    }
                 }
             }
             return SearchCommand::None;
@@ -428,11 +453,13 @@ impl SearchPanel {
                     SearchFocus::Results => {
                         if self.replacing {
                             SearchFocus::Replace
+                        } else if self.show_path {
+                            SearchFocus::Path
                         } else {
                             SearchFocus::Input
                         }
                     }
-                    SearchFocus::Replace => SearchFocus::Input,
+                    SearchFocus::Replace | SearchFocus::Path => SearchFocus::Input,
                 };
                 return SearchCommand::None;
             }
@@ -446,7 +473,7 @@ impl SearchPanel {
             }
             Key::Named(NamedKey::Enter) => {
                 return match self.focus {
-                    SearchFocus::Input => {
+                    SearchFocus::Input | SearchFocus::Path => {
                         if self.start_search() {
                             // The places that were found are what the person
                             // looks at now.
@@ -491,7 +518,7 @@ impl SearchPanel {
             }
             Key::Named(NamedKey::Backspace) | Key::Named(NamedKey::Delete) => {
                 // A key that changes the text belongs to the text.
-                if self.focus != SearchFocus::Replace {
+                if self.focus == SearchFocus::Results {
                     self.focus = SearchFocus::Input;
                 }
                 self.focused().handle_key(key, text, control);
@@ -503,11 +530,13 @@ impl SearchPanel {
                     // The key did not produce text of its own; the text of
                     // the event is what the user typed.
                     if let Some(typed) = text.filter(|typed| !typed.chars().any(char::is_control)) {
-                        self.focus = SearchFocus::Input;
-                        self.box_.type_text(typed);
+                        if self.focus == SearchFocus::Results {
+                            self.focus = SearchFocus::Input;
+                        }
+                        self.type_text(typed);
                     }
                 } else {
-                    if self.focus != SearchFocus::Replace {
+                    if self.focus == SearchFocus::Results {
                         self.focus = SearchFocus::Input;
                     }
                     self.focused().type_text(character);
@@ -746,7 +775,7 @@ pub fn draw_panel(
 
     // The box the replacement is written in, when the panel replaces as well
     // as finds.
-    let room = if panel.is_replacing() { REPLACE_ROOM } else { 0.0 };
+    let room = if panel.is_replacing() || panel.show_path { REPLACE_ROOM } else { 0.0 };
     if panel.is_replacing() {
         draw_box(
             scene,
@@ -757,6 +786,19 @@ pub fn draw_panel(
                 label: &panel.replace_field().title(),
                 text: panel.replacement(),
                 focused: panel.focus() == SearchFocus::Replace,
+            },
+            measurer,
+        );
+    } else if panel.show_path {
+        draw_box(
+            scene,
+            viewport,
+            REPLACE_TOP,
+            width,
+            BoxText {
+                label: "路径包含",
+                text: panel.path.text(),
+                focused: panel.focus() == SearchFocus::Path,
             },
             measurer,
         );
@@ -978,6 +1020,28 @@ mod tests {
         assert_eq!(panel.focus(), SearchFocus::Results);
         panel.handle_key(&named(NamedKey::Tab), None, false, false);
         assert_eq!(panel.focus(), SearchFocus::Input);
+    }
+
+    #[test]
+    fn search_regex_and_path_can_be_set_from_the_keyboard() {
+        let root = scratch("search-panel-regex-and-path");
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "Item42\n").unwrap();
+        fs::write(root.join("notes.txt"), "Item99\n").unwrap();
+        let mut panel = SearchPanel::new(root.clone(), "^item[0-9]+$");
+        panel.handle_key(&character("r"), None, false, true);
+        panel.handle_key(&character("p"), None, false, true);
+        assert_eq!(panel.focus(), SearchFocus::Path);
+        panel.type_text("src/");
+        panel.handle_key(&named(NamedKey::Enter), None, false, false);
+        for _ in 0..200 {
+            if panel.pump() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(panel.hits().len(), 1);
+        assert_eq!(panel.hits()[0].path, root.join("src/main.rs"));
     }
 
     #[test]

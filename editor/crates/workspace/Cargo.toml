@@ -6,4 +6,5 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+regex = "=1.13.1"
 thiserror.workspace = true

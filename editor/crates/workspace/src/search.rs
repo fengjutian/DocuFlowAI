@@ -50,8 +50,10 @@ pub struct SearchHit {
 }
 
 /// How a search is done.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchOptions {
+    pub regex: bool,
+    pub path_filter: String,
     /// Whether the case of the letters counts.
     pub case_sensitive: bool,
     /// Whether the text has to be a whole word.
@@ -67,6 +69,8 @@ pub struct SearchOptions {
 impl Default for SearchOptions {
     fn default() -> Self {
         SearchOptions {
+            regex: false,
+            path_filter: String::new(),
             case_sensitive: false,
             whole_word: false,
             max_hits: MAX_HITS,
@@ -77,6 +81,7 @@ impl Default for SearchOptions {
 /// What a search found.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SearchResults {
+    pub error: Option<String>,
     /// The places the text was found.
     pub hits: Vec<SearchHit>,
     /// How many files were read.
@@ -109,6 +114,21 @@ fn walk(root: &Path, needle: &str, options: SearchOptions) -> SearchResults {
         return results;
     }
     let matcher = Matcher::new(needle, options.case_sensitive, options.whole_word);
+    let regex = if options.regex {
+        match regex::RegexBuilder::new(needle)
+            .case_insensitive(!options.case_sensitive)
+            .build()
+        {
+            Ok(regex) => Some(regex),
+            Err(error) => {
+                results.error = Some(error.to_string());
+                return results;
+            }
+        }
+    } else {
+        None
+    };
+    let path_filter = options.path_filter.replace('\\', "/");
     let ignored = tree::ignored_directories();
 
     let mut directories = vec![root.to_path_buf()];
@@ -130,7 +150,14 @@ fn walk(root: &Path, needle: &str, options: SearchOptions) -> SearchResults {
             if !metadata.is_file() || metadata.len() > MAX_FILE_SIZE {
                 continue;
             }
-            let Ok(bytes) = fs::read(entry.path()) else {
+            let path = entry.path();
+            if !path_filter.is_empty()
+                && !path.strip_prefix(root).unwrap_or(&path).to_string_lossy()
+                    .replace('\\', "/").contains(&path_filter)
+            {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
                 continue;
             };
             if holds_no_text(&bytes) {
@@ -142,7 +169,13 @@ fn walk(root: &Path, needle: &str, options: SearchOptions) -> SearchResults {
             };
             results.files += 1;
             for (index, line) in text.lines().enumerate() {
-                if !matcher.finds(line) {
+                let found = match &regex {
+                    Some(regex) => regex.find_iter(line).any(|hit| {
+                        !options.whole_word || is_whole_word(line, hit.start(), hit.end())
+                    }),
+                    None => matcher.finds(line),
+                };
+                if !found {
                     continue;
                 }
                 results.hits.push(SearchHit {
@@ -322,6 +355,19 @@ mod tests {
             fs::create_dir_all(parent).expect("the scratch directory can be created");
         }
         fs::write(path, text).expect("the scratch file can be written");
+    }
+
+    #[test]
+    fn search_reports_an_invalid_regex_before_reading_files() {
+        let root = scratch("search-invalid-regex");
+        write_file(&root.join("notes.txt"), "[\n");
+        let results = search(&root, "[", SearchOptions {
+            regex: true,
+            ..SearchOptions::default()
+        });
+        assert!(results.error.is_some());
+        assert!(results.hits.is_empty());
+        assert_eq!(results.files, 0);
     }
 
     #[test]
