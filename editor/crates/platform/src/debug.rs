@@ -480,7 +480,7 @@ pub fn frame_at(
     if point.x < STACK_LEFT || point.x > STACK_LEFT + STACK_WIDTH {
         return None;
     }
-    let top = size.height - DEBUG_PANEL_HEIGHT + ROW_TOP;
+    let top = size.height - crate::layout::STATUS_BAR_HEIGHT - DEBUG_PANEL_HEIGHT + ROW_TOP;
     if point.y < top {
         return None;
     }
@@ -529,7 +529,7 @@ pub fn draw_panel(
 
     let rect = Rect::new(
         0.0,
-        size.height - DEBUG_PANEL_HEIGHT,
+        size.height - crate::layout::STATUS_BAR_HEIGHT - DEBUG_PANEL_HEIGHT,
         size.width,
         DEBUG_PANEL_HEIGHT,
     );
@@ -1062,7 +1062,7 @@ mod tests {
         let size = a_window();
         // The panel is at the bottom of the window, and the first frame is
         // on the first row of the column of the stack.
-        let top = size.height - DEBUG_PANEL_HEIGHT + ROW_TOP;
+        let top = size.height - crate::layout::STATUS_BAR_HEIGHT - DEBUG_PANEL_HEIGHT + ROW_TOP;
 
         assert_eq!(frame_at(codeweaver_render::Point { x: 40.0, y: top + 2.0 }, size, 3), Some(0));
         assert_eq!(
@@ -1082,7 +1082,7 @@ mod tests {
     #[test]
     fn a_pointer_that_is_not_on_a_frame_picks_nothing() {
         let size = a_window();
-        let top = size.height - DEBUG_PANEL_HEIGHT + ROW_TOP;
+        let top = size.height - crate::layout::STATUS_BAR_HEIGHT - DEBUG_PANEL_HEIGHT + ROW_TOP;
 
         // The column of the variables is not the column of the stack.
         assert_eq!(

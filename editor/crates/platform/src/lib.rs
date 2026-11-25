@@ -1,3 +1,4 @@
+mod activity_bar;
 mod agent;
 mod code_action;
 mod command;
@@ -12,15 +13,21 @@ mod diff_review;
 pub mod editor_view;
 pub mod find;
 mod git;
+mod gutter;
+mod icons;
 mod input;
 mod keybindings;
+mod layout;
 mod lsp;
+mod minimap;
 mod pane;
 mod paths;
 mod rename;
 mod search;
 mod settings;
 mod shell;
+mod sidebar;
+mod status_bar;
 mod task;
 #[cfg(test)]
 mod testing;
@@ -57,13 +64,17 @@ use devlog::DevLog;
 use editor_view::{
     BodyOverlay, EditorView, FindOverlay, LINE_HEIGHT, MarkSeverity, RendererMeasurer,
 };
+use activity_bar::{Activity, Badges, SideBar};
 use find::{FindBar, FindField};
-use git::GitPanel;
+use git::{GitPanel, GitStatus};
 use input::TextInputState;
+use layout::WindowLayout;
 use pane::EditorPane;
 use rename::RenameBox;
 use search::{SearchCommand, SearchPanel};
 use settings::{KeyRow, Settings};
+use sidebar::{Action as SideBarAction, Row as SideBarRow};
+use status_bar::StatusBar;
 use task::{Task, TaskOutput, TaskPanel, TaskState};
 use winit::{
     application::ApplicationHandler,
@@ -85,10 +96,6 @@ pub use codeweaver_syntax::HighlightPolicy;
 
 const WINDOW_TITLE: &str = "CodeWeaver";
 
-/// The height of the strip the tabs are drawn in.
-const TAB_BAR_HEIGHT: f32 = 34.0;
-/// The width of the panel the file tree is drawn in.
-const SIDEBAR_WIDTH: f32 = 220.0;
 /// The height of the output panel of a task.
 const TASK_PANEL_HEIGHT: f32 = 200.0;
 
@@ -180,6 +187,11 @@ pub struct NativeApplication {
     task_panel: bool,
     /// The panel of the changes of the repository, when it is open.
     git: Option<GitPanel>,
+    /// What git knows about the files of the project.
+    ///
+    /// It is asked for once and then kept, so that the badge on the activity
+    /// bar can say how many files changed without asking git every frame.
+    source_control: Option<GitStatus>,
     /// The box that asks for the message of a commit, when it is open.
     commit_box: Option<RenameBox>,
     /// The debug adapter, when one is named.
@@ -268,6 +280,12 @@ pub struct NativeApplication {
     /// It is kept so that the person who searches twice does not have to
     /// type the same word twice.
     search_needle: String,
+    /// The places the last search found.
+    ///
+    /// They are kept after the panel of the search is closed: the section of
+    /// the side bar shows them, and the badge on the activity bar counts
+    /// them.
+    search_hits: Vec<SearchHit>,
     /// The rename request that is on its way.
     ///
     /// The request is about one place in one document, and it is only good
@@ -289,6 +307,16 @@ pub struct NativeApplication {
     /// They are settled one at a time; the merged text is written once they
     /// all are.
     conflicts: Option<PendingConflict>,
+    /// The section the side bar shows, and whether it is shown at all.
+    ///
+    /// The section is a state: switching away and back again leaves the
+    /// content of the section as it was.
+    sidebar: SideBar,
+    /// Whether the keyboard is on the activity bar.
+    ///
+    /// The keyboard is on one thing at a time: the terminal has it, the find
+    /// bar has it, and when the person says so, the activity bar has it.
+    activity_focus: bool,
 }
 
 /// A change that conflicts with what the buffer holds.
@@ -529,6 +557,7 @@ impl NativeApplication {
             task_title: String::new(),
             task_panel: false,
             git: None,
+            source_control: None,
             commit_box: None,
             debug_adapter: None,
             debug: None,
@@ -559,11 +588,14 @@ impl NativeApplication {
             terminal_history: Vec::new(),
             search: None,
             search_needle: String::new(),
+            search_hits: Vec::new(),
             renaming: None,
             pending_diff: None,
             selected_hunk: 0,
             selected_context: 0,
             conflicts: None,
+            sidebar: SideBar::default(),
+            activity_focus: false,
         };
 
         // What happened while the editor started is in the log too: a run
@@ -1265,13 +1297,13 @@ impl NativeApplication {
     }
 
     /// Brings the tab that was clicked to the front.
-    fn press_tab_bar(&mut self, point: Point, size: Size) {
+    fn press_tab_bar(&mut self, point: Point, layout: &WindowLayout) {
         let strip = {
             let Some(renderer) = self.renderer.as_mut() else {
                 return;
             };
             let mut measurer = RendererMeasurer::new(renderer, TextFamily::SansSerif);
-            tab_strip(self.tabs.tabs(), self.active, size, &mut measurer)
+            tab_strip(self.tabs.tabs(), self.active, layout, &mut measurer)
         };
         self.activate_tab_at(point, &strip);
     }
@@ -1285,20 +1317,90 @@ impl NativeApplication {
         }
     }
 
-    /// Opens the file that was clicked, or opens and closes the directory.
-    fn press_file_tree(&mut self, point: Point, size: Size) {
-        let Some(tree) = self.tree.as_mut() else {
+    /// Does what the row of the side bar that was clicked says.
+    fn press_side_bar(&mut self, point: Point, panel: Rect) {
+        let rows = self.sidebar_rows(panel);
+        let Some(row) = sidebar::hit(&rows, point) else {
             return;
         };
-        let rows = shell::tree_rows(tree.nodes(), sidebar_rect(size));
-        let Some(row) = shell::tree_hit(&rows, point) else {
+        // A directory of the tree is opened and closed.
+        match &row.action {
+            SideBarAction::None => {}
+            SideBarAction::OpenFile(path) => {
+                self.open_file(path);
+            }
+            SideBarAction::OpenFileAt { path, line } => {
+                self.open_file(path);
+                self.go_to_line(*line);
+            }
+            SideBarAction::ToggleBreakpoint(line) => self.toggle_breakpoint_at(*line),
+            SideBarAction::ToggleDirectory(path) => {
+                if let Some(tree) = self.tree.as_mut() {
+                    tree.toggle(path);
+                }
+            }
+        }
+    }
+
+    /// Shows the section of the activity that was clicked.
+    ///
+    /// Clicking the activity that is on screen hides the side bar, the way
+    /// VS Code does it.
+    fn press_activity_bar(&mut self, point: Point, layout: &WindowLayout) {
+        let bar = activity_bar::ActivityBar::layout(
+            layout.activity_bar,
+            self.sidebar.selected(),
+            &self.badges(),
+        );
+        let Some(activity) = bar.hit(point) else {
             return;
         };
-        if row.directory {
-            tree.toggle(&row.path);
+        self.sidebar.pick(activity);
+    }
+
+    /// Jumps to the part of the file that was clicked on the map.
+    ///
+    /// The map shows the whole file, so a click on it says where in the file
+    /// the person wants to be. The caret stays where it is: the map is for
+    /// finding a place, not for moving the caret.
+    fn press_minimap(&mut self, point: Point, layout: &WindowLayout) {
+        let pane = &mut self.panes[self.active];
+        let total = pane.editor.buffer().line_count();
+        let Some(line) = pane
+            .view
+            .minimap(pane.editor.buffer())
+            .line_at(point.y, layout.minimap)
+        else {
+            return;
+        };
+        let visible = ((layout.body.size.height / LINE_HEIGHT).floor() as usize).max(1);
+        let first = line.saturating_sub(visible / 2).min(total.saturating_sub(1));
+        pane.view.view.first_line = first;
+    }
+
+    /// Puts the caret on a line of the file that is open.
+    fn go_to_line(&mut self, line: usize) {
+        let pane = &mut self.panes[self.active];
+        let buffer = pane.editor.buffer();
+        if line == 0 || line > buffer.line_count() {
             return;
         }
-        self.open_file(&row.path);
+        let offset = buffer.line_range(line - 1).start.0;
+        pane.editor.set_carets(&[TextOffset(offset)]);
+    }
+
+    /// Puts a breakpoint on a line of the file that is open, or takes it away.
+    fn toggle_breakpoint_at(&mut self, line: u32) {
+        let Some(uri) = self.uri_of_the_open_file() else {
+            self.status = Some("没有打开的文件，断点放不了".to_owned());
+            return;
+        };
+        let there = self.breakpoints.toggle(&uri, line);
+        self.status = Some(if there {
+            format!("第 {line} 行有了断点")
+        } else {
+            format!("第 {line} 行的断点去掉了")
+        });
     }
 
     /// The agent's transcript so far.
@@ -1736,7 +1838,9 @@ impl NativeApplication {
 
     /// How many lines of the body fit on screen.
     fn visible_lines(&self, scale_factor: f64) -> usize {
-        let body = editor_body_rect(self.window_size(scale_factor), self.bottom_panel_height());
+        let body = self
+            .window_layout(self.window_size(scale_factor))
+            .body;
         ((body.size.height / LINE_HEIGHT).floor() as usize).max(1)
     }
 
@@ -1745,12 +1849,12 @@ impl NativeApplication {
     /// The layout is only rebuilt when something it depends on changed, so
     /// a mouse move does not pay for measuring the text again.
     fn rebuild_layout(&mut self, scale_factor: f64) {
-        let bottom = self.bottom_panel_height();
+        let size = self.window_size(scale_factor);
+        let layout = self.window_layout(size);
+        let body = layout.body;
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        let size = renderer.logical_size(scale_factor);
-        let body = editor_body_rect(size, bottom);
         let mut measurer = RendererMeasurer::new(renderer, TextFamily::Monospace);
         let pane = &mut self.panes[self.active];
         pane.view.layout(
@@ -1982,14 +2086,28 @@ impl NativeApplication {
             return;
         };
         let size = self.window_size(scale_factor);
-        // The tab strip and the file tree are around the text: a click there
-        // is not a click in the document.
-        if tab_bar_rect(size).contains(cursor) {
-            self.press_tab_bar(cursor, size);
+        let layout = self.window_layout(size);
+        // The bar with the activities is on the left of the window: a click
+        // there picks the section of the side bar. The status bar is drawn
+        // over the bottom of the bar, so it is not part of it.
+        if layout.activity_bar.contains(cursor) && cursor.y < layout.status_bar.origin.y {
+            self.press_activity_bar(cursor, &layout);
             return;
         }
-        if sidebar_rect(size).contains(cursor) {
-            self.press_file_tree(cursor, size);
+        // The tab strip and the file tree are around the text: a click there
+        // is not a click in the document.
+        if layout.tab_bar.contains(cursor) {
+            self.press_tab_bar(cursor, &layout);
+            return;
+        }
+        if layout.sidebar.size.width > 0.0 && layout.sidebar.contains(cursor) {
+            self.press_side_bar(cursor, layout.sidebar_content());
+            return;
+        }
+        // The map of the document is on the right of the text: a click on it
+        // says where in the file to go.
+        if layout.minimap.contains(cursor) {
+            self.press_minimap(cursor, &layout);
             return;
         }
         // The panel of the debugger is at the bottom of the window: a click
@@ -1997,8 +2115,7 @@ impl NativeApplication {
         if self.press_the_debug_panel(cursor, size) {
             return;
         }
-        let bottom = self.bottom_panel_height();
-        let body = editor_body_rect(size, bottom);
+        let body = layout.body;
         if !body.contains(cursor) {
             return;
         }
@@ -2107,8 +2224,9 @@ impl NativeApplication {
         let Some(cursor) = self.cursor else {
             return;
         };
-        let bottom = self.bottom_panel_height();
-        let body = editor_body_rect(self.window_size(scale_factor), bottom);
+        let body = self
+            .window_layout(self.window_size(scale_factor))
+            .body;
         let pane = &mut self.panes[self.active];
         pane.view.drag(
             &mut pane.editor,
@@ -2449,6 +2567,67 @@ impl NativeApplication {
             return true;
         }
         false
+    }
+
+    /// Handles the keys of the activity bar.
+    ///
+    /// The keyboard is on one thing at a time. When the person says so, the
+    /// activity bar has it: the up and the down key walk through the
+    /// sections, `Enter` picks one, and `Esc` gives the keyboard back to the
+    /// document.
+    ///
+    /// The keys with a modifier belong to the editor: the shortcuts are the
+    /// same wherever the keyboard is, and the activity bar gives the keyboard
+    /// up when one of them is pressed.
+    fn handle_activity_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
+        if !self.activity_focus {
+            return false;
+        }
+        if self.modifiers.control_key() || self.modifiers.alt_key() {
+            self.activity_focus = false;
+            return false;
+        }
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.activity_focus = false;
+                self.status = Some("键盘还给正文了".to_owned());
+                true
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                let section = self.sidebar.section.previous();
+                self.sidebar.show(section);
+                self.status = Some(format!("分区：{}", section.label()));
+                true
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                let section = self.sidebar.section.next();
+                self.sidebar.show(section);
+                self.status = Some(format!("分区：{}", section.label()));
+                true
+            }
+            Key::Named(NamedKey::Enter) => {
+                let section = self.sidebar.section;
+                self.sidebar.pick(section);
+                self.status = Some(if self.sidebar.is_open() {
+                    format!("分区：{}", section.label())
+                } else {
+                    "侧边栏收起来了".to_owned()
+                });
+                true
+            }
+            _ => {
+                // The activity bar has the keyboard: what is typed does not
+                // go into the document.
+                true
+            }
+        }
+    }
+
+    /// Gives the keyboard to the activity bar.
+    fn focus_the_activity_bar(&mut self) {
+        self.activity_focus = true;
+        self.sidebar.show(Activity::Files);
+        self.status = Some("活动栏：↑↓ 换分区，Enter 选中，Esc 回到正文".to_owned());
     }
 
     /// Asks the server what it offers to do about the place of the caret.
@@ -3125,6 +3304,168 @@ impl NativeApplication {
         status
     }
 
+    /// Where the parts of the window are.
+    ///
+    /// The drawing and the clicking both go through here: a tab that is
+    /// drawn in one place and clicked in another is a tab that cannot be
+    /// clicked.
+    fn window_layout(&self, size: Size) -> WindowLayout {
+        WindowLayout::of(size, self.bottom_panel_height(), self.sidebar.is_open())
+    }
+
+    /// The numbers that are drawn on the activities.
+    ///
+    /// The numbers come from the real things: the hits of the search, the
+    /// files git knows about, the breakpoints.
+    fn badges(&self) -> Badges {
+        Badges {
+            search: self.search_hits.len(),
+            source_control: self
+                .source_control
+                .as_ref()
+                .map(|status| status.entries.len())
+                .unwrap_or(0),
+            debug: self
+                .breakpoints
+                .all()
+                .iter()
+                .map(|(_, lines)| lines.len())
+                .sum(),
+        }
+    }
+
+    /// What the status bar at the bottom of the window says.
+    ///
+    /// The left says what is open and what is wrong with it, the middle says
+    /// what the editor is doing inside, and the right says where the caret
+    /// is.
+    fn status_bar_text(&self) -> StatusBar {
+        let pane = &self.panes[self.active];
+        let (line, column) = self.caret_position();
+        StatusBar {
+            left: self.status_line(),
+            middle: format!(
+                "Buffer v{} · IME {} · Undo {} · Redo {} · 光标 {}",
+                pane.editor.version(),
+                if self.input.ime_enabled() { "ON" } else { "READY" },
+                pane.editor.can_undo(),
+                pane.editor.can_redo(),
+                pane.editor.cursor_count(),
+            ),
+            right: format!("行 {line}，列 {column}"),
+        }
+    }
+
+    /// Where the caret is: the line and the column, counting from one.
+    fn caret_position(&self) -> (usize, usize) {
+        let pane = &self.panes[self.active];
+        let buffer = pane.editor.buffer();
+        let caret = pane.editor.caret().0;
+        let line = buffer.line_of_offset(caret);
+        let start = buffer.line_range(line).start.0;
+        let column = buffer.slice(TextOffset(start)..TextOffset(caret)).chars().count();
+        (line + 1, column + 1)
+    }
+
+    /// The rows of the section of the side bar that is on screen.
+    ///
+    /// Every section shows what belongs to it. A section that has nothing to
+    /// show says why: an empty panel is a panel that looks broken.
+    fn sidebar_rows(&self, panel: Rect) -> Vec<SideBarRow> {
+        match self.sidebar.section {
+            Activity::Files => match self.tree.as_ref() {
+                Some(tree) => sidebar::tree_rows(tree.nodes(), panel),
+                None => sidebar::list_rows(panel, vec![sidebar::Row::text(
+                    "没有工程",
+                    "打开一个文件夹，里面才有文件",
+                )]),
+            },
+            Activity::Search => {
+                if self.search_hits.is_empty() {
+                    return sidebar::list_rows(panel, vec![sidebar::Row::text(
+                        "还没有搜过",
+                        "Ctrl+Shift+F 搜索整个工程",
+                    )]);
+                }
+                let rows = self
+                    .search_hits
+                    .iter()
+                    .map(|hit| sidebar::Row {
+                        title: hit
+                            .path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("?")
+                            .to_owned(),
+                        detail: format!("第 {} 行", hit.line),
+                        depth: 0,
+                        directory: false,
+                        expanded: false,
+                        action: SideBarAction::OpenFileAt {
+                            path: hit.path.clone(),
+                            line: hit.line,
+                        },
+                        rect: Rect::new(0.0, 0.0, 0.0, 0.0),
+                    })
+                    .collect();
+                sidebar::list_rows(panel, rows)
+            }
+            Activity::SourceControl => match self.source_control.as_ref() {
+                Some(status) => {
+                    let rows = status
+                        .entries
+                        .iter()
+                        .map(|entry| sidebar::Row {
+                            title: entry.path.clone(),
+                            detail: entry.label(),
+                            depth: 0,
+                            directory: false,
+                            expanded: false,
+                            action: SideBarAction::None,
+                            rect: Rect::new(0.0, 0.0, 0.0, 0.0),
+                        })
+                        .collect();
+                    sidebar::list_rows(panel, rows)
+                }
+                None => sidebar::list_rows(panel, vec![sidebar::Row::text(
+                    "没有改动",
+                    "Ctrl+Shift+G 问 git 要改动",
+                )]),
+            },
+            Activity::Debug => {
+                let mut rows = vec![sidebar::Row::text(
+                    self.debug
+                        .as_ref()
+                        .map(|debug| debug.state.text())
+                        .unwrap_or("没有调试"),
+                    "",
+                )];
+                if let Some(uri) = self.uri_of_the_open_file() {
+                    for line in self.breakpoints.lines_of(&uri) {
+                        rows.push(sidebar::Row {
+                            title: format!("第 {line} 行"),
+                            detail: if self.breakpoints.condition_of(&uri, line).is_some() {
+                                "有条件".to_owned()
+                            } else {
+                                String::new()
+                            },
+                            depth: 0,
+                            directory: false,
+                            expanded: false,
+                            action: SideBarAction::ToggleBreakpoint(line),
+                            rect: Rect::new(0.0, 0.0, 0.0, 0.0),
+                        });
+                    }
+                }
+                sidebar::list_rows(panel, rows)
+            }
+            Activity::Extensions => sidebar::list_rows(panel, vec![sidebar::Row::text(
+                "扩展",
+                "扩展生态是 V0.9.0 的事，这一版还没有",
+            )]),
+        }
+    }
+
     /// Starts an agent turn with the editor's current text as the prompt.
     ///
     /// The text the user chose as context travels with the prompt as
@@ -3246,6 +3587,9 @@ impl NativeApplication {
     /// Reads what git knows and puts it in the panel.
     fn load_git_panel(&mut self, root: &Path) -> Result<GitPanel, String> {
         let status = git::status(root)?;
+        // What git knows is kept, so that the badge on the activity bar can
+        // say how many files changed without asking git again.
+        self.source_control = Some(status.clone());
         let mut panel = GitPanel::new(root.to_path_buf(), status.entries);
         self.load_git_diff(&mut panel)?;
         Ok(panel)
@@ -4368,16 +4712,11 @@ impl NativeApplication {
         }
     }
 
-    /// Runs the command whose key was pressed.
+    /// The command whose key was pressed, if there is one.
     ///
     /// The key route does not know the commands one by one: it asks the
-    /// registry which command wants this key, and the command runs.
-    fn run_the_command_of_the_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
-        // A panel that is open takes every key: the key does not belong to
-        // the editor then.
-        if self.a_modal_is_open() {
-            return false;
-        }
+    /// registry which command wants this key.
+    fn command_of_the_key<T: AsRef<str>>(&self, key: &Key<T>) -> Option<String> {
         let pressed = commands::PressedKey {
             letter: key_letter(key),
             name: key_name(key),
@@ -4386,10 +4725,21 @@ impl NativeApplication {
             shift: self.modifiers.shift_key(),
             cmd: false,
         };
-        let Some(command) = self.commands.by_key(&pressed) else {
+        self.commands
+            .by_key(&pressed)
+            .map(|command| command.id.clone())
+    }
+
+    /// Runs the command whose key was pressed.
+    fn run_the_command_of_the_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
+        // A panel that is open takes every key: the key does not belong to
+        // the editor then.
+        if self.a_modal_is_open() {
+            return false;
+        }
+        let Some(id) = self.command_of_the_key(key) else {
             return false;
         };
-        let id = command.id.clone();
         self.run_named_command(&id)
     }
 
@@ -4414,6 +4764,16 @@ impl NativeApplication {
                 self.open_palette();
             }
             "workbench.developerPanel" => self.open_developer_panel(),
+            "view.activityBar" => self.focus_the_activity_bar(),
+            "view.toggleSidebar" => {
+                if self.sidebar.is_open() {
+                    self.sidebar.hide();
+                    self.status = Some("侧边栏收起来了".to_owned());
+                } else {
+                    self.sidebar.show(self.sidebar.section);
+                    self.status = Some("侧边栏打开了".to_owned());
+                }
+            }
             "workbench.settings" => self.open_settings(),
             "workbench.save" => {
                 if let Some(tab) = self.tabs.active().map(|tab| tab.id) {
@@ -4979,7 +5339,13 @@ impl NativeApplication {
         let Some(panel) = self.search.as_mut() else {
             return false;
         };
-        panel.pump()
+        let arrived = panel.pump();
+        if arrived {
+            // The places that were found are kept: the panel of the search
+            // can be closed, and the side bar still shows what was found.
+            self.search_hits = panel.hits().to_vec();
+        }
+        arrived
     }
 }
 
@@ -5195,6 +5561,11 @@ impl ApplicationHandler for NativeApplication {
                     window.request_redraw();
                     return;
                 }
+                // The activity bar takes the keyboard when the person says so.
+                if self.handle_activity_key(&event.logical_key.as_ref()) {
+                    window.request_redraw();
+                    return;
+                }
                 // The key may be the key of a command of the editor. The
                 // route does not know the commands one by one: it asks the
                 // registry.
@@ -5379,8 +5750,8 @@ impl ApplicationHandler for NativeApplication {
                 // What the editor says about itself goes into the log of the
                 // run, once per change.
                 self.log_the_status_if_it_changed();
-                // The status line is read before the renderer is borrowed.
-                let status_line = self.status_line();
+                // The status bar is read before the renderer is borrowed.
+                let status = self.status_bar_text();
                 // The lines of the developer panel are read before the
                 // renderer is borrowed as well.
                 let developer_lines = self.developer.as_ref().map(|_| self.developer_lines());
@@ -5421,6 +5792,12 @@ impl ApplicationHandler for NativeApplication {
                     })
                     .unwrap_or_default();
                 let scale_factor = window.scale_factor();
+                // Where the parts of the window are, and what the side bar
+                // shows, are worked out before the renderer is borrowed.
+                let size = self.window_size(scale_factor);
+                let layout = self.window_layout(size);
+                let sidebar_rows = self.sidebar_rows(layout.sidebar_content());
+                let badges = self.badges();
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
                 };
@@ -5441,7 +5818,7 @@ impl ApplicationHandler for NativeApplication {
                 });
                 let scene = build_scene(
                     renderer,
-                    renderer.logical_size(scale_factor),
+                    layout,
                     &pane.editor,
                     &self.input,
                     &mut pane.view,
@@ -5449,7 +5826,10 @@ impl ApplicationHandler for NativeApplication {
                     Chrome {
                         agent: self.agent.as_ref(),
                         agent_error: self.agent_error.as_deref(),
-                        status_line,
+                        status,
+                        sidebar: self.sidebar,
+                        sidebar_rows: &sidebar_rows,
+                        badges,
                         find: self.find.as_ref(),
                         rename: self.rename_box.as_ref(),
                         marks: &pane.marks,
@@ -5458,7 +5838,6 @@ impl ApplicationHandler for NativeApplication {
                         task_panel,
                         tabs: self.tabs.tabs(),
                         active: self.active,
-                        tree: self.tree.as_ref(),
                         prompt: prompt_text.as_deref(),
                         settings: self.settings.as_ref(),
                         git: self.git.as_ref(),
@@ -5581,7 +5960,14 @@ fn keybinding_text<T: AsRef<str>>(modifiers: ModifiersState, key: &Key<T>) -> Op
 struct Chrome<'a> {
     agent: Option<&'a AgentSession>,
     agent_error: Option<&'a str>,
-    status_line: String,
+    /// The status bar at the bottom of the window.
+    status: StatusBar,
+    /// The section of the side bar that is on screen.
+    sidebar: SideBar,
+    /// The rows of that section.
+    sidebar_rows: &'a [SideBarRow],
+    /// The numbers that are drawn on the activities.
+    badges: Badges,
     /// The find bar, when it is open.
     find: Option<&'a FindBar>,
     /// The box that asks for the new name, when it is open.
@@ -5598,8 +5984,6 @@ struct Chrome<'a> {
     tabs: &'a [Tab],
     /// The tab that is on screen.
     active: usize,
-    /// The files of the workspace.
-    tree: Option<&'a FileTree>,
     /// The question the window is asking, if it is asking one.
     prompt: Option<&'a str>,
     /// The settings panel, when it is open.
@@ -5694,24 +6078,16 @@ fn is_enter<T: AsRef<str>>(key: &Key<T>) -> bool {
 
 fn build_scene(
     renderer: &mut Renderer,
-    size: Size,
+    layout: WindowLayout,
     editor_state: &Editor,
     input: &TextInputState,
     view: &mut EditorView,
     highlights: &[Highlight],
     chrome: Chrome<'_>,
 ) -> FrameScene {
+    let size = layout.size;
     let viewport = Rect::new(0.0, 0.0, size.width, size.height);
-    // The output panel of the task takes the room at the bottom of the
-    // window, and the text of the document does not go under it.
-    let bottom = if chrome.task_panel.is_some() {
-        TASK_PANEL_HEIGHT
-    } else if chrome.debug.is_some() {
-        debug::DEBUG_PANEL_HEIGHT
-    } else {
-        0.0
-    };
-    let body = editor_body_rect(size, bottom);
+    let body = layout.body;
     let mut scene = FrameScene::default();
 
     // A panel that is drawn over the window hides what is under it.
@@ -5797,41 +6173,34 @@ fn build_scene(
             Color::rgb(0.30, 0.58, 0.96),
             viewport,
         );
-        let heading = format!(
-            "CodeWeaver · Buffer v{} · IME {} · Undo {} · Redo {} · 光标 {}",
-            editor_state.version(),
-            if input.ime_enabled() { "ON" } else { "READY" },
-            editor_state.can_undo(),
-            editor_state.can_redo(),
-            editor_state.cursor_count(),
+
+        // The line numbers are on the left of the text.
+        let current_line = editor_state.buffer().line_of_offset(editor_state.caret().0);
+        let numbers = gutter::lines(
+            editor_state.buffer(),
+            view.visual_lines(),
+            layout.gutter,
+            current_line,
         );
-        scene.push_text(
-            heading,
-            Rect::new(SIDEBAR_WIDTH + 16.0, TAB_BAR_HEIGHT + 6.0, size.width - 72.0, 28.0),
-            TextStyle {
-                clip: viewport,
-                color: Color::rgb(0.78, 0.82, 0.90),
-                font_size: 15.0,
-                line_height: 22.0,
-                family: TextFamily::SansSerif,
-            },
+        gutter::draw(
+            &mut scene,
+            viewport,
+            layout.gutter,
+            &numbers,
+            &mut measurer,
         );
-        // The status line sits under the heading.
-        scene.push_text(
-            chrome.status_line,
-            Rect::new(
-                SIDEBAR_WIDTH + 16.0,
-                TAB_BAR_HEIGHT + 26.0,
-                size.width - 72.0,
-                22.0,
-            ),
-            TextStyle {
-                clip: viewport,
-                color: Color::rgb(0.55, 0.60, 0.70),
-                font_size: 13.0,
-                line_height: 18.0,
-                family: TextFamily::SansSerif,
-            },
+
+        // The map of the whole document is on the right of the text.
+        let first_line = view.view.first_line;
+        let visible_lines = ((body.size.height / LINE_HEIGHT).floor() as usize).max(1);
+        let map = view.minimap(editor_state.buffer());
+        minimap::draw(
+            &mut scene,
+            viewport,
+            layout.minimap,
+            map,
+            first_line,
+            visible_lines,
         );
 
         view.draw(
@@ -5864,9 +6233,9 @@ fn build_scene(
                     Color::rgb(0.90, 0.35, 0.35)
                 };
                 scene.push_quad(
-                    Rect::new(body.origin.x - 12.0, body.origin.y + y + 6.0, 8.0, 8.0),
+                    Rect::new(layout.gutter.origin.x + 4.0, body.origin.y + y + 6.0, 8.0, 8.0),
                     colour,
-                    body,
+                    layout.gutter,
                 );
             }
         }
@@ -5875,6 +6244,7 @@ fn build_scene(
     push_agent_panel(
         &mut scene,
         size,
+        layout,
         chrome.agent,
         chrome.agent_error,
         chrome.conflicts.as_ref(),
@@ -5888,12 +6258,36 @@ fn build_scene(
     // the text: they are drawn around it. The strip is laid out here so that
     // the place of a tab is worked out the same way twice — once to draw it,
     // once to click it.
-    let strip = tab_strip(chrome.tabs, chrome.active, size, &mut ui_measurer);
-    push_tab_bar(&mut scene, viewport, tab_bar_rect(size), &strip.items);
-    if let Some(tree) = chrome.tree {
-        let rows = shell::tree_rows(tree.nodes(), sidebar_rect(size));
-        push_file_tree(&mut scene, viewport, sidebar_rect(size), &rows);
+    let strip = tab_strip(chrome.tabs, chrome.active, &layout, &mut ui_measurer);
+    push_tab_bar(&mut scene, viewport, layout.tab_bar, &strip.items);
+
+    // The bar with the activities is on the left of the window, and the
+    // section that was picked is on its right.
+    let bar = activity_bar::ActivityBar::layout(
+        layout.activity_bar,
+        chrome.sidebar.selected(),
+        &chrome.badges,
+    );
+    activity_bar::draw(&mut scene, viewport, layout.activity_bar, &bar.items);
+    if chrome.sidebar.is_open() {
+        sidebar::draw(
+            &mut scene,
+            viewport,
+            layout.sidebar,
+            chrome.sidebar.section.label(),
+            chrome.sidebar_rows,
+            &mut ui_measurer,
+        );
     }
+
+    // The status bar is at the bottom of the window.
+    status_bar::draw(
+        &mut scene,
+        viewport,
+        layout.status_bar,
+        &chrome.status,
+        &mut ui_measurer,
+    );
 
     // The question the window is asking is drawn last, over everything.
     if let Some(prompt) = chrome.prompt {
@@ -5958,23 +6352,6 @@ fn build_scene(
     scene
 }
 
-/// The area the agent panel is drawn in.
-fn agent_panel_rect(size: Size) -> Rect {
-    let width = (size.width * 0.34).clamp(280.0, 520.0);
-    Rect::new(size.width - width, 0.0, width, size.height)
-}
-
-/// The area the tab strip is drawn in.
-fn tab_bar_rect(size: Size) -> Rect {
-    let panel = agent_panel_rect(size);
-    Rect::new(
-        0.0,
-        0.0,
-        (panel.origin.x - 16.0).max(1.0),
-        TAB_BAR_HEIGHT,
-    )
-}
-
 /// Works out where the tabs are drawn.
 ///
 /// The drawing and the clicking both go through here: a tab that is drawn in
@@ -5982,37 +6359,11 @@ fn tab_bar_rect(size: Size) -> Rect {
 fn tab_strip(
     tabs: &[Tab],
     active: usize,
-    size: Size,
+    layout: &WindowLayout,
     measurer: &mut dyn TextMeasurer,
 ) -> shell::TabStrip {
     let dirty: Vec<bool> = tabs.iter().map(|tab| tab.dirty).collect();
-    shell::TabStrip::layout(tabs, &dirty, active, tab_bar_rect(size), measurer)
-}
-
-/// The area the file tree is drawn in.
-fn sidebar_rect(size: Size) -> Rect {
-    Rect::new(
-        0.0,
-        TAB_BAR_HEIGHT,
-        SIDEBAR_WIDTH,
-        (size.height - TAB_BAR_HEIGHT - 32.0).max(1.0),
-    )
-}
-
-/// The area the text body is drawn in.
-///
-/// `bottom` is the room that is kept at the bottom of the window for the
-/// output panel of a task: the text of the document does not go under it.
-fn editor_body_rect(size: Size, bottom: f32) -> Rect {
-    let panel = agent_panel_rect(size);
-    let left = SIDEBAR_WIDTH + 16.0;
-    let right = panel.origin.x - 16.0;
-    Rect::new(
-        left,
-        TAB_BAR_HEIGHT + 44.0,
-        (right - left).max(1.0),
-        (size.height - TAB_BAR_HEIGHT - 76.0 - bottom).max(1.0),
-    )
+    shell::TabStrip::layout(tabs, &dirty, active, layout.tab_bar, measurer)
 }
 
 /// Draws the tab strip.
@@ -6087,62 +6438,6 @@ fn push_tab_bar(
                 },
             );
         }
-    }
-}
-
-/// Draws the file tree.
-///
-/// A directory that is open shows a down arrow, a closed one a right arrow;
-/// the depth of a row is shown by how far it is indented.
-fn push_file_tree(
-    scene: &mut FrameScene,
-    viewport: Rect,
-    panel: Rect,
-    rows: &[shell::TreeRow],
-) {
-    scene.push_quad(panel, Color::rgb(0.10, 0.12, 0.16), viewport);
-    scene.push_quad(
-        Rect::new(
-            panel.origin.x + panel.size.width - 1.0,
-            panel.origin.y,
-            1.0,
-            panel.size.height,
-        ),
-        Color::rgb(0.20, 0.23, 0.29),
-        viewport,
-    );
-    for row in rows {
-        let indent = panel.origin.x + 8.0 + row.depth as f32 * shell::INDENT;
-        let marker = if row.directory {
-            if row.expanded { "▾" } else { "▸" }
-        } else {
-            ""
-        };
-        let label = if marker.is_empty() {
-            row.name.clone()
-        } else {
-            format!("{marker} {}", row.name)
-        };
-        scene.push_text(
-            label,
-            Rect::new(
-                indent,
-                row.rect.origin.y + 3.0,
-                (panel.origin.x + panel.size.width - indent - 8.0).max(1.0),
-                18.0,
-            ),
-            TextStyle {
-                clip: viewport,
-                color: if row.directory {
-                    Color::rgb(0.76, 0.80, 0.88)
-                } else {
-                    Color::rgb(0.60, 0.64, 0.72)
-                },
-                font_size: 13.0,
-                line_height: 18.0,
-                family: TextFamily::SansSerif,
-            },
-        );
     }
 }
 
@@ -6560,11 +6855,12 @@ fn push_rename_box(
 
 /// The place of the output panel of the task.
 ///
-/// The panel is at the bottom of the window, under the text of the document.
+/// The panel is at the bottom of the window, under the text of the document
+/// and above the status bar.
 fn task_panel_rect(size: Size) -> Rect {
     Rect::new(
         0.0,
-        size.height - TASK_PANEL_HEIGHT,
+        size.height - layout::STATUS_BAR_HEIGHT - TASK_PANEL_HEIGHT,
         size.width,
         TASK_PANEL_HEIGHT,
     )
@@ -6693,12 +6989,13 @@ fn push_task_panel(
 fn push_agent_panel(
     scene: &mut FrameScene,
     size: Size,
+    layout: WindowLayout,
     agent: Option<&AgentSession>,
     agent_error: Option<&str>,
     conflict: Option<&ConflictView>,
 ) {
     let viewport = Rect::new(0.0, 0.0, size.width, size.height);
-    let panel = agent_panel_rect(size);
+    let panel = layout.agent_panel;
     let content = Rect::new(
         panel.origin.x + 16.0,
         56.0,
@@ -7065,6 +7362,166 @@ mod tests {
     /// A key that has a name, like Enter or Escape.
     fn named(key: NamedKey) -> Key<&'static str> {
         Key::Named(key)
+    }
+
+    #[test]
+    fn clicking_an_activity_picks_the_section_of_the_side_bar() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true);
+
+        // The second activity is the search.
+        let point = Point { x: 24.0, y: 60.0 };
+        app.press_activity_bar(point, &layout);
+        assert_eq!(app.sidebar.section, Activity::Search);
+        assert!(app.sidebar.is_open(), "the side bar is shown");
+    }
+
+    #[test]
+    fn picking_the_same_activity_again_hides_the_side_bar() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true);
+
+        // The search is not the section that is on screen: picking it shows
+        // it.
+        let point = Point { x: 24.0, y: 60.0 };
+        app.press_activity_bar(point, &layout);
+        assert!(app.sidebar.is_open());
+        // Picking it again hides the side bar.
+        app.press_activity_bar(point, &layout);
+        assert!(!app.sidebar.is_open(), "the side bar is hidden");
+    }
+
+    #[test]
+    fn the_keyboard_walks_through_the_activities() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+
+        // Ctrl+Shift+E gives the keyboard to the activity bar.
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(app.run_the_command_of_the_key(&character("e")));
+        assert!(app.activity_focus, "the activity bar has the keyboard");
+
+        app.modifiers = ModifiersState::default();
+        assert!(app.handle_activity_key(&named(NamedKey::ArrowDown)));
+        assert_eq!(app.sidebar.section, Activity::Search);
+        assert!(app.handle_activity_key(&named(NamedKey::ArrowUp)));
+        assert_eq!(app.sidebar.section, Activity::Files);
+
+        // The keyboard goes back to the document.
+        assert!(app.handle_activity_key(&named(NamedKey::Escape)));
+        assert!(!app.activity_focus);
+    }
+
+    #[test]
+    fn what_is_typed_does_not_go_into_the_document_while_the_activity_bar_has_the_keyboard() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(app.run_the_command_of_the_key(&character("e")));
+        app.modifiers = ModifiersState::default();
+
+        // The activity bar eats the key: the document does not see it.
+        assert!(app.handle_activity_key(&character("x")));
+        assert_eq!(app.panes[app.active].editor.text(), "");
+    }
+
+    #[test]
+    fn the_side_bar_can_be_hidden_and_shown_again() {
+        let mut app = NativeApplication::new(None).expect("the application starts");
+
+        app.modifiers = ModifiersState::CONTROL;
+        assert!(app.run_the_command_of_the_key(&character("b")));
+        assert!(!app.sidebar.is_open(), "the side bar is hidden");
+        assert!(app.run_the_command_of_the_key(&character("b")));
+        assert!(app.sidebar.is_open(), "the side bar is shown");
+    }
+
+    #[test]
+    fn the_status_bar_says_where_the_caret_is() {
+        let directory = scratch_dir("status-bar");
+        let file = directory.join("main.rs");
+        fs::write(&file, "one\ntwo\n").unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+
+        let status = app.status_bar_text();
+        assert!(status.right.contains("行 1，列 1"), "got {}", status.right);
+        assert!(status.middle.contains("Buffer v"), "got {}", status.middle);
+        assert!(status.left.contains("main.rs"), "got {}", status.left);
+
+        // The caret moves down: the status bar says so.
+        app.panes[0].editor.set_carets(&[TextOffset(4)]);
+        let status = app.status_bar_text();
+        assert!(status.right.contains("行 2，列 1"), "got {}", status.right);
+    }
+
+    #[test]
+    fn clicking_the_map_jumps_to_that_part_of_the_file() {
+        let directory = scratch_dir("minimap");
+        let file = directory.join("main.rs");
+        let text = (0..200)
+            .map(|index| format!("line {index}\n"))
+            .collect::<String>();
+        fs::write(&file, text).unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true);
+
+        // The middle of the map is the middle of the file. The map of a
+        // short file does not fill the whole strip, so the middle of the map
+        // is not the middle of the strip.
+        let pane = &mut app.panes[0];
+        let geometry = pane
+            .view
+            .minimap(pane.editor.buffer())
+            .geometry(layout.minimap);
+        let point = Point {
+            x: layout.minimap.origin.x + 10.0,
+            y: layout.minimap.origin.y + geometry.height / 2.0,
+        };
+        app.press_minimap(point, &layout);
+        let first = app.panes[0].view.view.first_line;
+        assert!(
+            first > 50 && first < 150,
+            "the view is in the middle of the file, got {first}"
+        );
+    }
+
+    #[test]
+    fn the_map_is_built_again_when_the_text_changed() {
+        let directory = scratch_dir("minimap-version");
+        let file = directory.join("main.rs");
+        fs::write(&file, "one\ntwo\nthree").unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+
+        let pane = &mut app.panes[0];
+        assert_eq!(pane.view.minimap(pane.editor.buffer()).len(), 3);
+        // The text changed: the map is built again, and it knows the new
+        // line.
+        pane.editor.insert("\nfour").expect("the text goes in");
+        assert_eq!(pane.view.minimap(pane.editor.buffer()).len(), 4);
+    }
+
+    #[test]
+    fn the_line_numbers_are_the_numbers_of_the_lines_of_the_document() {
+        let directory = scratch_dir("gutter");
+        let file = directory.join("main.rs");
+        fs::write(&file, "one\ntwo\nthree").unwrap();
+        let app = NativeApplication::new(Some(file)).expect("the application starts");
+
+        let window = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true);
+        let buffer = app.panes[0].editor.buffer();
+        let mut measurer = MonospaceMeasurer::new(8.0);
+        let text = codeweaver_ui::TextLayout::build(
+            buffer,
+            0,
+            10,
+            400.0,
+            16.0,
+            LINE_HEIGHT,
+            &mut measurer,
+        );
+        let numbers = gutter::lines(buffer, &text.lines, window.gutter, 0);
+        assert_eq!(
+            numbers.iter().map(|line| line.number).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]
@@ -8542,12 +8999,23 @@ mod tests {
         // Without the modifiers the key is not the key of the command.
         assert!(!app.run_the_command_of_the_key(&character("b")));
         app.modifiers = ModifiersState::CONTROL;
-        assert!(!app.run_the_command_of_the_key(&character("b")));
+        // Ctrl+B is the key of the side bar now; the build wants the shift
+        // with it.
+        assert_ne!(
+            app.command_of_the_key(&character("b")).as_deref(),
+            Some("task.build")
+        );
         // With them the command runs: the editor looks for the build command.
         app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
-        assert!(app.run_the_command_of_the_key(&character("b")));
+        assert_eq!(
+            app.command_of_the_key(&character("b")).as_deref(),
+            Some("task.build")
+        );
         // But only with the `b`.
-        assert!(!app.run_the_command_of_the_key(&character("a")));
+        assert_ne!(
+            app.command_of_the_key(&character("a")).as_deref(),
+            Some("task.build")
+        );
     }
 
     #[test]
@@ -8699,8 +9167,9 @@ mod tests {
 
         // The strip is laid out and hit the same way as it is drawn.
         let size = Size::new(1200.0, 800.0);
+        let layout = WindowLayout::of(size, 0.0, true);
         let mut measurer = MonospaceMeasurer::new(13.0);
-        let strip = tab_strip(app.tabs.tabs(), app.active, size, &mut measurer);
+        let strip = tab_strip(app.tabs.tabs(), app.active, &layout, &mut measurer);
         let first_tab = strip.items[0].rect;
         let point = Point {
             x: first_tab.origin.x + 4.0,

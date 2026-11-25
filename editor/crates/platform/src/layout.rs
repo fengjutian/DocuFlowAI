@@ -11,6 +11,8 @@
 
 use codeweaver_render::{Rect, Size};
 
+use crate::minimap;
+
 /// The width of the bar with the activities on the left.
 pub const ACTIVITY_BAR_WIDTH: f32 = 48.0;
 /// The width of the side bar.
@@ -37,6 +39,8 @@ const AGENT_MAX: f32 = 520.0;
 /// Where the parts of the window are.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WindowLayout {
+    /// The size of the window.
+    pub size: Size,
     /// The bar with the activities on the left.
     pub activity_bar: Rect,
     /// The side bar with the section that was picked.
@@ -47,6 +51,8 @@ pub struct WindowLayout {
     pub gutter: Rect,
     /// The text of the document.
     pub body: Rect,
+    /// The strip with the map of the document.
+    pub minimap: Rect,
     /// The status bar at the bottom of the window.
     pub status_bar: Rect,
     /// The panel of the agent on the right.
@@ -89,10 +95,17 @@ impl WindowLayout {
         let top = TAB_BAR_HEIGHT;
         let height = (above - top - bottom).max(1.0);
         let gutter = Rect::new(left, top, GUTTER_WIDTH, height);
+        // The map of the document is on the right of the text.
+        let minimap = Rect::new(
+            (right - minimap::WIDTH).max(left + GUTTER_WIDTH),
+            top,
+            minimap::WIDTH,
+            height,
+        );
         let body = Rect::new(
             left + GUTTER_WIDTH,
             top,
-            (right - left - GUTTER_WIDTH).max(1.0),
+            (minimap.origin.x - minimap::GAP - left - GUTTER_WIDTH).max(1.0),
             height,
         );
         let tab_bar = Rect::new(
@@ -103,11 +116,13 @@ impl WindowLayout {
         );
 
         WindowLayout {
+            size,
             activity_bar,
             sidebar,
             tab_bar,
             gutter,
             body,
+            minimap,
             status_bar,
             agent_panel,
         }
@@ -170,6 +185,14 @@ mod tests {
         let layout = WindowLayout::of(size(), 0.0, true);
         assert_eq!(layout.gutter.size.width, GUTTER_WIDTH);
         assert_eq!(layout.body.origin.x, layout.gutter.max_x());
+    }
+
+    #[test]
+    fn the_map_of_the_document_is_on_the_right_of_the_text() {
+        let layout = WindowLayout::of(size(), 0.0, true);
+        assert_eq!(layout.minimap.size.width, minimap::WIDTH);
+        assert!(layout.body.max_x() <= layout.minimap.origin.x);
+        assert!(layout.minimap.max_x() <= layout.agent_panel.origin.x);
     }
 
     #[test]

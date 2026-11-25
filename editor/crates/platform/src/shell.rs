@@ -1,21 +1,19 @@
-//! The chrome around the text: the tab strip and the file tree.
+//! The chrome around the text: the tab strip.
 //!
-//! Both are drawn and clicked, so the place of a tab and the place of a file
-//! have to be worked out the same way twice — once to draw, once to hit test.
-//! That is why the layout lives here and not in the drawing code: a tab that
-//! is drawn in one place and clicked in another is a tab that cannot be
-//! clicked.
+//! It is drawn and clicked, so the place of a tab has to be worked out the
+//! same way twice — once to draw, once to hit test. That is why the layout
+//! lives here and not in the drawing code: a tab that is drawn in one place
+//! and clicked in another is a tab that cannot be clicked.
+//!
+//! The side bar is not here: it is a part of the window in its own right
+//! (`sidebar`).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use codeweaver_render::{Point, Rect};
 use codeweaver_ui::TextMeasurer;
 use codeweaver_workbench::{Tab, TabId};
 
-/// The height of one row of the file tree.
-pub const ROW_HEIGHT: f32 = 22.0;
-/// How much a level of the tree is indented.
-pub const INDENT: f32 = 14.0;
 /// The padding on both sides of the text of a tab.
 pub const TAB_PADDING: f32 = 12.0;
 /// The space a tab needs for the dot that says it has unsaved changes.
@@ -85,47 +83,6 @@ impl TabStrip {
             .find(|item| item.rect.contains(point))
             .map(|item| item.id)
     }
-}
-
-/// One row of the file tree.
-#[derive(Clone, Debug)]
-pub struct TreeRow {
-    pub path: PathBuf,
-    pub name: String,
-    /// How deep the row is below the root.
-    pub depth: usize,
-    /// Whether the row is a directory.
-    pub directory: bool,
-    /// Whether the directory is open.
-    pub expanded: bool,
-    /// Where the row is drawn.
-    pub rect: Rect,
-}
-
-/// The rows of the file tree, in the order they are drawn.
-pub fn tree_rows(nodes: &[codeweaver_workspace::TreeNode], panel: Rect) -> Vec<TreeRow> {
-    let mut rows = Vec::new();
-    let mut y = panel.origin.y;
-    for node in nodes {
-        if y + ROW_HEIGHT > panel.origin.y + panel.size.height {
-            break;
-        }
-        rows.push(TreeRow {
-            path: node.path.clone(),
-            name: node.name.clone(),
-            depth: node.depth,
-            directory: node.kind == codeweaver_workspace::NodeKind::Directory,
-            expanded: node.expanded,
-            rect: Rect::new(panel.origin.x, y, panel.size.width, ROW_HEIGHT),
-        });
-        y += ROW_HEIGHT;
-    }
-    rows
-}
-
-/// The row that was clicked, if one was.
-pub fn tree_hit(rows: &[TreeRow], point: Point) -> Option<&TreeRow> {
-    rows.iter().find(|row| row.rect.contains(point))
 }
 
 /// The name of a file, without its directory.

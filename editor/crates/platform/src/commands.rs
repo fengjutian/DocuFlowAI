@@ -340,6 +340,8 @@ pub fn default_registry() -> CommandRegistry {
     let commands: Vec<Command> = vec![
         command("workbench.commandPalette", "命令面板", "视图", "ctrl+shift+p", When::Always),
         command("workbench.developerPanel", "开发者面板", "视图", "ctrl+shift+d", When::Always),
+        command("view.activityBar", "活动栏", "视图", "ctrl+shift+e", When::Always),
+        command("view.toggleSidebar", "收起或展开侧边栏", "视图", "ctrl+b", When::Always),
         command("workbench.settings", "打开设置", "文件", "ctrl+,", When::Always),
         command("workbench.save", "保存文件", "文件", "ctrl+s", When::HasFile),
         command("workbench.closeTab", "关闭标签页", "文件", "ctrl+w", When::Always),
@@ -356,7 +358,7 @@ pub fn default_registry() -> CommandRegistry {
         command("debug.toggleBreakpoint", "切换断点", "调试", "f9", When::HasFile),
         command("debug.start", "开始调试", "调试", "f5", When::Always),
         command("debug.stop", "结束调试", "调试", "f8", When::Always),
-        command("debug.evaluate", "调试表达式求值", "调试", "ctrl+shift+e", When::Always),
+        command("debug.evaluate", "调试表达式求值", "调试", "ctrl+shift+i", When::Always),
         command("agent.startTurn", "把当前内容交给 Agent", "Agent", "ctrl+m", When::Always),
     ];
     for command in commands {

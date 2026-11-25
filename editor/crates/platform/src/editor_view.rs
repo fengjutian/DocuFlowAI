@@ -15,6 +15,8 @@ use codeweaver_ui::{
     LineMetrics, TextLayout, TextMeasurer, ViewState, VisualLine, caret_shape, selection_rects,
 };
 
+use crate::minimap::Minimap;
+
 /// The size the body text is drawn at.
 pub const FONT_SIZE: f32 = 16.0;
 /// The height of one line of the body.
@@ -125,6 +127,10 @@ pub struct EditorView {
     pub view: ViewState,
     /// The layout of the text that is on screen.
     layout: TextLayout,
+    /// The map of the whole document.
+    minimap: Minimap,
+    /// The version of the text the map was built from.
+    minimap_version: u64,
     /// The offset the current mouse drag started at.
     drag_anchor: Option<usize>,
     /// The selection the current mouse drag is moving.
@@ -156,6 +162,8 @@ impl EditorView {
         EditorView {
             view: ViewState::new(),
             layout: TextLayout::default(),
+            minimap: Minimap::default(),
+            minimap_version: u64::MAX,
             drag_anchor: None,
             drag_index: None,
             built: Built {
@@ -387,6 +395,28 @@ impl EditorView {
     /// Returns nothing when the offset is not on screen.
     pub fn point_of(&self, offset: usize) -> Option<(f32, f32)> {
         self.layout.offset_point(offset)
+    }
+
+    /// The rows of the text that are on screen.
+    ///
+    /// A row of the text is not always a line of the document: a line that is
+    /// too long is drawn in more than one row. The line numbers need to know
+    /// which rows are on screen.
+    pub fn visual_lines(&self) -> &[VisualLine] {
+        &self.layout.lines
+    }
+
+    /// The map of the whole document.
+    ///
+    /// The map is built again when the text changed: counting the characters
+    /// of every line is not free, and it does not have to be done twice for
+    /// the same text.
+    pub fn minimap(&mut self, buffer: &Buffer) -> &Minimap {
+        if buffer.version() != self.minimap_version {
+            self.minimap = Minimap::of(buffer);
+            self.minimap_version = buffer.version();
+        }
+        &self.minimap
     }
 
     /// Draws the body: the selection, the text and the caret.
