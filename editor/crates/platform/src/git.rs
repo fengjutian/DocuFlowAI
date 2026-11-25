@@ -617,16 +617,7 @@ pub const COMMIT_HINT: &str = "↑↓ 挑提交 · Esc 回到改过的文件";
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A directory of scratch files for the checks that need one.
-    fn scratch_dir(name: &str) -> PathBuf {
-        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/test-scratch")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("the scratch directory can be created");
-        directory
-    }
+    use crate::testing::scratch_dir;
 
     /// A repository of its own, with a name to commit under.
     ///

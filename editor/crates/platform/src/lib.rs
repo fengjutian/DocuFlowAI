@@ -17,6 +17,8 @@ mod search;
 mod settings;
 mod shell;
 mod task;
+#[cfg(test)]
+mod testing;
 
 use std::{ops::Range, path::{Path, PathBuf}, sync::Arc, time::{Duration, Instant}};
 
@@ -6252,16 +6254,10 @@ mod tests {
     use super::*;
     use std::fs;
 
+    use crate::testing::{scratch, scratch_dir, scratch_project};
     use codeweaver_lsp::protocol::CodeAction;
     use codeweaver_text::TextOffset;
     use codeweaver_ui::MonospaceMeasurer;
-
-    /// A scratch file inside the crate's own directory.
-    fn scratch(name: &str) -> PathBuf {
-        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-scratch");
-        fs::create_dir_all(&directory).expect("the scratch directory can be created");
-        directory.join(name)
-    }
 
     #[test]
     fn opens_a_file_into_the_buffer() {
@@ -6526,7 +6522,7 @@ mod tests {
     /// An application with a file that is open, and the panel of the search
     /// open on it.
     fn app_with_search() -> NativeApplication {
-        let directory = scratch_dir("search-app");
+        let directory = scratch_project("search-app");
         let file = directory.join("notes.txt");
         fs::write(&file, "the needle is here\n").unwrap();
         let mut app = NativeApplication::new(Some(file)).expect("the application starts");
@@ -6576,7 +6572,7 @@ mod tests {
 
     #[test]
     fn the_search_opens_the_place_that_is_picked() {
-        let directory = scratch_dir("search-opens");
+        let directory = scratch_project("search-opens");
         let file = directory.join("notes.txt");
         fs::write(&file, "the first line\nthe needle is here\n").unwrap();
 
@@ -6777,7 +6773,7 @@ mod tests {
 
     #[test]
     fn the_text_is_replaced_in_the_files_that_were_found() {
-        let directory = scratch_dir("search-replaces");
+        let directory = scratch_project("search-replaces");
         let file = directory.join("notes.txt");
         fs::write(&file, "the needle is here\nand the needle is there\n").unwrap();
         let other = directory.join("other.txt");
@@ -6810,12 +6806,17 @@ mod tests {
         let hits = app
             .search
             .as_ref()
-            .map(|panel| panel.hits().len())
-            .unwrap_or(0);
-        assert_eq!(hits, 2, "the text is in two files");
+            .expect("the panel is open")
+            .hits()
+            .to_vec();
+        // The text is in two files, and in three places: the file that is
+        // open holds it twice.
+        let files: std::collections::HashSet<_> = hits.iter().map(|hit| &hit.path).collect();
+        assert_eq!(files.len(), 2, "the text is in two files");
+        assert_eq!(hits.len(), 3, "the text is in three places");
 
-        // The tab key twice: the places, and then the replacement.
-        app.handle_search_key(&named(NamedKey::Tab), None);
+        // The search is done: the focus is on the places that were found.
+        // The tab key goes on to the replacement.
         app.handle_search_key(&named(NamedKey::Tab), None);
         for letter in ["p", "i", "n"] {
             app.handle_search_key(&character(letter), Some(letter));
@@ -6840,7 +6841,7 @@ mod tests {
 
     #[test]
     fn a_file_that_does_not_hold_the_text_any_more_is_not_changed() {
-        let directory = scratch_dir("search-replaces-changed");
+        let directory = scratch_project("search-replaces-changed");
         let file = directory.join("notes.txt");
         fs::write(&file, "the needle is here\n").unwrap();
 
@@ -7072,14 +7073,6 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-    }
-
-    /// A directory of scratch files for the checks that need more than one.
-    fn scratch_dir(name: &str) -> PathBuf {
-        let directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-scratch").join(name);
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).expect("the scratch directory can be created");
-        directory
     }
 
     #[test]

@@ -340,16 +340,7 @@ pub fn split_command(line: &str) -> Result<(String, Vec<String>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A directory of scratch files for the checks that need one.
-    fn scratch_dir(name: &str) -> std::path::PathBuf {
-        let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("target/test-scratch")
-            .join(name);
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("the scratch directory can be created");
-        directory
-    }
+    use crate::testing::scratch_dir;
 
     /// Waits for the task to say something, and gives up after a while.
     fn wait_for_output(task: &Task, wanted: impl Fn(&TaskOutput) -> bool) -> TaskOutput {
