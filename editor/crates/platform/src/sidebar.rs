@@ -15,6 +15,8 @@ use codeweaver_render::{Color, FrameScene, Point, Rect, TextFamily, TextStyle};
 use codeweaver_ui::TextMeasurer;
 use codeweaver_workspace::{NodeKind, TreeNode};
 
+use crate::file_icons;
+
 /// The height of the title of a section.
 pub const TITLE_HEIGHT: f32 = 28.0;
 /// The height of one row.
@@ -23,6 +25,12 @@ pub const ROW_HEIGHT: f32 = 22.0;
 pub const INDENT: f32 = 14.0;
 /// The space on the left of the rows.
 const PADDING: f32 = 8.0;
+/// The room the mark of a row takes before the name of the file.
+///
+/// A folder has an arrow and a file has a mark of its own. Both take the same
+/// room, so that the names of the files and of the folders stand in one
+/// column.
+pub const MARK_WIDTH: f32 = file_icons::SIZE + file_icons::GAP;
 
 /// The color of the panel.
 const PANEL_COLOR: Color = Color::rgb(0.10, 0.12, 0.16);
@@ -135,6 +143,19 @@ pub fn hit(rows: &[Row], point: Point) -> Option<&Row> {
     rows.iter().find(|row| row.rect.contains(point))
 }
 
+/// The kind of thing a row stands for, when the row is a file.
+///
+/// The row says what happens when it is clicked, and a row that opens a file
+/// is a file: the mark in front of the name is the mark of that file. A row
+/// that opens nothing has no mark.
+fn kind_of(action: &Action) -> Option<file_icons::Kind> {
+    match action {
+        Action::OpenFile(path) => Some(file_icons::Kind::of(path)),
+        Action::OpenFileAt { path, .. } => Some(file_icons::Kind::of(path)),
+        Action::None | Action::ToggleBreakpoint(_) | Action::ToggleDirectory(_) => None,
+    }
+}
+
 /// Draws the section: its title and its rows.
 pub fn draw(
     scene: &mut FrameScene,
@@ -179,22 +200,45 @@ pub fn draw(
 
     for row in rows {
         let indent = panel.origin.x + PADDING + row.depth as f32 * INDENT;
-        let marker = if row.directory {
-            if row.expanded { "▾ " } else { "▸ " }
+        let kind = kind_of(&row.action);
+        let name_x = if row.directory || kind.is_some() {
+            indent + MARK_WIDTH
         } else {
-            ""
+            indent
         };
-        let label = if marker.is_empty() {
-            row.title.clone()
-        } else {
-            format!("{marker}{}", row.title)
-        };
+        if row.directory {
+            let marker = if row.expanded { "▾" } else { "▸" };
+            scene.push_text(
+                marker.to_owned(),
+                Rect::new(indent, row.rect.origin.y + 3.0, MARK_WIDTH, 18.0),
+                TextStyle {
+                    clip: viewport,
+                    color: DIRECTORY_COLOR,
+                    font_size: 13.0,
+                    line_height: 18.0,
+                    family: TextFamily::SansSerif,
+                },
+            );
+        } else if let Some(kind) = kind {
+            // The mark of the file says what kind of file it is.
+            file_icons::draw(
+                scene,
+                viewport,
+                Rect::new(
+                    indent,
+                    row.rect.origin.y + 5.0,
+                    file_icons::SIZE,
+                    file_icons::SIZE,
+                ),
+                kind,
+            );
+        }
         scene.push_text(
-            label,
+            row.title.clone(),
             Rect::new(
-                indent,
+                name_x,
                 row.rect.origin.y + 3.0,
-                (panel.max_x() - indent - PADDING).max(1.0),
+                (panel.max_x() - name_x - PADDING).max(1.0),
                 18.0,
             ),
             TextStyle {
@@ -234,6 +278,7 @@ pub fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codeweaver_ui::MonospaceMeasurer;
 
     /// The panel of a side bar.
     fn panel() -> Rect {
@@ -301,5 +346,49 @@ mod tests {
     fn clicking_a_row_of_the_tree_opens_the_file() {
         let rows = tree_rows(&nodes(), panel());
         assert_eq!(rows[1].action, Action::OpenFile(PathBuf::from("src/main.rs")));
+    }
+
+    #[test]
+    fn the_file_has_a_mark_that_says_what_kind_of_file_it_is() {
+        let mut scene = FrameScene::default();
+        let mut measurer = MonospaceMeasurer::new(8.0);
+        let rows = tree_rows(&nodes(), panel());
+        draw(
+            &mut scene,
+            Rect::new(0.0, 0.0, 800.0, 600.0),
+            panel(),
+            "文件",
+            &rows,
+            &mut measurer,
+        );
+        // The mark of the file is drawn in the colour of its kind.
+        let code = file_icons::color_of(file_icons::Kind::Code);
+        assert!(
+            scene.quads.iter().any(|quad| quad.color == code),
+            "the mark of the file is drawn"
+        );
+    }
+
+    #[test]
+    fn the_name_of_the_file_starts_after_its_mark() {
+        let mut scene = FrameScene::default();
+        let mut measurer = MonospaceMeasurer::new(8.0);
+        let rows = tree_rows(&nodes(), panel());
+        draw(
+            &mut scene,
+            Rect::new(0.0, 0.0, 800.0, 600.0),
+            panel(),
+            "文件",
+            &rows,
+            &mut measurer,
+        );
+        // The title of the section, the arrow of the folder, the name of the
+        // folder and the name of the file.
+        assert_eq!(scene.glyph_runs.len(), 4);
+        let name = scene.glyph_runs[3].bounds;
+        assert_eq!(
+            name.origin.x,
+            panel().origin.x + PADDING + INDENT + MARK_WIDTH
+        );
     }
 }

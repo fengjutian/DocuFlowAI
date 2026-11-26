@@ -12,6 +12,7 @@ mod developer;
 mod devlog;
 mod diff_review;
 pub mod editor_view;
+pub mod file_icons;
 pub mod find;
 mod git;
 mod gutter;
