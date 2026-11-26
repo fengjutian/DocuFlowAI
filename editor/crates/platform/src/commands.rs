@@ -345,6 +345,7 @@ pub fn default_registry() -> CommandRegistry {
         command("view.zoomIn", "放大", "视图", "ctrl+=", When::Always),
         command("view.zoomOut", "缩小", "视图", "ctrl+-", When::Always),
         command("view.zoomReset", "重置缩放", "视图", "ctrl+0", When::Always),
+        command("view.splitRight", "向右分屏", "视图", "ctrl+\\", When::Always),
         command("workbench.settings", "打开设置", "文件", "ctrl+,", When::Always),
         command("workbench.save", "保存文件", "文件", "ctrl+s", When::HasFile),
         command("workbench.closeTab", "关闭标签页", "文件", "ctrl+w", When::Always),

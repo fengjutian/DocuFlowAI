@@ -44,30 +44,30 @@ impl TabStrip {
     /// The tabs are laid out from left to right and stop before the agent
     /// panel; a tab that does not fit is not drawn at all, because a strip
     /// that runs under the panel would hide the tabs behind it.
+    ///
+    /// The tabs are the ones of **one column** of the window: a column has
+    /// its own tabs, and the ones of the other column are not on its strip.
+    /// Each of them carries the flag that says whether it has changes that
+    /// are not on disk yet.
     pub fn layout(
-        tabs: &[Tab],
-        dirty: &[bool],
+        tabs: &[(Tab, bool)],
         active: usize,
         strip: Rect,
         measurer: &mut dyn TextMeasurer,
     ) -> TabStrip {
         let mut items = Vec::new();
         let mut x = strip.origin.x;
-        for (index, tab) in tabs.iter().enumerate() {
+        for (index, (tab, dirty)) in tabs.iter().enumerate() {
             let width = TAB_PADDING * 2.0
                 + measurer.measure(&tab.title, 13.0).width
-                + if dirty.get(index).copied().unwrap_or(false) {
-                    DIRTY_SPACE
-                } else {
-                    0.0
-                };
+                + if *dirty { DIRTY_SPACE } else { 0.0 };
             if x + width > strip.origin.x + strip.size.width {
                 break;
             }
             items.push(TabItem {
                 id: tab.id,
                 title: tab.title.clone(),
-                dirty: dirty.get(index).copied().unwrap_or(false),
+                dirty: *dirty,
                 active: index == active,
                 rect: Rect::new(x, strip.origin.y, width, strip.size.height),
             });

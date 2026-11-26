@@ -15,6 +15,7 @@ pub mod editor_view;
 pub mod file_icons;
 pub mod find;
 mod git;
+mod groups;
 mod gutter;
 mod icons;
 mod input;
@@ -49,7 +50,7 @@ use codeweaver_lsp::{
 use codeweaver_render::{
     Color, FrameScene, Point, Rect, Renderer, RendererError, Size, TextFamily, TextStyle,
 };
-use codeweaver_syntax::{Highlight, Language};
+use codeweaver_syntax::Language;
 use codeweaver_text::{Bias, TextOffset};
 use codeweaver_ui::TextMeasurer;
 use codeweaver_workspace::{
@@ -70,8 +71,9 @@ use editor_view::{
 use activity_bar::{Activity, Badges, SideBar};
 use find::{FindBar, FindField};
 use git::{GitPanel, GitStatus};
+use groups::Groups;
 use input::TextInputState;
-use layout::WindowLayout;
+use layout::{ColumnLayout, WindowLayout, SEPARATOR};
 use pane::EditorPane;
 use rename::RenameBox;
 use search::{SearchCommand, SearchPanel};
@@ -222,16 +224,15 @@ pub struct NativeApplication {
     tabs: TabBar,
     /// The pane of every tab, in the order of the tabs.
     panes: Vec<EditorPane>,
-    /// The tab that is on screen.
-    active: usize,
+    /// The columns of the window, and the tabs in them.
+    ///
+    /// A window with one column shows one group of tabs. A window that is
+    /// split shows two, and each of them has its own tabs and its own tab in
+    /// front. The columns are the window: which column has the keyboard is
+    /// asked of them, not remembered apart.
+    groups: Groups,
     /// The files of the workspace, as a tree.
     tree: Option<FileTree>,
-    /// The pieces of the path of the file that is on screen.
-    ///
-    /// They are worked out when the file on screen changes and then kept: the
-    /// root of the project is found by walking up the disk, and the path of a
-    /// file does not change by itself.
-    crumbs: Vec<breadcrumbs::Crumb>,
     /// The files that are watched for changes outside the editor.
     detector: ChangeDetector,
     /// The question the window is asking the user, if it is asking one.
@@ -519,6 +520,11 @@ impl NativeApplication {
             panes[0].server_version = Some(panes[0].editor.version());
         }
 
+        // The window starts with one column, and that column shows the file
+        // that is open.
+        let mut groups = Groups::new();
+        groups.add(0);
+
         let mut commands = commands::default_registry();
         // The size of the text the person chose is remembered in a file of the
         // user, next to the file of the keys.
@@ -601,9 +607,8 @@ impl NativeApplication {
             breakpoint_condition_line: None,
             tabs,
             panes,
-            active: 0,
+            groups,
             tree,
-            crumbs: Vec::new(),
             detector,
             prompt: None,
             settings: None,
@@ -637,14 +642,14 @@ impl NativeApplication {
         // The path of the file that is on screen is worked out once here and
         // then kept: the root of the project is found by walking up the disk,
         // and the path does not change by itself.
-        application.refresh_crumbs();
+        application.refresh_crumbs_of(0);
         // The text is drawn at the size the person chose.
         application.apply_the_zoom();
 
         // What happened while the editor started is in the log too: a run
         // that failed to start is the run one wants to read about most.
         if application.dev_log.is_some() {
-            let opened = match application.panes[application.active].document.as_ref() {
+            let opened = match application.panes[front_tab(&application.groups)].document.as_ref() {
                 Some(document) => format!("打开了 {}", document.path().display()),
                 None => "没有打开文件".to_owned(),
             };
@@ -700,7 +705,7 @@ impl NativeApplication {
     /// The pane that is on screen.
     #[cfg(test)]
     fn pane_mut(&mut self) -> &mut EditorPane {
-        &mut self.panes[self.active]
+        &mut self.panes[front_tab(&self.groups)]
     }
 
     /// Sets how the agent endpoint is started.
@@ -737,22 +742,22 @@ impl NativeApplication {
 
     /// The editor's buffer.
     pub fn editor(&self) -> &Editor {
-        &self.panes[self.active].editor
+        &self.panes[front_tab(&self.groups)].editor
     }
 
     /// The editor's buffer, for the callers that edit it.
     pub fn editor_mut(&mut self) -> &mut Editor {
-        &mut self.panes[self.active].editor
+        &mut self.panes[front_tab(&self.groups)].editor
     }
 
     /// The view of the text on screen.
     pub fn view(&self) -> &EditorView {
-        &self.panes[self.active].view
+        &self.panes[front_tab(&self.groups)].view
     }
 
     /// The view of the text on screen, for the callers that move it.
     pub fn view_mut(&mut self) -> &mut EditorView {
-        &mut self.panes[self.active].view
+        &mut self.panes[front_tab(&self.groups)].view
     }
 
     /// Sets the sizes at which the highlighter gives up.
@@ -768,12 +773,12 @@ impl NativeApplication {
 
     /// The file that is open, if any.
     pub fn document(&self) -> Option<&Document> {
-        self.panes[self.active].document.as_ref()
+        self.panes[front_tab(&self.groups)].document.as_ref()
     }
 
     /// The file that is open, for the callers that change it.
     pub fn document_mut(&mut self) -> Option<&mut Document> {
-        self.panes[self.active].document.as_mut()
+        self.panes[front_tab(&self.groups)].document.as_mut()
     }
 
     /// Opens a file in a tab.
@@ -808,6 +813,13 @@ impl NativeApplication {
             self.detector.watch(document.path(), document.fingerprint());
         }
         self.panes.push(pane);
+        // The file is opened in the column that has the keyboard: a column
+        // has its own tabs, and the tabs of one column are not the tabs of
+        // the other.
+        self.groups.add(index);
+        // The path above the text is the path of the file that was just
+        // opened.
+        self.refresh_crumbs_of(index);
         // The file that is opened is drawn at the size the window has.
         self.apply_the_zoom();
         // The breakpoints of the file follow its text again: the anchors of
@@ -844,20 +856,41 @@ impl NativeApplication {
 
     /// Brings a tab to the front.
     fn activate_tab(&mut self, index: usize) {
-        if index >= self.panes.len() || index == self.active {
+        if index >= self.panes.len() {
             return;
         }
+        let column = self.groups.column_of(index);
+        if column == Some(self.groups.active()) && self.groups.front() == Some(index) {
+            return;
+        }
+        // The tab belongs to a column: it comes to the front there, and that
+        // column becomes the one that has the keyboard.
+        self.groups.focus(index);
         self.tabs.activate_index(index);
-        self.active = index;
-        // The path above the text is the path of the file that is now on
-        // screen.
-        self.refresh_crumbs();
         // The language server is told about the document that is now on
         // screen; it knows nothing about the ones that were closed.
         self.tell_server_about_the_new_document();
         // The change waiting for the user is the one about the file that is
         // now in front.
         self.note_new_diff();
+    }
+
+    /// Opens a column to the right of the active one.
+    ///
+    /// The new column shows a file of its own: a column has its own tabs,
+    /// and the tabs of one column are not the tabs of the other. The column
+    /// that opens becomes the one that has the keyboard.
+    fn split_right(&mut self) {
+        let tab = self.tabs.open_scratch("untitled");
+        let index = self.tabs.len() - 1;
+        self.panes.push(EditorPane::scratch(tab, None));
+        self.groups.split(index);
+        // The path above the text is the path of the file that was just
+        // opened.
+        self.refresh_crumbs_of(index);
+        // The file that is opened is drawn at the size the window has.
+        self.apply_the_zoom();
+        self.status = Some(format!("窗口分成了 {} 栏", self.groups.len()));
     }
 
     /// Closes a tab.
@@ -871,20 +904,23 @@ impl NativeApplication {
         }
         self.panes.remove(index);
         self.tabs.close(tab);
+        // The column the tab was in loses it. A column that has no tabs left
+        // goes away with it, unless it is the only column there is.
+        self.groups.remove(index);
 
         if self.panes.is_empty() {
             // The last tab was closed: an empty editor takes its place, so
             // there is always something to type into.
             let tab = self.tabs.open_scratch("untitled");
             self.panes.push(EditorPane::scratch(tab, None));
-            self.active = 0;
-            self.refresh_crumbs();
+            self.groups = Groups::new();
+            self.groups.add(0);
             return;
         }
-        // The workbench decides which tab comes to the front.
-        let active = self.tabs.active_index().unwrap_or(0);
-        self.active = active.min(self.panes.len() - 1);
-        self.refresh_crumbs();
+        // The tab in front of the active column is the one that is on screen.
+        if let Some(front) = self.groups.front() {
+            self.tabs.activate_index(front);
+        }
     }
 
     /// Closes the tab with the given id, wherever it is.
@@ -964,7 +1000,7 @@ impl NativeApplication {
         let Some(server) = self.server.as_ref() else {
             return;
         };
-        let pane = &mut self.panes[self.active];
+        let pane = &mut self.panes[front_tab(&self.groups)];
         let Some(path) = pane.document.as_ref().map(|document| document.path().to_path_buf())
         else {
             pane.document_uri = None;
@@ -991,7 +1027,7 @@ impl NativeApplication {
     /// version of the text: an answer that arrives after the text changed
     /// again is about a text that is gone, and is dropped.
     fn pump_syntax(&mut self) -> bool {
-        let pane = &mut self.panes[self.active];
+        let pane = &mut self.panes[front_tab(&self.groups)];
         let version = pane.editor.version();
         let visible = pane.view.visible_range();
         let bytes = pane.editor.buffer().len().0;
@@ -1102,24 +1138,32 @@ impl NativeApplication {
         }
     }
 
-    /// Works out the pieces of the path of the file that is on screen.
+    /// Works out the pieces of the path of a file.
     ///
     /// The path is the one on the disk, shortened with the root of the
     /// project the file belongs to. The tree of files cannot say it: the tree
     /// is rooted at the folder of the file, so it does not know where that
     /// folder is in the project.
-    fn refresh_crumbs(&mut self) {
-        let Some(document) = self
+    ///
+    /// The pieces belong to the file and not to the window: two columns show
+    /// two files, and each of them has its own path above the text.
+    fn refresh_crumbs_of(&mut self, index: usize) {
+        let path = self
             .panes
-            .get(self.active)
+            .get(index)
             .and_then(|pane| pane.document.as_ref())
-        else {
-            self.crumbs.clear();
+            .map(|document| document.path().to_path_buf());
+        let Some(path) = path else {
+            if let Some(pane) = self.panes.get_mut(index) {
+                pane.crumbs.clear();
+            }
             return;
         };
-        let path = document.path();
-        let root = lsp::workspace_root(path);
-        self.crumbs = breadcrumbs::of(path, Some(root.as_path()));
+        let root = lsp::workspace_root(&path);
+        let crumbs = breadcrumbs::of(&path, Some(root.as_path()));
+        if let Some(pane) = self.panes.get_mut(index) {
+            pane.crumbs = crumbs;
+        }
     }
 
     /// Handles the keys of the question the window is asking.
@@ -1174,7 +1218,7 @@ impl NativeApplication {
     /// The panel starts on the values that are in force now, so what the user
     /// sees is what the editor is doing.
     fn open_settings(&mut self) {
-        let policy = self.panes[self.active].policy;
+        let policy = self.panes[front_tab(&self.groups)].policy;
         self.settings = Some(Settings::with_keys(
             policy,
             self.zoom,
@@ -1415,13 +1459,22 @@ impl NativeApplication {
     }
 
     /// Brings the tab that was clicked to the front.
-    fn press_tab_bar(&mut self, point: Point, layout: &WindowLayout) {
+    ///
+    /// The tab belongs to the column it was clicked in: a column has its own
+    /// tabs, and the one that is clicked comes to the front of its own
+    /// column. That column becomes the one that has the keyboard.
+    fn press_tab_bar(&mut self, point: Point, column: usize, layout: &WindowLayout) {
         let strip = {
             let Some(renderer) = self.renderer.as_mut() else {
                 return;
             };
+            let Some(place) = layout.columns.get(column) else {
+                return;
+            };
             let mut measurer = RendererMeasurer::new(renderer, TextFamily::SansSerif);
-            tab_strip(self.tabs.tabs(), self.active, layout, &mut measurer)
+            let tabs = tabs_of_a_column(&self.tabs, &self.groups, column);
+            let active = front_of_a_column(&self.groups, column);
+            shell::TabStrip::layout(&tabs, active, place.tab_bar, &mut measurer)
         };
         self.activate_tab_at(point, &strip);
     }
@@ -1481,13 +1534,19 @@ impl NativeApplication {
     /// A folder of the path is a folder of files: the tree of files goes to
     /// that folder, so that the person can see what is in it. The file
     /// itself is the file that is open already, so it only says so.
-    fn press_breadcrumbs(&mut self, point: Point, layout: &WindowLayout) {
+    fn press_breadcrumbs(&mut self, point: Point, column: usize, layout: &WindowLayout) {
         let strip = {
             let Some(renderer) = self.renderer.as_mut() else {
                 return;
             };
+            let Some(place) = layout.columns.get(column) else {
+                return;
+            };
+            let Some(tab) = self.groups.front_of(column) else {
+                return;
+            };
             let mut measurer = RendererMeasurer::new(renderer, TextFamily::SansSerif);
-            breadcrumbs::strip(layout.breadcrumbs, &self.crumbs, &mut measurer)
+            breadcrumbs::strip(place.breadcrumbs, &self.panes[tab].crumbs, &mut measurer)
         };
         self.go_to_the_place_of_the_path(&strip, point);
     }
@@ -1513,24 +1572,33 @@ impl NativeApplication {
     /// The map shows the whole file, so a click on it says where in the file
     /// the person wants to be. The caret stays where it is: the map is for
     /// finding a place, not for moving the caret.
-    fn press_minimap(&mut self, point: Point, layout: &WindowLayout) {
-        let pane = &mut self.panes[self.active];
+    fn press_minimap(&mut self, point: Point, column: usize, layout: &WindowLayout) {
+        let Some(place) = layout.columns.get(column) else {
+            return;
+        };
+        let Some(minimap) = place.minimap else {
+            return;
+        };
+        let Some(tab) = self.groups.front_of(column) else {
+            return;
+        };
+        let pane = &mut self.panes[tab];
         let total = pane.editor.buffer().line_count();
         let Some(line) = pane
             .view
             .minimap(pane.editor.buffer())
-            .line_at(point.y, layout.minimap)
+            .line_at(point.y, minimap)
         else {
             return;
         };
-        let visible = ((layout.body.size.height / self.zoom.line_height()).floor() as usize).max(1);
+        let visible = ((place.body.size.height / self.zoom.line_height()).floor() as usize).max(1);
         let first = line.saturating_sub(visible / 2).min(total.saturating_sub(1));
         pane.view.view.first_line = first;
     }
 
     /// Puts the caret on a line of the file that is open.
     fn go_to_line(&mut self, line: usize) {
-        let pane = &mut self.panes[self.active];
+        let pane = &mut self.panes[front_tab(&self.groups)];
         let buffer = pane.editor.buffer();
         if line == 0 || line > buffer.line_count() {
             return;
@@ -1649,21 +1717,21 @@ impl NativeApplication {
         };
         let current = self
             .panes
-            .get(self.active)
+            .get(front_tab(&self.groups))
             .and_then(|pane| pane.document.as_ref())
             .map(|document| document.display_path())
             .zip(
                 self.panes
-                    .get(self.active)
+                    .get(front_tab(&self.groups))
                     .map(|pane| pane.editor.text()),
             );
         let selection = self
             .panes
-            .get(self.active)
+            .get(front_tab(&self.groups))
             .and_then(|pane| context::selection_text(&pane.editor))
             .zip(
                 self.panes
-                    .get(self.active)
+                    .get(front_tab(&self.groups))
                     .and_then(|pane| pane.document.as_ref())
                     .map(|document| document.display_path()),
             );
@@ -1671,7 +1739,7 @@ impl NativeApplication {
             .panes
             .iter()
             .enumerate()
-            .filter(|(index, _)| *index != self.active)
+            .filter(|(index, _)| *index != front_tab(&self.groups))
             .filter_map(|(_, pane)| {
                 let document = pane.document.as_ref()?;
                 Some((document.display_path(), pane.editor.text()))
@@ -1730,7 +1798,7 @@ impl NativeApplication {
     /// The path of the file that is open, as the agent names it.
     fn open_path(&self) -> Option<String> {
         self.panes
-            .get(self.active)
+            .get(front_tab(&self.groups))
             .and_then(|pane| pane.document.as_ref())
             .map(|document| document.display_path())
     }
@@ -1829,7 +1897,7 @@ impl NativeApplication {
     /// panel already holds a baseline — it was recorded when the change
     /// arrived — that one is used.
     fn note_pending_diff(&mut self, path: String, patch: String) {
-        let Some(pane) = self.panes.get(self.active) else {
+        let Some(pane) = self.panes.get(front_tab(&self.groups)) else {
             return;
         };
         let current_version = pane.editor.version();
@@ -1878,7 +1946,7 @@ impl NativeApplication {
             return;
         };
 
-        let Some(pane) = self.panes.get(self.active) else {
+        let Some(pane) = self.panes.get(front_tab(&self.groups)) else {
             return;
         };
         let current_text = pane.editor.text();
@@ -1904,7 +1972,7 @@ impl NativeApplication {
             } => {
                 // The text is written as one transaction, so one undo takes
                 // the whole change back.
-                let pane = &mut self.panes[self.active];
+                let pane = &mut self.panes[front_tab(&self.groups)];
                 let length = pane.editor.buffer().len();
                 let range = TextOffset(0)..length;
                 if pane.editor.replace_ranges(vec![range], &text).is_err() {
@@ -1962,7 +2030,7 @@ impl NativeApplication {
         let conflicts = self.conflicts.take();
         let _ = conflicts;
 
-        let pane = &mut self.panes[self.active];
+        let pane = &mut self.panes[front_tab(&self.groups)];
         let length = pane.editor.buffer().len();
         let range = TextOffset(0)..length;
         if pane.editor.replace_ranges(vec![range], &text).is_err() {
@@ -1988,10 +2056,13 @@ impl NativeApplication {
 
     /// How many lines of the body fit on screen.
     fn visible_lines(&self, scale_factor: f64) -> usize {
-        let body = self
-            .window_layout(self.window_size(scale_factor))
-            .body;
-        ((body.size.height / self.zoom.line_height()).floor() as usize).max(1)
+        let layout = self.window_layout(self.window_size(scale_factor));
+        // The lines that fit on screen are the ones of the column that has
+        // the keyboard.
+        let Some(column) = layout.column(self.groups.active()) else {
+            return 1;
+        };
+        ((column.body.size.height / self.zoom.line_height()).floor() as usize).max(1)
     }
 
     /// Rebuilds the layout of the text on screen.
@@ -2001,12 +2072,17 @@ impl NativeApplication {
     fn rebuild_layout(&mut self, scale_factor: f64) {
         let size = self.window_size(scale_factor);
         let layout = self.window_layout(size);
-        let body = layout.body;
+        // The layout of the text is the one of the column that has the
+        // keyboard.
+        let Some(place) = layout.column(self.groups.active()).copied() else {
+            return;
+        };
+        let body = place.body;
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
         let mut measurer = RendererMeasurer::new(renderer, TextFamily::Monospace);
-        let pane = &mut self.panes[self.active];
+        let pane = &mut self.panes[front_tab(&self.groups)];
         pane.view.layout(
             pane.editor.buffer(),
             body.size.width,
@@ -2035,26 +2111,26 @@ impl NativeApplication {
                 LspEvent::Diagnostics { uri, diagnostics } => {
                     // The server may talk about other documents; only the one
                     // on screen is drawn.
-                    if Some(uri.as_str()) != self.panes[self.active].document_uri.as_deref() {
+                    if Some(uri.as_str()) != self.panes[front_tab(&self.groups)].document_uri.as_deref() {
                         continue;
                     }
-                    let marks = lsp::marks_for(self.panes[self.active].editor.buffer(), &diagnostics);
-                    self.panes[self.active].errors = marks
+                    let marks = lsp::marks_for(self.panes[front_tab(&self.groups)].editor.buffer(), &diagnostics);
+                    self.panes[front_tab(&self.groups)].errors = marks
                         .iter()
                         .filter(|mark| mark.severity == MarkSeverity::Error)
                         .count();
-                    self.panes[self.active].warnings = marks
+                    self.panes[front_tab(&self.groups)].warnings = marks
                         .iter()
                         .filter(|mark| mark.severity == MarkSeverity::Warning)
                         .count();
-                    self.panes[self.active].marks = marks;
+                    self.panes[front_tab(&self.groups)].marks = marks;
                     changed = true;
                 }
                 LspEvent::Disconnected { reason } => {
                     eprintln!("the language server went away: {reason}");
                     self.status = Some(format!("语言服务器断开了：{reason}"));
                     self.server = None;
-                    self.panes[self.active].marks.clear();
+                    self.panes[front_tab(&self.groups)].marks.clear();
                     changed = true;
                 }
                 LspEvent::Message { text } => {
@@ -2067,10 +2143,10 @@ impl NativeApplication {
         // The completions the server offered, with the ones that do not
         // match the word in front of the caret left out.
         for list in lists {
-            let caret = self.panes[self.active].editor.caret().0;
-            let prefix = completion::word_before(self.panes[self.active].editor.buffer(), caret);
+            let caret = self.panes[front_tab(&self.groups)].editor.caret().0;
+            let prefix = completion::word_before(self.panes[front_tab(&self.groups)].editor.buffer(), caret);
             let items = completion::matching(list.items, &prefix);
-            let start = completion::word_start(self.panes[self.active].editor.buffer(), caret);
+            let start = completion::word_start(self.panes[front_tab(&self.groups)].editor.buffer(), caret);
             if let Some(popup) = CompletionPopup::new(items, start) {
                 self.completion = Some(popup);
                 changed = true;
@@ -2188,7 +2264,7 @@ impl NativeApplication {
     /// The server is told about every edit, so its answers are about the text
     /// that is on screen and not about the text as the file was opened.
     fn tell_server_about_the_change(&mut self) {
-        let active = self.active;
+        let active = front_tab(&self.groups);
         self.tell_server_about_the_change_of(active);
     }
 
@@ -2219,13 +2295,23 @@ impl NativeApplication {
 
     /// Scrolls the body so that the caret is on screen.
     fn keep_caret_visible(&mut self, scale_factor: f64) {
-        let pane = &self.panes[self.active];
+        let pane = &self.panes[front_tab(&self.groups)];
         let total_lines = pane.editor.buffer().line_count();
         let visible = self.visible_lines(scale_factor);
         let caret = pane.editor.caret().0;
-        let pane = &mut self.panes[self.active];
+        let pane = &mut self.panes[front_tab(&self.groups)];
         pane.view
             .ensure_caret_visible(pane.editor.buffer(), caret, total_lines, visible);
+    }
+
+    /// The column a click is in, and which gets the keyboard.
+    ///
+    /// A click in a column is a click in that column: the keyboard goes
+    /// there, because that is what the person means.
+    fn column_of_the_click(&mut self, cursor: Point, layout: &WindowLayout) -> Option<usize> {
+        let column = layout.column_at(cursor)?;
+        self.groups.activate(column);
+        Some(column)
     }
 
     /// Handles a mouse press in the editor body.
@@ -2244,26 +2330,36 @@ impl NativeApplication {
             self.press_activity_bar(cursor, &layout);
             return;
         }
-        // The tab strip and the file tree are around the text: a click there
-        // is not a click in the document.
-        if layout.tab_bar.contains(cursor) {
-            self.press_tab_bar(cursor, &layout);
-            return;
-        }
-        // The path above the text: a click on a piece of it says where the
-        // person wants to be.
-        if layout.breadcrumbs.contains(cursor) {
-            self.press_breadcrumbs(cursor, &layout);
-            return;
+        // Which column is the click in? The click gives the keyboard to the
+        // column it is in: that is what the person means.
+        let column = self.column_of_the_click(cursor, &layout);
+        if let Some(column) = column {
+            let Some(place) = layout.columns.get(column) else {
+                return;
+            };
+            // The tab strip and the file tree are around the text: a click
+            // there is not a click in the document.
+            if place.tab_bar.contains(cursor) {
+                self.press_tab_bar(cursor, column, &layout);
+                return;
+            }
+            // The path above the text: a click on a piece of it says where the
+            // person wants to be.
+            if place.breadcrumbs.contains(cursor) {
+                self.press_breadcrumbs(cursor, column, &layout);
+                return;
+            }
+            // The map of the document is on the right of the text: a click on
+            // it says where in the file to go.
+            if let Some(minimap) = place.minimap
+                && minimap.contains(cursor)
+            {
+                self.press_minimap(cursor, column, &layout);
+                return;
+            }
         }
         if layout.sidebar.size.width > 0.0 && layout.sidebar.contains(cursor) {
             self.press_side_bar(cursor, layout.sidebar_content());
-            return;
-        }
-        // The map of the document is on the right of the text: a click on it
-        // says where in the file to go.
-        if layout.minimap.contains(cursor) {
-            self.press_minimap(cursor, &layout);
             return;
         }
         // The panel of the debugger is at the bottom of the window: a click
@@ -2271,12 +2367,22 @@ impl NativeApplication {
         if self.press_the_debug_panel(cursor, size) {
             return;
         }
-        let body = layout.body;
+        // The text of the document is in the column that was clicked.
+        let Some(column) = column else {
+            return;
+        };
+        let Some(place) = layout.columns.get(column) else {
+            return;
+        };
+        let body = place.body;
         if !body.contains(cursor) {
             return;
         }
         let add = self.modifiers.control_key();
-        let pane = &mut self.panes[self.active];
+        let Some(tab) = self.groups.front_of(column) else {
+            return;
+        };
+        let pane = &mut self.panes[tab];
         pane.view.press(
             &mut pane.editor,
             cursor.x - body.origin.x,
@@ -2353,7 +2459,7 @@ impl NativeApplication {
             // The file could not be opened: the reason was said already.
             return;
         }
-        let pane = &mut self.panes[self.active];
+        let pane = &mut self.panes[front_tab(&self.groups)];
         let offset = pane.editor.buffer().line_range(line.saturating_sub(1) as usize).start;
         pane.editor.set_carets(&[offset]);
         // The line of the frame is scrolled into the picture: a place that
@@ -2374,7 +2480,7 @@ impl NativeApplication {
 
     /// Handles the mouse moving while a drag is in progress.
     fn drag_body(&mut self, scale_factor: f64) {
-        if !self.panes[self.active].view.is_dragging() {
+        if !self.panes[front_tab(&self.groups)].view.is_dragging() {
             return;
         }
         let Some(cursor) = self.cursor else {
@@ -2382,8 +2488,11 @@ impl NativeApplication {
         };
         let body = self
             .window_layout(self.window_size(scale_factor))
-            .body;
-        let pane = &mut self.panes[self.active];
+            .columns
+            .get(self.groups.active())
+            .map(|column| column.body)
+            .unwrap_or(Rect::new(0.0, 0.0, 0.0, 0.0));
+        let pane = &mut self.panes[front_tab(&self.groups)];
         pane.view.drag(
             &mut pane.editor,
             cursor.x - body.origin.x,
@@ -2397,22 +2506,22 @@ impl NativeApplication {
     /// so the caret can keep moving.
     fn move_caret_vertically(&mut self, scale_factor: f64, delta: isize) {
         {
-            let pane = &mut self.panes[self.active];
+            let pane = &mut self.panes[front_tab(&self.groups)];
             if pane.view.move_vertical(&mut pane.editor, delta) {
                 return;
             }
         }
-        let total_lines = self.panes[self.active].editor.buffer().line_count();
-        self.panes[self.active].view.scroll(delta, total_lines);
+        let total_lines = self.panes[front_tab(&self.groups)].editor.buffer().line_count();
+        self.panes[front_tab(&self.groups)].view.scroll(delta, total_lines);
         self.rebuild_layout(scale_factor);
-        let pane = &mut self.panes[self.active];
+        let pane = &mut self.panes[front_tab(&self.groups)];
         pane.view.move_vertical(&mut pane.editor, delta);
     }
 
     /// Scrolls the body by a number of lines.
     fn scroll_body(&mut self, lines: isize) {
-        let total_lines = self.panes[self.active].editor.buffer().line_count();
-        self.panes[self.active].view.scroll(lines, total_lines);
+        let total_lines = self.panes[front_tab(&self.groups)].editor.buffer().line_count();
+        self.panes[front_tab(&self.groups)].view.scroll(lines, total_lines);
     }
 
     /// Scrolls the body the way the wheel was turned.
@@ -2550,7 +2659,7 @@ impl NativeApplication {
                     return true;
                 }
                 Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
-                    if let Err(error) = completion.apply(&mut self.panes[self.active].editor) {
+                    if let Err(error) = completion.apply(&mut self.panes[front_tab(&self.groups)].editor) {
                         eprintln!("could not put the completion in: {error}");
                     }
                     return true;
@@ -2572,11 +2681,11 @@ impl NativeApplication {
 
     /// Asks the server what could come next at the caret.
     fn request_completion(&mut self) {
-        let Some(uri) = self.panes[self.active].document_uri.clone() else {
+        let Some(uri) = self.panes[front_tab(&self.groups)].document_uri.clone() else {
             return;
         };
-        let caret = self.panes[self.active].editor.caret().0;
-        let position = lsp::position_of(self.panes[self.active].editor.buffer(), caret);
+        let caret = self.panes[front_tab(&self.groups)].editor.caret().0;
+        let position = lsp::position_of(self.panes[front_tab(&self.groups)].editor.buffer(), caret);
         let outcome = self
             .server
             .as_ref()
@@ -2602,11 +2711,11 @@ impl NativeApplication {
             // server work twice for one press of the key.
             return;
         }
-        let Some(uri) = self.panes[self.active].document_uri.clone() else {
+        let Some(uri) = self.panes[front_tab(&self.groups)].document_uri.clone() else {
             self.status = Some("这个文件没有语言服务器，格式化不了".to_owned());
             return;
         };
-        let editor = &self.panes[self.active].editor;
+        let editor = &self.panes[front_tab(&self.groups)].editor;
         let buffer = editor.buffer();
         let selection = editor.selection().range(buffer);
         let outcome = self.server.as_ref().map(|server| {
@@ -2630,7 +2739,7 @@ impl NativeApplication {
                 // about: an answer that comes back for a text that has
                 // changed since then does not fit the text that is there
                 // now.
-                self.formatting = Some(self.panes[self.active].editor.version());
+                self.formatting = Some(self.panes[front_tab(&self.groups)].editor.version());
                 self.status = Some("正在格式化…".to_owned());
             }
             Some(Err(error)) => {
@@ -2652,12 +2761,12 @@ impl NativeApplication {
     ///
     /// Returns whether the text changed.
     fn apply_formatting(&mut self, edits: Vec<TextEdit>, sent_at: u64) -> bool {
-        if sent_at != self.panes[self.active].editor.version() {
+        if sent_at != self.panes[front_tab(&self.groups)].editor.version() {
             self.status = Some("文件在格式化期间变了，格式化结果没有用上".to_owned());
             return false;
         }
         let Some(changes) =
-            lsp::formatting_changes(self.panes[self.active].editor.buffer(), &edits)
+            lsp::formatting_changes(self.panes[front_tab(&self.groups)].editor.buffer(), &edits)
         else {
             self.status = Some("格式化结果对不上这个文件，没有改".to_owned());
             return false;
@@ -2666,7 +2775,7 @@ impl NativeApplication {
             self.status = Some("这个文件已经排好了版".to_owned());
             return false;
         }
-        if let Err(error) = self.panes[self.active].editor.replace_edits(changes) {
+        if let Err(error) = self.panes[front_tab(&self.groups)].editor.replace_edits(changes) {
             eprintln!("could not put the formatting in: {error}");
             self.status = Some(format!("格式化结果写不进去：{error}"));
             return false;
@@ -2791,12 +2900,12 @@ impl NativeApplication {
     /// The answer comes later: the window collects it and opens the list of
     /// the things the server offers.
     fn request_code_action(&mut self) {
-        let Some(uri) = self.panes[self.active].document_uri.clone() else {
+        let Some(uri) = self.panes[front_tab(&self.groups)].document_uri.clone() else {
             self.status = Some("这个文件没有语言服务器，代码操作不了".to_owned());
             return;
         };
-        let caret = self.panes[self.active].editor.caret().0;
-        let range = lsp::line_range(self.panes[self.active].editor.buffer(), caret);
+        let caret = self.panes[front_tab(&self.groups)].editor.caret().0;
+        let range = lsp::line_range(self.panes[front_tab(&self.groups)].editor.buffer(), caret);
         let outcome = self
             .server
             .as_ref()
@@ -2807,7 +2916,7 @@ impl NativeApplication {
                 // text: the list may be picked much later.
                 self.action_target = Some((
                     uri,
-                    self.panes[self.active].editor.version(),
+                    self.panes[front_tab(&self.groups)].editor.version(),
                 ));
                 self.status = Some("正在问服务器这里能做什么…".to_owned());
             }
@@ -2834,8 +2943,8 @@ impl NativeApplication {
             let (uri, version) = match self.action_target.clone() {
                 Some(target) => target,
                 None => (
-                    self.panes[self.active].document_uri.clone().unwrap_or_default(),
-                    self.panes[self.active].editor.version(),
+                    self.panes[front_tab(&self.groups)].document_uri.clone().unwrap_or_default(),
+                    self.panes[front_tab(&self.groups)].editor.version(),
                 ),
             };
             let outcome = self.apply_workspace_edit(edit, &uri, version, "代码操作");
@@ -2937,7 +3046,7 @@ impl NativeApplication {
             self.status = Some("已经有任务在跑了".to_owned());
             return;
         }
-        let Some(path) = self.panes[self.active]
+        let Some(path) = self.panes[front_tab(&self.groups)]
             .document
             .as_ref()
             .map(|document| document.path().to_path_buf())
@@ -3007,13 +3116,13 @@ impl NativeApplication {
             self.status = Some("没有语言服务器，重命名不了".to_owned());
             return;
         }
-        let caret = self.panes[self.active].editor.caret().0;
-        let Some((start, end)) = rename::word_at_caret(self.panes[self.active].editor.buffer(), caret)
+        let caret = self.panes[front_tab(&self.groups)].editor.caret().0;
+        let Some((start, end)) = rename::word_at_caret(self.panes[front_tab(&self.groups)].editor.buffer(), caret)
         else {
             self.status = Some("光标处没有可以重命名的名字".to_owned());
             return;
         };
-        let name = self.panes[self.active]
+        let name = self.panes[front_tab(&self.groups)]
             .editor
             .buffer()
             .slice(TextOffset(start)..TextOffset(end))
@@ -3077,11 +3186,11 @@ impl NativeApplication {
             self.status = Some("名字没有变，没有重命名".to_owned());
             return;
         }
-        let Some(uri) = self.panes[self.active].document_uri.clone() else {
+        let Some(uri) = self.panes[front_tab(&self.groups)].document_uri.clone() else {
             self.status = Some("这个文件没有语言服务器，重命名不了".to_owned());
             return;
         };
-        let position = lsp::position_of(self.panes[self.active].editor.buffer(), rename.start());
+        let position = lsp::position_of(self.panes[front_tab(&self.groups)].editor.buffer(), rename.start());
         let outcome = self
             .server
             .as_ref()
@@ -3094,7 +3203,7 @@ impl NativeApplication {
                 // now.
                 self.renaming = Some(RenameRequest {
                     uri,
-                    version: self.panes[self.active].editor.version(),
+                    version: self.panes[front_tab(&self.groups)].editor.version(),
                     new_name,
                 });
                 self.status = Some("正在重命名…".to_owned());
@@ -3346,7 +3455,7 @@ impl NativeApplication {
             && let Some(letter) = key_letter(key)
         {
             if letter.eq_ignore_ascii_case(&'c') {
-                find.toggle_case_sensitive(&self.panes[self.active].editor);
+                find.toggle_case_sensitive(&self.panes[front_tab(&self.groups)].editor);
                 let count = find.match_count();
                 self.status = Some(format!("{count} 处匹配"));
             }
@@ -3362,10 +3471,10 @@ impl NativeApplication {
             }
             Key::Named(NamedKey::Enter) => {
                 if self.modifiers.control_key() && self.modifiers.alt_key() {
-                    let count = find.replace_all(&mut self.panes[self.active].editor);
+                    let count = find.replace_all(&mut self.panes[front_tab(&self.groups)].editor);
                     self.status = Some(format!("替换了 {count} 处"));
                 } else if self.modifiers.alt_key() {
-                    let count = find.select_all_matches(&mut self.panes[self.active].editor);
+                    let count = find.select_all_matches(&mut self.panes[front_tab(&self.groups)].editor);
                     self.status = Some(format!("选中了 {count} 处"));
                 } else if self.modifiers.shift_key() {
                     find.previous_match();
@@ -3374,20 +3483,20 @@ impl NativeApplication {
                 }
             }
             Key::Named(NamedKey::Tab) => find.toggle_field(),
-            Key::Named(NamedKey::Backspace) => find.backspace(&self.panes[self.active].editor),
-            Key::Named(NamedKey::Space) => find.type_text(&self.panes[self.active].editor, " "),
+            Key::Named(NamedKey::Backspace) => find.backspace(&self.panes[front_tab(&self.groups)].editor),
+            Key::Named(NamedKey::Space) => find.type_text(&self.panes[front_tab(&self.groups)].editor, " "),
             Key::Character(character) if !self.modifiers.control_key() => {
                 let character = character.as_ref();
                 if character.chars().any(char::is_control) {
                     // The key did not produce text of its own; the text of
                     // the event is what the user typed.
                     if let Some(typed) = text.filter(|typed| !typed.chars().any(char::is_control)) {
-                        find.type_text(&self.panes[self.active].editor, typed);
+                        find.type_text(&self.panes[front_tab(&self.groups)].editor, typed);
                     } else {
                         handled = false;
                     }
                 } else {
-                    find.type_text(&self.panes[self.active].editor, character);
+                    find.type_text(&self.panes[front_tab(&self.groups)].editor, character);
                 }
             }
             _ => {
@@ -3403,7 +3512,7 @@ impl NativeApplication {
     /// Opens the find bar and searches for what the editor has selected.
     fn open_find(&mut self, replacing: bool) {
         let mut find = self.find.take().unwrap_or_default();
-        find.open(&mut self.panes[self.active].editor, replacing);
+        find.open(&mut self.panes[front_tab(&self.groups)].editor, replacing);
         self.find = Some(find);
     }
 
@@ -3413,8 +3522,8 @@ impl NativeApplication {
     /// find bar can be looked at without a keyboard.
     pub fn open_find_with(&mut self, query: &str) {
         let mut find = self.find.take().unwrap_or_default();
-        find.open(&mut self.panes[self.active].editor, false);
-        find.type_text(&self.panes[self.active].editor, query);
+        find.open(&mut self.panes[front_tab(&self.groups)].editor, false);
+        find.type_text(&self.panes[front_tab(&self.groups)].editor, query);
         self.find = Some(find);
     }
 
@@ -3429,9 +3538,9 @@ impl NativeApplication {
     /// The status line: the open file, whether it changed, and the last
     /// message.
     fn status_line(&self) -> String {
-        let mut status = match self.panes[self.active].document.as_ref() {
+        let mut status = match self.panes[front_tab(&self.groups)].document.as_ref() {
             Some(document) => {
-                let dirty = if document.is_dirty(&self.panes[self.active].editor.text()) {
+                let dirty = if document.is_dirty(&self.panes[front_tab(&self.groups)].editor.text()) {
                     " ●"
                 } else {
                     ""
@@ -3442,13 +3551,13 @@ impl NativeApplication {
         };
         // What the language server found wrong is counted, so that the user
         // knows there is something to look at.
-        if self.panes[self.active].errors > 0 || self.panes[self.active].warnings > 0 {
-            status.push_str(&format!("  ·  ✕ {}  ⚠ {}", self.panes[self.active].errors, self.panes[self.active].warnings));
+        if self.panes[front_tab(&self.groups)].errors > 0 || self.panes[front_tab(&self.groups)].warnings > 0 {
+            status.push_str(&format!("  ·  ✕ {}  ⚠ {}", self.panes[front_tab(&self.groups)].errors, self.panes[front_tab(&self.groups)].warnings));
         }
         // A file that is too big is not coloured, and the user is told why:
         // a document that quietly loses its colours looks broken.
-        if self.panes[self.active].degraded {
-            let policy = self.panes[self.active].policy;
+        if self.panes[front_tab(&self.groups)].degraded {
+            let policy = self.panes[front_tab(&self.groups)].policy;
             status.push_str(&format!(
                 "  ·  降级模式：文件超过 {} 字节或 {} 行，不做语法高亮",
                 policy.max_bytes, policy.max_lines
@@ -3460,13 +3569,48 @@ impl NativeApplication {
         status
     }
 
+    /// The columns of the window, and what each of them shows.
+    ///
+    /// A column has its own tabs: the tabs of one column are not the tabs of
+    /// the other, and the tab in front of it is the file the column shows.
+    fn columns_of_the_window(&self) -> Vec<ColumnData> {
+        let mut columns = Vec::new();
+        for index in 0..self.groups.len() {
+            let Some(tab) = self.groups.front_of(index) else {
+                continue;
+            };
+            let tabs: Vec<(Tab, bool)> = self
+                .groups
+                .tabs_of(index)
+                .iter()
+                .filter_map(|place| {
+                    let tab = self.tabs.tabs().get(*place)?;
+                    Some((tab.clone(), tab.dirty))
+                })
+                .collect();
+            let active = self
+                .groups
+                .tabs_of(index)
+                .iter()
+                .position(|place| *place == tab)
+                .unwrap_or(0);
+            columns.push(ColumnData { tab, tabs, active });
+        }
+        columns
+    }
+
     /// Where the parts of the window are.
     ///
     /// The drawing and the clicking both go through here: a tab that is
     /// drawn in one place and clicked in another is a tab that cannot be
     /// clicked.
     fn window_layout(&self, size: Size) -> WindowLayout {
-        WindowLayout::of(size, self.bottom_panel_height(), self.sidebar.is_open())
+        WindowLayout::of(
+            size,
+            self.bottom_panel_height(),
+            self.sidebar.is_open(),
+            self.groups.len(),
+        )
     }
 
     /// The numbers that are drawn on the activities.
@@ -3496,8 +3640,15 @@ impl NativeApplication {
     /// what the editor is doing inside, and the right says where the caret
     /// is.
     fn status_bar_text(&self) -> StatusBar {
-        let pane = &self.panes[self.active];
+        let pane = &self.panes[front_tab(&self.groups)];
         let (line, column) = self.caret_position();
+        // A window that is split says which of its columns has the keyboard.
+        let columns = self.groups.len();
+        let place = if columns > 1 {
+            format!(" · 栏 {}/{}", self.groups.active() + 1, columns)
+        } else {
+            String::new()
+        };
         StatusBar {
             left: self.status_line(),
             middle: format!(
@@ -3508,13 +3659,16 @@ impl NativeApplication {
                 pane.editor.can_redo(),
                 pane.editor.cursor_count(),
             ),
-            right: format!("行 {line}，列 {column} · {}", self.zoom.label()),
+            right: format!(
+                "行 {line}，列 {column} · {}{place}",
+                self.zoom.label()
+            ),
         }
     }
 
     /// Where the caret is: the line and the column, counting from one.
     fn caret_position(&self) -> (usize, usize) {
-        let pane = &self.panes[self.active];
+        let pane = &self.panes[front_tab(&self.groups)];
         let buffer = pane.editor.buffer();
         let caret = pane.editor.caret().0;
         let line = buffer.line_of_offset(caret);
@@ -3628,7 +3782,7 @@ impl NativeApplication {
     /// separate blocks, so the agent knows which is the request and which is
     /// the material.
     pub fn start_agent_turn(&mut self) {
-        let prompt = self.panes[self.active].editor.text();
+        let prompt = self.panes[front_tab(&self.groups)].editor.text();
         if prompt.trim().is_empty() {
             self.agent_error =
                 Some("the buffer is empty, so there is nothing to ask about".to_owned());
@@ -3646,7 +3800,7 @@ impl NativeApplication {
             };
             // The agent works in the directory of the open file, so its
             // context is the file the user is actually looking at.
-            if let Some(document) = self.panes[self.active].document.as_ref()
+            if let Some(document) = self.panes[front_tab(&self.groups)].document.as_ref()
                 && let Some(directory) = document.path().parent()
             {
                 settings.cwd = directory.to_path_buf();
@@ -3714,7 +3868,7 @@ impl NativeApplication {
         // find bar give up their place to the panel of the changes.
         self.rename_box = None;
         self.find = None;
-        let Some(path) = self.panes[self.active]
+        let Some(path) = self.panes[front_tab(&self.groups)]
             .document
             .as_ref()
             .map(|document| document.path().to_path_buf())
@@ -4166,7 +4320,7 @@ impl NativeApplication {
 
     /// The address of the file that is on screen.
     fn uri_of_the_open_file(&self) -> Option<String> {
-        self.uri_of_a_pane(self.active)
+        self.uri_of_a_pane(front_tab(&self.groups))
     }
 
     /// The address of the file of a tab.
@@ -4188,8 +4342,8 @@ impl NativeApplication {
             self.status = Some("这个文件没有地址，断点放不了".to_owned());
             return;
         };
-        let caret = self.panes[self.active].editor.caret().0;
-        let line = self.panes[self.active].editor.buffer().line_of_offset(caret) + 1;
+        let caret = self.panes[front_tab(&self.groups)].editor.caret().0;
+        let line = self.panes[front_tab(&self.groups)].editor.buffer().line_of_offset(caret) + 1;
         if self.breakpoints.toggle(&uri, line as u32) {
             // The place of the breakpoint is remembered, so that it follows
             // the text when the file changes above it.
@@ -4245,8 +4399,8 @@ impl NativeApplication {
 
     /// The line the caret is on.
     fn the_line_of_the_caret(&self) -> Option<u32> {
-        let caret = self.panes[self.active].editor.caret().0;
-        let line = self.panes[self.active].editor.buffer().line_of_offset(caret) + 1;
+        let caret = self.panes[front_tab(&self.groups)].editor.caret().0;
+        let line = self.panes[front_tab(&self.groups)].editor.buffer().line_of_offset(caret) + 1;
         Some(line as u32)
     }
 
@@ -4330,7 +4484,7 @@ impl NativeApplication {
     /// when the file changes.
     fn remember_the_place_of_the_breakpoint(&mut self, uri: &str, line: u32) {
         let anchor = {
-            let editor = &mut self.panes[self.active].editor;
+            let editor = &mut self.panes[front_tab(&self.groups)].editor;
             let offset = editor
                 .buffer()
                 .line_range(line.saturating_sub(1) as usize)
@@ -4343,7 +4497,7 @@ impl NativeApplication {
     /// Forgets where the breakpoint of a line was.
     fn forget_the_place_of_the_breakpoint(&mut self, uri: &str, line: u32) {
         if let Some(anchor) = self.breakpoints.forget(uri, line) {
-            self.panes[self.active]
+            self.panes[front_tab(&self.groups)]
                 .editor
                 .buffer_mut()
                 .release_anchor(&anchor);
@@ -4409,7 +4563,7 @@ impl NativeApplication {
             self.status = Some("没有调试适配器（用 --dap <program> 点名）".to_owned());
             return;
         };
-        let Some(path) = self.panes[self.active]
+        let Some(path) = self.panes[front_tab(&self.groups)]
             .document
             .as_ref()
             .map(|document| document.path().to_path_buf())
@@ -4853,7 +5007,7 @@ impl NativeApplication {
     ///
     /// The editor tells the registry what is true right now; the registry
     /// says which commands that lets it run.
-    fn command_context(&self) -> CommandContext {        let pane = &self.panes[self.active];
+    fn command_context(&self) -> CommandContext {        let pane = &self.panes[front_tab(&self.groups)];
         let has_name_at_caret = rename::word_at_caret(pane.editor.buffer(), pane.editor.caret().0)
             .is_some();
         let has_repository = pane
@@ -4943,13 +5097,14 @@ impl NativeApplication {
                 self.set_zoom(self.zoom.reset());
                 self.status = Some(format!("字号 {}", self.zoom.label()));
             }
+            "view.splitRight" => self.split_right(),
             "workbench.save" => {
                 if let Some(tab) = self.tabs.active().map(|tab| tab.id) {
                     self.save_tab(tab);
                     self.sync_dirty_flags();
                 }
             }
-            "workbench.closeTab" => self.request_close(self.active),
+            "workbench.closeTab" => self.request_close(front_tab(&self.groups)),
             "editor.format" => self.request_format(),
             "editor.rename" => self.open_rename_box(),
             "editor.codeAction" => self.request_code_action(),
@@ -5041,7 +5196,7 @@ impl NativeApplication {
         if self.command_history.len() > 50 {
             self.command_history.remove(0);
         }
-        let Some(path) = self.panes[self.active]
+        let Some(path) = self.panes[front_tab(&self.groups)]
             .document
             .as_ref()
             .map(|document| document.path().to_path_buf())
@@ -5090,7 +5245,7 @@ impl NativeApplication {
             self.status = Some("有个面板开着，先把它关掉再开终端".to_owned());
             return;
         }
-        let Some(path) = self.panes[self.active]
+        let Some(path) = self.panes[front_tab(&self.groups)]
             .document
             .as_ref()
             .map(|document| document.path().to_path_buf())
@@ -5338,7 +5493,7 @@ impl NativeApplication {
     /// With `replacing` the panel has a box for the text that takes the
     /// place of what is found: it replaces as well as it finds.
     fn open_search_panel(&mut self, replacing: bool) {
-        let Some(path) = self.panes[self.active]
+        let Some(path) = self.panes[front_tab(&self.groups)]
             .document
             .as_ref()
             .map(|document| document.path().to_path_buf())
@@ -5476,7 +5631,7 @@ impl NativeApplication {
         if !self.open_file(&hit.path) {
             return;
         }
-        let pane = &mut self.panes[self.active];
+        let pane = &mut self.panes[front_tab(&self.groups)];
         let line = hit.line.saturating_sub(1);
         let offset = pane.editor.buffer().line_range(line).start;
         pane.editor.set_carets(&[offset]);
@@ -5596,7 +5751,7 @@ impl ApplicationHandler for NativeApplication {
                         // While the find bar is open, the composed text goes
                         // into the bar instead of the document.
                         if let Some(find) = self.find.as_mut() {
-                            find.type_text(&self.panes[self.active].editor, &text);
+                            find.type_text(&self.panes[front_tab(&self.groups)].editor, &text);
                         } else if let Some(rename) = self.rename_box.as_mut() {
                             rename.type_text(&text);
                         } else if let Some(commit) = self.commit_box.as_mut() {
@@ -5615,7 +5770,7 @@ impl ApplicationHandler for NativeApplication {
                             && let Some(terminal) = self.terminal_input.as_mut()
                         {
                             terminal.type_text(&text);
-                        } else if let Err(error) = self.panes[self.active].editor.insert(&text) {
+                        } else if let Err(error) = self.panes[front_tab(&self.groups)].editor.insert(&text) {
                             eprintln!("failed to commit IME text: {error}");
                         }
                         self.input.finish_commit();
@@ -5638,7 +5793,7 @@ impl ApplicationHandler for NativeApplication {
                     let scale_factor = window.scale_factor();
                     match state {
                         ElementState::Pressed => self.press_body(scale_factor),
-                        ElementState::Released => self.panes[self.active].view.release(),
+                        ElementState::Released => self.panes[front_tab(&self.groups)].view.release(),
                     }
                     window.request_redraw();
                 }
@@ -5800,51 +5955,51 @@ impl ApplicationHandler for NativeApplication {
                 // to be current before the caret is moved.
                 self.rebuild_layout(scale_factor);
                 let result = match event.logical_key.as_ref() {
-                    Key::Named(NamedKey::Backspace) => self.panes[self.active].editor.backspace(),
-                    Key::Named(NamedKey::Delete) => self.panes[self.active].editor.delete_forward(),
+                    Key::Named(NamedKey::Backspace) => self.panes[front_tab(&self.groups)].editor.backspace(),
+                    Key::Named(NamedKey::Delete) => self.panes[front_tab(&self.groups)].editor.delete_forward(),
                     Key::Named(NamedKey::ArrowLeft) if self.modifiers.shift_key() => {
-                        self.panes[self.active].editor.extend_left();
+                        self.panes[front_tab(&self.groups)].editor.extend_left();
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowRight) if self.modifiers.shift_key() => {
-                        self.panes[self.active].editor.extend_right();
+                        self.panes[front_tab(&self.groups)].editor.extend_right();
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowUp) if self.modifiers.shift_key() => {
-                        let pane = &mut self.panes[self.active];
+                        let pane = &mut self.panes[front_tab(&self.groups)];
                         pane.view.extend_vertical(&mut pane.editor, -1);
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowDown) if self.modifiers.shift_key() => {
-                        let pane = &mut self.panes[self.active];
+                        let pane = &mut self.panes[front_tab(&self.groups)];
                         pane.view.extend_vertical(&mut pane.editor, 1);
                         Ok(())
                     }
                     Key::Named(NamedKey::Home) if self.modifiers.shift_key() => {
-                        let pane = &mut self.panes[self.active];
+                        let pane = &mut self.panes[front_tab(&self.groups)];
                         pane.view.extend_to_line_edge(&mut pane.editor, false);
                         Ok(())
                     }
                     Key::Named(NamedKey::End) if self.modifiers.shift_key() => {
-                        let pane = &mut self.panes[self.active];
+                        let pane = &mut self.panes[front_tab(&self.groups)];
                         pane.view.extend_to_line_edge(&mut pane.editor, true);
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowLeft) => {
-                        self.panes[self.active].editor.move_left();
+                        self.panes[front_tab(&self.groups)].editor.move_left();
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowRight) => {
-                        self.panes[self.active].editor.move_right();
+                        self.panes[front_tab(&self.groups)].editor.move_right();
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowUp) if self.modifiers.alt_key() => {
-                        let pane = &mut self.panes[self.active];
+                        let pane = &mut self.panes[front_tab(&self.groups)];
                         pane.view.add_cursor_vertically(&mut pane.editor, -1);
                         Ok(())
                     }
                     Key::Named(NamedKey::ArrowDown) if self.modifiers.alt_key() => {
-                        let pane = &mut self.panes[self.active];
+                        let pane = &mut self.panes[front_tab(&self.groups)];
                         pane.view.add_cursor_vertically(&mut pane.editor, 1);
                         Ok(())
                     }
@@ -5857,36 +6012,36 @@ impl ApplicationHandler for NativeApplication {
                         Ok(())
                     }
                     Key::Named(NamedKey::Escape) => {
-                        self.panes[self.active].editor.collapse_to_primary();
+                        self.panes[front_tab(&self.groups)].editor.collapse_to_primary();
                         Ok(())
                     }
                     Key::Named(NamedKey::Home) => {
-                        let pane = &mut self.panes[self.active];
+                        let pane = &mut self.panes[front_tab(&self.groups)];
                         pane.view.move_to_line_edge(&mut pane.editor, false);
                         Ok(())
                     }
                     Key::Named(NamedKey::End) => {
-                        let pane = &mut self.panes[self.active];
+                        let pane = &mut self.panes[front_tab(&self.groups)];
                         pane.view.move_to_line_edge(&mut pane.editor, true);
                         Ok(())
                     }
-                    Key::Named(NamedKey::Enter) => self.panes[self.active].editor.insert("\n"),
+                    Key::Named(NamedKey::Enter) => self.panes[front_tab(&self.groups)].editor.insert("\n"),
                     Key::Character(character)
                         if self.modifiers.control_key() && character.eq_ignore_ascii_case("z") =>
                     {
-                        self.panes[self.active].editor.undo()
+                        self.panes[front_tab(&self.groups)].editor.undo()
                     }
                     Key::Character(character)
                         if self.modifiers.control_key() && character.eq_ignore_ascii_case("y") =>
                     {
-                        self.panes[self.active].editor.redo()
+                        self.panes[front_tab(&self.groups)].editor.redo()
                     }
                     _ if self.input.preedit().is_empty()
                         && !self.modifiers.control_key()
                         && let Some(text) = event.text
                         && !text.chars().any(char::is_control) =>
                     {
-                        self.panes[self.active].editor.insert(&text)
+                        self.panes[front_tab(&self.groups)].editor.insert(&text)
                     }
                     _ => Ok(()),
                 };
@@ -5988,10 +6143,12 @@ impl ApplicationHandler for NativeApplication {
                 let layout = self.window_layout(size);
                 let sidebar_rows = self.sidebar_rows(layout.sidebar_content());
                 let badges = self.badges();
+                // The columns of the window: each of them shows a file of its
+                // own. They are worked out before the renderer is borrowed.
+                let columns = self.columns_of_the_window();
                 let Some(renderer) = self.renderer.as_mut() else {
                     return;
                 };
-                let pane = &mut self.panes[self.active];
                 let prompt_text = self.prompt.as_ref().map(|prompt| prompt.text());
                 let conflict = self.conflicts.as_ref().map(|pending| ConflictView {
                     total: pending.merge.conflicts.len(),
@@ -6009,10 +6166,9 @@ impl ApplicationHandler for NativeApplication {
                 let scene = build_scene(
                     renderer,
                     layout,
-                    &pane.editor,
+                    &mut self.panes,
+                    &columns,
                     &self.input,
-                    &mut pane.view,
-                    &pane.highlights,
                     Chrome {
                         agent: self.agent.as_ref(),
                         agent_error: self.agent_error.as_deref(),
@@ -6022,13 +6178,10 @@ impl ApplicationHandler for NativeApplication {
                         badges,
                         find: self.find.as_ref(),
                         rename: self.rename_box.as_ref(),
-                        marks: &pane.marks,
                         completion: self.completion.as_ref(),
                         actions: self.actions.as_ref(),
                         task_panel,
-                        tabs: self.tabs.tabs(),
-                        active: self.active,
-                        crumbs: &self.crumbs,
+                        active_column: self.groups.active(),
                         prompt: prompt_text.as_deref(),
                         settings: self.settings.as_ref(),
                         git: self.git.as_ref(),
@@ -6163,20 +6316,17 @@ struct Chrome<'a> {
     find: Option<&'a FindBar>,
     /// The box that asks for the new name, when it is open.
     rename: Option<&'a RenameBox>,
-    /// The things the language server found wrong in the document.
-    marks: &'a [editor_view::Mark],
     /// The list of completions, when it is open.
     completion: Option<&'a CompletionPopup>,
     /// The things the server offers to do, when the list is open.
     actions: Option<&'a ActionPopup>,
     /// The output of the task, when the panel is open.
     task_panel: Option<TaskPanel<'a>>,
-    /// The tabs that are open.
-    tabs: &'a [Tab],
-    /// The tab that is on screen.
-    active: usize,
-    /// The pieces of the path of the file that is on screen.
-    crumbs: &'a [breadcrumbs::Crumb],
+    /// The column that has the keyboard.
+    ///
+    /// The panels that float over the window are drawn over it, and the
+    /// keys go to the file it shows.
+    active_column: usize,
     /// The question the window is asking, if it is asking one.
     prompt: Option<&'a str>,
     /// The settings panel, when it is open.
@@ -6269,19 +6419,170 @@ fn is_enter<T: AsRef<str>>(key: &Key<T>) -> bool {
     }
 }
 
+/// Draws the chrome of one column: its strip of tabs and the row that says
+/// where the file is.
+///
+/// The strip of tabs and the path of the file are part of the window, not of
+/// the text: they are drawn around it. The strip is laid out here so that the
+/// place of a tab is worked out the same way twice — once to draw it, once to
+/// click it.
+fn push_the_chrome_of_a_column(
+    scene: &mut FrameScene,
+    viewport: Rect,
+    layout: &ColumnLayout,
+    tabs: &[(Tab, bool)],
+    active: usize,
+    crumbs: &[breadcrumbs::Crumb],
+    ui_measurer: &mut RendererMeasurer,
+) {
+    let strip = shell::TabStrip::layout(tabs, active, layout.tab_bar, ui_measurer);
+    push_tab_bar(scene, viewport, layout.tab_bar, &strip.items);
+
+    // The path of the file that is on screen is above the text: it says where
+    // the person is, and every piece of it is a place that can be clicked.
+    let pieces = breadcrumbs::strip(layout.breadcrumbs, crumbs, ui_measurer);
+    breadcrumbs::draw(scene, viewport, layout.breadcrumbs, &pieces);
+}
+
+/// Draws the text of one column: the ground, the line numbers, the map and
+/// the text itself.
+#[allow(clippy::too_many_arguments)]
+fn push_the_text_of_a_column(
+    scene: &mut FrameScene,
+    viewport: Rect,
+    layout: &ColumnLayout,
+    pane: &mut EditorPane,
+    overlay: FindOverlay,
+    breakpoints: &[BreakpointMark],
+    input: &TextInputState,
+    measurer: &mut RendererMeasurer,
+) {
+    let body = layout.body;
+    // The pieces of the pane are borrowed apart: the text is drawn with the
+    // view of the file, and the path with the marks of the file.
+    let EditorPane {
+        editor,
+        view,
+        highlights,
+        marks,
+        ..
+    } = pane;
+
+    // Only the renderer knows how the text is shaped, so the layout is
+    // measured through it.
+    view.layout(
+        editor.buffer(),
+        body.size.width,
+        body.size.height,
+        measurer,
+    );
+
+    // The highlights were made on the highlighter's own thread; they are the
+    // ones that belong to the text that is on screen.
+    scene.push_quad(body, Color::rgb(0.075, 0.086, 0.11), viewport);
+    scene.push_quad(
+        Rect::new(body.origin.x, body.origin.y, 3.0, body.size.height),
+        Color::rgb(0.30, 0.58, 0.96),
+        viewport,
+    );
+
+    // The line numbers are on the left of the text.
+    let current_line = editor.buffer().line_of_offset(editor.caret().0);
+    let numbers = gutter::lines(
+        editor.buffer(),
+        view.visual_lines(),
+        layout.gutter,
+        current_line,
+        view.zoom().line_height(),
+    );
+    gutter::draw(
+        scene,
+        viewport,
+        layout.gutter,
+        &numbers,
+        view.zoom().gutter_font_size(),
+        view.zoom().line_height(),
+        measurer,
+    );
+
+    // The map of the whole document is on the right of the text. A column
+    // that is too narrow for it has none: the text is worth more.
+    let first_line = view.view.first_line;
+    let visible_lines = ((body.size.height / view.zoom().line_height()).floor() as usize).max(1);
+    if let Some(minimap) = layout.minimap {
+        let map = view.minimap(editor.buffer());
+        minimap::draw(scene, viewport, minimap, map, first_line, visible_lines);
+    }
+
+    view.draw(
+        scene,
+        editor,
+        input.preedit(),
+        body,
+        BodyOverlay {
+            find: overlay,
+            highlights: highlights.as_slice(),
+            marks: marks.as_slice(),
+        },
+        measurer,
+    );
+
+    // The breakpoints of the file that is on screen are drawn in the margin
+    // of the text: a breakpoint that cannot be seen is a breakpoint nobody
+    // knows about. A breakpoint with a condition is drawn in another colour:
+    // it stops the program only sometimes.
+    for mark in breakpoints {
+        let index = mark.line as usize;
+        if index == 0 || index > editor.buffer().line_count() {
+            continue;
+        }
+        let offset = editor.buffer().line_range(index - 1).start.0;
+        if let Some((_, y)) = view.point_of(offset) {
+            let colour = if mark.conditional {
+                Color::rgb(0.95, 0.68, 0.25)
+            } else {
+                Color::rgb(0.90, 0.35, 0.35)
+            };
+            scene.push_quad(
+                Rect::new(layout.gutter.origin.x + 4.0, body.origin.y + y + 6.0, 8.0, 8.0),
+                colour,
+                layout.gutter,
+            );
+        }
+    }
+}
+
+/// What one column of the window shows, without the text itself.
+struct ColumnData {
+    /// The tab in front of the column, by its place in the tab bar.
+    tab: usize,
+    /// The tabs of the column, with the flag that says which of them have
+    /// changes that are not on disk yet.
+    tabs: Vec<(Tab, bool)>,
+    /// Which of them is in front.
+    active: usize,
+}
+
 fn build_scene(
     renderer: &mut Renderer,
     layout: WindowLayout,
-    editor_state: &Editor,
+    panes: &mut [EditorPane],
+    columns: &[ColumnData],
     input: &TextInputState,
-    view: &mut EditorView,
-    highlights: &[Highlight],
     chrome: Chrome<'_>,
 ) -> FrameScene {
     let size = layout.size;
     let viewport = Rect::new(0.0, 0.0, size.width, size.height);
-    let body = layout.body;
     let mut scene = FrameScene::default();
+
+    // The column that has the keyboard. The panels that float over the
+    // window are drawn over it.
+    let active_column = chrome.active_column;
+    let body = layout
+        .columns
+        .get(active_column)
+        .map(|column| column.body)
+        .unwrap_or(viewport);
 
     // A panel that is drawn over the window hides what is under it.
     //
@@ -6332,106 +6633,87 @@ fn build_scene(
         return scene;
     }
 
-    // The matches the find bar found, and the one it is on.
+    // The matches the find bar found, and the one it is on. They belong to
+    // the column that has the keyboard: the find bar floats over it.
     let (matches, current_match) = match chrome.find {
         Some(find) => (find.matches(), Some(find.current_index())),
         None => (NO_MATCHES, None),
     };
-    let overlay = FindOverlay {
-        // The find bar floats over the body, so the text under it is left
-        // out.
-        bar: chrome
-            .find
-            .map(|find| find_bar_rect(body, find.replacing())),
-        matches,
-        current: current_match,
-    };
+    let find_bar = chrome
+        .find
+        .map(|find| find_bar_rect(body, find.replacing()));
 
+    // The chrome of the columns: the strips of tabs and the rows that say where
+    // the files are.
+    {
+        // The strip of tabs is drawn in the sans-serif face, so it gets a
+        // measurer of its own.
+        let mut ui_measurer = RendererMeasurer::new(renderer, TextFamily::SansSerif);
+        for (index, column) in columns.iter().enumerate() {
+            let Some(place) = layout.columns.get(index) else {
+                continue;
+            };
+            let Some(pane) = panes.get(column.tab) else {
+                continue;
+            };
+            push_the_chrome_of_a_column(
+                &mut scene,
+                viewport,
+                place,
+                &column.tabs,
+                column.active,
+                &pane.crumbs,
+                &mut ui_measurer,
+            );
+        }
+    }
+
+    // The text of the columns. Each of them has its own text, its own line
+    // numbers and its own map of the document: a window with two columns
+    // shows two files, not one file twice.
     {
         // Only the renderer knows how the text is shaped, so the layout is
         // measured through it.
         let mut measurer = RendererMeasurer::new(renderer, TextFamily::Monospace);
-        view.layout(
-            editor_state.buffer(),
-            body.size.width,
-            body.size.height,
-            &mut measurer,
-        );
-
-        // The highlights were made on the highlighter's own thread; they are
-        // the ones that belong to the text that is on screen.
-        scene.push_quad(body, Color::rgb(0.075, 0.086, 0.11), viewport);
-        scene.push_quad(
-            Rect::new(body.origin.x, body.origin.y, 3.0, body.size.height),
-            Color::rgb(0.30, 0.58, 0.96),
-            viewport,
-        );
-
-        // The line numbers are on the left of the text.
-        let current_line = editor_state.buffer().line_of_offset(editor_state.caret().0);
-        let numbers = gutter::lines(
-            editor_state.buffer(),
-            view.visual_lines(),
-            layout.gutter,
-            current_line,
-            view.zoom().line_height(),
-        );
-        gutter::draw(
-            &mut scene,
-            viewport,
-            layout.gutter,
-            &numbers,
-            view.zoom().gutter_font_size(),
-            view.zoom().line_height(),
-            &mut measurer,
-        );
-
-        // The map of the whole document is on the right of the text.
-        let first_line = view.view.first_line;
-        let visible_lines = ((body.size.height / view.zoom().line_height()).floor() as usize).max(1);
-        let map = view.minimap(editor_state.buffer());
-        minimap::draw(
-            &mut scene,
-            viewport,
-            layout.minimap,
-            map,
-            first_line,
-            visible_lines,
-        );
-
-        view.draw(
-            &mut scene,
-            editor_state,
-            input.preedit(),
-            body,
-            BodyOverlay {
-                find: overlay,
-                highlights,
-                marks: chrome.marks,
-            },
-            &mut measurer,
-        );
-
-        // The breakpoints of the file that is on screen are drawn in the
-        // margin of the text: a breakpoint that cannot be seen is a
-        // breakpoint nobody knows about. A breakpoint with a condition is
-        // drawn in another colour: it stops the program only sometimes.
-        for mark in chrome.breakpoints {
-            let index = mark.line as usize;
-            if index == 0 || index > editor_state.buffer().line_count() {
+        for (index, column) in columns.iter().enumerate() {
+            let Some(place) = layout.columns.get(index) else {
                 continue;
-            }
-            let offset = editor_state.buffer().line_range(index - 1).start.0;
-            if let Some((_, y)) = view.point_of(offset) {
-                let colour = if mark.conditional {
-                    Color::rgb(0.95, 0.68, 0.25)
-                } else {
-                    Color::rgb(0.90, 0.35, 0.35)
-                };
+            };
+            let Some(pane) = panes.get_mut(column.tab) else {
+                continue;
+            };
+            let overlay = if index == active_column {
+                FindOverlay {
+                    // The find bar floats over the body, so the text under it
+                    // is left out.
+                    bar: find_bar,
+                    matches,
+                    current: current_match,
+                }
+            } else {
+                FindOverlay {
+                    bar: None,
+                    matches: NO_MATCHES,
+                    current: None,
+                }
+            };
+            push_the_text_of_a_column(
+                &mut scene,
+                viewport,
+                place,
+                pane,
+                overlay,
+                chrome.breakpoints,
+                input,
+                &mut measurer,
+            );
+            // The line between two columns: the eye needs to know where one
+            // column ends and the other begins.
+            if index > 0 {
                 scene.push_quad(
-                    Rect::new(layout.gutter.origin.x + 4.0, body.origin.y + y + 6.0, 8.0, 8.0),
-                    colour,
-                    layout.gutter,
+                    Rect::new(place.column.origin.x - SEPARATOR, 0.0, SEPARATOR, size.height),
+                    Color::rgb(0.16, 0.18, 0.22),
+                    viewport,
                 );
             }
         }
@@ -6440,7 +6722,7 @@ fn build_scene(
     push_agent_panel(
         &mut scene,
         size,
-        layout,
+        &layout,
         chrome.agent,
         chrome.agent_error,
         chrome.conflicts.as_ref(),
@@ -6449,18 +6731,6 @@ fn build_scene(
     // The find bar is drawn in the sans-serif face, so it gets a measurer of
     // its own.
     let mut ui_measurer = RendererMeasurer::new(renderer, TextFamily::SansSerif);
-
-    // The strip of tabs and the tree of files are part of the window, not of
-    // the text: they are drawn around it. The strip is laid out here so that
-    // the place of a tab is worked out the same way twice — once to draw it,
-    // once to click it.
-    let strip = tab_strip(chrome.tabs, chrome.active, &layout, &mut ui_measurer);
-    push_tab_bar(&mut scene, viewport, layout.tab_bar, &strip.items);
-
-    // The path of the file that is on screen is above the text: it says where
-    // the person is, and every piece of it is a place that can be clicked.
-    let crumbs = breadcrumbs::strip(layout.breadcrumbs, chrome.crumbs, &mut ui_measurer);
-    breadcrumbs::draw(&mut scene, viewport, layout.breadcrumbs, &crumbs);
 
     // The bar with the activities is on the left of the window, and the
     // section that was picked is on its right.
@@ -6513,9 +6783,13 @@ fn build_scene(
         &mut ui_measurer,
     );
 
-    // The list of completions floats under the caret.
+    // The list of completions floats under the caret. It belongs to the column
+    // that has the keyboard: the caret is in that column.
+    let active_tab = columns.get(active_column).map(|column| column.tab);
     if let Some(popup) = chrome.completion
-        && let Some(point) = view.point_of(editor_state.caret().0)
+        && let Some(tab) = active_tab
+        && let Some(pane) = panes.get_mut(tab)
+        && let Some(point) = pane.view.point_of(pane.editor.caret().0)
     {
         completion::draw(
             &mut scene,
@@ -6530,7 +6804,9 @@ fn build_scene(
     // The list of the things the server offers floats under the caret as
     // well.
     if let Some(popup) = chrome.actions
-        && let Some(point) = view.point_of(editor_state.caret().0)
+        && let Some(tab) = active_tab
+        && let Some(pane) = panes.get_mut(tab)
+        && let Some(point) = pane.view.point_of(pane.editor.caret().0)
     {
         code_action::draw(
             &mut scene,
@@ -6553,18 +6829,40 @@ fn build_scene(
     scene
 }
 
-/// Works out where the tabs are drawn.
+/// The tabs of a column, with the flag that says which of them have changes.
 ///
-/// The drawing and the clicking both go through here: a tab that is drawn in
-/// one place and clicked in another is a tab that cannot be clicked.
-fn tab_strip(
-    tabs: &[Tab],
-    active: usize,
-    layout: &WindowLayout,
-    measurer: &mut dyn TextMeasurer,
-) -> shell::TabStrip {
-    let dirty: Vec<bool> = tabs.iter().map(|tab| tab.dirty).collect();
-    shell::TabStrip::layout(tabs, &dirty, active, layout.tab_bar, measurer)
+/// They are the tabs of **one** column: a column has its own tabs, and the
+/// ones of the other column are not on its strip.
+fn tabs_of_a_column(tabs: &TabBar, groups: &Groups, column: usize) -> Vec<(Tab, bool)> {
+    groups
+        .tabs_of(column)
+        .iter()
+        .filter_map(|place| {
+            let tab = tabs.tabs().get(*place)?;
+            Some((tab.clone(), tab.dirty))
+        })
+        .collect()
+}
+
+/// Which of the tabs of a column is in front.
+fn front_of_a_column(groups: &Groups, column: usize) -> usize {
+    let Some(front) = groups.front_of(column) else {
+        return 0;
+    };
+    groups
+        .tabs_of(column)
+        .iter()
+        .position(|place| *place == front)
+        .unwrap_or(0)
+}
+
+/// The tab in front of the active column, by its place in the tab bar.
+///
+/// It is a free function and not a method of the window on purpose: the
+/// panes of the window and the groups of the window are two different
+/// fields, and borrowing one of them must not borrow the other.
+fn front_tab(groups: &Groups) -> usize {
+    groups.front().unwrap_or(0)
 }
 
 /// Draws the tab strip.
@@ -7190,7 +7488,7 @@ fn push_task_panel(
 fn push_agent_panel(
     scene: &mut FrameScene,
     size: Size,
-    layout: WindowLayout,
+    layout: &WindowLayout,
     agent: Option<&AgentSession>,
     agent_error: Option<&str>,
     conflict: Option<&ConflictView>,
@@ -7568,7 +7866,7 @@ mod tests {
     #[test]
     fn clicking_an_activity_picks_the_section_of_the_side_bar() {
         let mut app = NativeApplication::new(None).expect("the application starts");
-        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true);
+        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true, 1);
 
         // The second activity is the search.
         let point = Point { x: 24.0, y: 60.0 };
@@ -7580,7 +7878,7 @@ mod tests {
     #[test]
     fn picking_the_same_activity_again_hides_the_side_bar() {
         let mut app = NativeApplication::new(None).expect("the application starts");
-        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true);
+        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true, 1);
 
         // The search is not the section that is on screen: picking it shows
         // it.
@@ -7621,7 +7919,7 @@ mod tests {
 
         // The activity bar eats the key: the document does not see it.
         assert!(app.handle_activity_key(&character("x")));
-        assert_eq!(app.panes[app.active].editor.text(), "");
+        assert_eq!(app.panes[front_tab(&app.groups)].editor.text(), "");
     }
 
     #[test]
@@ -7662,7 +7960,7 @@ mod tests {
         fs::write(&file, "one\ntwo\n").unwrap();
         let app = NativeApplication::new(Some(file)).expect("the application starts");
 
-        let labels: Vec<&str> = app.crumbs.iter().map(|crumb| crumb.label.as_str()).collect();
+        let labels: Vec<&str> = app.panes[0].crumbs.iter().map(|crumb| crumb.label.as_str()).collect();
         assert_eq!(labels.last(), Some(&"main.rs"), "got {labels:?}");
         assert!(labels.contains(&"src"), "got {labels:?}");
         assert!(
@@ -7679,10 +7977,10 @@ mod tests {
         let file = folder.join("main.rs");
         fs::write(&file, "one\ntwo\n").unwrap();
         let mut app = NativeApplication::new(Some(file)).expect("the application starts");
-        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true);
+        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true, 1);
 
         let mut measurer = MonospaceMeasurer::new(8.0);
-        let strip = breadcrumbs::strip(layout.breadcrumbs, &app.crumbs, &mut measurer);
+        let strip = breadcrumbs::strip(layout.column(0).expect("there is a column").breadcrumbs, &app.panes[0].crumbs, &mut measurer);
         let index = strip
             .crumbs
             .iter()
@@ -7713,10 +8011,10 @@ mod tests {
         let file = project.join("main.rs");
         fs::write(&file, "one\ntwo\n").unwrap();
         let mut app = NativeApplication::new(Some(file)).expect("the application starts");
-        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true);
+        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true, 1);
 
         let mut measurer = MonospaceMeasurer::new(8.0);
-        let strip = breadcrumbs::strip(layout.breadcrumbs, &app.crumbs, &mut measurer);
+        let strip = breadcrumbs::strip(layout.column(0).expect("there is a column").breadcrumbs, &app.panes[0].crumbs, &mut measurer);
         let last = strip.crumbs.last().expect("the file is in the path");
         let place = last.rect;
         app.go_to_the_place_of_the_path(
@@ -7737,8 +8035,7 @@ mod tests {
     }
 
     #[test]
-    fn the_path_is_worked_out_again_when_another_tab_comes_to_the_front() {
-        let project = scratch_project("breadcrumbs-tabs");
+    fn the_path_of_the_file_in_front_is_the_one_that_is_shown() {        let project = scratch_project("breadcrumbs-tabs");
         let first = project.join("first.rs");
         let second = project.join("second.rs");
         fs::write(&first, "one\n").unwrap();
@@ -7746,7 +8043,14 @@ mod tests {
         let mut app = NativeApplication::new(Some(first)).expect("the application starts");
         app.open_file(&second);
 
-        let labels: Vec<&str> = app.crumbs.iter().map(|crumb| crumb.label.as_str()).collect();
+        // The path belongs to the file, so the file that is in front has its
+        // own path above the text.
+        let front = front_tab(&app.groups);
+        let labels: Vec<&str> = app.panes[front]
+            .crumbs
+            .iter()
+            .map(|crumb| crumb.label.as_str())
+            .collect();
         assert_eq!(labels.last(), Some(&"second.rs"), "got {labels:?}");
     }
 
@@ -7759,7 +8063,7 @@ mod tests {
             .collect::<String>();
         fs::write(&file, text).unwrap();
         let mut app = NativeApplication::new(Some(file)).expect("the application starts");
-        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true);
+        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true, 1);
 
         // The middle of the map is the middle of the file. The map of a
         // short file does not fill the whole strip, so the middle of the map
@@ -7768,12 +8072,12 @@ mod tests {
         let geometry = pane
             .view
             .minimap(pane.editor.buffer())
-            .geometry(layout.minimap);
+            .geometry(layout.column(0).expect("there is a column").minimap.expect("a wide column has a map"));
         let point = Point {
-            x: layout.minimap.origin.x + 10.0,
-            y: layout.minimap.origin.y + geometry.height / 2.0,
+            x: layout.column(0).expect("there is a column").minimap.expect("a wide column has a map").origin.x + 10.0,
+            y: layout.column(0).expect("there is a column").minimap.expect("a wide column has a map").origin.y + geometry.height / 2.0,
         };
-        app.press_minimap(point, &layout);
+        app.press_minimap(point, 0, &layout);
         let first = app.panes[0].view.view.first_line;
         assert!(
             first > 50 && first < 150,
@@ -7803,7 +8107,7 @@ mod tests {
         fs::write(&file, "one\ntwo\nthree").unwrap();
         let app = NativeApplication::new(Some(file)).expect("the application starts");
 
-        let window = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true);
+        let window = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true, 1);
         let buffer = app.panes[0].editor.buffer();
         let mut measurer = MonospaceMeasurer::new(8.0);
         let text = codeweaver_ui::TextLayout::build(
@@ -7815,7 +8119,7 @@ mod tests {
             app.zoom.line_height(),
             &mut measurer,
         );
-        let numbers = gutter::lines(buffer, &text.lines, window.gutter, 0, app.zoom.line_height());
+        let numbers = gutter::lines(buffer, &text.lines, window.column(0).expect("there is a column").gutter, 0, app.zoom.line_height());
         assert_eq!(
             numbers.iter().map(|line| line.number).collect::<Vec<_>>(),
             vec![1, 2, 3]
@@ -7918,7 +8222,7 @@ mod tests {
         app.zoom_path = Some(directory.join("settings.json"));
         app.run_named_command("view.zoomIn");
 
-        let window = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true);
+        let window = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true, 1);
         let buffer = app.panes[0].editor.buffer();
         let mut measurer = MonospaceMeasurer::new(8.0);
         let line_height = app.zoom.line_height();
@@ -7931,7 +8235,7 @@ mod tests {
             line_height,
             &mut measurer,
         );
-        let numbers = gutter::lines(buffer, &text.lines, window.gutter, 0, line_height);
+        let numbers = gutter::lines(buffer, &text.lines, window.column(0).expect("there is a column").gutter, 0, line_height);
         // The second number is one row of the text lower than the first one:
         // the numbers follow the size of the text.
         let distance = numbers[1].rect.origin.y - numbers[0].rect.origin.y;
@@ -8587,7 +8891,7 @@ mod tests {
 
         assert_eq!(app.tabs.len(), 2, "the second file has its own tab");
         assert_eq!(app.panes.len(), 2, "every tab has its own buffer");
-        assert_eq!(app.active, 1, "the file that was opened is in front");
+        assert_eq!(front_tab(&app.groups), 1, "the file that was opened is in front");
         assert_eq!(app.editor().text(), "two\n");
         assert_eq!(
             app.tabs.tabs()[0].title,
@@ -8606,14 +8910,14 @@ mod tests {
 
         let mut app = NativeApplication::new(Some(first.clone())).expect("the application starts");
         app.open_file(&second);
-        assert_eq!(app.active, 1);
+        assert_eq!(front_tab(&app.groups), 1);
 
         // The first file is opened again.
         assert!(app.open_file(&first));
 
         assert_eq!(app.tabs.len(), 2, "the file is not opened twice");
         assert_eq!(app.panes.len(), 2, "and it does not get a second buffer");
-        assert_eq!(app.active, 0, "the tab that was there comes to the front");
+        assert_eq!(front_tab(&app.groups), 0, "the tab that was there comes to the front");
     }
 
     #[test]
@@ -8631,7 +8935,7 @@ mod tests {
 
         assert_eq!(app.tabs.len(), 1);
         assert_eq!(app.panes.len(), 1);
-        assert_eq!(app.active, 0);
+        assert_eq!(front_tab(&app.groups), 0);
         assert_eq!(app.editor().text(), "one\n");
     }
 
@@ -8895,9 +9199,9 @@ mod tests {
         app_with_layout(&mut app);
 
         assert!(wait_for_syntax(&mut app), "the highlighter answers");
-        assert!(!app.panes[app.active].degraded, "the file is small enough");
+        assert!(!app.panes[front_tab(&app.groups)].degraded, "the file is small enough");
         assert!(
-            !app.panes[app.active].highlights.is_empty(),
+            !app.panes[front_tab(&app.groups)].highlights.is_empty(),
             "the text is coloured"
         );
     }
@@ -8919,8 +9223,8 @@ mod tests {
             app.pump_syntax(),
             "the window has to say that the file is too big"
         );
-        assert!(app.panes[app.active].degraded, "the file is not coloured");
-        assert!(app.panes[app.active].highlights.is_empty());
+        assert!(app.panes[front_tab(&app.groups)].degraded, "the file is not coloured");
+        assert!(app.panes[front_tab(&app.groups)].highlights.is_empty());
         assert!(
             app.status_line().contains("降级模式"),
             "the status line says why, got {}",
@@ -9511,7 +9815,7 @@ mod tests {
 
         // The user looks at the other file before picking one.
         assert!(app.open_file(&second));
-        let second_index = app.active;
+        let second_index = front_tab(&app.groups);
 
         let popup = ActionPopup::new(vec![code_action(&first_uri, "run")]).expect("there is a list");
         app.apply_code_action(&popup);
@@ -9580,13 +9884,16 @@ mod tests {
 
         let mut app = NativeApplication::new(Some(first.clone())).expect("the application starts");
         app.open_file(&second);
-        assert_eq!(app.active, 1);
+        assert_eq!(front_tab(&app.groups), 1);
 
         // The strip is laid out and hit the same way as it is drawn.
         let size = Size::new(1200.0, 800.0);
-        let layout = WindowLayout::of(size, 0.0, true);
+        let layout = WindowLayout::of(size, 0.0, true, 1);
         let mut measurer = MonospaceMeasurer::new(13.0);
-        let strip = tab_strip(app.tabs.tabs(), app.active, &layout, &mut measurer);
+        let tabs = tabs_of_a_column(&app.tabs, &app.groups, 0);
+        let active = front_of_a_column(&app.groups, 0);
+        let place = layout.column(0).expect("there is a column");
+        let strip = shell::TabStrip::layout(&tabs, active, place.tab_bar, &mut measurer);
         let first_tab = strip.items[0].rect;
         let point = Point {
             x: first_tab.origin.x + 4.0,
@@ -9595,7 +9902,7 @@ mod tests {
 
         app.activate_tab_at(point, &strip);
 
-        assert_eq!(app.active, 0, "the tab that was clicked is in front");
+        assert_eq!(front_tab(&app.groups), 0, "the tab that was clicked is in front");
     }
 
     #[test]
@@ -9628,7 +9935,7 @@ mod tests {
         assert!(app.handle_settings_key(&named(NamedKey::ArrowRight)));
 
         assert_eq!(
-            app.panes[app.active].policy.max_bytes,
+            app.panes[front_tab(&app.groups)].policy.max_bytes,
             2_000_000,
             "the new limit is in force at once"
         );
@@ -9663,18 +9970,18 @@ mod tests {
             max_lines: 1,
         });
         app.pump_syntax();
-        assert!(app.panes[app.active].degraded, "the file is too big");
+        assert!(app.panes[front_tab(&app.groups)].degraded, "the file is too big");
 
         // The limit is raised again.
         app.set_highlight_policy(HighlightPolicy::default());
 
         assert!(wait_for_syntax(&mut app), "the highlighter answers again");
         assert!(
-            !app.panes[app.active].degraded,
+            !app.panes[front_tab(&app.groups)].degraded,
             "the file is small enough to be coloured again"
         );
         assert!(
-            !app.panes[app.active].highlights.is_empty(),
+            !app.panes[front_tab(&app.groups)].highlights.is_empty(),
             "the text is coloured again"
         );
     }
@@ -10221,5 +10528,112 @@ mod tests {
         let app = NativeApplication::new(Some(file)).expect("the application starts");
         let said = app.status.clone().expect("the editor says what is wrong");
         assert!(said.contains("editor.noSuchCommand"), "got {said}");
+    }
+
+    #[test]
+    fn the_window_can_be_split_into_two_columns() {
+        let directory = scratch_dir("split");
+        let file = directory.join("main.rs");
+        fs::write(&file, "one\ntwo\nthree").unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        assert_eq!(app.groups.len(), 1, "the window starts with one column");
+
+        assert!(app.run_named_command("view.splitRight"));
+        assert_eq!(app.groups.len(), 2, "the window has two columns now");
+
+        // The new column shows a file of its own: the columns do not show the
+        // same file twice.
+        let front = front_tab(&app.groups);
+        assert_ne!(front, 0, "the new column shows a file of its own");
+        assert!(
+            app.panes[front].document.is_none(),
+            "the file of the new column is a new one"
+        );
+
+        // The two columns do not lie on top of each other.
+        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true, 2);
+        let left = layout.column(0).expect("there is a column");
+        let right = layout.column(1).expect("there is a column");
+        assert!(left.body.max_x() <= right.body.origin.x);
+        assert!(right.tab_bar.origin.x > left.tab_bar.origin.x);
+    }
+
+    #[test]
+    fn clicking_in_a_column_gives_it_the_keyboard() {
+        let directory = scratch_dir("split-click");
+        let file = directory.join("main.rs");
+        fs::write(&file, "one\ntwo\nthree").unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.run_named_command("view.splitRight");
+        assert_eq!(app.groups.active(), 1, "the new column has the keyboard");
+
+        // The click is in the first column: that column gets the keyboard.
+        // The layout is worked out here and not by the application: a test
+        // has no window, and the size of a window that is not there is
+        // nothing at all.
+        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true, 2);
+        let left = layout.column(0).expect("there is a column");
+        let clicked = Point {
+            x: left.body.origin.x + 10.0,
+            y: left.body.origin.y + 10.0,
+        };
+        let column = app.column_of_the_click(clicked, &layout);
+        assert_eq!(column, Some(0), "the click is in the first column");
+        assert_eq!(app.groups.active(), 0, "the column that was clicked has the keyboard");
+        let status = app.status_bar_text();
+        assert!(
+            status.right.contains("栏 1/2"),
+            "the status bar says which column it is, got {}",
+            status.right
+        );
+    }
+
+    #[test]
+    fn each_column_has_its_own_file() {
+        let directory = scratch_dir("split-files");
+        let first = directory.join("first.rs");
+        let second = directory.join("second.rs");
+        fs::write(&first, "one\n").unwrap();
+        fs::write(&second, "two\n").unwrap();
+        let mut app = NativeApplication::new(Some(first.clone())).expect("the application starts");
+        app.run_named_command("view.splitRight");
+
+        // The file is opened in the column that has the keyboard.
+        app.open_file(&second);
+        let right = app.groups.active();
+        let tab = app.groups.front_of(right).expect("the column has a tab");
+        assert_eq!(
+            app.panes[tab].document.as_ref().map(|document| document.path()),
+            Some(second.as_path()),
+            "the file is in the column that has the keyboard"
+        );
+
+        // The other column still shows the file it had.
+        let left = 1 - right;
+        let tab = app.groups.front_of(left).expect("the column has a tab");
+        assert_eq!(
+            app.panes[tab].document.as_ref().map(|document| document.path()),
+            Some(first.as_path()),
+            "the other column still shows its own file"
+        );
+    }
+
+    #[test]
+    fn the_column_goes_away_when_its_last_tab_is_closed() {
+        let directory = scratch_dir("split-close");
+        let file = directory.join("main.rs");
+        fs::write(&file, "one\ntwo\nthree").unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.run_named_command("view.splitRight");
+        assert_eq!(app.groups.len(), 2);
+
+        let tab = app
+            .groups
+            .front_of(1)
+            .expect("the second column has a tab");
+        let id = app.tabs.tabs()[tab].id;
+        app.close_tab_by_id(id);
+        assert_eq!(app.groups.len(), 1, "the column went away with its tab");
+        assert_eq!(front_tab(&app.groups), 0, "the file that is left is on screen");
     }
 }

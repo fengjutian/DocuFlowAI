@@ -21,6 +21,7 @@ use codeweaver_text::BufferVersion;
 use codeweaver_workspace::Document;
 use codeweaver_workbench::TabId;
 
+use crate::breadcrumbs;
 use crate::editor_view::{EditorView, Mark};
 
 /// One open document.
@@ -64,6 +65,11 @@ pub struct EditorPane {
     /// The highlighter is asked again when the text or the visible part
     /// changed; a scroll is a new range, a keystroke is a new version.
     pub asked: Option<(BufferVersion, Range<usize>)>,
+    /// The pieces of the path of this file.
+    ///
+    /// The path belongs to the file and not to the window: two columns show
+    /// two files, and each of them has its own path above the text.
+    pub crumbs: Vec<breadcrumbs::Crumb>,
 }
 
 impl EditorPane {
@@ -84,6 +90,7 @@ impl EditorPane {
             document_uri: None,
             server_version: None,
             asked: None,
+            crumbs: Vec::new(),
         }
     }
 
@@ -108,6 +115,7 @@ impl EditorPane {
             document_uri,
             server_version: None,
             asked: None,
+            crumbs: Vec::new(),
         }
     }
 
