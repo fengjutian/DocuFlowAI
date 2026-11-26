@@ -169,12 +169,17 @@ $LIST_X = 16
 $LIST_Y = 90
 $LIST_WIDTH = 1120
 $LIST_HEIGHT = 560
-$BODY_X = 236
-$BODY_Y = 78
+# The text of the document starts after the bar of activities, the side bar,
+# the gap and the line numbers: 48 + 220 + 16 + 56. It is below the strip of
+# tabs and the row that says where the file is: 34 + 24.
+$BODY_X = 340
+$BODY_Y = 58
 $BODY_WIDTH = 540
 $BODY_HEIGHT = 560
-$STATUS_X = 236
-$STATUS_Y = 60
+# The status bar is at the bottom of the window, and its text starts 12 pixels
+# from the left.
+$STATUS_X = 12
+$STATUS_BAR_HEIGHT = 24
 $STATUS_WIDTH = 700
 $STATUS_HEIGHT = 22
 
@@ -451,7 +456,7 @@ try {
         $bodyWidth = To-Screen $BODY_WIDTH
         $bodyHeight = To-Screen $BODY_HEIGHT
         $statusLeft = To-Screen $STATUS_X
-        $statusTop = To-Screen $STATUS_Y
+        $statusTop = To-Screen ($panel.Height / $script:Scale - $STATUS_BAR_HEIGHT)
         $statusWidth = To-Screen $STATUS_WIDTH
         $statusHeight = To-Screen $STATUS_HEIGHT
 

@@ -191,8 +191,8 @@ $OUTPUT_Y = 634
 
 # The first row of the text of the document, where the string of the file of
 # the frame is drawn.
-$BODY_X = 236
-$BODY_Y = 78
+$BODY_X = 340
+$BODY_Y = 58
 $BODY_WIDTH = 540
 
 # The flags of the mouse of Windows.

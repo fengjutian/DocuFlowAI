@@ -140,6 +140,10 @@ $SIDEBAR_WIDTH = 220.0
 $GUTTER_WIDTH = 56.0
 $STATUS_BAR_HEIGHT = 24.0
 $ITEM_HEIGHT = 48.0
+# The row that says where the file is sits between the tabs and the text, so
+# the line numbers start below it.
+$TAB_BAR_HEIGHT = 34.0
+$BREADCRUMB_HEIGHT = 24.0
 
 if (-not (Test-Path $exe)) {
     throw "the editor is not built; run 'cargo build -p codeweaver-editor' first"
@@ -316,9 +320,11 @@ function Get-Places($shot) {
         # The side bar is next to it.
         SideBarLeft = $ACTIVITY_BAR_WIDTH
         SideBarRight = $ACTIVITY_BAR_WIDTH + $SIDEBAR_WIDTH
-        # The line numbers are on the left of the text.
+        # The line numbers are on the left of the text, below the row that
+        # says where the file is.
         GutterLeft = $ACTIVITY_BAR_WIDTH + $SIDEBAR_WIDTH + 16.0
         GutterRight = $ACTIVITY_BAR_WIDTH + $SIDEBAR_WIDTH + 16.0 + $GUTTER_WIDTH
+        GutterTop = $TAB_BAR_HEIGHT + $BREADCRUMB_HEIGHT
         # The status bar is at the bottom of the window.
         StatusTop = $logicalHeight - $STATUS_BAR_HEIGHT
     }
@@ -414,7 +420,7 @@ try {
         Check 'the activity that is on screen is marked' (($markFirst -gt 20) -and ($markSecond -lt 5)) "$markFirst pixels of the mark on the first activity"
 
         # 6. The line numbers are on the left of the text.
-        $numbers = Count-Bright-In $startShot (To-Screen $places.GutterLeft) (To-Screen 40.0) (To-Screen $GUTTER_WIDTH) (To-Screen 80.0) 60
+        $numbers = Count-Bright-In $startShot (To-Screen $places.GutterLeft) (To-Screen $places.GutterTop) (To-Screen $GUTTER_WIDTH) (To-Screen 80.0) 60
         Write-Host "pixels of the line numbers: $numbers"
         Check 'the line numbers are drawn' ($numbers -gt 10) "$numbers pixels of the numbers of the lines"
 

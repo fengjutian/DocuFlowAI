@@ -11,6 +11,7 @@
 
 use codeweaver_render::{Rect, Size};
 
+use crate::breadcrumbs;
 use crate::minimap;
 
 /// The width of the bar with the activities on the left.
@@ -47,6 +48,8 @@ pub struct WindowLayout {
     pub sidebar: Rect,
     /// The strip the tabs are drawn in.
     pub tab_bar: Rect,
+    /// The row that says where the file that is open is.
+    pub breadcrumbs: Rect,
     /// The strip the line numbers are drawn in.
     pub gutter: Rect,
     /// The text of the document.
@@ -92,7 +95,9 @@ impl WindowLayout {
         // before the panel of the agent.
         let left = ACTIVITY_BAR_WIDTH + sidebar_width + GAP;
         let right = (agent_panel.origin.x - GAP).max(left + 1.0);
-        let top = TAB_BAR_HEIGHT;
+        // The row that says where the file is is between the tabs and the
+        // text: it is part of the window around the text, not part of it.
+        let top = TAB_BAR_HEIGHT + breadcrumbs::HEIGHT;
         let height = (above - top - bottom).max(1.0);
         let gutter = Rect::new(left, top, GUTTER_WIDTH, height);
         // The map of the document is on the right of the text.
@@ -114,12 +119,21 @@ impl WindowLayout {
             (right - ACTIVITY_BAR_WIDTH - sidebar_width).max(1.0),
             TAB_BAR_HEIGHT,
         );
+        // The row of the path is as wide as the strip of tabs: both are the
+        // head of the place the text is in.
+        let breadcrumbs = Rect::new(
+            ACTIVITY_BAR_WIDTH + sidebar_width,
+            TAB_BAR_HEIGHT,
+            (right - ACTIVITY_BAR_WIDTH - sidebar_width).max(1.0),
+            breadcrumbs::HEIGHT,
+        );
 
         WindowLayout {
             size,
             activity_bar,
             sidebar,
             tab_bar,
+            breadcrumbs,
             gutter,
             body,
             minimap,
@@ -174,10 +188,26 @@ mod tests {
     }
 
     #[test]
-    fn the_text_of_the_document_starts_under_the_tabs() {
+    fn the_text_of_the_document_starts_under_the_path() {
         let layout = WindowLayout::of(size(), 0.0, true);
-        assert_eq!(layout.body.origin.y, TAB_BAR_HEIGHT);
-        assert_eq!(layout.gutter.origin.y, TAB_BAR_HEIGHT);
+        assert_eq!(layout.body.origin.y, TAB_BAR_HEIGHT + breadcrumbs::HEIGHT);
+        assert_eq!(layout.gutter.origin.y, TAB_BAR_HEIGHT + breadcrumbs::HEIGHT);
+    }
+
+    #[test]
+    fn the_path_is_between_the_tabs_and_the_text() {
+        let layout = WindowLayout::of(size(), 0.0, true);
+        assert_eq!(layout.breadcrumbs.origin.y, TAB_BAR_HEIGHT);
+        assert_eq!(layout.breadcrumbs.size.height, breadcrumbs::HEIGHT);
+        assert!(layout.tab_bar.max_y() <= layout.breadcrumbs.origin.y);
+        assert!(layout.breadcrumbs.max_y() <= layout.body.origin.y);
+    }
+
+    #[test]
+    fn the_path_is_as_wide_as_the_strip_of_tabs() {
+        let layout = WindowLayout::of(size(), 0.0, true);
+        assert_eq!(layout.breadcrumbs.origin.x, layout.tab_bar.origin.x);
+        assert_eq!(layout.breadcrumbs.size.width, layout.tab_bar.size.width);
     }
 
     #[test]

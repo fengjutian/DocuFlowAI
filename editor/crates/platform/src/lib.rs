@@ -1,5 +1,6 @@
 mod activity_bar;
 mod agent;
+mod breadcrumbs;
 mod code_action;
 mod command;
 mod command_palette;
@@ -222,6 +223,12 @@ pub struct NativeApplication {
     active: usize,
     /// The files of the workspace, as a tree.
     tree: Option<FileTree>,
+    /// The pieces of the path of the file that is on screen.
+    ///
+    /// They are worked out when the file on screen changes and then kept: the
+    /// root of the project is found by walking up the disk, and the path of a
+    /// file does not change by itself.
+    crumbs: Vec<breadcrumbs::Crumb>,
     /// The files that are watched for changes outside the editor.
     detector: ChangeDetector,
     /// The question the window is asking the user, if it is asking one.
@@ -570,6 +577,7 @@ impl NativeApplication {
             panes,
             active: 0,
             tree,
+            crumbs: Vec::new(),
             detector,
             prompt: None,
             settings: None,
@@ -597,6 +605,11 @@ impl NativeApplication {
             sidebar: SideBar::default(),
             activity_focus: false,
         };
+
+        // The path of the file that is on screen is worked out once here and
+        // then kept: the root of the project is found by walking up the disk,
+        // and the path does not change by itself.
+        application.refresh_crumbs();
 
         // What happened while the editor started is in the log too: a run
         // that failed to start is the run one wants to read about most.
@@ -804,6 +817,9 @@ impl NativeApplication {
         }
         self.tabs.activate_index(index);
         self.active = index;
+        // The path above the text is the path of the file that is now on
+        // screen.
+        self.refresh_crumbs();
         // The language server is told about the document that is now on
         // screen; it knows nothing about the ones that were closed.
         self.tell_server_about_the_new_document();
@@ -830,11 +846,13 @@ impl NativeApplication {
             let tab = self.tabs.open_scratch("untitled");
             self.panes.push(EditorPane::scratch(tab, None));
             self.active = 0;
+            self.refresh_crumbs();
             return;
         }
         // The workbench decides which tab comes to the front.
         let active = self.tabs.active_index().unwrap_or(0);
         self.active = active.min(self.panes.len() - 1);
+        self.refresh_crumbs();
     }
 
     /// Closes the tab with the given id, wherever it is.
@@ -1021,6 +1039,26 @@ impl NativeApplication {
         if !follows {
             self.tree = Some(FileTree::new(root.to_path_buf()));
         }
+    }
+
+    /// Works out the pieces of the path of the file that is on screen.
+    ///
+    /// The path is the one on the disk, shortened with the root of the
+    /// project the file belongs to. The tree of files cannot say it: the tree
+    /// is rooted at the folder of the file, so it does not know where that
+    /// folder is in the project.
+    fn refresh_crumbs(&mut self) {
+        let Some(document) = self
+            .panes
+            .get(self.active)
+            .and_then(|pane| pane.document.as_ref())
+        else {
+            self.crumbs.clear();
+            return;
+        };
+        let path = document.path();
+        let root = lsp::workspace_root(path);
+        self.crumbs = breadcrumbs::of(path, Some(root.as_path()));
     }
 
     /// Handles the keys of the question the window is asking.
@@ -1356,6 +1394,38 @@ impl NativeApplication {
             return;
         };
         self.sidebar.pick(activity);
+    }
+
+    /// Jumps to the place of the path that was clicked.
+    ///
+    /// A folder of the path is a folder of files: the tree of files goes to
+    /// that folder, so that the person can see what is in it. The file
+    /// itself is the file that is open already, so it only says so.
+    fn press_breadcrumbs(&mut self, point: Point, layout: &WindowLayout) {
+        let strip = {
+            let Some(renderer) = self.renderer.as_mut() else {
+                return;
+            };
+            let mut measurer = RendererMeasurer::new(renderer, TextFamily::SansSerif);
+            breadcrumbs::strip(layout.breadcrumbs, &self.crumbs, &mut measurer)
+        };
+        self.go_to_the_place_of_the_path(&strip, point);
+    }
+
+    /// Does what the piece of the path under the point says.
+    fn go_to_the_place_of_the_path(&mut self, strip: &breadcrumbs::Strip, point: Point) {
+        let Some(crumb) = breadcrumbs::hit(strip, point) else {
+            return;
+        };
+        if crumb.file {
+            self.status = Some(format!("已经在这个文件里：{}", crumb.path.display()));
+            return;
+        }
+        // The folder of the path: the tree of files goes there, and the side
+        // bar shows it.
+        self.sidebar.show(Activity::Files);
+        self.tree = Some(FileTree::new(crumb.path.clone()));
+        self.status = Some(format!("文件树现在看的是 {}", crumb.path.display()));
     }
 
     /// Jumps to the part of the file that was clicked on the map.
@@ -2098,6 +2168,12 @@ impl NativeApplication {
         // is not a click in the document.
         if layout.tab_bar.contains(cursor) {
             self.press_tab_bar(cursor, &layout);
+            return;
+        }
+        // The path above the text: a click on a piece of it says where the
+        // person wants to be.
+        if layout.breadcrumbs.contains(cursor) {
+            self.press_breadcrumbs(cursor, &layout);
             return;
         }
         if layout.sidebar.size.width > 0.0 && layout.sidebar.contains(cursor) {
@@ -5838,6 +5914,7 @@ impl ApplicationHandler for NativeApplication {
                         task_panel,
                         tabs: self.tabs.tabs(),
                         active: self.active,
+                        crumbs: &self.crumbs,
                         prompt: prompt_text.as_deref(),
                         settings: self.settings.as_ref(),
                         git: self.git.as_ref(),
@@ -5984,6 +6061,8 @@ struct Chrome<'a> {
     tabs: &'a [Tab],
     /// The tab that is on screen.
     active: usize,
+    /// The pieces of the path of the file that is on screen.
+    crumbs: &'a [breadcrumbs::Crumb],
     /// The question the window is asking, if it is asking one.
     prompt: Option<&'a str>,
     /// The settings panel, when it is open.
@@ -6260,6 +6339,11 @@ fn build_scene(
     // once to click it.
     let strip = tab_strip(chrome.tabs, chrome.active, &layout, &mut ui_measurer);
     push_tab_bar(&mut scene, viewport, layout.tab_bar, &strip.items);
+
+    // The path of the file that is on screen is above the text: it says where
+    // the person is, and every piece of it is a place that can be clicked.
+    let crumbs = breadcrumbs::strip(layout.breadcrumbs, chrome.crumbs, &mut ui_measurer);
+    breadcrumbs::draw(&mut scene, viewport, layout.breadcrumbs, &crumbs);
 
     // The bar with the activities is on the left of the window, and the
     // section that was picked is on its right.
@@ -7450,6 +7534,103 @@ mod tests {
         app.panes[0].editor.set_carets(&[TextOffset(4)]);
         let status = app.status_bar_text();
         assert!(status.right.contains("行 2，列 1"), "got {}", status.right);
+    }
+
+    #[test]
+    fn the_path_of_the_file_that_is_open_is_said_above_the_text() {
+        let project = scratch_project("breadcrumbs");
+        let folder = project.join("src");
+        fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("main.rs");
+        fs::write(&file, "one\ntwo\n").unwrap();
+        let app = NativeApplication::new(Some(file)).expect("the application starts");
+
+        let labels: Vec<&str> = app.crumbs.iter().map(|crumb| crumb.label.as_str()).collect();
+        assert_eq!(labels.last(), Some(&"main.rs"), "got {labels:?}");
+        assert!(labels.contains(&"src"), "got {labels:?}");
+        assert!(
+            labels.contains(&"breadcrumbs"),
+            "the project is in the path, got {labels:?}"
+        );
+    }
+
+    #[test]
+    fn clicking_a_folder_of_the_path_makes_the_file_tree_look_at_it() {
+        let project = scratch_project("breadcrumbs-click");
+        let folder = project.join("src");
+        fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("main.rs");
+        fs::write(&file, "one\ntwo\n").unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true);
+
+        let mut measurer = MonospaceMeasurer::new(8.0);
+        let strip = breadcrumbs::strip(layout.breadcrumbs, &app.crumbs, &mut measurer);
+        let index = strip
+            .crumbs
+            .iter()
+            .position(|crumb| crumb.label == "src")
+            .expect("the folder is in the path");
+        let place = strip.crumbs[index].rect;
+        app.go_to_the_place_of_the_path(
+            &strip,
+            Point {
+                x: place.origin.x + 1.0,
+                y: place.origin.y + 4.0,
+            },
+        );
+
+        let root = app
+            .tree
+            .as_ref()
+            .expect("the tree of files is there")
+            .root()
+            .to_path_buf();
+        assert_eq!(root, folder, "the tree looks at the folder of the path");
+        assert!(app.sidebar.is_open(), "the side bar shows the files");
+    }
+
+    #[test]
+    fn clicking_the_file_of_the_path_says_that_it_is_open() {
+        let project = scratch_project("breadcrumbs-file");
+        let file = project.join("main.rs");
+        fs::write(&file, "one\ntwo\n").unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        let layout = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true);
+
+        let mut measurer = MonospaceMeasurer::new(8.0);
+        let strip = breadcrumbs::strip(layout.breadcrumbs, &app.crumbs, &mut measurer);
+        let last = strip.crumbs.last().expect("the file is in the path");
+        let place = last.rect;
+        app.go_to_the_place_of_the_path(
+            &strip,
+            Point {
+                x: place.origin.x + 1.0,
+                y: place.origin.y + 4.0,
+            },
+        );
+
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("已经在这个文件里")),
+            "got {:?}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn the_path_is_worked_out_again_when_another_tab_comes_to_the_front() {
+        let project = scratch_project("breadcrumbs-tabs");
+        let first = project.join("first.rs");
+        let second = project.join("second.rs");
+        fs::write(&first, "one\n").unwrap();
+        fs::write(&second, "two\n").unwrap();
+        let mut app = NativeApplication::new(Some(first)).expect("the application starts");
+        app.open_file(&second);
+
+        let labels: Vec<&str> = app.crumbs.iter().map(|crumb| crumb.label.as_str()).collect();
+        assert_eq!(labels.last(), Some(&"second.rs"), "got {labels:?}");
     }
 
     #[test]

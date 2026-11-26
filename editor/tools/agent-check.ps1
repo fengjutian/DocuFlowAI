@@ -332,11 +332,15 @@ function Get-PanelRect($shot) {
 # The area the text of the document is drawn in, in the picture.
 function Get-BodyRect($shot) {
     $panel = Get-PanelRect $shot
-    $left = $shot.Left + [int](To-Physical 236)
+    # The text of the document starts after the bar of activities, the side
+    # bar, the gap and the line numbers: 48 + 220 + 16 + 56.
+    $left = $shot.Left + [int](To-Physical 340)
     $right = $panel.Left - [int](To-Physical 16)
     return @{
         Left = $left
-        Top = $shot.Top + [int](To-Physical 78)
+        # Below the strip of tabs and the row that says where the file is:
+        # 34 + 24.
+        Top = $shot.Top + [int](To-Physical 58)
         Width = [Math]::Max($right - $left, 1)
         Height = [int](To-Physical 200)
     }

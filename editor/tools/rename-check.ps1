@@ -324,11 +324,15 @@ function Count-Difference($first, $second, [int]$left, [int]$top, [int]$width, [
 function Get-BodyRect($shot) {
     $logical = $shot.Width / $script:Factor
     $panelLogical = [Math]::Min([Math]::Max($logical * 0.34, 280), 520)
-    $left = $shot.Left + [int](To-Physical 236)
+    # The text of the document starts after the bar of activities, the side
+    # bar, the gap and the line numbers: 48 + 220 + 16 + 56.
+    $left = $shot.Left + [int](To-Physical 340)
     $right = $shot.Left + $shot.Width - [int](To-Physical $panelLogical) - [int](To-Physical 16)
     return @{
         Left = $left
-        Top = $shot.Top + [int](To-Physical 78)
+        # Below the strip of tabs and the row that says where the file is:
+        # 34 + 24.
+        Top = $shot.Top + [int](To-Physical 58)
         Width = [Math]::Max($right - $left, 1)
         Height = [int](To-Physical 200)
     }

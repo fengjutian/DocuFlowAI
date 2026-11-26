@@ -460,7 +460,7 @@ try {
         $closedShot = Save-Window $handle $shotClosed
         Write-Host "saved $shotClosed"
         $left = Count-In $closedShot 0 0 $closedShot.Width $closedShot.Height $PALETTE_GROUND_RGB 6
-        $body = Count-Bright-In $closedShot (To-Screen 236) (To-Screen 78) (To-Screen 400) (To-Screen 200)
+        $body = Count-Bright-In $closedShot (To-Screen 340) (To-Screen 58) (To-Screen 400) (To-Screen 200)
         Write-Host "pixels of the ground of the panel: $left, bright pixels of the document: $body"
         Check 'the escape key closes the panel' ($left -lt ($area / 10)) "$left pixels of the ground of the panel are left"
         Check 'the document is back' ($body -gt 20) "$body bright pixels of the document"
@@ -492,7 +492,7 @@ try {
         $afterShot = Save-Window $handle (Join-Path $logs 'command-palette-after.png')
         Write-Host "saved $(Join-Path $logs 'command-palette-after.png')"
         $left = Count-In $afterShot 0 0 $afterShot.Width $afterShot.Height $SETTINGS_GROUND_RGB 6
-        $body = Count-Bright-In $afterShot (To-Screen 236) (To-Screen 78) (To-Screen 400) (To-Screen 200)
+        $body = Count-Bright-In $afterShot (To-Screen 340) (To-Screen 58) (To-Screen 400) (To-Screen 200)
         Write-Host "pixels of the ground of the settings: $left, bright pixels of the document: $body"
         Check 'the escape key closes the panel of the settings' ($left -lt ($area / 10)) "$left pixels of the ground of the settings are left"
         Check 'the document is back after the command ran' ($body -gt 20) "$body bright pixels of the document"

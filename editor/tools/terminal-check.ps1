@@ -140,8 +140,8 @@ $OUTPUT_FROM_BOTTOM = 168
 
 # The place of the text of the document, so that what is typed into the
 # terminal can be told from what is typed into the document.
-$BODY_LEFT = 236
-$BODY_TOP = 78
+$BODY_LEFT = 340
+$BODY_TOP = 58
 $BODY_WIDTH = 540
 $BODY_HEIGHT = 380
 

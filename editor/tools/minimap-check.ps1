@@ -124,6 +124,9 @@ $SIDEBAR_WIDTH = 220.0
 $MINIMAP_WIDTH = 90.0
 $STATUS_BAR_HEIGHT = 24.0
 $TAB_BAR_HEIGHT = 34.0
+# The row that says where the file is sits between the tabs and the text, so
+# the map of the document starts below it.
+$BREADCRUMB_HEIGHT = 24.0
 
 if (-not (Test-Path $exe)) {
     throw "the editor is not built; run 'cargo build -p codeweaver-editor' first"
@@ -272,8 +275,8 @@ function Get-Places($shot) {
         LogicalWidth = $logicalWidth
         LogicalHeight = $logicalHeight
         MapLeft = $right - $MINIMAP_WIDTH
-        MapTop = $TAB_BAR_HEIGHT
-        MapHeight = $logicalHeight - $TAB_BAR_HEIGHT - $STATUS_BAR_HEIGHT
+        MapTop = $TAB_BAR_HEIGHT + $BREADCRUMB_HEIGHT
+        MapHeight = $logicalHeight - $TAB_BAR_HEIGHT - $BREADCRUMB_HEIGHT - $STATUS_BAR_HEIGHT
     }
 }
 

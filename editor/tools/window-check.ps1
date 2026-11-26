@@ -107,12 +107,11 @@ $MK_LBUTTON = 0x0001
 
 # Where the body sits inside the client area, and how tall a line is.
 #
-# The body is where the text is: to the right of the tree of files and below
-# the strip of tabs. The tree is 220 pixels wide and the strip is 34 pixels
-# high, and the body keeps 16 pixels from the tree and 44 pixels from the
-# strip.
-$BODY_X = 236
-$BODY_Y = 78
+# The body is where the text is: to the right of the bar of activities, the
+# tree of files and the line numbers, and below the strip of tabs and the row
+# that says where the file is. That is 48 + 220 + 16 + 56 and 34 + 24.
+$BODY_X = 340
+$BODY_Y = 58
 $LINE_HEIGHT = 22
 
 # The colours the editor draws its parts in, as the code writes them.
