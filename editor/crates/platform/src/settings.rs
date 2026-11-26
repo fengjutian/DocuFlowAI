@@ -12,6 +12,8 @@
 
 use codeweaver_syntax::HighlightPolicy;
 
+use crate::zoom::{self, Zoom};
+
 /// What a setting is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -19,6 +21,8 @@ pub enum Kind {
     Bytes,
     /// The number of lines at which the highlighter gives up.
     Lines,
+    /// The size of the text of the document, in percent.
+    FontSize,
 }
 
 /// One value a setting can take.
@@ -87,7 +91,7 @@ pub struct Settings {
 
 impl Settings {
     /// The panel for a policy, with the values of that policy picked.
-    pub fn new(policy: HighlightPolicy) -> Self {
+    pub fn new(policy: HighlightPolicy, zoom: Zoom) -> Self {
         let bytes = Item {
             kind: Kind::Bytes,
             title: "高亮大小上限".to_owned(),
@@ -121,9 +125,24 @@ impl Settings {
             let wanted = match item.kind {
                 Kind::Bytes => policy.max_bytes as u64,
                 Kind::Lines => policy.max_lines as u64,
+                Kind::FontSize => continue,
             };
             item.picked = nearest(&item.choices, wanted);
         }
+        // The size of the text is a setting of its own: it is remembered
+        // between the runs, so it is written down in the file of the settings.
+        items.push(Item {
+            kind: Kind::FontSize,
+            title: "字号".to_owned(),
+            choices: zoom::STEPS
+                .iter()
+                .map(|step| Choice {
+                    label: format!("{step}%"),
+                    value: *step as u64,
+                })
+                .collect(),
+            picked: zoom.nearest_step(),
+        });
         Settings {
             items,
             selected: 0,
@@ -133,10 +152,18 @@ impl Settings {
     }
 
     /// The panel with the values of a policy and the keys of the commands.
-    pub fn with_keys(policy: HighlightPolicy, keys: Vec<KeyRow>) -> Self {
-        let mut settings = Self::new(policy);
+    pub fn with_keys(policy: HighlightPolicy, zoom: Zoom, keys: Vec<KeyRow>) -> Self {
+        let mut settings = Self::new(policy, zoom);
         settings.keys = keys;
         settings
+    }
+
+    /// What the setting the user is on is about.
+    pub fn kind_of_the_picked(&self) -> Option<Kind> {
+        if self.on_a_key() {
+            return None;
+        }
+        self.items.get(self.selected).map(|item| item.kind)
     }
 
     /// How many rows the panel has.
@@ -238,9 +265,24 @@ impl Settings {
             match item.kind {
                 Kind::Bytes => policy.max_bytes = choice.value as usize,
                 Kind::Lines => policy.max_lines = choice.value as usize,
+                Kind::FontSize => {}
             }
         }
         policy
+    }
+
+    /// The size of the text the panel describes.
+    pub fn zoom(&self) -> Zoom {
+        for item in &self.items {
+            if item.kind != Kind::FontSize {
+                continue;
+            }
+            let Some(choice) = item.choices.get(item.picked) else {
+                break;
+            };
+            return Zoom::of(choice.value as f32);
+        }
+        Zoom::default()
     }
 
     /// The lines of the settings, the way the panel draws them.
@@ -332,11 +374,14 @@ mod tests {
 
     #[test]
     fn the_panel_starts_on_the_values_the_editor_has() {
-        let panel = Settings::new(HighlightPolicy {
-            max_bytes: 2_000_000,
-            max_lines: 20_000,
-        });
-        assert_eq!(panel.items.len(), 2);
+        let panel = Settings::new(
+            HighlightPolicy {
+                max_bytes: 2_000_000,
+                max_lines: 20_000,
+            },
+            Zoom::default(),
+        );
+        assert_eq!(panel.items.len(), 3);
         assert_eq!(panel.items[0].picked, 4);
         assert_eq!(panel.items[1].picked, 2);
         assert_eq!(panel.policy().max_bytes, 2_000_000);
@@ -345,23 +390,26 @@ mod tests {
 
     #[test]
     fn the_panel_starts_on_the_default_values() {
-        let panel = Settings::new(HighlightPolicy::default());
+        let panel = Settings::new(HighlightPolicy::default(), Zoom::default());
         assert_eq!(panel.policy(), HighlightPolicy::default());
     }
 
     #[test]
     fn a_value_that_is_not_one_of_the_choices_picks_the_nearest() {
-        let panel = Settings::new(HighlightPolicy {
-            max_bytes: 700_000,
-            max_lines: 50_000,
-        });
+        let panel = Settings::new(
+            HighlightPolicy {
+                max_bytes: 700_000,
+                max_lines: 50_000,
+            },
+            Zoom::default(),
+        );
         // 700 KB is nearer to 500 KB than to 1 MB.
         assert_eq!(panel.policy().max_bytes, 500_000);
     }
 
     #[test]
     fn changing_the_value_moves_to_the_next_choice() {
-        let mut panel = Settings::new(HighlightPolicy::default());
+        let mut panel = Settings::new(HighlightPolicy::default(), Zoom::default());
         assert!(panel.change_value(1));
         assert_eq!(panel.policy().max_bytes, 2_000_000);
         assert!(panel.change_value(-1));
@@ -370,7 +418,7 @@ mod tests {
 
     #[test]
     fn a_value_at_the_end_of_its_steps_does_not_move() {
-        let mut panel = Settings::new(HighlightPolicy::default());
+        let mut panel = Settings::new(HighlightPolicy::default(), Zoom::default());
         for _ in 0..10 {
             panel.change_value(1);
         }
@@ -382,7 +430,7 @@ mod tests {
 
     #[test]
     fn the_selection_stays_inside_the_list() {
-        let mut panel = Settings::new(HighlightPolicy::default());
+        let mut panel = Settings::new(HighlightPolicy::default(), Zoom::default());
         panel.move_selection(-1);
         assert_eq!(panel.selected, 0);
         panel.move_selection(5);
@@ -393,14 +441,16 @@ mod tests {
 
     #[test]
     fn the_rows_show_the_setting_and_its_value() {
-        let panel = Settings::new(HighlightPolicy::default());
+        let panel = Settings::new(HighlightPolicy::default(), Zoom::default());
         let rows = panel.rows();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert!(rows[0].selected);
         assert!(!rows[1].selected);
         assert_eq!(rows[0].title, "高亮大小上限");
         assert_eq!(rows[0].value, "1 MB");
         assert_eq!(rows[1].value, "50,000 行");
+        assert_eq!(rows[2].title, "字号");
+        assert_eq!(rows[2].value, "100%");
     }
 
     fn keys() -> Vec<KeyRow> {
@@ -420,20 +470,20 @@ mod tests {
 
     #[test]
     fn the_keys_of_the_commands_come_after_the_settings() {
-        let panel = Settings::with_keys(HighlightPolicy::default(), keys());
+        let panel = Settings::with_keys(HighlightPolicy::default(), Zoom::default(), keys());
         let rows = panel.all_rows();
-        assert_eq!(rows.len(), 4);
-        assert_eq!(rows[2].title, "编辑 · 格式化文档");
-        assert_eq!(rows[2].value, "Alt+Shift+F");
-        assert!(!rows[2].selected, "the first setting is picked");
-        assert_eq!(panel.len(), 4);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[3].title, "编辑 · 格式化文档");
+        assert_eq!(rows[3].value, "Alt+Shift+F");
+        assert!(!rows[3].selected, "the first setting is picked");
+        assert_eq!(panel.len(), 5);
     }
 
     #[test]
     fn the_selection_walks_from_a_setting_to_a_key() {
-        let mut panel = Settings::with_keys(HighlightPolicy::default(), keys());
-        panel.move_selection(2);
-        assert!(panel.on_a_key(), "the third row is a key");
+        let mut panel = Settings::with_keys(HighlightPolicy::default(), Zoom::default(), keys());
+        panel.move_selection(3);
+        assert!(panel.on_a_key(), "the fourth row is a key");
         assert_eq!(
             panel.selected_key().map(|row| row.command.as_str()),
             Some("editor.format")
@@ -444,38 +494,38 @@ mod tests {
             Some("editor.rename")
         );
         panel.move_selection(9);
-        assert_eq!(panel.selected, 3, "the selection stops at the last row");
+        assert_eq!(panel.selected, 4, "the selection stops at the last row");
     }
 
     #[test]
     fn the_arrows_do_not_change_the_value_of_a_key() {
-        let mut panel = Settings::with_keys(HighlightPolicy::default(), keys());
-        panel.move_selection(2);
+        let mut panel = Settings::with_keys(HighlightPolicy::default(), Zoom::default(), keys());
+        panel.move_selection(3);
         assert!(!panel.change_value(1), "a key is not a value");
         assert_eq!(panel.policy(), HighlightPolicy::default());
     }
 
     #[test]
     fn enter_on_a_key_waits_for_a_key_of_its_own() {
-        let mut panel = Settings::with_keys(HighlightPolicy::default(), keys());
+        let mut panel = Settings::with_keys(HighlightPolicy::default(), Zoom::default(), keys());
         assert!(!panel.begin_recording(), "the first row is a setting");
-        panel.move_selection(3);
+        panel.move_selection(4);
         assert!(panel.begin_recording());
         assert!(panel.recording());
         let rows = panel.all_rows();
-        assert_eq!(rows[3].value, "按新的键…", "the row says what it waits for");
+        assert_eq!(rows[4].value, "按新的键…", "the row says what it waits for");
         panel.cancel_recording();
         assert!(!panel.recording());
-        assert_eq!(panel.all_rows()[3].value, "F2", "the old key is still there");
+        assert_eq!(panel.all_rows()[4].value, "F2", "the old key is still there");
     }
 
     #[test]
     fn the_key_that_is_given_is_the_key_of_the_command_from_then_on() {
-        let mut panel = Settings::with_keys(HighlightPolicy::default(), keys());
-        panel.move_selection(2);
+        let mut panel = Settings::with_keys(HighlightPolicy::default(), Zoom::default(), keys());
+        panel.move_selection(3);
         panel.begin_recording();
         panel.set_key("editor.format", "Ctrl+Alt+K");
-        assert_eq!(panel.all_rows()[2].value, "Ctrl+Alt+K");
+        assert_eq!(panel.all_rows()[3].value, "Ctrl+Alt+K");
         assert!(!panel.recording(), "the panel has its answer");
     }
 
@@ -488,7 +538,7 @@ mod tests {
                 key: "Ctrl+K".to_owned(),
             })
             .collect();
-        let mut panel = Settings::with_keys(HighlightPolicy::default(), many);
+        let mut panel = Settings::with_keys(HighlightPolicy::default(), Zoom::default(), many);
         let rows = panel.visible_rows();
         assert_eq!(rows.len(), VISIBLE_ROWS, "the panel is not taller than that");
         assert!(rows[0].selected, "the first row is in the window");

@@ -33,6 +33,7 @@ mod status_bar;
 mod task;
 #[cfg(test)]
 mod testing;
+pub mod zoom;
 
 use std::{ops::Range, path::{Path, PathBuf}, sync::Arc, time::{Duration, Instant}};
 
@@ -64,7 +65,7 @@ use debug::{BreakpointMark, Breakpoints, DebugPanel, DebugState, DebugStep, Debu
 use developer::{DeveloperCommand, DeveloperPanel, Line as DeveloperLine};
 use devlog::DevLog;
 use editor_view::{
-    BodyOverlay, EditorView, FindOverlay, LINE_HEIGHT, MarkSeverity, RendererMeasurer,
+    BodyOverlay, EditorView, FindOverlay, MarkSeverity, RendererMeasurer,
 };
 use activity_bar::{Activity, Badges, SideBar};
 use find::{FindBar, FindField};
@@ -74,10 +75,11 @@ use layout::WindowLayout;
 use pane::EditorPane;
 use rename::RenameBox;
 use search::{SearchCommand, SearchPanel};
-use settings::{KeyRow, Settings};
+use settings::{KeyRow, Kind as SettingKind, Settings};
 use sidebar::{Action as SideBarAction, Row as SideBarRow};
 use status_bar::StatusBar;
 use task::{Task, TaskOutput, TaskPanel, TaskState};
+use zoom::Zoom;
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
@@ -320,6 +322,17 @@ pub struct NativeApplication {
     /// The section is a state: switching away and back again leaves the
     /// content of the section as it was.
     sidebar: SideBar,
+    /// How big the text of the document is drawn.
+    ///
+    /// The size belongs to the window, not to a file: every file is drawn at
+    /// the same size, and the size the person chose is remembered.
+    zoom: Zoom,
+    /// Where the size is remembered.
+    ///
+    /// It is the file of the user, next to the file of the keys. A test may
+    /// point it somewhere else: a test that changes the size must not write
+    /// into the settings of the person who runs the tests.
+    zoom_path: Option<PathBuf>,
     /// Whether the keyboard is on the activity bar.
     ///
     /// The keyboard is on one thing at a time: the terminal has it, the find
@@ -507,6 +520,15 @@ impl NativeApplication {
         }
 
         let mut commands = commands::default_registry();
+        // The size of the text the person chose is remembered in a file of the
+        // user, next to the file of the keys.
+        let zoom_path = zoom::user_path();
+        let settings = zoom_path.as_deref().map(|path| zoom::read(path));
+        let zoom = settings.as_ref().map(|loaded| loaded.zoom).unwrap_or_default();
+        let settings_errors = settings
+            .as_ref()
+            .map(|loaded| loaded.errors.clone())
+            .unwrap_or_default();
         // The keys in the file of the user and the file of the project are
         // put over the ones the editor was built with, before anything is
         // read from the registry: what the editor starts with is what the
@@ -542,6 +564,9 @@ impl NativeApplication {
                 }
             })
         });
+        // The same goes for the file of the settings: a size that cannot be
+        // read is said out loud, and the usual size is used.
+        let status = status.or_else(|| settings_errors.first().cloned());
 
         let mut application = NativeApplication {
             window: None,
@@ -604,6 +629,8 @@ impl NativeApplication {
             selected_context: 0,
             conflicts: None,
             sidebar: SideBar::default(),
+            zoom,
+            zoom_path,
             activity_focus: false,
         };
 
@@ -611,6 +638,8 @@ impl NativeApplication {
         // then kept: the root of the project is found by walking up the disk,
         // and the path does not change by itself.
         application.refresh_crumbs();
+        // The text is drawn at the size the person chose.
+        application.apply_the_zoom();
 
         // What happened while the editor started is in the log too: a run
         // that failed to start is the run one wants to read about most.
@@ -779,6 +808,8 @@ impl NativeApplication {
             self.detector.watch(document.path(), document.fingerprint());
         }
         self.panes.push(pane);
+        // The file that is opened is drawn at the size the window has.
+        self.apply_the_zoom();
         // The breakpoints of the file follow its text again: the anchors of
         // the closed file died with its buffer.
         self.track_the_breakpoints_of_the_pane(self.panes.len() - 1);
@@ -1042,6 +1073,35 @@ impl NativeApplication {
         }
     }
 
+    /// Draws the text at the size the window has.
+    ///
+    /// The size belongs to the window and not to a file: every file is drawn
+    /// at the same size. The view of every file is told about it, so that a
+    /// file that is opened later is drawn at the same size as the others.
+    fn apply_the_zoom(&mut self) {
+        let zoom = self.zoom;
+        for pane in &mut self.panes {
+            pane.view.set_zoom(zoom);
+        }
+    }
+
+    /// Draws the text bigger or smaller.
+    ///
+    /// The size is remembered in the file of the settings, so that the person
+    /// does not have to make the text big again after every restart.
+    fn set_zoom(&mut self, zoom: Zoom) {
+        if zoom == self.zoom {
+            return;
+        }
+        self.zoom = zoom;
+        self.apply_the_zoom();
+        if let Some(path) = self.zoom_path.clone()
+            && let Err(error) = zoom::write(&path, zoom)
+        {
+            self.status = Some(format!("字号没有记住：{error}"));
+        }
+    }
+
     /// Works out the pieces of the path of the file that is on screen.
     ///
     /// The path is the one on the disk, shortened with the root of the
@@ -1115,7 +1175,11 @@ impl NativeApplication {
     /// sees is what the editor is doing.
     fn open_settings(&mut self) {
         let policy = self.panes[self.active].policy;
-        self.settings = Some(Settings::with_keys(policy, self.command_keys()));
+        self.settings = Some(Settings::with_keys(
+            policy,
+            self.zoom,
+            self.command_keys(),
+        ));
     }
 
     /// The key each command has now, for the panel of the settings.
@@ -1174,42 +1238,57 @@ impl NativeApplication {
             return true;
         }
 
-        let Some(settings) = self.settings.as_mut() else {
-            return true;
-        };
-        let policy = match key {
-            Key::Named(NamedKey::ArrowUp) => {
-                settings.move_selection(-1);
-                None
-            }
-            Key::Named(NamedKey::ArrowDown) => {
-                settings.move_selection(1);
-                None
-            }
-            Key::Named(NamedKey::ArrowLeft) => {
-                if settings.change_value(-1) {
-                    Some(settings.policy())
-                } else {
-                    None
+        // What was changed matters: the size of the text is a setting of its
+        // own, and changing the limit of the highlighter must not change it.
+        let (changed, changed_kind, policy, zoom) = {
+            let Some(settings) = self.settings.as_mut() else {
+                return true;
+            };
+            let mut changed_kind = None;
+            let changed = match key {
+                Key::Named(NamedKey::ArrowUp) => {
+                    settings.move_selection(-1);
+                    false
                 }
-            }
-            Key::Named(NamedKey::ArrowRight) => {
-                if settings.change_value(1) {
-                    Some(settings.policy())
-                } else {
-                    None
+                Key::Named(NamedKey::ArrowDown) => {
+                    settings.move_selection(1);
+                    false
                 }
-            }
-            _ => None,
+                Key::Named(NamedKey::ArrowLeft) => {
+                    let kind = settings.kind_of_the_picked();
+                    if settings.change_value(-1) {
+                        changed_kind = kind;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Key::Named(NamedKey::ArrowRight) => {
+                    let kind = settings.kind_of_the_picked();
+                    if settings.change_value(1) {
+                        changed_kind = kind;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            (changed, changed_kind, settings.policy(), settings.zoom())
         };
         // A new value is put in force at once: a setting that has to be
         // confirmed before it counts is a setting nobody changes.
-        if let Some(policy) = policy {
+        if changed {
             self.set_highlight_policy(policy);
-            self.status = Some(format!(
-                "高亮上限：{} 字节 / {} 行",
-                policy.max_bytes, policy.max_lines
-            ));
+            if changed_kind == Some(SettingKind::FontSize) {
+                self.set_zoom(zoom);
+                self.status = Some(format!("字号 {}", zoom.label()));
+            } else {
+                self.status = Some(format!(
+                    "高亮上限：{} 字节 / {} 行",
+                    policy.max_bytes, policy.max_lines
+                ));
+            }
         }
         true
     }
@@ -1444,7 +1523,7 @@ impl NativeApplication {
         else {
             return;
         };
-        let visible = ((layout.body.size.height / LINE_HEIGHT).floor() as usize).max(1);
+        let visible = ((layout.body.size.height / self.zoom.line_height()).floor() as usize).max(1);
         let first = line.saturating_sub(visible / 2).min(total.saturating_sub(1));
         pane.view.view.first_line = first;
     }
@@ -1912,7 +1991,7 @@ impl NativeApplication {
         let body = self
             .window_layout(self.window_size(scale_factor))
             .body;
-        ((body.size.height / LINE_HEIGHT).floor() as usize).max(1)
+        ((body.size.height / self.zoom.line_height()).floor() as usize).max(1)
     }
 
     /// Rebuilds the layout of the text on screen.
@@ -3429,7 +3508,7 @@ impl NativeApplication {
                 pane.editor.can_redo(),
                 pane.editor.cursor_count(),
             ),
-            right: format!("行 {line}，列 {column}"),
+            right: format!("行 {line}，列 {column} · {}", self.zoom.label()),
         }
     }
 
@@ -4852,6 +4931,18 @@ impl NativeApplication {
                 }
             }
             "workbench.settings" => self.open_settings(),
+            "view.zoomIn" => {
+                self.set_zoom(self.zoom.bigger());
+                self.status = Some(format!("字号 {}", self.zoom.label()));
+            }
+            "view.zoomOut" => {
+                self.set_zoom(self.zoom.smaller());
+                self.status = Some(format!("字号 {}", self.zoom.label()));
+            }
+            "view.zoomReset" => {
+                self.set_zoom(self.zoom.reset());
+                self.status = Some(format!("字号 {}", self.zoom.label()));
+            }
             "workbench.save" => {
                 if let Some(tab) = self.tabs.active().map(|tab| tab.id) {
                     self.save_tab(tab);
@@ -5553,10 +5644,32 @@ impl ApplicationHandler for NativeApplication {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if self.modifiers.control_key() {
+                    // The wheel with the control key held changes the size of
+                    // the text instead of scrolling it.
+                    let notches = match delta {
+                        MouseScrollDelta::LineDelta(lines, _) => lines,
+                        MouseScrollDelta::PixelDelta(pixels) => pixels.y as f32 / 40.0,
+                    };
+                    if notches != 0.0 {
+                        let zoom = if notches > 0.0 {
+                            self.zoom.bigger()
+                        } else {
+                            self.zoom.smaller()
+                        };
+                        self.set_zoom(zoom);
+                        self.status = Some(format!("字号 {}", self.zoom.label()));
+                    }
+                    window.request_redraw();
+                    return;
+                }
                 let lines = match delta {
                     MouseScrollDelta::LineDelta(lines, _) => lines as isize,
+                    // The wheel that is turned sideways scrolls sideways; the
+                    // text is scrolled up and down, so the vertical part of
+                    // the movement is the one that counts.
                     MouseScrollDelta::PixelDelta(pixels) => {
-                        (pixels.x / LINE_HEIGHT as f64) as isize
+                        (pixels.y / self.zoom.line_height() as f64) as isize
                     }
                 };
                 if lines != 0 {
@@ -6261,18 +6374,21 @@ fn build_scene(
             view.visual_lines(),
             layout.gutter,
             current_line,
+            view.zoom().line_height(),
         );
         gutter::draw(
             &mut scene,
             viewport,
             layout.gutter,
             &numbers,
+            view.zoom().gutter_font_size(),
+            view.zoom().line_height(),
             &mut measurer,
         );
 
         // The map of the whole document is on the right of the text.
         let first_line = view.view.first_line;
-        let visible_lines = ((body.size.height / LINE_HEIGHT).floor() as usize).max(1);
+        let visible_lines = ((body.size.height / view.zoom().line_height()).floor() as usize).max(1);
         let map = view.minimap(editor_state.buffer());
         minimap::draw(
             &mut scene,
@@ -7696,13 +7812,90 @@ mod tests {
             10,
             400.0,
             16.0,
-            LINE_HEIGHT,
+            app.zoom.line_height(),
             &mut measurer,
         );
-        let numbers = gutter::lines(buffer, &text.lines, window.gutter, 0);
+        let numbers = gutter::lines(buffer, &text.lines, window.gutter, 0, app.zoom.line_height());
         assert_eq!(
             numbers.iter().map(|line| line.number).collect::<Vec<_>>(),
             vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn the_command_makes_the_text_bigger_and_the_size_is_remembered() {
+        let directory = scratch_dir("zoom-command");
+        let file = directory.join("main.rs");
+        fs::write(&file, "one\ntwo\nthree").unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        // The size is remembered in the file of the check, not in the file of
+        // the person who runs the checks.
+        app.zoom_path = Some(directory.join("settings.json"));
+
+        assert_eq!(app.zoom.percent, 100.0);
+        assert!(app.run_named_command("view.zoomIn"));
+        assert_eq!(app.zoom.percent, 110.0);
+        let size = app.panes[0].view.zoom().font_size();
+        assert!((size - 17.6).abs() < 0.01, "the text is bigger, got {size}");
+        let written = fs::read_to_string(directory.join("settings.json"))
+            .expect("the size is remembered in the file");
+        assert!(written.contains("110"), "got {written}");
+
+        assert!(app.run_named_command("view.zoomOut"));
+        assert_eq!(app.zoom.percent, 100.0);
+        assert!(app.run_named_command("view.zoomReset"));
+        assert_eq!(app.zoom.percent, 100.0);
+    }
+
+    #[test]
+    fn a_file_that_is_opened_later_is_drawn_at_the_size_of_the_window() {
+        let directory = scratch_dir("zoom-later");
+        let first = directory.join("first.rs");
+        let second = directory.join("second.rs");
+        fs::write(&first, "one\ntwo").unwrap();
+        fs::write(&second, "three\nfour").unwrap();
+        let mut app = NativeApplication::new(Some(first)).expect("the application starts");
+        app.zoom_path = Some(directory.join("settings.json"));
+        app.run_named_command("view.zoomIn");
+
+        assert!(app.open_file(&second));
+        let last = app.panes.len() - 1;
+        assert_eq!(
+            app.panes[last].view.zoom().percent,
+            110.0,
+            "the file that is opened later is drawn at the size of the window"
+        );
+    }
+
+    #[test]
+    fn the_numbers_of_the_lines_stay_on_their_lines_when_the_text_is_bigger() {
+        let directory = scratch_dir("zoom-gutter");
+        let file = directory.join("main.rs");
+        fs::write(&file, "one\ntwo\nthree").unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.zoom_path = Some(directory.join("settings.json"));
+        app.run_named_command("view.zoomIn");
+
+        let window = WindowLayout::of(Size::new(1280.0, 800.0), 0.0, true);
+        let buffer = app.panes[0].editor.buffer();
+        let mut measurer = MonospaceMeasurer::new(8.0);
+        let line_height = app.zoom.line_height();
+        let text = codeweaver_ui::TextLayout::build(
+            buffer,
+            0,
+            10,
+            400.0,
+            app.zoom.font_size(),
+            line_height,
+            &mut measurer,
+        );
+        let numbers = gutter::lines(buffer, &text.lines, window.gutter, 0, line_height);
+        // The second number is one row of the text lower than the first one:
+        // the numbers follow the size of the text.
+        let distance = numbers[1].rect.origin.y - numbers[0].rect.origin.y;
+        assert!(
+            (distance - line_height).abs() < 0.01,
+            "the numbers keep the rows of the text, got {distance} and {line_height}"
         );
     }
 

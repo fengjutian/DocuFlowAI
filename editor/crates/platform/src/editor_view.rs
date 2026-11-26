@@ -16,11 +16,8 @@ use codeweaver_ui::{
 };
 
 use crate::minimap::Minimap;
+use crate::zoom::Zoom;
 
-/// The size the body text is drawn at.
-pub const FONT_SIZE: f32 = 16.0;
-/// The height of one line of the body.
-pub const LINE_HEIGHT: f32 = 22.0;
 /// The width of the caret.
 const CARET_WIDTH: f32 = 2.0;
 
@@ -135,6 +132,8 @@ pub struct EditorView {
     drag_anchor: Option<usize>,
     /// The selection the current mouse drag is moving.
     drag_index: Option<usize>,
+    /// How big the text is drawn.
+    zoom: Zoom,
     /// What the layout was built from.
     built: Built,
 }
@@ -149,6 +148,8 @@ struct Built {
     width: f32,
     height: f32,
     first_line: usize,
+    /// How big the text was drawn at.
+    zoom: f32,
 }
 
 impl Default for EditorView {
@@ -166,13 +167,28 @@ impl EditorView {
             minimap_version: u64::MAX,
             drag_anchor: None,
             drag_index: None,
+            zoom: Zoom::default(),
             built: Built {
                 version: u64::MAX,
                 width: 0.0,
                 height: 0.0,
                 first_line: 0,
+                zoom: 0.0,
             },
         }
+    }
+
+    /// How big the text is drawn.
+    pub fn zoom(&self) -> Zoom {
+        self.zoom
+    }
+
+    /// Draws the text bigger or smaller.
+    ///
+    /// The layout of the text is built again: a text that is drawn at another
+    /// size wraps into other lines, so the place of every line is another one.
+    pub fn set_zoom(&mut self, zoom: Zoom) {
+        self.zoom = zoom;
     }
 
     /// Rebuilds the layout when the text, the scroll position or the size of
@@ -189,18 +205,20 @@ impl EditorView {
             width,
             height,
             first_line: self.view.first_line,
+            zoom: self.zoom.percent,
         };
         if built == self.built {
             return;
         }
-        let lines = ((height / LINE_HEIGHT).floor() as usize).max(1);
+        let line_height = self.zoom.line_height();
+        let lines = ((height / line_height).floor() as usize).max(1);
         self.layout = TextLayout::build(
             buffer,
             self.view.first_line,
             lines,
             width,
-            FONT_SIZE,
-            LINE_HEIGHT,
+            self.zoom.font_size(),
+            line_height,
             measurer,
         );
         self.built = built;
@@ -434,6 +452,7 @@ impl EditorView {
     ) {
         let clip = body;
         let find = overlay.find;
+        let line_height = self.zoom.line_height();
 
         for (index, range) in find.matches.iter().enumerate() {
             let color = if Some(index) == find.current {
@@ -482,7 +501,7 @@ impl EditorView {
                     scene.push_quad(
                         Rect::new(
                             body.origin.x + point.0,
-                            body.origin.y + point.1 + LINE_HEIGHT - 2.0,
+                            body.origin.y + point.1 + line_height - 2.0,
                             4.0,
                             2.0,
                         ),
@@ -511,7 +530,7 @@ impl EditorView {
             let y = body.origin.y + line.y;
             // A line that runs under the floating part stops at its edge.
             let line_clip = match find.bar {
-                Some(bar) if y + LINE_HEIGHT > bar.origin.y && y < bar.max_y() => Rect::new(
+                Some(bar) if y + line_height > bar.origin.y && y < bar.max_y() => Rect::new(
                     body.origin.x,
                     body.origin.y,
                     (bar.origin.x - body.origin.x).max(1.0),
@@ -565,12 +584,14 @@ impl EditorView {
     ) {
         // The composition belongs between the text before the caret and the
         // text after it, so the line is split there.
+        let line_height = self.zoom.line_height();
         let split = self
             .preedit_split(line, caret, preedit)
             .map(|at| line.range.start + at);
         let pieces = pieces_of(line, highlights, split);
+        let font_size = self.zoom.font_size();
         let width = match split {
-            Some(_) => measurer.measure(preedit, FONT_SIZE).width,
+            Some(_) => measurer.measure(preedit, font_size).width,
             None => 0.0,
         };
         for piece in pieces {
@@ -581,7 +602,7 @@ impl EditorView {
             {
                 x += width;
             }
-            push_piece(scene, line, &piece, x, y, body, clip);
+            push_piece(scene, line, &piece, x, y, body, clip, font_size, line_height);
         }
         if let Some(split) = split {
             push_text(
@@ -592,6 +613,8 @@ impl EditorView {
                 body,
                 clip,
                 TEXT_COLOR,
+                font_size,
+                line_height,
             );
         }
     }
@@ -669,6 +692,7 @@ fn pieces_of(line: &VisualLine, highlights: &[Highlight], split: Option<usize>) 
 }
 
 /// Draws one piece of a line.
+#[allow(clippy::too_many_arguments)]
 fn push_piece(
     scene: &mut FrameScene,
     line: &VisualLine,
@@ -677,13 +701,16 @@ fn push_piece(
     y: f32,
     body: Rect,
     clip: Rect,
+    font_size: f32,
+    line_height: f32,
 ) {
     let text = &line.text[piece.start - line.range.start..piece.end - line.range.start];
     let color = piece.kind.map(highlight_color).unwrap_or(TEXT_COLOR);
-    push_text(scene, text, x, y, body, clip, color);
+    push_text(scene, text, x, y, body, clip, color, font_size, line_height);
 }
 
 /// Draws a run of text.
+#[allow(clippy::too_many_arguments)]
 fn push_text(
     scene: &mut FrameScene,
     text: &str,
@@ -692,17 +719,19 @@ fn push_text(
     body: Rect,
     clip: Rect,
     color: Color,
+    font_size: f32,
+    line_height: f32,
 ) {
     // The run is wider than the body so the renderer does not wrap the
     // text a second time: the body already wrapped it.
     scene.push_text(
         text,
-        Rect::new(x, y, body.size.width * 2.0, LINE_HEIGHT),
+        Rect::new(x, y, body.size.width * 2.0, line_height),
         TextStyle {
             clip,
             color,
-            font_size: FONT_SIZE,
-            line_height: LINE_HEIGHT,
+            font_size,
+            line_height,
             family: TextFamily::Monospace,
         },
     );

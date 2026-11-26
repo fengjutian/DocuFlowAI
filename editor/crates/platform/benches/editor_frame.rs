@@ -23,7 +23,8 @@
 
 use std::time::{Duration, Instant};
 
-use codeweaver_platform::editor_view::{FONT_SIZE, LINE_HEIGHT, ShaperMeasurer};
+use codeweaver_platform::editor_view::ShaperMeasurer;
+use codeweaver_platform::zoom::{DEFAULT_FONT_SIZE as FONT_SIZE, DEFAULT_LINE_HEIGHT as LINE_HEIGHT};
 use codeweaver_render::{TextFamily, TextShaper};
 use codeweaver_text::Buffer;
 use codeweaver_ui::TextLayout;

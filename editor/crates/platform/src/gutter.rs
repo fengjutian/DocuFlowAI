@@ -10,16 +10,6 @@ use codeweaver_render::{Color, FrameScene, Rect, TextFamily, TextStyle};
 use codeweaver_text::Buffer;
 use codeweaver_ui::{TextMeasurer, VisualLine};
 
-/// The size the line numbers are drawn at.
-///
-/// The numbers are smaller than the text of the document, so that the text
-/// stays the thing the eye goes to.
-pub const FONT_SIZE: f32 = 13.0;
-/// The height of one row of numbers.
-///
-/// It is the height of one line of the text, so that a number and the line
-/// it belongs to are on the same row.
-pub const LINE_HEIGHT: f32 = 22.0;
 /// The space between the numbers and the text of the document.
 const PADDING: f32 = 10.0;
 /// How far the number is moved down, so that its bottom line is the bottom
@@ -48,12 +38,15 @@ pub struct GutterLine {
 ///
 /// `visual` are the rows of the text that are on screen: a row of the text
 /// is not always a line of the document. `current` is the line of the
-/// document the caret is on, counting from zero.
+/// document the caret is on, counting from zero. `line_height` is the height
+/// of one line of the text: a number and the line it belongs to have to be
+/// on the same row, and the text can be drawn bigger or smaller.
 pub fn lines(
     buffer: &Buffer,
     visual: &[VisualLine],
     gutter: Rect,
     current: usize,
+    line_height: f32,
 ) -> Vec<GutterLine> {
     visual
         .iter()
@@ -66,7 +59,7 @@ pub fn lines(
                     gutter.origin.x,
                     gutter.origin.y + row.y,
                     gutter.size.width,
-                    LINE_HEIGHT,
+                    line_height,
                 ),
             }
         })
@@ -82,6 +75,8 @@ pub fn draw(
     viewport: Rect,
     gutter: Rect,
     numbers: &[GutterLine],
+    font_size: f32,
+    line_height: f32,
     measurer: &mut dyn TextMeasurer,
 ) {
     for number in numbers {
@@ -91,14 +86,14 @@ pub fn draw(
             scene.push_quad(number.rect, CURRENT_BACKGROUND, viewport);
         }
         let text = number.number.to_string();
-        let width = measurer.measure(&text, FONT_SIZE).width;
+        let width = measurer.measure(&text, font_size).width;
         scene.push_text(
             text,
             Rect::new(
                 gutter.max_x() - PADDING - width,
                 number.rect.origin.y + BASELINE_OFFSET,
                 width + 2.0,
-                LINE_HEIGHT,
+                line_height,
             ),
             TextStyle {
                 clip: viewport,
@@ -107,8 +102,8 @@ pub fn draw(
                 } else {
                     NUMBER_COLOR
                 },
-                font_size: FONT_SIZE,
-                line_height: LINE_HEIGHT,
+                font_size,
+                line_height,
                 family: TextFamily::SansSerif,
             },
         );
@@ -119,6 +114,11 @@ pub fn draw(
 mod tests {
     use super::*;
     use codeweaver_ui::MonospaceMeasurer;
+
+    /// The height of one line of the text.
+    const LINE_HEIGHT: f32 = 22.0;
+    /// The size the numbers are drawn at.
+    const FONT_SIZE: f32 = 13.0;
 
     /// The gutter of a window that is 800 pixels wide.
     fn gutter() -> Rect {
@@ -135,11 +135,10 @@ mod tests {
         let mut measurer = MonospaceMeasurer::new(8.0);
         codeweaver_ui::TextLayout::build(buffer, 0, 10, 400.0, 16.0, LINE_HEIGHT, &mut measurer).lines
     }
-
     #[test]
     fn every_line_of_the_document_has_a_number() {
         let buffer = buffer();
-        let numbers = lines(&buffer, &rows(&buffer), gutter(), 0);
+        let numbers = lines(&buffer, &rows(&buffer), gutter(), 0, LINE_HEIGHT);
         assert_eq!(
             numbers.iter().map(|line| line.number).collect::<Vec<_>>(),
             vec![1, 2, 3]
@@ -152,14 +151,14 @@ mod tests {
         let rows = rows(&buffer);
         // The second row of the text is the second line of the document.
         assert_eq!(rows[1].range.start, 4);
-        let numbers = lines(&buffer, &rows, gutter(), 0);
+        let numbers = lines(&buffer, &rows, gutter(), 0, LINE_HEIGHT);
         assert_eq!(numbers[1].number, 2);
     }
 
     #[test]
     fn the_line_of_the_caret_is_the_one_that_is_marked() {
         let buffer = buffer();
-        let numbers = lines(&buffer, &rows(&buffer), gutter(), 1);
+        let numbers = lines(&buffer, &rows(&buffer), gutter(), 1, LINE_HEIGHT);
         assert!(numbers[1].current);
         assert!(!numbers[0].current);
         assert!(!numbers[2].current);
@@ -169,7 +168,7 @@ mod tests {
     fn the_numbers_are_on_the_rows_of_the_text() {
         let buffer = buffer();
         let rows = rows(&buffer);
-        let numbers = lines(&buffer, &rows, gutter(), 0);
+        let numbers = lines(&buffer, &rows, gutter(), 0, LINE_HEIGHT);
         assert_eq!(numbers[0].rect.origin.y, gutter().origin.y);
         assert_eq!(numbers[1].rect.origin.y, gutter().origin.y + rows[1].y);
     }
@@ -195,6 +194,8 @@ mod tests {
             Rect::new(0.0, 0.0, 800.0, 600.0),
             Rect::new(0.0, 0.0, 56.0, 400.0),
             &numbers,
+            FONT_SIZE,
+            LINE_HEIGHT,
             &mut measurer,
         );
         assert_eq!(scene.glyph_runs.len(), 2);
