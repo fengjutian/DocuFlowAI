@@ -78,6 +78,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\
 
 - 仓库目录带 **Low 完整性标签** → 在仓库里构建出的二进制以低完整性运行，**起不了 Medium 完整性的 `node.exe`（os error 5）**。验收脚本因此把编辑器复制到 `%LOCALAPPDATA%\CodeWeaver\check` 再运行。
 - 同一条约束管着 **`git.exe`**（`D:\Program Files\Git\cmd`，Medium 完整性）：仓库里的二进制（含 `cargo test` 的测试二进制）起不了它。因此凡是要真跑 `git` 的单元检查，都得把测试二进制复制到 `%LOCALAPPDATA%` 之外再跑（见 `editor/tools/git-unit-check.ps1`）；`cargo test` 里那组检查会整组跳过并打印 `BLOCKED:`——**跳过不算通过**。
+- 同一条约束还管着**系统临时目录**：`%TEMP%` 是 Medium 完整性，**低完整性的测试二进制写不进去**（`create_dir_all` 报「拒绝访问。 (os error 5)」）。单元测试要落文件就写进 **crate 自己的 `target/`** 里：`crates/platform/src/testing.rs` 的 `scratch()` / `scratch_dir()` / `scratch_project()` 就是干这个的（`CARGO_MANIFEST_DIR/target/test-scratch`）。别用 `std::env::temp_dir()`。
+- 测试**别写用户真实的设置文件**：应用层的测试要把 `zoom_path`（字号设置）等指向 scratch 目录，别让测试去动 `%APPDATA%\CodeWeaver\` 里的真东西。
 - 本机 `rust-analyzer` 是 rustup 代理且组件未装在默认工具链，代理报「Unknown binary」；可用二进制在 `%USERPROFILE%\.rustup\toolchains\1.98.1-x86_64-pc-windows-msvc\bin\rust-analyzer.exe`，用编辑器的 `--lsp <program>` 点名它。
 - 验收用的工程必须自带空 `[workspace]` 表，并放在工作区之外，否则 `cargo locate-project` 会报「believes it's in a workspace when it's not」。
 - **窗口级脚本里数颜色：方块要 sRGB 换算，文字不用。** 显卡把颜色写进 sRGB 屏幕时方块过了转换（`To-Screen`/`To-Pixel`），文字那一遍没过（`To-Bytes`）。拿文字的办法去数方块，数出来永远是 0；六个脚本（`command`/`git`/`search`/`terminal`/`task`/`debug`）曾都踩过这一脚，已改对。新写脚本照着 `tools/command-palette-check.ps1` 的 `To-Pixel`/`To-Bytes` 区分。

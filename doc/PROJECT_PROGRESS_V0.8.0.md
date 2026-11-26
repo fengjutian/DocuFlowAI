@@ -126,7 +126,7 @@ V0.7.0 把编辑器的**外壳**换成了 VS Code 的样子：命令注册表、
 - **读不动的设置文件不会挡住启动**：逐条报错（哪个值不对、为什么），字号回落到默认值。
 - **设置面板里两行互不牵连**：改「高亮上限」不会顺手改字号，改字号也不会动高亮上限。
 - **组件拆分**：字号是 `crates/platform/src/zoom.rs`，不认识 `NativeApplication`；窗口布局照旧只有一份。
-- 单元测试覆盖：字号与行高的换算、范围夹取、`nearest_step`（面板给的是「离当前字号最近的一档」）、设置文件的读与写、读不动的文件逐条报错；应用层测试：命令改字号并写盘、后开的文件同尺寸、行号跟着行高走。窗口级验收脚本证明：行距变宽了、屏幕上的行变少了、行号没跟错行、设置文件写对了、重启后还是这个字号、状态栏右边说了当前字号。
+- 单元测试覆盖：字号与行高的换算、范围夹取、`nearest_step`（面板给的是「离当前字号最近的一档」）、设置文件的读与写、读不动的文件逐条报错；应用层测试：命令改字号并写盘、后开的文件同尺寸、行号跟着行高走、面板里改字号生效且不牵连高亮上限。窗口级验收脚本证明：行距变宽了、屏幕上的行变少了、行号没跟错行、设置文件写对了、重启后还是这个字号、状态栏右边说了当前字号。
 
 实现落点：
 
@@ -134,7 +134,7 @@ V0.7.0 把编辑器的**外壳**换成了 VS Code 的样子：命令注册表、
 - `crates/platform/src/editor_view.rs`：删掉 `FONT_SIZE`/`LINE_HEIGHT` 常量；`EditorView` 增 `zoom` 字段 + `zoom()`/`set_zoom()`；排版缓存（`Built`）里存字号——字号变了必须重排版；`layout()`/`draw()`/`push_line()`/`push_piece()`/`push_text()` 都吃字号与行高参数。
 - `crates/platform/src/gutter.rs`：删掉自己的 `FONT_SIZE`/`LINE_HEIGHT` 常量；`lines()` 增 `line_height` 参数、`draw()` 增 `font_size`/`line_height` 参数（行号跟着正文的行高走）。
 - `crates/platform/src/commands.rs`：新增 `view.zoomIn`（`ctrl+=`）、`view.zoomOut`（`ctrl+-`）、`view.zoomReset`（`ctrl+0`）。
-- `crates/platform/src/lib.rs`：`NativeApplication` 增 `zoom` 与 `zoom_path`；启动时读设置文件（读不出来的错误进状态栏）；`apply_the_zoom()`（推给所有 pane 的 view）、`set_zoom()`（改字号 + 写盘 + 失败时明说）；`open_file` 后也 `apply_the_zoom()`；可见行数、缩略图跳行、排版行数都改用缩放后的行高；`Ctrl+滚轮` 改字号（普通滚轮照旧滚动）；状态栏右边写当前字号；**顺手修掉像素滚轮拿 `pixels.x` 算纵向滚动的缺陷**（改成 `pixels.y`）。三个应用层测试。
+- `crates/platform/src/lib.rs`：`NativeApplication` 增 `zoom` 与 `zoom_path`；启动时读设置文件（读不出来的错误进状态栏）；`apply_the_zoom()`（推给所有 pane 的 view）、`set_zoom()`（改字号 + 写盘 + 失败时明说）；`open_file` 后也 `apply_the_zoom()`；可见行数、缩略图跳行、排版行数都改用缩放后的行高；`Ctrl+滚轮` 改字号（普通滚轮照旧滚动）；状态栏右边写当前字号；**顺手修掉像素滚轮拿 `pixels.x` 算纵向滚动的缺陷**（改成 `pixels.y`）。四个应用层测试。
 - `crates/platform/src/settings.rs`：`Kind` 增 `FontSize`；面板第三行是「字号」（选项 `zoom::STEPS`）；新增 `kind_of_the_picked()` 与 `zoom()`；面板按键处理改成「只改被改的那一行」。
 - `crates/platform/src/settings.rs` 的 `Settings::new(policy, zoom)` / `with_keys(policy, zoom, keys)` 签名变了；六个旧测试按新的行数改过。
 
@@ -229,7 +229,7 @@ cd codeweaver-workspace; npm run build
 
 | 检查 | 命令 | 结果 |
 |---|---|---|
-| 编辑器全量单元测试 | `cargo test --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --no-fail-fast` | **704 项全过，0 失败**（其中 platform 402 项，本轮 +16：zoom 13 + 应用层 3） |
+| 编辑器全量单元测试 | `cargo test --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --no-fail-fast` | **705 项全过，0 失败**（其中 platform 403 项，本轮 +17：zoom 13 + 应用层 4） |
 | 编辑器静态检查 | `cargo clippy --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --all-targets` | **0 告警**，exit 0 |
 | 编辑器构建 | `cargo build --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml -p codeweaver-editor` | **成功**，版本仍是 `0.8.0` |
 | git 模块单元检查（工作区之外跑） | `powershell -NoProfile -ExecutionPolicy Bypass -File editor\tools\git-unit-check.ps1` | **12 项全过，0 失败** |
