@@ -523,7 +523,7 @@ impl NativeApplication {
         // The size of the text the person chose is remembered in a file of the
         // user, next to the file of the keys.
         let zoom_path = zoom::user_path();
-        let settings = zoom_path.as_deref().map(|path| zoom::read(path));
+        let settings = zoom_path.as_deref().map(zoom::read);
         let zoom = settings.as_ref().map(|loaded| loaded.zoom).unwrap_or_default();
         let settings_errors = settings
             .as_ref()
@@ -7845,6 +7845,48 @@ mod tests {
         assert_eq!(app.zoom.percent, 100.0);
         assert!(app.run_named_command("view.zoomReset"));
         assert_eq!(app.zoom.percent, 100.0);
+    }
+
+    #[test]
+    fn the_size_of_the_text_is_changed_in_the_panel_and_the_limits_are_left_alone() {
+        let directory = scratch_dir("zoom-panel");
+        let file = directory.join("main.rs");
+        fs::write(&file, "one\ntwo\nthree").unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.zoom_path = Some(directory.join("settings.json"));
+
+        app.open_settings();
+        // The rows are: the limit of the bytes, the limit of the lines, the
+        // size of the text, and then the keys.
+        app.handle_settings_key(&named(NamedKey::ArrowDown));
+        app.handle_settings_key(&named(NamedKey::ArrowDown));
+        assert_eq!(
+            app.settings
+                .as_ref()
+                .expect("the panel is open")
+                .kind_of_the_picked(),
+            Some(SettingKind::FontSize),
+            "the size of the text is the third row"
+        );
+        app.handle_settings_key(&named(NamedKey::ArrowRight));
+        assert_eq!(app.zoom.percent, 110.0, "the text is bigger");
+        let size = app.panes[0].view.zoom().font_size();
+        assert!((size - 17.6).abs() < 0.01, "the text is drawn bigger, got {size}");
+
+        // The limit of the bytes is changed: the size of the text stays where
+        // the person put it.
+        app.handle_settings_key(&named(NamedKey::ArrowUp));
+        app.handle_settings_key(&named(NamedKey::ArrowUp));
+        assert_eq!(
+            app.settings
+                .as_ref()
+                .expect("the panel is open")
+                .kind_of_the_picked(),
+            Some(SettingKind::Bytes),
+            "the limit of the bytes is the first row"
+        );
+        app.handle_settings_key(&named(NamedKey::ArrowRight));
+        assert_eq!(app.zoom.percent, 110.0, "the size of the text did not change");
     }
 
     #[test]
