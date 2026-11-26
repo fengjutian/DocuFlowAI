@@ -3594,9 +3594,34 @@ impl NativeApplication {
                 .iter()
                 .position(|place| *place == tab)
                 .unwrap_or(0);
-            columns.push(ColumnData { tab, tabs, active });
+            // The breakpoints in the margin are the ones of the file that
+            // this column shows: a column shows another file, and the
+            // breakpoints of that file belong in it.
+            let breakpoints = self
+                .uri_of_a_pane(tab)
+                .map(|uri| self.breakpoint_marks_of(&uri))
+                .unwrap_or_default();
+            columns.push(ColumnData {
+                tab,
+                tabs,
+                active,
+                breakpoints,
+            });
         }
         columns
+    }
+
+    /// The breakpoints of a file, as they are drawn in its margin.
+    fn breakpoint_marks_of(&self, uri: &str) -> Vec<BreakpointMark> {
+        let conditions = self.breakpoints.conditions_of(uri);
+        self.breakpoints
+            .lines_of(uri)
+            .into_iter()
+            .map(|line| BreakpointMark {
+                line,
+                conditional: conditions.contains_key(&line),
+            })
+            .collect()
     }
 
     /// Where the parts of the window are.
@@ -6120,22 +6145,8 @@ impl ApplicationHandler for NativeApplication {
                     selected_frame: debug.selected_frame,
                     program: &debug.program,
                 });
-                // The breakpoints of the file that is on screen are the ones
-                // that are drawn in its margin.
-                let breakpoints = self
-                    .uri_of_the_open_file()
-                    .map(|uri| {
-                        let conditions = self.breakpoints.conditions_of(&uri);
-                        self.breakpoints
-                            .lines_of(&uri)
-                            .into_iter()
-                            .map(|line| BreakpointMark {
-                                line,
-                                conditional: conditions.contains_key(&line),
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                // The breakpoints in the margin belong to the file that the
+                // column shows, so they are worked out with the columns.
                 let scale_factor = window.scale_factor();
                 // Where the parts of the window are, and what the side bar
                 // shows, are worked out before the renderer is borrowed.
@@ -6194,7 +6205,6 @@ impl ApplicationHandler for NativeApplication {
                         developer: self.developer.as_ref(),
                         developer_lines: developer_lines.as_deref().unwrap_or(&[]),
                         debug: debug_panel,
-                        breakpoints: &breakpoints,
                         conflicts: conflict,
                     },
                 );
@@ -6351,9 +6361,6 @@ struct Chrome<'a> {
     developer_lines: &'a [DeveloperLine],
     /// The panel of the debugger, when there is a session.
     debug: Option<DebugPanel<'a>>,
-    /// The lines of the breakpoints of the file that is on screen.
-    /// The breakpoints of the file that is on screen, as they are drawn.
-    breakpoints: &'a [BreakpointMark],
     /// The conflicts between the buffer and a proposed change.
     conflicts: Option<ConflictView>,
 }
@@ -6561,6 +6568,9 @@ struct ColumnData {
     tabs: Vec<(Tab, bool)>,
     /// Which of them is in front.
     active: usize,
+    /// The breakpoints of the file that the column shows, as they are drawn
+    /// in its margin.
+    breakpoints: Vec<BreakpointMark>,
 }
 
 fn build_scene(
@@ -6703,7 +6713,7 @@ fn build_scene(
                 place,
                 pane,
                 overlay,
-                chrome.breakpoints,
+                &column.breakpoints,
                 input,
                 &mut measurer,
             );
@@ -10586,6 +10596,64 @@ mod tests {
             "the status bar says which column it is, got {}",
             status.right
         );
+    }
+
+    #[test]
+    fn the_place_of_a_column_is_kept_when_another_column_is_used() {
+        let directory = scratch_dir("split-caret");
+        let file = directory.join("main.rs");
+        fs::write(&file, "one\ntwo\nthree\n").unwrap();
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.run_named_command("view.splitRight");
+        assert_eq!(app.groups.active(), 1, "the new column has the keyboard");
+
+        // The caret of the first column is on the third line.
+        let left = app.groups.front_of(0).expect("the first column has a tab");
+        app.panes[left].editor.set_carets(&[TextOffset(8)]);
+        let before = app.panes[left].editor.caret().0;
+        assert_eq!(before, 8, "the caret is where it was put");
+
+        // The other column takes the keyboard, and then the first one gets it
+        // back: the place of the caret is where the file was left.
+        app.groups.activate(1);
+        assert_eq!(app.groups.active(), 1, "the second column has the keyboard");
+        app.groups.activate(0);
+        assert_eq!(
+            app.panes[left].editor.caret().0,
+            before,
+            "the caret of the column is still where it was"
+        );
+    }
+
+    #[test]
+    fn every_column_shows_the_breakpoints_of_its_own_file() {
+        let directory = scratch_dir("split-breakpoints");
+        let first = directory.join("first.rs");
+        let second = directory.join("second.rs");
+        fs::write(&first, "one\ntwo\n").unwrap();
+        fs::write(&second, "three\nfour\n").unwrap();
+        let mut app = NativeApplication::new(Some(first.clone())).expect("the application starts");
+        // A breakpoint on the first line of the first file.
+        app.toggle_breakpoint();
+
+        // The second file is opened in the second column, with a breakpoint of
+        // its own on its second line.
+        app.run_named_command("view.splitRight");
+        app.open_file(&second);
+        app.pane_mut().editor.set_carets(&[TextOffset(6)]);
+        app.toggle_breakpoint();
+
+        let columns = app.columns_of_the_window();
+        assert_eq!(columns.len(), 2, "the window has two columns");
+        let lines_of = |column: &ColumnData| {
+            column
+                .breakpoints
+                .iter()
+                .map(|mark| mark.line)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lines_of(&columns[0]), vec![1], "the first column has its own");
+        assert_eq!(lines_of(&columns[1]), vec![2], "the second column has its own");
     }
 
     #[test]
