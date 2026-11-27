@@ -36,6 +36,7 @@ mod task;
 #[cfg(test)]
 mod testing;
 pub mod workspace_file;
+pub mod workspace_settings;
 pub mod zoom;
 
 use std::{ops::Range, path::{Path, PathBuf}, sync::Arc, time::{Duration, Instant}};
@@ -345,7 +346,22 @@ pub struct NativeApplication {
     ///
     /// The size belongs to the window, not to a file: every file is drawn at
     /// the same size, and the size the person chose is remembered.
+    ///
+    /// This is the size that is **in force**: it may be the size of the
+    /// workspace rather than the size of the user.
     zoom: Zoom,
+    /// How big the text of the document is drawn, as the file of the user says.
+    ///
+    /// The size of the user and the size in force are two things: a workspace
+    /// may have a size of its own, and the size of the user is still the size
+    /// of the user.
+    user_zoom: Zoom,
+    /// The settings that are in force, and who says so.
+    ///
+    /// It is what the panel of the settings and the state line need to say:
+    /// a size that the workspace has fixed cannot be changed here, and the
+    /// person has to be told that.
+    settings_in_force: workspace_settings::Resolved,
     /// Where the size is remembered.
     ///
     /// It is the file of the user, next to the file of the keys. A test may
@@ -671,6 +687,8 @@ impl NativeApplication {
             conflicts: None,
             sidebar: SideBar::default(),
             zoom,
+            user_zoom: zoom,
+            settings_in_force: workspace_settings::Resolved::default(),
             zoom_path,
             activity_focus: false,
         };
@@ -1296,9 +1314,21 @@ impl NativeApplication {
                 let name = workspace.name.clone();
                 let count = workspace.roots.len();
                 self.open_workspace = Some(workspace);
+                // The settings of the workspace are in force from now on: the
+                // size of the text may be the size of the workspace.
+                self.apply_the_settings_of_the_workspace();
                 let mut said = format!("工作区 {name} 打开了 {count} 个文件夹");
                 if !missing.is_empty() {
                     said.push_str(&format!("，其中的 {} 不在了", missing.join("、")));
+                }
+                if self.settings_in_force.from_the_workspace {
+                    said.push_str(&format!("，字号 {}（工作区定的）", self.zoom.label()));
+                }
+                for error in &self.settings_in_force.errors {
+                    said.push_str(&format!("，{error}"));
+                }
+                for key in &self.settings_in_force.unknown {
+                    said.push_str(&format!("，{key} 这个设置编辑器还不认"));
                 }
                 self.status = Some(said);
                 true
@@ -1378,17 +1408,54 @@ impl NativeApplication {
     ///
     /// The size is remembered in the file of the settings, so that the person
     /// does not have to make the text big again after every restart.
+    ///
+    /// What is changed is the size of the **user**. A workspace may have a
+    /// size of its own, and then that one is in force: the size of the user is
+    /// changed all the same, and what is drawn stays the size of the
+    /// workspace. That is said out loud — a change that does not show up must
+    /// not look like it did.
     fn set_zoom(&mut self, zoom: Zoom) {
-        if zoom == self.zoom {
+        if zoom == self.user_zoom {
             return;
         }
-        self.zoom = zoom;
-        self.apply_the_zoom();
+        self.user_zoom = zoom;
         if let Some(path) = self.zoom_path.clone()
             && let Err(error) = zoom::write(&path, zoom)
         {
             self.status = Some(format!("字号没有记住：{error}"));
         }
+        self.apply_the_settings_of_the_workspace();
+    }
+
+    /// Works out the settings that are in force and puts them in force.
+    ///
+    /// The settings of the workspace win over the settings of the user: a
+    /// person who writes a setting down in a workspace file writes it down
+    /// for that one project, and not for every project they open afterwards.
+    fn apply_the_settings_of_the_workspace(&mut self) {
+        let workspace = self.open_workspace.as_ref().map(|workspace| {
+            workspace_settings::Settings::new(workspace.settings.clone())
+        });
+        self.settings_in_force = workspace_settings::resolve(self.user_zoom, workspace.as_ref());
+        self.zoom = self.settings_in_force.zoom;
+        self.apply_the_zoom();
+    }
+
+    /// Says what the size of the text is, and who says it.
+    ///
+    /// A size that the workspace has fixed cannot be changed here, and the
+    /// person has to be told that: the size they changed is not the size that
+    /// is on the screen.
+    fn say_the_size(&mut self) {
+        self.status = Some(if self.settings_in_force.from_the_workspace {
+            format!(
+                "工作区把字号定成 {} 了，你的 {} 这里用不上",
+                self.zoom.label(),
+                self.user_zoom.label()
+            )
+        } else {
+            format!("字号 {}", self.zoom.label())
+        });
     }
 
     /// Works out the pieces of the path of a file.
@@ -1579,7 +1646,7 @@ impl NativeApplication {
             self.set_highlight_policy(policy);
             if changed_kind == Some(SettingKind::FontSize) {
                 self.set_zoom(zoom);
-                self.status = Some(format!("字号 {}", zoom.label()));
+                self.say_the_size();
             } else {
                 self.status = Some(format!(
                     "高亮上限：{} 字节 / {} 行",
@@ -1819,6 +1886,9 @@ impl NativeApplication {
         self.sidebar.show(Activity::Files);
         self.tree = Some(FileForest::single(crumb.path.clone()));
         self.open_workspace = None;
+        // The workspace let go of the settings as well: the size of the text
+        // is the size of the user again.
+        self.apply_the_settings_of_the_workspace();
         self.status = Some(format!("文件树现在看的是 {}", crumb.path.display()));
     }
 
@@ -3950,9 +4020,15 @@ impl NativeApplication {
                 pane.editor.can_redo(),
                 pane.editor.cursor_count(),
             ),
+            // A size that the workspace has fixed says so: the person has to
+            // know that changing it does nothing.
             right: format!(
                 "行 {line}，列 {column} · {}{place}{workspace}",
-                self.zoom.label()
+                if self.settings_in_force.from_the_workspace {
+                    format!("{}（工作区定的）", self.zoom.label())
+                } else {
+                    self.zoom.label()
+                }
             ),
         }
     }
@@ -5618,16 +5694,18 @@ impl NativeApplication {
             }
             "workbench.settings" => self.open_settings(),
             "view.zoomIn" => {
-                self.set_zoom(self.zoom.bigger());
-                self.status = Some(format!("字号 {}", self.zoom.label()));
+                // The size of the user is the one that is changed: the size
+                // that is on the screen may be the size of the workspace.
+                self.set_zoom(self.user_zoom.bigger());
+                self.say_the_size();
             }
             "view.zoomOut" => {
-                self.set_zoom(self.zoom.smaller());
-                self.status = Some(format!("字号 {}", self.zoom.label()));
+                self.set_zoom(self.user_zoom.smaller());
+                self.say_the_size();
             }
             "view.zoomReset" => {
-                self.set_zoom(self.zoom.reset());
-                self.status = Some(format!("字号 {}", self.zoom.label()));
+                self.set_zoom(self.user_zoom.reset());
+                self.say_the_size();
             }
             "view.splitRight" => self.split_right(),
             "workbench.save" => {
@@ -6405,12 +6483,12 @@ impl ApplicationHandler for NativeApplication {
                     };
                     if notches != 0.0 {
                         let zoom = if notches > 0.0 {
-                            self.zoom.bigger()
+                            self.user_zoom.bigger()
                         } else {
-                            self.zoom.smaller()
+                            self.user_zoom.smaller()
                         };
                         self.set_zoom(zoom);
-                        self.status = Some(format!("字号 {}", self.zoom.label()));
+                        self.say_the_size();
                     }
                     window.request_redraw();
                     return;
@@ -10008,6 +10086,155 @@ mod tests {
             vec!["first", "one.txt", "乙", "two.txt"]
         );
         assert_eq!(app.sidebar_title(), "project");
+    }
+
+    /// A workspace file with settings in it, and the folder they are about.
+    fn a_workspace_file_with_settings(name: &str, settings: &str) -> (PathBuf, PathBuf) {
+        let directory = scratch_dir(name);
+        let folder = directory.join("first");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("one.txt"), "one\n").unwrap();
+        let file = directory.join("project.code-workspace");
+        fs::write(
+            &file,
+            format!("{{ \"folders\": [ {{ \"path\": \"first\" }} ], \"settings\": {settings} }}"),
+        )
+        .unwrap();
+        (directory, file)
+    }
+
+    #[test]
+    fn the_settings_of_a_workspace_are_in_force() {
+        let (_, file) = a_workspace_file_with_settings(
+            "workspace-settings",
+            "{ \"editor.fontSize\": 20 }",
+        );
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.zoom_path = Some(scratch_dir("workspace-settings-user").join("settings.json"));
+
+        app.open_file(&file);
+
+        assert_eq!(app.zoom.percent, 125.0, "20 pixels is a quarter bigger");
+        let said = app.status.clone().expect("the editor says what happened");
+        assert!(said.contains("工作区定的"), "got {said}");
+        // The state line says it too: the size on the screen is not the size
+        // of the user.
+        let status = app.status_bar_text();
+        assert!(status.right.contains("工作区定的"), "got {}", status.right);
+    }
+
+    #[test]
+    fn the_size_of_the_user_is_left_alone_when_the_workspace_has_one() {
+        let (directory, file) =
+            a_workspace_file_with_settings("workspace-settings-user", "{ \"editor.fontSize\": 20 }");
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        let user_settings = directory.join("user-settings.json");
+        app.zoom_path = Some(user_settings.clone());
+
+        app.open_file(&file);
+
+        assert!(
+            !user_settings.exists(),
+            "the settings of the user are not written by the workspace"
+        );
+        assert_eq!(app.user_zoom.percent, 100.0, "the size of the user did not move");
+    }
+
+    #[test]
+    fn a_workspace_without_a_size_leaves_the_size_of_the_user_alone() {
+        let (_, file) =
+            a_workspace_file_with_settings("workspace-no-settings", "{ \"editor.tabSize\": 4 }");
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.user_zoom = Zoom::of(120.0);
+        app.zoom = Zoom::of(120.0);
+
+        app.open_file(&file);
+
+        assert_eq!(app.zoom.percent, 120.0, "the size of the user is in force");
+        assert!(!app.settings_in_force.from_the_workspace);
+    }
+
+    #[test]
+    fn a_broken_size_in_the_workspace_is_named_and_the_size_of_the_user_is_used() {
+        let (_, file) =
+            a_workspace_file_with_settings("workspace-broken-size", "{ \"editor.fontSize\": \"big\" }");
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.user_zoom = Zoom::of(120.0);
+        app.zoom = Zoom::of(120.0);
+
+        app.open_file(&file);
+
+        let said = app.status.clone().expect("the editor says what happened");
+        assert!(said.contains("不是一个数字"), "got {said}");
+        assert_eq!(app.zoom.percent, 120.0, "the size of the user is in force");
+    }
+
+    #[test]
+    fn a_setting_the_editor_does_not_know_is_named() {
+        let (_, file) = a_workspace_file_with_settings(
+            "workspace-unknown-setting",
+            "{ \"editor.fontSize\": 20, \"editor.tabSize\": 4 }",
+        );
+        let mut app = NativeApplication::new(None).expect("the application starts");
+
+        app.open_file(&file);
+
+        let said = app.status.clone().expect("the editor says what happened");
+        assert!(said.contains("editor.tabSize"), "got {said}");
+        assert!(said.contains("还不认"), "got {said}");
+    }
+
+    #[test]
+    fn the_size_cannot_be_changed_while_the_workspace_has_one() {
+        let (_, file) =
+            a_workspace_file_with_settings("workspace-fixed-size", "{ \"editor.fontSize\": 20 }");
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.zoom_path = Some(scratch_dir("workspace-fixed-user").join("settings.json"));
+        app.open_file(&file);
+
+        assert!(app.run_named_command("view.zoomIn"));
+
+        assert_eq!(
+            app.zoom.percent, 125.0,
+            "the size of the workspace is still the one in force"
+        );
+        assert_eq!(app.user_zoom.percent, 110.0, "the size of the user did change");
+        let said = app.status.clone().expect("the editor says what happened");
+        assert!(said.contains("工作区"), "got {said}");
+        assert!(said.contains("用不上"), "got {said}");
+    }
+
+    #[test]
+    fn the_size_of_the_user_is_in_force_again_when_the_workspace_lets_go() {
+        let (directory, file) =
+            a_workspace_file_with_settings("workspace-lets-go", "{ \"editor.fontSize\": 20 }");
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.zoom_path = Some(directory.join("user-settings.json"));
+        app.user_zoom = Zoom::of(120.0);
+        app.zoom = Zoom::of(120.0);
+        app.open_file(&file);
+        assert_eq!(app.zoom.percent, 125.0, "the workspace says what the size is");
+
+        // The folder of the path is clicked on: the workspace lets go of the
+        // tree, and of the settings with it.
+        let folder = directory.join("first");
+        let strip = breadcrumbs::Strip {
+            crumbs: vec![breadcrumbs::Crumb {
+                label: "first".to_owned(),
+                path: folder,
+                file: false,
+                rect: Rect::new(0.0, 0.0, 60.0, 20.0),
+            }],
+            separators: Vec::new(),
+            dots: None,
+        };
+        app.go_to_the_place_of_the_path(&strip, Point { x: 10.0, y: 10.0 });
+
+        assert!(app.open_workspace.is_none(), "the workspace let go");
+        assert_eq!(
+            app.zoom.percent, 120.0,
+            "the size of the user is in force again"
+        );
     }
 
     /// An application whose body is laid out, so the highlighter has a range

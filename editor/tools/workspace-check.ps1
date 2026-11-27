@@ -13,6 +13,14 @@
 #    section.
 # 3. The right of the status bar names the workspace that is open.
 # 4. Clicking a folder of the workspace closes it: the files under it go away.
+# 5. The settings of the workspace are in force: the text of the document is
+#    drawn bigger, because the workspace file says so.
+# 6. The right of the status bar says that the size comes from the workspace.
+#
+# The size of the text of the user is decided by the check: the editor reads
+# the settings of the user from APPDATA, and the check points that at a folder
+# of its own. Without that, the size of the person who runs the check would
+# decide what the check sees.
 #
 # The places are worked out the way the editor works them out: the bar of the
 # activities (48), the side bar (220), the title of a section (28), a row of
@@ -35,6 +43,7 @@ $plainFile = Join-Path $project 'alpha\one.txt'
 $shotWorkspace = Join-Path $logs 'workspace-on.png'
 $shotPlain = Join-Path $logs 'workspace-off.png'
 $shotClosed = Join-Path $logs 'workspace-closed.png'
+$shotSized = Join-Path $logs 'workspace-sized.png'
 $report = Join-Path $logs 'workspace-check.json'
 
 $sig = @'
@@ -112,6 +121,15 @@ $ROW = 22.0
 $INDENT = 14.0
 $MARK = 15.0
 
+# The place of the text of the document: the side bar, the gap, and the strip
+# of the line numbers are behind it.
+$TEXT_X = $ACTIVITY_BAR + $SIDEBAR + 16.0 + 56.0
+# The strip of the tabs, and the row that says where the file is, are above it.
+$TEXT_Y = 34.0 + 24.0
+# How much of the text is looked at: the first line or two.
+$TEXT_WIDTH = 300.0
+$TEXT_HEIGHT = 50.0
+
 if (-not (Test-Path $exe)) {
     throw "the editor is not built; run 'cargo build -p codeweaver-editor' first"
 }
@@ -137,8 +155,25 @@ Write-Output "the editor runs from $runExe"
 
 New-Item -ItemType Directory -Force -Path $logs | Out-Null
 
+# The settings of the user.
+#
+# The editor reads them from APPDATA, and the check points that at a folder of
+# its own: the size of the text has to be the one the check decides, and not
+# the one of the person who runs the check.
+$appData = Join-Path $run 'appdata'
+$env:APPDATA = $appData
+New-Item -ItemType Directory -Force -Path (Join-Path $appData 'CodeWeaver') | Out-Null
+[System.IO.File]::WriteAllText(
+    (Join-Path $appData 'CodeWeaver\settings.json'),
+    "{ `"fontSize`": 100 }`n",
+    (New-Object System.Text.UTF8Encoding($false)))
+Write-Output "the settings of the user: $(Join-Path $appData 'CodeWeaver\settings.json')"
+
 # The files of the check: two folders, a file in each of them, and the
 # workspace file that names the two folders.
+#
+# The workspace file says how big the text is to be: 24 pixels is a half
+# bigger than the 16 pixels that is the usual size.
 if (Test-Path $project) { Remove-Item -Recurse -Force $project }
 New-Item -ItemType Directory -Force -Path (Join-Path $project 'alpha') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $project 'beta') | Out-Null
@@ -152,7 +187,7 @@ New-Item -ItemType Directory -Force -Path (Join-Path $project 'beta') | Out-Null
     (New-Object System.Text.UTF8Encoding($false)))
 [System.IO.File]::WriteAllText(
     $workspaceFile,
-    "{`n  `"folders`": [`n    { `"path`": `"alpha`" },`n    { `"path`": `"beta`" }`n  ]`n}`n",
+    "{`n  `"folders`": [`n    { `"path`": `"alpha`" },`n    { `"path`": `"beta`" }`n  ],`n  `"settings`": { `"editor.fontSize`": 24 }`n}`n",
     (New-Object System.Text.UTF8Encoding($false)))
 Write-Output "the workspace file: $workspaceFile"
 
@@ -389,6 +424,15 @@ try {
         $width = [int]($shot.Width / $script:Factor)
         $height = [int]($shot.Height / $script:Factor)
         Write-Host "the window is $width by $height pixels"
+
+        # The text of the document, and the right of the status bar: the size
+        # of the user is 100 percent, and that is what the editor draws.
+        $documentPlain = Region $shot $TEXT_X $TEXT_Y $TEXT_WIDTH $TEXT_HEIGHT
+        $inkDocumentPlain = Count-Ink $shot.Bitmap $documentPlain.Left $documentPlain.Top $documentPlain.Width $documentPlain.Height
+        $statusPlain = Region $shot ($width - 300) ($height - 20) 288 16
+        $inkStatusPlain = Count-Ink $shot.Bitmap $statusPlain.Left $statusPlain.Top $statusPlain.Width $statusPlain.Height
+        Write-Host "the text of the document: $inkDocumentPlain pixels of ink at the size of the user"
+        Write-Host "the right of the status bar: $inkStatusPlain pixels of ink at the size of the user"
     }
     finally {
         Get-Process -Name codeweaver-editor -ErrorAction SilentlyContinue | Stop-Process -Force
@@ -456,6 +500,30 @@ try {
         Check 'the right of the status bar names the workspace' `
             ($saidStatus -gt 0) `
             "$saidStatus pixels of the right of the status bar are different from the state without a workspace"
+
+        # The file of the workspace is opened by clicking it in the file
+        # panel: the text of the document is then drawn at the size the
+        # workspace says, which is a half bigger than the size of the user.
+        Click-At $one ($nameOfFile + 10) ($firstFile + 10)
+        Focus-Editor $handle
+        Start-Sleep -Seconds 2
+
+        $three = Save-Window $handle $shotSized
+        Write-Host "saved $shotSized"
+        $documentSized = Region $three $TEXT_X $TEXT_Y $TEXT_WIDTH $TEXT_HEIGHT
+        $inkDocumentSized = Count-Ink $three.Bitmap $documentSized.Left $documentSized.Top $documentSized.Width $documentSized.Height
+        $statusSized = Region $three ($width - 300) ($height - 20) 288 16
+        $inkStatusSized = Count-Ink $three.Bitmap $statusSized.Left $statusSized.Top $statusSized.Width $statusSized.Height
+        Write-Host "the text of the document: $inkDocumentSized pixels of ink at the size of the workspace"
+        Write-Host "the right of the status bar: $inkStatusSized pixels of ink at the size of the workspace"
+
+        Check 'the size of the workspace is the size of the text' `
+            ($inkDocumentSized -gt [int]($inkDocumentPlain * 1.3)) `
+            "$inkDocumentPlain pixels of ink at 100 percent, $inkDocumentSized at 150 percent"
+
+        Check 'the status bar says that the size comes from the workspace' `
+            ($inkStatusSized -gt $inkStatusPlain) `
+            "$inkStatusPlain pixels of ink at the size of the user, $inkStatusSized at the size of the workspace"
 
         # Clicking the first folder of the workspace closes it: the files under
         # it go away, and the rows below move up.
