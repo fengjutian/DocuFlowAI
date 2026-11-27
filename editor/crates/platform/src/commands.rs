@@ -365,10 +365,13 @@ pub fn default_registry() -> CommandRegistry {
         command("terminal.runCommand", "运行命令…", "终端", "ctrl+shift+u", When::Always),
         command("task.build", "运行构建任务", "终端", "ctrl+shift+b", When::HasFile),
         command("git.showChanges", "显示源代码管理更改", "源代码管理", "ctrl+shift+g", When::HasRepository),
-        command("git.showBranches", "显示分支与远端", "源代码管理", "", When::HasRepository),
-        command("git.fetch", "从远端取回", "源代码管理", "", When::HasRepository),
-        command("git.pull", "从远端更新", "源代码管理", "", When::HasRepository),
-        command("git.push", "推到远端", "源代码管理", "", When::HasRepository),
+        // The four keys are the same letters the branch view uses inside the
+        // panel (B for the branches, F to fetch, U to update, P to push), so
+        // that the panel and the command table are said in one voice.
+        command("git.showBranches", "显示分支与远端", "源代码管理", "ctrl+alt+b", When::HasRepository),
+        command("git.fetch", "从远端取回", "源代码管理", "ctrl+alt+f", When::HasRepository),
+        command("git.pull", "从远端更新", "源代码管理", "ctrl+alt+u", When::HasRepository),
+        command("git.push", "推到远端", "源代码管理", "ctrl+alt+p", When::HasRepository),
         command("debug.toggleBreakpoint", "切换断点", "调试", "f9", When::HasFile),
         command("debug.start", "开始调试", "调试", "f5", When::Always),
         command("debug.stop", "结束调试", "调试", "f8", When::Always),

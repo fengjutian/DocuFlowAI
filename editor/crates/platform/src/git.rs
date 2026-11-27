@@ -427,6 +427,56 @@ pub fn switch_to(root: &Path, name: &str) -> Result<(), String> {
     }
 }
 
+/// Goes to a branch that is on a remote.
+///
+/// A branch that is on a remote is not here yet: a local branch that follows
+/// it is made, and the program goes to that one. The other way round — asking
+/// git to switch to the branch on the remote — leaves the repository in a
+/// detached head, and the program would be nowhere in particular.
+pub fn switch_to_a_remote(root: &Path, remote_branch: &str) -> Result<String, String> {
+    // The local branch is named after the branch on the remote: the remote's
+    // "origin/main" is the local "main", and the remote's "origin/feature/x"
+    // is the local "feature/x".
+    let name = match remote_branch.split_once('/') {
+        Some((_, branch)) => branch,
+        None => remote_branch,
+    };
+    // A local branch of that name may already be there: then it is enough to
+    // go to it.
+    if branches(root)?
+        .iter()
+        .any(|branch| !branch.remote && branch.name == name)
+    {
+        switch_to(root, name)?;
+        return Ok(name.to_owned());
+    }
+    // Otherwise it is made, and it follows the branch on the remote.
+    match run(
+        root,
+        &[
+            "switch".to_owned(),
+            "--track".to_owned(),
+            remote_branch.to_owned(),
+        ],
+    ) {
+        Ok(_) => Ok(name.to_owned()),
+        Err(_) => {
+            // The older git has no switch; the checkout is the way of saying
+            // the same thing there.
+            run(
+                root,
+                &[
+                    "checkout".to_owned(),
+                    "-b".to_owned(),
+                    name.to_owned(),
+                    remote_branch.to_owned(),
+                ],
+            )?;
+            Ok(name.to_owned())
+        }
+    }
+}
+
 /// Makes a branch and goes to it.
 ///
 /// The older git has no switch, and the checkout is the way of saying the
@@ -457,8 +507,20 @@ pub fn fetch(root: &Path, remote: Option<&str>) -> Result<String, String> {
 /// Only a fast-forward is done: a merge would open a window of its own to
 /// write the message in, and the editor has no such window. When the
 /// branches have gone apart, git says so and nothing is changed.
-pub fn pull(root: &Path) -> Result<String, String> {
-    run(root, &["pull".to_owned(), "--ff-only".to_owned()])
+///
+/// The remote and the branch are named when they are known. A branch that
+/// does not follow a remote yet has no upstream, and plain `git pull` would
+/// only say that it does not know what to merge; naming them says what is
+/// meant and lets the change come in.
+pub fn pull(root: &Path, remote: Option<&str>, branch: Option<&str>) -> Result<String, String> {
+    let mut args = vec!["pull".to_owned(), "--ff-only".to_owned()];
+    if let Some(name) = remote {
+        args.push(name.to_owned());
+    }
+    if let Some(name) = branch {
+        args.push(name.to_owned());
+    }
+    run(root, &args)
 }
 
 /// Sends what is here to the remote.
@@ -1451,6 +1513,45 @@ mod tests {
     }
 
     #[test]
+    fn a_branch_on_a_remote_is_gone_to_by_a_local_branch_that_follows_it() {
+        let Some(directory) = repository_with_a_commit("git-remote-branch") else {
+            return;
+        };
+        let Some(remote) = remote_repository("git-remote-branch-remote") else {
+            return;
+        };
+        let address = remote.to_string_lossy().to_string();
+        run(&directory, &["remote", "add", "origin", &address]).expect("the remote is added");
+        // The remote has a branch that is not here: it is called "main",
+        // while the branch here is called something else.
+        run(&directory, &["push", "origin", "HEAD:refs/heads/main"]).expect("the branch is pushed");
+        fetch(&directory, Some("origin")).expect("the remote is read");
+
+        // The branch on the remote is not here yet: a local branch that
+        // follows it is made, and the program goes to that one.
+        let name = switch_to_a_remote(&directory, "origin/main").expect("the branch is gone to");
+        assert_eq!(name, "main", "the local branch is named after the remote's");
+        assert_eq!(
+            current_branch(&directory).expect("the branch is known"),
+            "main",
+            "the program is on the local branch"
+        );
+        let said = run(&directory, &["branch", "-vv"]).expect("the branches are read");
+        assert!(
+            said.contains("origin/main"),
+            "the local branch follows the branch on the remote: {said}"
+        );
+
+        // The second time the local branch is there already: it is enough to
+        // go to it.
+        let name = switch_to_a_remote(&directory, "origin/main").expect("the branch is gone to");
+        assert_eq!(name, "main", "the same branch");
+
+        let _ = std::fs::remove_dir_all(&directory);
+        let _ = std::fs::remove_dir_all(&remote);
+    }
+
+    #[test]
     fn a_branch_can_be_made_and_gone_to() {
         let Some(directory) = repository_with_a_commit("git-create-branch") else {
             return;
@@ -1527,18 +1628,33 @@ mod tests {
         push(&directory, Some("origin"), &branch).expect("the branch is pushed");
 
         // Another clone of the same remote gets a commit that is not here.
-        let Some(other) = repository("git-pull-other") else {
-            return;
-        };
-        run(&other, &["remote", "add", "origin", &address]).expect("the remote is added");
-        run(&other, &["fetch", "origin"]).expect("the remote is read");
+        // It is a clone and not a new repository: two repositories that were
+        // made apart have no history in common, and nothing can be brought
+        // in from one to the other.
+        let other = scratch_dir("git-pull-other");
+        let address_for_the_clone = address.replace('\\', "/");
+        run(
+            &scratch_dir("git-pull-clone"),
+            &[
+                "clone".to_owned(),
+                "--quiet".to_owned(),
+                address_for_the_clone,
+                other.to_string_lossy().to_string(),
+            ],
+        )
+        .expect("the repository is cloned");
+        run(&other, &["config", "user.email", "check@example.com"])
+            .expect("the email is set");
+        run(&other, &["config", "user.name", "check"]).expect("the name is set");
         write(&other, "notes.txt", "the second line\n");
         run(&other, &["add", "notes.txt"]).expect("the file is added");
         run(&other, &["commit", "-m", "the second one"]).expect("the commit is made");
-        run(&other, &["push", "origin", "HEAD:refs/heads/main"]).expect("the commit is pushed");
+        push(&other, Some("origin"), &branch).expect("the commit is pushed");
 
-        // The change is brought in here.
-        pull(&directory).expect("the remote is brought in");
+        // The change is brought in here. The branch follows no remote yet, so
+        // the remote and the branch are named: a plain pull would only say
+        // that it does not know what to merge.
+        pull(&directory, Some("origin"), Some(&branch)).expect("the remote is brought in");
         let text = std::fs::read_to_string(directory.join("notes.txt")).expect("the file is read");
         assert!(text.contains("the second line"), "got {text}");
 

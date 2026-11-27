@@ -2,7 +2,7 @@
 
 文档号：`V0.9.0`  
 产品版本：`0.9.0`  
-状态：进行中（DF-0901/0902/0903 已实现，窗口级验收待跑）  
+状态：进行中（DF-0901/0902/0903/0904 已实现，窗口级验收待跑）  
 更新日期：2026-11-27
 
 ---
@@ -55,6 +55,10 @@ V0.8.0 把编辑器的**编辑体验**补齐了：缩略图滑块、面包屑、
 **第一轮做完的是 DF-0901 工作区文件**：编辑器原来只认**一个**文件夹（文件树跟着打开的文件走），现在多了一层**工作区**。一个 `.code-workspace` 文件（JSON，`folders` 数组每项一个 `path`、可以带 `name`，外加一个 `settings` 对象）点名好几个文件夹，编辑器把它们收在一个工程里；**相对路径按工作区文件自己所在的目录解析**，所以整个文件夹搬走了那个文件还是同一个意思。**点文件树里的 `.code-workspace` 文件就开成工作区**（不是当文本文件打开），命令行传进来也一样。**文件树里每个根占一行**，可展开可收起，文件在各自的根下面；**没有工作区文件的老样子不变**（一个文件夹的工程还是把内容直接铺开）。**工作区名看得见**（侧边栏标题与状态栏右边）。**读不出来要明说**：文件不在、JSON 坏了、`folders` 不是数组、第几项没有 `path`、某个文件夹在磁盘上没了——**分别说清楚是哪一种**。新组件 `crates/platform/src/workspace_file.rs`（16 个单测）不认识 `NativeApplication`：这个文件的读写、路径的解析、名字的来路，都是**纯计算**；多根的树是 `crates/workspace/src/tree.rs` 里新的 `FileForest`（7 个单测），**原来那棵树一个字没动**，多根是加在上面的一层。命令 `workspace.save`（`Ctrl+Shift+S`）把根写回已经打开的工作区文件；没有工作区就在根的旁边写一个 `<文件夹名>.code-workspace`。`.code-workspace` 在文件树里有**自己的记号**（青色框里一条竖线，像一个分屏的窗口）。本轮把**产品版本从 `0.8.0` 抬到了 `0.9.0`**（ACP 的协议版本仍是 1）。
 
 **第三轮做完的是 DF-0903 真调试适配器 debugpy**：调试**第一次对着真适配器跑通了**。用的适配器是 **debugpy 1.8.22**（装在 `%LOCALAPPDATA%\CodeWeaver\check\debugpy-venv` 这个**仓库之外**的虚拟环境里，**不污染用户自己的 Python**），走的是 `python -m debugpy.adapter` 的 **stdio 通道**（DAP 的传输层一个字没改）。跑通的完整一轮是：**握手 → 断点 → 停住 → 栈帧 → 变量（`total = 42`）→ 继续 → 程序跑完退出（退出码 0）**，用时 **2.23 秒**。过程中改掉的两个真问题：**握手的顺序**（从「等 `initialized` 才发 launch」改成 VS Code 的 `initialize → launch → initialized → setBreakpoints → configurationDone`）与 **`source.path` 给的形态**（从编辑器的地址 `file:///…` 改成**磁盘上的路径**）。另外把**适配器关于自己的话**（debugpy 的 telemetry）从面板里滤掉了——那是说给机器听的，不是说给人听的。新组件 `crates/dap/src/handshake.rs`（11 个单测）管**顺序的规则**，`platform/src/debug.rs` 管**会话的驱动**（从 `platform/src/lib.rs` 搬过来，lib.rs 少了 175 行）。真适配器的验收是**一个真的测试**加一个**在工作区之外跑**的脚本 `tools/dap-real-check.ps1`——**不碰桌面**，所以本地就能跑。
+**第四轮做完的是 DF-0904 Git 分支与远端**：Git 面板从「改过的文件」与「最近的提交」两块，变成**三块**——第三块是**分支与远端**。**当前在哪个分支标出来**（绿色的 `●`），**远端的名字与地址都看得见**（名字是橙的，地址是蓝的），**切得过去**（`Enter`）、**建得出来**（`N` 问名字，回车就建好并切过去）、**取回/更新/推送**各有各的键（`F` / `U` / `P`）。**推送不能按一下就没了**：它先要确认（说清推到哪个远端的哪个分支），回车才算。**状态栏左边常驻写着现在在哪个分支**。这一轮的四个命令也进了命令表：`git.showBranches` / `git.fetch` / `git.pull` / `git.push`，键位与面板里那四个字母一一对应（`Ctrl+Alt+B/F/U/P`）。
+
+这一轮的设计有一条是刻意的：**「读 git 说的话」是纯计算**（`parse_branches` / `parse_remotes`），**单测不需要 git**——仓库里跑得起来，不必把测试二进制搬出工作区；真 git 的检查才需要搬。另外两条是这一轮踩出来的，写在这里：**`git branch -a` 要看全 refname**（用 `%(refname:short)` 的话，远端的 `refs/remotes/origin/HEAD` 会缩成 `origin`，看着像本地分支）；**`git pull` 得说清是哪个远端的哪个分支**（分支没跟着远端时，光一个 `git pull` 只会说「不知道该合并哪个」）。
+
 
 
 ## 2. 当前完成度
@@ -69,7 +73,7 @@ V0.8.0 把编辑器的**编辑体验**补齐了：缩略图滑块、面包屑、
 | 语言能力 | 语法高亮（后台）、LSP 补全与诊断、格式化、重命名、代码操作 | onType 格式化、重命名预备 | 可用 |
 | 调试 | DAP 客户端、断点、单步、变量、条件断点、表达式求值、调用栈、跳源码、**真适配器 debugpy 已验（DF-0903）** | 命中次数、多线程、调试控制台 | 可用 |
 | Agent | ACP 客户端、面板、审批、流式输出、上下文选择、Diff 按块批准、轨迹 | 语义冲突判断 | 可用 |
-| 开发工具 | 任务运行器、交互式终端、Git 面板、全局搜索与替换 | 真伪终端（PTY）、终端多标签、分支与远端 | 基础可用 |
+| 开发工具 | 任务运行器、交互式终端、Git 面板、全局搜索与替换、**分支与远端（DF-0904）** | 真伪终端（PTY）、终端多标签、图形化的冲突解决 | 基础可用 |
 | 外壳与命令（V0.7.0） | 命令注册表、命令面板、活动栏与侧边栏分区、行号槽、底部状态栏、键位可改、开发模式 | 窗口级验收（统一回归那轮） | 可用 |
 | 编辑体验（V0.8.0） | 缩略图滑块、面包屑、文件图标、缩放、分屏视图、多光标补齐 | 窗口级验收 | 可用 |
 
@@ -191,7 +195,7 @@ V0.8.0 把编辑器的**编辑体验**补齐了：缩略图滑块、面包屑、
 
 已知边界（本版本内不做，写在 §7 结转里）：调试**只对着一个适配器验过**（debugpy）；**别的语言的真适配器没验**；调试控制台没有（适配器的话只是列在面板里）；命中次数、多线程没有。
 
-### DF-0904 Git 分支与远端（计划中）
+### DF-0904 Git 分支与远端（已实现，窗口级验收待跑）
 
 Git 面板现在只有「改过的文件」与「最近的提交」两块。VS Code 的源代码管理视图还有两块：**分支**（当前在哪个分支、有哪些分支、可以切过去）与**远端**（有哪些远端、可以取回/更新/推送）。没有这两块，分支只能靠命令行切，远程只能靠命令行推。
 
@@ -206,18 +210,34 @@ Git 面板现在只有「改过的文件」与「最近的提交」两块。VS C
 - **组件拆分**：**解析 git 说的话是纯计算**（`parse_branches` / `parse_remotes`），单测**不需要 git**——仓库里跑得起来；面板只负责「挑哪一个」。
 - **不联网也能验**：真 git 的检查用**一个本地路径当远端**（`git remote add origin <文件夹>`），推与拉都在本机里跑，不碰网络。
 
-实现落点（计划）：
+实现落点：
 
 - **`crates/platform/src/git.rs`**：
-  - `Branch{name, current, remote, upstream}`、`Remote{name, fetch_url, push_url}`。
-  - `parse_branches(output)`：从 `git branch -a --format=…` 的输出里读出分支；`refs/heads/` 是本地、`refs/remotes/` 是远端，`refs/remotes/*/HEAD` 是远端的指针（**跳过**，它不是一个分支）。
-  - `parse_remotes(output)`：从 `git remote -v` 的输出里读出远端的名字与两个地址。
+  - `Branch{name, current, remote, upstream}`、`Remote{name, fetch_url, push_url}`、`BranchItem{Branch, Remote}`——**面板上看到的一行**要么是一个分支，要么是一个远端。
+  - `parse_branches(output)` / `parse_remotes(output)`：**纯计算**，git 说的话变成分支与远端。**单测不需要 git**，仓库里跑得起来。
+    - 分支用 `git branch -a --format=%(HEAD)|%(refname)|%(upstream:short)` 读：**要看全 refname**——`refs/heads/` 是本地、`refs/remotes/` 是远端；`refs/remotes/*/HEAD` 是远端的指针，**跳过**（它不是一个分支）。用 `%(refname:short)` 的话，`refs/remotes/origin/HEAD` 会缩成 `origin`，**看着像本地分支**。
+    - 远端用 `git remote -v` 读：**fetch 与 push 两行合成一个远端**，两个地址不一样时两个都留着。
   - `branches` / `remotes` / `current_branch`：问 git 要那三样东西。
   - `switch_to` / `create_branch`：`git switch`（旧版 git 退回 `git checkout`）。
-  - `fetch` / `pull` / `push`：对着当前分支的那个远端。
-- **`crates/platform/src/git.rs` 的 `GitPanel`**：`showing_commits: bool` 换成 `GitView`（文件 / 提交 / 分支三个视图），面板多画分支与远端。
+  - `fetch` / `pull` / `push`：`run()` 把 **stdin 接成 null**——远端要密码时不会把编辑器挂死，git 会自己说「问不出来」。
+  - **`pull(root, remote, branch)`**：**把远端与分支说清楚**。分支还没跟着远端时，光一个 `git pull` 只会说「不知道该合并哪个」；说清楚之后快进就快进、快进不了就**明说**（`--ff-only`：合并会弹自己的窗口，编辑器没有那个窗口）。
+  - `GitView`（文件 / 提交 / 分支三个视图）**取代** `showing_commits: bool`。
+  - `GitPanel`：`load_branches()`（分支在前、远端在后）、`selected_branch()` / `selected_remote()`、`view()` / `hint()`。面板画分支与远端：**当前分支是绿的（带 `●`）**，**远端分支是灰的**，**远端的名字是橙的、地址是蓝的**，挑中的那一行背后有**一块自己的颜色**。
+  - `GitBox` / `GitAsking`：**问 git 什么的那只盒子**（新分支的名字、推送的确认）。
 - **`crates/platform/src/lib.rs`**：窗口接线（`B` 进分支视图、`Enter` 切分支、`N` 新建、`F` 取回、`U` 更新、`P` 推送 + 确认框）。
-- **`crates/platform/src/commands.rs`**：新命令 `git.showBranches` / `git.fetch` / `git.pull` / `git.push`。
+  - **面板的按键改成 `'keys:` 标签块**：没用的键**跳出块**而不是跳函数——面板**永远放得回去**（顺手修掉了「按了没用的键面板整个被丢掉」的老问题）。
+  - `current_branch`：状态栏**左边常驻**写着「分支 X · 」；**编辑器启动时就读一次**（不是等面板打开才知道）。
+  - `the_remote_of(panel)`：当前分支跟着哪个远端就用哪个；没跟就用第一个远端。
+  - `ask_to_push` / `push_the_branch`：**推送先问**（`GitBox::confirm_push` 说清推到哪个远端的哪个分支），回车才真推。
+- **`crates/platform/src/commands.rs`**：新命令 `git.showBranches` / `git.fetch` / `git.pull` / `git.push`。**键位与面板里那四个字母一一对应**：`Ctrl+Alt+B` / `Ctrl+Alt+F` / `Ctrl+Alt+U` / `Ctrl+Alt+P`（命令表有规矩：每条命令都要有键，且**不能有两个命令抢同一个键**）。
+- **渲染层接线（`Chrome` 多了一个 `git_box`）**：**问 git 的那只盒子原来根本没画**——按 `N` 会「对着空气打字」。现在它跟别的盒子一样浮在面板上（面板打开时**只画地面**，面板的字不会盖在盒子上）。
+- 窗口脚本 **`editor/tools/git-branch-check.ps1`**（本轮新写，**只做了静态校验，没有运行**：运行会抢桌面）。
+
+单测（**+17**：git.rs 10 + 应用层 7）：
+
+- git.rs **4 条纯解析**（不要 git）：分支读对了、git 说的话里没有分支时就是没有、远端读对了、远端没有自己的地址时用读回来的那个。
+- git.rs **6 条真 git**（要 git，**在工作区之外跑**）：分支读得出来、切得过去、建得出来、远端读得出来、推得出去、**远端有的能取回来**。
+- 应用层 **7 条**：分支视图看得见分支与远端、`B` 能回到改过的文件、**状态栏写着当前分支**、面板里能建分支、面板里能切分支、**推送先要确认**、**没有远端时明说**。这 7 条的名字里都有 `git`，所以 `tools/git-unit-check.ps1` 的过滤（名字里有 `git`）**也覆盖得到**。
 
 已知边界（本版本内不做，写在 §7 结转里）：**没有 `launch.json` 那样的 git 配置**（分支名、远端名都是命令行给的）；**没有图形化的冲突解决**；**不能删分支、不能删远端**；**合并与变基不做**；**拉取与推送不认凭据的交互**（要输密码的远端不行）。
 
@@ -274,6 +294,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\
 # 运行时与控制台（版本号跟着文档号走，两边都要对）
 cd D:\github\DocuFlowAI\codeweaver-hermes-lab; npm test
 cd D:\github\DocuFlowAI\codeweaver-workspace; npm run build
+
+# 窗口级验收（会抢桌面、抢焦点、注入按键，留到统一回归那一轮跑）
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\tools\git-branch-check.ps1
 ```
 
 ### 6.2 实测结果
@@ -333,6 +356,29 @@ cd D:\github\DocuFlowAI\codeweaver-workspace; npm run build
 
 本轮的验收脚本 `tools/dap-real-check.ps1` 与 git 那个是**同一个套路**：测试二进制在仓库里构建（**低完整性**），**复制到 `%LOCALAPPDATA%\CodeWeaver\check` 再跑**（普通完整性），普通完整性的进程才起得了普通完整性的 `python.exe`。脚本**不碰桌面**（不起窗口、不抢焦点、不动指针），所以**本地就能跑**——这跟那些必须留到统一回归的窗口级脚本不一样。Python 与 debugpy 装在**仓库之外**的虚拟环境 `%LOCALAPPDATA%\CodeWeaver\check\debugpy-venv` 里，**不污染用户自己的 Python**。脚本把**输出与报告**留在 `editor\.dev-logs\dap-real-check.{log,json}`。
 
+**2026-11-27（V0.9.0 第四轮：Git 分支与远端 DF-0904）**
+
+| 检查 | 命令 | 结果 |
+|---|---|---|
+| 编辑器全量单元测试 | `cargo test --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --message-format=short` | **824 项全过，0 失败**（本轮 +17：git.rs 10（4 条纯解析 + 6 条真 git）+ 应用层 7） |
+| 编辑器静态检查 | `cargo clippy --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --all-targets` | **0 告警**，exit 0 |
+| 编辑器构建 | `cargo build --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace` | **成功**，版本仍是 `0.9.0` |
+| git 模块单元检查（工作区之外跑） | `powershell -NoProfile -ExecutionPolicy Bypass -File editor\tools\git-unit-check.ps1` | **29 项全过，0 失败**（上一轮 12 项 + 本轮 17 项：git.rs 10 + 应用层 7） |
+| 运行时测试 | `cd codeweaver-hermes-lab; npm test` | **689 项，688 过 / 1 跳过 / 0 失败**，exit 0 |
+| 控制台构建 | `cd codeweaver-workspace; npm run build` | **成功**（`tsc && vite build`） |
+| 窗口级验收 | `editor\tools\git-branch-check.ps1`（本轮新写） | **未跑**：脚本会抢桌面。本轮只做了静态解析校验：**0 解析错误、无 BOM、无非 ASCII 字节** |
+
+本轮修掉的三个真问题：
+
+- **命令表的键位不能空**。命令表里每条命令都必须有键（`every_command_of_the_editor_has_a_key`），而且**不能有两个命令抢同一个键**。新加的四条命令第一版键位写的是空字符串，`command(...)` 直接 panic——**一整片应用层测试跟着变红**（命令表是在构造应用时就建的）。最后定在 `Ctrl+Alt+B/F/U/P`：**与面板里那四个字母一一对应**，也不撞任何已有的键。
+- **`git pull` 不会自己知道该合并哪个**。分支还没跟着远端时，`git pull --ff-only` 只会说「不知道该合并哪个」——**这句话在编辑器里等于没做事**。改成**把远端与分支说清楚**（`git pull --ff-only <远端> <分支>`）之后，快进就快进、快进不了就明说。
+- **问 git 的那只盒子根本没画**。`GitBox`（新分支的名字、推送的确认）**处理了按键，却没有被画出来**——按 `N` 会「对着空气打字」。渲染层（`Chrome`）多了一个 `git_box`，盒子现在跟别的盒子一样浮在面板上。
+
+本轮记下来的两件事，是为了下一个人别再踩：
+
+- **读 git 说的话要看全 refname**。`git branch -a --format=%(refname:short)` 会把远端的 `refs/remotes/origin/HEAD` 缩成 `origin`——**看着像一个本地分支**。用全 refname（`refs/heads/` 是本地、`refs/remotes/` 是远端）才分得清；`refs/remotes/*/HEAD` 是远端的指针，**跳过**。
+- **「解析」与「问 git」要分开**。`parse_branches` / `parse_remotes` 是**纯计算**，单测**不需要 git**，在仓库里就能跑；真 git 的那几条才需要把测试二进制搬出工作区（低完整性起不了 `git.exe`）。这样分开的另一个好处：**单测不用 git 也能在别人的机器上跑**。
+
 
 ### 6.3 环境约束（影响验收怎么跑）
 
@@ -342,16 +388,17 @@ cd D:\github\DocuFlowAI\codeweaver-workspace; npm run build
 
 ### 6.4 待跑的验收
 
-- V0.8.0、V0.7.0 与 V0.6.0 留下来的窗口级脚本都还没跑；本期补两个（`workspace-check.ps1` 5 项、`search-roots-check.ps1` 4 项），随统一回归一起跑。
+- V0.8.0、V0.7.0 与 V0.6.0 留下来的窗口级脚本都还没跑；本期补三个（`workspace-check.ps1` 5 项、`search-roots-check.ps1` 4 项、`git-branch-check.ps1` 12 项），随统一回归一起跑。
 - **`workspace-check.ps1` 起两个编辑器**：一个用普通文件打开（标题是「资源管理器」、状态栏没有工作区），一个用工作区文件打开（标题是工作区名、状态栏有「· 工作区 proj」）。两者的**标题那一块**和**状态栏右边那一块**比一比，像素不一样就说明它变了。这么比是因为**没法读屏幕上的字**——只能比像素。
 - 行的位置是**算出来的**：侧边栏从 48 开始，段标题 28 高，一行 22 高，一级缩进 14，记号占 15。所以第一个根在第 0 行（y=28）、它的文件在第 1 行（y=50）、第二个根在第 2 行（y=72）、它的文件在第 3 行（y=94）。点第一个根之后行会往上挪一格，所以「第二个根下面那个文件」的位置会空出来——这就是「点一下能收起」的证据。
 - **`search-roots-check.ps1` 量的是「地方的列」**：搜索面板的框在 (16,16)，「找到几处」那行在 y=66，地方那一列从 y=90 开始，一行 22 高。地方的字色是 `rgb(0.62,0.70,0.86)`——**文字不用 sRGB 换算**（`To-Bytes`，不是 `To-Pixel`）。两个根各有一处时，第一行和第二行**都**该有字；只搜一个根时第二行是空的。
+- **`git-branch-check.ps1` 数的是分支视图里的四种颜色**：列表从 x=16 起，第一行在 y=42，一行 22 高；**当前分支是绿的**（`rgb(0.42,0.78,0.56)`，`●` 在前）、**远端的名字是橙的**（`rgb(0.93,0.74,0.42)`，占前 96 像素）、**远端的地址是蓝的**（`rgb(0.62,0.70,0.86)`，从 x=116 起）、**挑中的那一行背后有一块自己的颜色**（`rgb(0.18,0.30,0.52)`）。**文字不用 sRGB 换算，块要换算**（`To-Bytes` 与 `To-Pixel` 的区别）。那只问 git 的盒子浮在面板上（`rgb(0.10,0.12,0.16)`，在 (244,86) 380×40），面板打开时**只画地面**，盒子的地才算数。
 - 本轮新写的两个脚本只做了**静态**校验（PowerShell 解析 0 错误、无 BOM、无非 ASCII 字节），**没有运行**——运行会抢桌面。
 - **本轮的 `dap-real-check.ps1` 是跑过的**（第三轮）：它**不碰桌面**——不起窗口、不抢焦点、不动指针——所以它跟那些窗口级脚本不是一回事，**本地就能跑**。它跑的是**协议与会话这一层**（进程之间的对话），不是窗口上的东西。真适配器那一层的证据因此是**可追溯的**（`editor\.dev-logs\dap-real-check.{log,json}`）。
 
 ## 7. 本期结转
 
-- **窗口级的证据仍然空着**：V0.6.0 与 V0.7.0 留下的十四个脚本，加上 V0.8.0 的七个与本期的两个（`workspace-check.ps1`、`search-roots-check.ps1`），一次都没跑（会抢桌面），统一回归那一轮跑全套。
+- **窗口级的证据仍然空着**：V0.6.0 与 V0.7.0 留下的十四个脚本，加上 V0.8.0 的七个与本期的三个（`workspace-check.ps1`、`search-roots-check.ps1`、`git-branch-check.ps1`），一次都没跑（会抢桌面），统一回归那一轮跑全套。
 - **工作区里的设置还没生效**：`settings` 段**解析出来了**，但**没有**盖过用户设置——本期的字号还是只从 `%APPDATA%\CodeWeaver\settings.json` 读。下一步要定的是**谁盖谁**（VS Code 是工作区设置盖用户设置）。
 - **会话恢复没有做**：下次启动还是空的编辑器。
 - **工作区的根不能改**：只能整个打开一个工作区文件，不能把文件夹加进去或拿掉。
@@ -362,3 +409,7 @@ cd D:\github\DocuFlowAI\codeweaver-workspace; npm run build
 - **调试没有控制台**：适配器说的话只是**列在面板里**，不能像 VS Code 那样在控制台里输入。
 - **命中次数与多线程没有**：断点不知道被命中了几次，线程也只有一个。
 - **调试的 launch 配置很粗**：现在**只能调「当前打开的那个文件」**，没有 `launch.json`，也没有「先起服务再调」「跑起来带参数」这些说法。
+- **分支与远端只有「做」没有「改」**：能列、能切、能建、能取回/更新/推送，但**不能删分支、不能删远端、不能改名**；**没有图形化的冲突解决**。
+- **合并与变基不做**：`pull` 只快进（`--ff-only`）——分支走散了时 git **明说**并且**什么都不改**。编辑器没有合并冲突的那扇窗。
+- **远端的凭据不交互**：要输密码的远端（走 HTTPS 且要口令）**推不了**——git 的 stdin 是接成 null 的，它会自己说「问不出来」，编辑器不会挂死，也不会偷偷把密码记下来。
+- **远端分支切不过去**：面板里远端的分支（`origin/main`）是**看的，不是能切的**——要切先得在本地建一个跟着它的分支。

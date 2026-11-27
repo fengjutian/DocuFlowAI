@@ -495,6 +495,12 @@ impl NativeApplication {
         // be said out loud.
         let mut workspace_file_to_open = None;
 
+        // The repository the file belongs to is found before the file is
+        // opened: the branch it is on is said in the state line from the
+        // start, and not only after the panel of the changes was opened.
+        let repository_root = path
+            .as_ref()
+            .and_then(|path| git::repository_root(path));
         match path {
             Some(path) if workspace_file::is_workspace_file(&path) => {
                 let tab = tabs.open_scratch("untitled");
@@ -673,6 +679,11 @@ impl NativeApplication {
         // then kept: the root of the project is found by walking up the disk,
         // and the path does not change by itself.
         application.refresh_crumbs_of(0);
+        // The branch the program is on is read at the start as well: the
+        // state line says it before anything is done in the window.
+        if let Some(root) = repository_root {
+            application.remember_the_branch(&root);
+        }
         // The text is drawn at the size the person chose.
         application.apply_the_zoom();
         // A workspace that was named on the command line is opened now: the
@@ -866,6 +877,13 @@ impl NativeApplication {
         self.track_the_breakpoints_of_the_pane(self.panes.len() - 1);
         self.show_tree_of(path);
         self.activate_tab(index);
+        // The branch of the repository the file belongs to is read again:
+        // the file may be in another repository than the one before it.
+        if let Some(root) = git::repository_root(path) {
+            self.remember_the_branch(&root);
+        } else {
+            self.current_branch = None;
+        }
         true
     }
 
@@ -4334,6 +4352,10 @@ impl NativeApplication {
         };
         // Whether the diff of the file that is picked is read again.
         let mut reread = true;
+        // The keys are in a block of their own: a key that does nothing
+        // leaves the block instead of the function, so that the panel is
+        // put back and does not close under the hand of the person.
+        'keys: {
         match key {
             Key::Named(NamedKey::Escape) => {
                 if panel.view() != GitView::Files {
@@ -4377,12 +4399,12 @@ impl NativeApplication {
                         // The file is staged, and the panel says so at once:
                         // staging is something a person has to see.
                         if view != GitView::Files {
-                            return true;
+                            break 'keys;
                         }
                         let picked = panel.selected_entry().map(|entry| entry.path.clone());
                         let Some(path) = picked else {
                             self.status = Some("没有文件可以暂存".to_owned());
-                            return true;
+                            break 'keys;
                         };
                         let root = panel.root.clone();
                         match git::stage(&root, &path) {
@@ -4404,7 +4426,7 @@ impl NativeApplication {
                     }
                     Some('c') => {
                         if view != GitView::Files {
-                            return true;
+                            break 'keys;
                         }
                         self.commit_box = Some(RenameBox::message("提交说明"));
                         self.status = Some("写提交说明，回车确认，Esc 取消".to_owned());
@@ -4415,22 +4437,22 @@ impl NativeApplication {
                         if view == GitView::Branches {
                             self.update_the_branch(&mut panel);
                             reread = false;
-                            return true;
+                            break 'keys;
                         }
                         // The file goes out of the staging area: the file
                         // itself is not touched, only the index is.
                         if view != GitView::Files {
-                            return true;
+                            break 'keys;
                         }
                         let Some(entry) = panel.selected_entry() else {
                             self.status = Some("没有文件可以取消暂存".to_owned());
-                            return true;
+                            break 'keys;
                         };
                         let path = entry.path.clone();
                         let staged = entry.staged;
                         if !staged {
                             self.status = Some(format!("{path} 没有暂存"));
-                            return true;
+                            break 'keys;
                         }
                         let root = panel.root.clone();
                         match git::unstage(&root, &path) {
@@ -4454,7 +4476,7 @@ impl NativeApplication {
                         // The commits of the repository: the panel becomes a
                         // page of them.
                         if view != GitView::Files {
-                            return true;
+                            break 'keys;
                         }
                         let root = panel.root.clone();
                         match git::commits(&root, 30) {
@@ -4493,7 +4515,7 @@ impl NativeApplication {
                     Some('n') => {
                         // A new branch: the box asks for its name.
                         if view != GitView::Branches {
-                            return true;
+                            break 'keys;
                         }
                         self.git_box = Some(GitBox::new_branch());
                         self.status =
@@ -4503,7 +4525,7 @@ impl NativeApplication {
                         // What the remotes have is taken; nothing here
                         // changes.
                         if view != GitView::Branches {
-                            return true;
+                            break 'keys;
                         }
                         self.fetch_the_remotes(&mut panel);
                         reread = false;
@@ -4512,7 +4534,7 @@ impl NativeApplication {
                         // Pushing cannot be undone from here, so it is asked
                         // for first.
                         if view != GitView::Branches {
-                            return true;
+                            break 'keys;
                         }
                         self.ask_to_push(&panel);
                     }
@@ -4520,6 +4542,7 @@ impl NativeApplication {
                 }
             }
             _ => {}
+        }
         }
         // The diff of the file that is picked is read again.
         if reread
@@ -4533,25 +4556,33 @@ impl NativeApplication {
 
     /// Goes to the branch that is picked.
     fn go_to_the_branch(&mut self, panel: &mut GitPanel) {
-        let Some(branch) = panel.selected_branch().map(|branch| branch.name.clone()) else {
+        let Some(branch) = panel.selected_branch().cloned() else {
             self.status = Some("挑的是远端，不是分支".to_owned());
             return;
         };
-        if panel.selected_branch().is_some_and(|branch| branch.current) {
-            self.status = Some(format!("已经在 {branch} 上了"));
+        if branch.current {
+            self.status = Some(format!("已经在 {} 上了", branch.name));
             return;
         }
         let root = panel.root.clone();
-        match git::switch_to(&root, &branch) {
-            Ok(()) => {
+        // A branch that is on a remote is not here yet: a local branch that
+        // follows it is made, and the program goes to that one.
+        let went = if branch.remote {
+            git::switch_to_a_remote(&root, &branch.name)
+                .map(|name| format!("{name}（跟着 {}）", branch.name))
+        } else {
+            git::switch_to(&root, &branch.name).map(|()| branch.name.clone())
+        };
+        match went {
+            Ok(where_to) => {
                 self.remember_the_branch(&root);
                 if let Err(error) = panel.load_branches() {
-                    self.status = Some(format!("切到 {branch} 了，但分支读不了：{error}"));
+                    self.status = Some(format!("切到 {where_to} 了，但分支读不了：{error}"));
                     return;
                 }
-                self.status = Some(format!("切到 {branch} 了"));
+                self.status = Some(format!("切到 {where_to} 了"));
             }
-            Err(error) => self.status = Some(format!("切不到 {branch}：{error}")),
+            Err(error) => self.status = Some(format!("切不到 {}：{error}", branch.name)),
         }
     }
 
@@ -4600,7 +4631,10 @@ impl NativeApplication {
     /// Brings what the remote has into the branch that is checked out.
     fn update_the_branch(&mut self, panel: &mut GitPanel) {
         let root = panel.root.clone();
-        match git::pull(&root) {
+        let remote = self.the_remote_of(panel);
+        let branch = panel.current_branch.clone();
+        let branch = (!branch.is_empty()).then_some(branch);
+        match git::pull(&root, remote.as_deref(), branch.as_deref()) {
             Ok(said) => {
                 if let Err(error) = panel.load_branches() {
                     self.status = Some(format!("更新完了，但分支读不了：{error}"));
@@ -4755,7 +4789,11 @@ impl NativeApplication {
             self.status = Some("这个文件不在 git 仓库里".to_owned());
             return;
         };
-        match git::pull(&root) {
+        let remote = git::remotes(&root)
+            .ok()
+            .and_then(|remotes| remotes.first().map(|remote| remote.name.clone()));
+        let branch = self.current_branch.clone().filter(|name| !name.is_empty());
+        match git::pull(&root, remote.as_deref(), branch.as_deref()) {
             Ok(said) => {
                 let said = said.trim();
                 self.status = Some(if said.is_empty() {
@@ -6739,6 +6777,7 @@ impl ApplicationHandler for NativeApplication {
                         settings: self.settings.as_ref(),
                         git: self.git.as_ref(),
                         commit: self.commit_box.as_ref(),
+                        git_box: self.git_box.as_ref(),
                         command: self.command_box.as_ref().map(|box_| box_.field()),
                         condition: self.breakpoint_condition.as_ref().map(|box_| box_.field()),
                         expression: self.debug_expression.as_ref().map(|box_| box_.field()),
@@ -6892,6 +6931,13 @@ struct Chrome<'a> {
     git: Option<&'a GitPanel>,
     /// The box that asks for the message of a commit, when it is open.
     commit: Option<&'a RenameBox>,
+    /// The box that asks git something, when it is open.
+    ///
+    /// It asks for the name of a branch to make, or whether the branch may
+    /// be pushed. It is a box of its own, and it is drawn over the panel of
+    /// the changes: a name that is typed into the void is a name that is
+    /// nowhere.
+    git_box: Option<&'a GitBox>,
     /// The box that asks for a command, when it is open.
     command: Option<&'a RenameBox>,
     /// The box that asks for the condition of a breakpoint, when it is open.
@@ -7169,16 +7215,24 @@ fn build_scene(
     // The panel of the changes covers the window, the way the settings do.
     if let Some(panel) = chrome.git {
         let mut ui_measurer = RendererMeasurer::new(renderer, TextFamily::SansSerif);
-        if chrome.commit.is_some() {
-            // Only the ground of the panel is drawn while the message of the
-            // commit is being written: the text of the panel would lie on
-            // top of the box.
+        if chrome.commit.is_some() || chrome.git_box.is_some() {
+            // Only the ground of the panel is drawn while a box is open: the
+            // text of the panel would lie on top of the box.
             git::draw_background(&mut scene, viewport);
         } else {
             git::draw_panel(&mut scene, viewport, size, panel, &mut ui_measurer);
         }
         // The box that asks for the message of the commit floats over it.
         push_rename_box(&mut scene, size, body, chrome.commit, &mut ui_measurer);
+        // The box that asks git something floats over it as well: the name of
+        // a branch and the question about a push are written there.
+        push_rename_box(
+            &mut scene,
+            size,
+            body,
+            chrome.git_box.map(|box_| &box_.input),
+            &mut ui_measurer,
+        );
         return scene;
     }
 
@@ -7326,8 +7380,8 @@ fn build_scene(
 
     // The box that asks for the new name floats over the body. The box that
     // asks for a command, the box that asks for the condition of a
-    // breakpoint and the box that asks for an expression are the same box,
-    // and only one of them is open.
+    // breakpoint, the box that asks for an expression and the box that asks
+    // git something are the same box, and only one of them is open.
     push_rename_box(
         &mut scene,
         size,
@@ -7336,7 +7390,8 @@ fn build_scene(
             .rename
             .or(chrome.command)
             .or(chrome.condition)
-            .or(chrome.expression),
+            .or(chrome.expression)
+            .or(chrome.git_box.map(|box_| &box_.input)),
         &mut ui_measurer,
     );
 
@@ -10961,7 +11016,7 @@ mod tests {
         assert!(app.handle_git_key(&character("l"), None));
 
         let panel = app.git.as_ref().expect("the panel is still open");
-        assert!(panel.is_showing_commits(), "the commits are shown");
+        assert_eq!(panel.view(), GitView::Commits, "the commits are shown");
         assert_eq!(panel.commits.len(), 1, "there is one commit");
         assert_eq!(panel.commits[0].message, "the first one");
         assert!(
@@ -10973,8 +11028,173 @@ mod tests {
         // The escape key goes back to the files, and the panel stays open.
         assert!(app.handle_git_key(&named(NamedKey::Escape), None));
         let panel = app.git.as_ref().expect("the panel is still open");
-        assert!(!panel.is_showing_commits(), "the files are shown again");
+        assert_eq!(panel.view(), GitView::Files, "the files are shown again");
         assert_eq!(panel.entries.len(), 1, "the changed file is still there");
+    }
+
+    /// A repository with a file in it and a remote of its own.
+    ///
+    /// The remote is a bare repository on this machine: the checks push to it
+    /// and fetch from it without asking anything of the network.
+    fn git_project_with_a_remote(name: &str) -> Option<(PathBuf, PathBuf)> {
+        let (directory, file) = git_project(name)?;
+        let remote = scratch_dir(&format!("{name}-remote"));
+        git::run(&remote, &["init", "--quiet", "--bare"]).expect("the remote is made");
+        git::run(
+            &directory,
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        )
+        .expect("the remote is added");
+        Some((directory, file))
+    }
+
+    #[test]
+    fn the_git_branch_view_shows_the_branches_and_the_remotes() {
+        let Some((_, file)) = git_project_with_a_remote("git-branch-view") else {
+            return;
+        };
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.open_git_panel();
+        assert!(app.handle_git_key(&character("b"), None));
+
+        let panel = app.git.as_ref().expect("the panel is still open");
+        assert_eq!(panel.view(), GitView::Branches, "the branches are shown");
+        assert!(
+            panel
+                .branch_items
+                .iter()
+                .any(|item| matches!(item, git::BranchItem::Remote(_))),
+            "the remote is in the list: {:?}",
+            panel.branch_items
+        );
+        assert!(!panel.current_branch.is_empty(), "the branch is known");
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("分支"), "got {status}");
+    }
+
+    #[test]
+    fn the_git_branch_view_goes_back_to_the_changed_files() {
+        let Some((_, file)) = git_project("git-branch-back") else {
+            return;
+        };
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.open_git_panel();
+        app.handle_git_key(&character("b"), None);
+        assert!(app.handle_git_key(&character("b"), None));
+
+        let panel = app.git.as_ref().expect("the panel is still open");
+        assert_eq!(panel.view(), GitView::Files, "the files are shown again");
+    }
+
+    #[test]
+    fn the_git_state_line_says_which_branch_the_program_is_on() {
+        let Some((_, file)) = git_project("git-branch-state") else {
+            return;
+        };
+
+        let app = NativeApplication::new(Some(file)).expect("the application starts");
+        let branch = app.current_branch.clone().expect("the branch is known");
+        assert!(!branch.is_empty(), "the branch has a name");
+    }
+
+    #[test]
+    fn a_git_branch_can_be_made_from_the_panel() {
+        let Some((directory, file)) = git_project("git-new-branch") else {
+            return;
+        };
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.open_git_panel();
+        app.handle_git_key(&character("b"), None);
+        app.handle_git_key(&character("n"), None);
+        assert!(app.git_box.is_some(), "the box asks for the name");
+
+        for letter in ["t", "h", "e"] {
+            app.handle_git_box_key(&character(letter), None);
+        }
+        app.handle_git_box_key(&named(NamedKey::Enter), None);
+
+        assert!(app.git_box.is_none(), "the box is closed");
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("建了"), "got {status}");
+        let said = git::run(&directory, &["branch", "--list", "the"]).expect("the branches are read");
+        assert!(said.contains("the"), "got {said}");
+    }
+
+    #[test]
+    fn a_git_branch_can_be_gone_to_from_the_panel() {
+        let Some((directory, file)) = git_project("git-switch-branch") else {
+            return;
+        };
+        // Another branch is made, and the first one is gone back to.
+        let first = git::current_branch(&directory).expect("the branch is known");
+        git::create_branch(&directory, "the-other").expect("the branch is made");
+        git::switch_to(&directory, &first).expect("the branch is gone to");
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.open_git_panel();
+        app.handle_git_key(&character("b"), None);
+
+        // The other branch is picked: the list is walked until it is there.
+        for _ in 0..8 {
+            let picked = app
+                .git
+                .as_ref()
+                .expect("the panel is open")
+                .selected_branch()
+                .map(|branch| branch.name.clone());
+            if picked.as_deref() == Some("the-other") {
+                break;
+            }
+            app.handle_git_key(&named(NamedKey::ArrowDown), None);
+        }
+        app.handle_git_key(&named(NamedKey::Enter), None);
+
+        let now = git::current_branch(&directory).expect("the branch is known");
+        assert_eq!(now, "the-other", "the branch is gone to");
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("切到"), "got {status}");
+    }
+
+    #[test]
+    fn the_git_push_is_asked_for_first() {
+        let Some((_, file)) = git_project_with_a_remote("git-push-ask") else {
+            return;
+        };
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.open_git_panel();
+        app.handle_git_key(&character("b"), None);
+        app.handle_git_key(&character("p"), None);
+
+        let asking = app.git_box.as_ref().expect("the box asks first");
+        assert!(
+            matches!(asking.asking, git::GitAsking::Push { .. }),
+            "got {:?}",
+            asking.asking
+        );
+
+        // The escape key leaves it alone: nothing is pushed.
+        app.handle_git_box_key(&named(NamedKey::Escape), None);
+        assert!(app.git_box.is_none(), "the box is closed");
+    }
+
+    #[test]
+    fn the_git_push_says_so_when_there_is_no_remote() {
+        let Some((_, file)) = git_project("git-push-no-remote") else {
+            return;
+        };
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.open_git_panel();
+        app.handle_git_key(&character("b"), None);
+        app.handle_git_key(&character("p"), None);
+
+        assert!(app.git_box.is_none(), "there is nothing to confirm");
+        let status = app.status.clone().unwrap_or_default();
+        assert!(status.contains("没有远端"), "got {status}");
     }
 
     #[test]
