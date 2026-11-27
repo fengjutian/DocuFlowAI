@@ -191,6 +191,36 @@ V0.8.0 把编辑器的**编辑体验**补齐了：缩略图滑块、面包屑、
 
 已知边界（本版本内不做，写在 §7 结转里）：调试**只对着一个适配器验过**（debugpy）；**别的语言的真适配器没验**；调试控制台没有（适配器的话只是列在面板里）；命中次数、多线程没有。
 
+### DF-0904 Git 分支与远端（计划中）
+
+Git 面板现在只有「改过的文件」与「最近的提交」两块。VS Code 的源代码管理视图还有两块：**分支**（当前在哪个分支、有哪些分支、可以切过去）与**远端**（有哪些远端、可以取回/更新/推送）。没有这两块，分支只能靠命令行切，远程只能靠命令行推。
+
+验收标准：
+
+- **分支看得见**：本地分支与远端分支都在列表里，**当前的分支标出来**，远端分支带远端的名字（`origin/main`）。
+- **切得过去**：`Enter` 切到挑中的分支；切不动时**明说为什么**（有未提交的改动、那个分支不存在、有冲突）。
+- **能建分支**：`N` 问名字，回车建出来并切过去；名字空着不行。
+- **远端看得见**：远端的名字与它的地址（fetch 与 push 不一样时两个都写）。
+- **取回/更新/推送**：三个动作各自是命令，也各有键；**推送要指名审批**——按推送键先要确认（说清推到哪个远端的哪个分支），回车才算。
+- **当前分支看得见**：状态栏写着现在在哪个分支。
+- **组件拆分**：**解析 git 说的话是纯计算**（`parse_branches` / `parse_remotes`），单测**不需要 git**——仓库里跑得起来；面板只负责「挑哪一个」。
+- **不联网也能验**：真 git 的检查用**一个本地路径当远端**（`git remote add origin <文件夹>`），推与拉都在本机里跑，不碰网络。
+
+实现落点（计划）：
+
+- **`crates/platform/src/git.rs`**：
+  - `Branch{name, current, remote, upstream}`、`Remote{name, fetch_url, push_url}`。
+  - `parse_branches(output)`：从 `git branch -a --format=…` 的输出里读出分支；`refs/heads/` 是本地、`refs/remotes/` 是远端，`refs/remotes/*/HEAD` 是远端的指针（**跳过**，它不是一个分支）。
+  - `parse_remotes(output)`：从 `git remote -v` 的输出里读出远端的名字与两个地址。
+  - `branches` / `remotes` / `current_branch`：问 git 要那三样东西。
+  - `switch_to` / `create_branch`：`git switch`（旧版 git 退回 `git checkout`）。
+  - `fetch` / `pull` / `push`：对着当前分支的那个远端。
+- **`crates/platform/src/git.rs` 的 `GitPanel`**：`showing_commits: bool` 换成 `GitView`（文件 / 提交 / 分支三个视图），面板多画分支与远端。
+- **`crates/platform/src/lib.rs`**：窗口接线（`B` 进分支视图、`Enter` 切分支、`N` 新建、`F` 取回、`U` 更新、`P` 推送 + 确认框）。
+- **`crates/platform/src/commands.rs`**：新命令 `git.showBranches` / `git.fetch` / `git.pull` / `git.push`。
+
+已知边界（本版本内不做，写在 §7 结转里）：**没有 `launch.json` 那样的 git 配置**（分支名、远端名都是命令行给的）；**没有图形化的冲突解决**；**不能删分支、不能删远端**；**合并与变基不做**；**拉取与推送不认凭据的交互**（要输密码的远端不行）。
+
 ## 4. 未开发功能拆分
 
 ### 仍留在 V0.9.0 后面的
