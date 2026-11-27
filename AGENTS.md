@@ -4,9 +4,9 @@ CodeWeaver：一个自研原生编辑器（Rust + wgpu/winit）、一个 Agent �
 
 ## 仓库结构
 
-- `editor/` — 自研原生编辑器，Rust workspace（14 个 crate，产品版本 `0.8.0`）
-- `codeweaver-hermes-lab/` — Agent 运行时与 ACP 端点（TypeScript/Node，`0.8.0`）
-- `codeweaver-workspace/` — 控制台前端 + Tauri 外壳（React/Vite/Tauri，`0.8.0`）
+- `editor/` — 自研原生编辑器，Rust workspace（14 个 crate，产品版本 `0.9.0`）
+- `codeweaver-hermes-lab/` — Agent 运行时与 ACP 端点（TypeScript/Node，`0.9.0`）
+- `codeweaver-workspace/` — 控制台前端 + Tauri 外壳（React/Vite/Tauri，`0.9.0`）
 - `client/` — 上游研究基线（Zed，只读，不提交）
 - `doc/` — 版本文档与设计文档（进度文档、ADR、方案）
 - `scripts/` — 本地开发栈（`dev.py`、`check-runtime.py`）
@@ -59,7 +59,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\
 ## 开发流程
 
 1. **先写版本文档再实现**：新版本先建 `doc/PROJECT_PROGRESS_V0.X.0.md`（写清本期做什么、每项的验收标准），再动代码。
-2. **产品版本必须与主进度文档号一致**：`0.8.0` ↔ `V0.8.0`。改动版本时 `editor/Cargo.toml`、`editor/Cargo.lock`、两个 Node 子项目、`src-tauri/tauri.conf.json`、ACP 握手版本要一起改。**ACP 的协议版本（`PROTOCOL_VERSION` / `ACP_PROTOCOL_VERSION`，现在是 1）是协议版本，不是产品版本**——它跟着协议走，不跟着版本号走。
+2. **产品版本必须与主进度文档号一致**：`0.9.0` ↔ `V0.9.0`。改动版本时 `editor/Cargo.toml`、`editor/Cargo.lock`、两个 Node 子项目、`src-tauri/tauri.conf.json`、ACP 握手版本要一起改。**ACP 的协议版本（`PROTOCOL_VERSION` / `ACP_PROTOCOL_VERSION`，现在是 1）是协议版本，不是产品版本**——它跟着协议走，不跟着版本号走。
 3. **「完成」= 实现 + 自动化测试 + 可追溯验收结果**。三项缺一不可。
 4. **Mock 契约通过与真实运行时通过分开记录**，不互相替代。
 5. **未完成项只能标「计划 / 进行中 / 阻塞」**，界面占位不算完成。

@@ -17,6 +17,7 @@
 //! the project, and a search that missed them would miss a lot.
 
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -96,7 +97,52 @@ pub struct SearchResults {
 /// they are in the file. A directory that cannot be read is skipped: one
 /// unreadable folder does not stop the whole search.
 pub fn search(root: &Path, needle: &str, options: SearchOptions) -> SearchResults {
-    let mut results = walk(root, needle, options);
+    search_in(&[root.to_path_buf()], needle, options)
+}
+
+/// Searches for `needle` in the files of several roots.
+///
+/// A workspace can name more than one folder, and a search in it has to look
+/// in all of them. The places of every root are put together, a file that is
+/// in two roots is counted once, and the most places are collected in all.
+pub fn search_in(roots: &[PathBuf], needle: &str, options: SearchOptions) -> SearchResults {
+    let mut results = SearchResults::default();
+    if needle.is_empty() {
+        return results;
+    }
+    let mut seen: HashSet<(PathBuf, usize)> = HashSet::new();
+    for root in roots {
+        // The places of the roots before this one count towards the most that
+        // are collected: the limit is for the whole search, not for a root.
+        let left = options.max_hits.saturating_sub(results.hits.len());
+        if left == 0 {
+            results.truncated = true;
+            break;
+        }
+        let one = walk(
+            root,
+            needle,
+            SearchOptions {
+                max_hits: left,
+                ..options.clone()
+            },
+        );
+        if one.truncated {
+            results.truncated = true;
+        }
+        results.files += one.files;
+        if results.error.is_none() {
+            results.error = one.error;
+        }
+        for hit in one.hits {
+            // A place that is in two roots is one place: it is found once. The
+            // line is part of the place: the same file holds the text on
+            // several lines, and each of them is a place of its own.
+            if seen.insert((hit.path.clone(), hit.line)) {
+                results.hits.push(hit);
+            }
+        }
+    }
     // The places are sorted by the file they are in: a list in the order the
     // disk gave the files is not a list a person can read.
     results.hits.sort_by(|left, right| {
@@ -408,6 +454,78 @@ mod tests {
 
         assert_eq!(results.hits.len(), 1);
         assert_eq!(results.hits[0].line, 3);
+    }
+
+    #[test]
+    fn the_text_is_found_in_every_root() {
+        let first = scratch("search-in-first-root");
+        let second = scratch("search-in-second-root");
+        write_file(&first.join("a.txt"), "the needle is here\n");
+        write_file(&second.join("b.txt"), "the needle is there too\n");
+
+        let results = search_in(
+            &[first.clone(), second.clone()],
+            "needle",
+            SearchOptions::default(),
+        );
+
+        assert_eq!(results.hits.len(), 2, "both roots are searched");
+        assert!(results.hits.iter().any(|hit| hit.path == first.join("a.txt")));
+        assert!(results.hits.iter().any(|hit| hit.path == second.join("b.txt")));
+        assert_eq!(results.files, 2, "both files are read");
+    }
+
+    #[test]
+    fn a_file_that_is_in_two_roots_is_found_once() {
+        let outer = scratch("search-roots-overlap");
+        let inner = outer.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        write_file(&inner.join("a.txt"), "the needle is here\n");
+
+        let results = search_in(
+            &[outer.clone(), inner.clone()],
+            "needle",
+            SearchOptions::default(),
+        );
+
+        assert_eq!(results.hits.len(), 1, "the file is found once");
+        assert_eq!(results.hits[0].path, inner.join("a.txt"));
+    }
+
+    #[test]
+    fn the_most_places_are_collected_in_all_the_roots() {
+        let first = scratch("search-limit-first-root");
+        let second = scratch("search-limit-second-root");
+        write_file(&first.join("a.txt"), "needle one\nneedle two\n");
+        write_file(&second.join("b.txt"), "needle three\nneedle four\n");
+
+        let results = search_in(
+            &[first, second],
+            "needle",
+            SearchOptions {
+                max_hits: 3,
+                ..SearchOptions::default()
+            },
+        );
+
+        assert_eq!(results.hits.len(), 3, "the limit is for the whole search");
+        assert!(results.truncated, "the search says that it stopped early");
+    }
+
+    #[test]
+    fn a_root_that_is_not_there_is_skipped() {
+        let root = scratch("search-in-missing-root");
+        write_file(&root.join("a.txt"), "the needle is here\n");
+        let missing = root.join("nowhere");
+
+        let results = search_in(
+            &[missing, root.clone()],
+            "needle",
+            SearchOptions::default(),
+        );
+
+        assert_eq!(results.hits.len(), 1, "the other root is still searched");
+        assert_eq!(results.hits[0].path, root.join("a.txt"));
     }
 
     #[test]

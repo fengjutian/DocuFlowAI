@@ -16,7 +16,7 @@ use std::{
 
 use codeweaver_render::{Color, FrameScene, Rect, Size, TextFamily, TextStyle};
 use codeweaver_ui::TextMeasurer;
-use codeweaver_workspace::search::{search, SearchHit, SearchOptions, SearchResults};
+use codeweaver_workspace::search::{search_in, SearchHit, SearchOptions, SearchResults};
 use winit::keyboard::{Key, NamedKey};
 
 use crate::rename::RenameBox;
@@ -106,8 +106,11 @@ pub struct SearchPanel {
     regex: bool,
     show_path: bool,
     path: RenameBox,
-    /// The root of the project that is searched.
-    root: PathBuf,
+    /// The roots of the project that is searched.
+    ///
+    /// A workspace can name more than one folder, and the search looks in all
+    /// of them.
+    roots: Vec<PathBuf>,
     /// The places the text was found.
     hits: Vec<SearchHit>,
     /// Which place is picked, counted from the first one.
@@ -123,25 +126,27 @@ pub struct SearchPanel {
 }
 
 impl SearchPanel {
-    /// Opens the panel over the project rooted at `root`.
+    /// Opens the panel over the projects rooted at the given folders.
     ///
-    /// The text that was looked for last time is in the box already: the
-    /// person who searches twice does not want to type it twice.
-    pub fn new(root: PathBuf, needle: &str) -> Self {
-        Self::open(root, needle, false)
+    /// A workspace can name more than one folder, and a search in it has to
+    /// look in all of them. The text that was looked for last time is in the
+    /// box already: the person who searches twice does not want to type it
+    /// twice.
+    pub fn new(roots: Vec<PathBuf>, needle: &str) -> Self {
+        Self::open(roots, needle, false)
     }
 
-    /// Opens the panel over the project rooted at `root`, to replace as well
-    /// as to find.
+    /// Opens the panel over the projects rooted at the given folders, to
+    /// replace as well as to find.
     ///
     /// The box of the replacement is there from the start: the person who
     /// wants to replace knows what they want to replace it with.
-    pub fn with_replace(root: PathBuf, needle: &str) -> Self {
-        Self::open(root, needle, true)
+    pub fn with_replace(roots: Vec<PathBuf>, needle: &str) -> Self {
+        Self::open(roots, needle, true)
     }
 
     /// Opens the panel, with or without the box of the replacement.
-    fn open(root: PathBuf, needle: &str, replacing: bool) -> Self {
+    fn open(roots: Vec<PathBuf>, needle: &str, replacing: bool) -> Self {
         let mut box_ = RenameBox::message("查找");
         if !needle.is_empty() {
             box_.set_text(needle);
@@ -155,7 +160,7 @@ impl SearchPanel {
             regex: false,
             show_path: false,
             path: RenameBox::message("路径包含"),
-            root,
+            roots,
             hits: Vec::new(),
             selected: 0,
             focus: SearchFocus::Input,
@@ -281,12 +286,17 @@ impl SearchPanel {
         }
     }
 
-    /// The root of the project that is searched.
+    /// The root the file is in, if it is in one of the roots.
     ///
-    /// The places are told in words relative to it: `src/main.rs:12` says
-    /// more than a path that starts at the drive of the machine.
-    pub fn root(&self) -> &Path {
-        &self.root
+    /// The root that holds the file the longest is the one that is named: a
+    /// folder inside another folder of the same workspace is shown with the
+    /// path inside the folder that is inside.
+    pub fn root_of(&self, path: &Path) -> Option<&Path> {
+        self.roots
+            .iter()
+            .filter(|root| is_inside(root, path))
+            .max_by_key(|root| root.components().count())
+            .map(|root| root.as_path())
     }
 
     /// The places the text was found.
@@ -321,7 +331,10 @@ impl SearchPanel {
 
     /// Where the place is, in words: the path inside the project, and the line.
     pub fn place_of(&self, hit: &SearchHit) -> String {
-        let path = hit.path.strip_prefix(&self.root).unwrap_or(&hit.path);
+        let path = match self.root_of(&hit.path) {
+            Some(root) => hit.path.strip_prefix(root).unwrap_or(&hit.path),
+            None => hit.path.as_path(),
+        };
         format!("{}:{}", path.display(), hit.line)
     }
 
@@ -356,7 +369,7 @@ impl SearchPanel {
             self.status = "要找的文字不能是空的".to_owned();
             return false;
         }
-        let root = self.root.clone();
+        let roots = self.roots.clone();
         let (sender, answers) = channel();
         self.status = format!("正在找 {needle}…");
         // The thread is left to finish on its own: the panel may be gone by
@@ -369,7 +382,7 @@ impl SearchPanel {
             ..SearchOptions::default()
         };
         std::thread::spawn(move || {
-            let results = search(&root, &needle, options);
+            let results = search_in(&roots, &needle, options);
             let _ = sender.send(results);
         });
         self.answers = Some(answers);
@@ -901,6 +914,26 @@ pub fn draw_panel(
     let _ = measurer;
 }
 
+/// Whether a path is inside a folder.
+///
+/// Windows file names are not case sensitive, so a path that arrives with a
+/// different case is still inside the folder. The separator is part of the
+/// test, so that `C:\a` is not the folder of `C:\ab`.
+fn is_inside(folder: &Path, path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let mut folder = folder.to_string_lossy().to_lowercase();
+        if !folder.ends_with(std::path::MAIN_SEPARATOR) {
+            folder.push(std::path::MAIN_SEPARATOR);
+        }
+        path.to_string_lossy().to_lowercase().starts_with(&folder)
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(folder)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -928,7 +961,7 @@ mod tests {
 
     #[test]
     fn the_panel_starts_with_the_text_that_was_looked_for() {
-        let panel = SearchPanel::new(PathBuf::from("C:\\project"), "needle");
+        let panel = SearchPanel::new(vec![PathBuf::from("C:\\project")], "needle");
         assert_eq!(panel.needle(), "needle");
         assert_eq!(panel.focus(), SearchFocus::Input);
         assert!(panel.hits().is_empty());
@@ -937,14 +970,14 @@ mod tests {
 
     #[test]
     fn the_panel_starts_empty_when_there_was_no_text() {
-        let panel = SearchPanel::new(PathBuf::from("C:\\project"), "");
+        let panel = SearchPanel::new(vec![PathBuf::from("C:\\project")], "");
         assert_eq!(panel.needle(), "");
         assert_eq!(panel.field().title(), "查找");
     }
 
     #[test]
     fn the_panel_that_replaces_has_a_box_for_the_replacement() {
-        let panel = SearchPanel::with_replace(PathBuf::from("C:\\project"), "needle");
+        let panel = SearchPanel::with_replace(vec![PathBuf::from("C:\\project")], "needle");
         assert!(panel.is_replacing());
         assert_eq!(panel.needle(), "needle");
         assert_eq!(panel.replacement(), "");
@@ -953,7 +986,7 @@ mod tests {
 
     #[test]
     fn the_tab_key_moves_to_the_replacement_when_the_panel_replaces() {
-        let mut panel = SearchPanel::with_replace(PathBuf::from("C:\\project"), "");
+        let mut panel = SearchPanel::with_replace(vec![PathBuf::from("C:\\project")], "");
         panel.handle_key(&named(NamedKey::Tab), None, false, false);
         assert_eq!(panel.focus(), SearchFocus::Results);
         panel.handle_key(&named(NamedKey::Tab), None, false, false);
@@ -964,7 +997,7 @@ mod tests {
 
     #[test]
     fn what_is_typed_in_the_replacement_stays_in_the_replacement() {
-        let mut panel = SearchPanel::with_replace(PathBuf::from("C:\\project"), "needle");
+        let mut panel = SearchPanel::with_replace(vec![PathBuf::from("C:\\project")], "needle");
         // The tab key twice: the text, the places, the replacement.
         panel.handle_key(&named(NamedKey::Tab), None, false, false);
         panel.handle_key(&named(NamedKey::Tab), None, false, false);
@@ -977,7 +1010,7 @@ mod tests {
 
     #[test]
     fn there_is_nothing_to_replace_when_nothing_was_found() {
-        let mut panel = SearchPanel::with_replace(PathBuf::from("C:\\project"), "needle");
+        let mut panel = SearchPanel::with_replace(vec![PathBuf::from("C:\\project")], "needle");
         panel.handle_key(&named(NamedKey::Tab), None, false, false);
         panel.handle_key(&named(NamedKey::Tab), None, false, false);
         panel.handle_key(&character("p"), Some("p"), false, false);
@@ -995,7 +1028,7 @@ mod tests {
 
     #[test]
     fn typing_goes_into_the_text_that_is_looked_for() {
-        let mut panel = SearchPanel::new(PathBuf::from("C:\\project"), "");
+        let mut panel = SearchPanel::new(vec![PathBuf::from("C:\\project")], "");
         assert_eq!(
             panel.handle_key(&character("n"), Some("n"), false, false),
             SearchCommand::None
@@ -1006,7 +1039,7 @@ mod tests {
 
     #[test]
     fn the_escape_key_closes_the_panel() {
-        let mut panel = SearchPanel::new(PathBuf::from("C:\\project"), "");
+        let mut panel = SearchPanel::new(vec![PathBuf::from("C:\\project")], "");
         assert_eq!(
             panel.handle_key(&named(NamedKey::Escape), None, false, false),
             SearchCommand::Close
@@ -1015,7 +1048,7 @@ mod tests {
 
     #[test]
     fn the_tab_key_moves_between_the_text_and_the_places() {
-        let mut panel = SearchPanel::new(PathBuf::from("C:\\project"), "");
+        let mut panel = SearchPanel::new(vec![PathBuf::from("C:\\project")], "");
         panel.handle_key(&named(NamedKey::Tab), None, false, false);
         assert_eq!(panel.focus(), SearchFocus::Results);
         panel.handle_key(&named(NamedKey::Tab), None, false, false);
@@ -1028,7 +1061,7 @@ mod tests {
         fs::create_dir(root.join("src")).unwrap();
         fs::write(root.join("src/main.rs"), "Item42\n").unwrap();
         fs::write(root.join("notes.txt"), "Item99\n").unwrap();
-        let mut panel = SearchPanel::new(root.clone(), "^item[0-9]+$");
+        let mut panel = SearchPanel::new(vec![root.clone()], "^item[0-9]+$");
         panel.handle_key(&character("r"), None, false, true);
         panel.handle_key(&character("p"), None, false, true);
         assert_eq!(panel.focus(), SearchFocus::Path);
@@ -1049,7 +1082,7 @@ mod tests {
         let root = scratch("search-panel-finds-the-text");
         fs::write(root.join("notes.txt"), "the first line\nthe needle is here\n").unwrap();
 
-        let mut panel = SearchPanel::new(root.clone(), "needle");
+        let mut panel = SearchPanel::new(vec![root.clone()], "needle");
         panel.start_search();
         assert!(panel.is_running());
 
@@ -1077,7 +1110,7 @@ mod tests {
         let root = scratch("search-panel-finds-nothing");
         fs::write(root.join("notes.txt"), "something else\n").unwrap();
 
-        let mut panel = SearchPanel::new(root.clone(), "needle");
+        let mut panel = SearchPanel::new(vec![root.clone()], "needle");
         panel.start_search();
         for _ in 0..200 {
             if panel.pump() {
@@ -1092,7 +1125,7 @@ mod tests {
 
     #[test]
     fn an_empty_text_is_not_searched_for() {
-        let mut panel = SearchPanel::new(PathBuf::from("C:\\project"), "");
+        let mut panel = SearchPanel::new(vec![PathBuf::from("C:\\project")], "");
         panel.start_search();
         assert!(!panel.is_running());
         assert_eq!(panel.status(), "要找的文字不能是空的");
@@ -1110,11 +1143,66 @@ mod tests {
     }
 
     #[test]
+    fn the_search_looks_in_every_root_of_the_panel() {
+        let first = scratch("search-panel-two-roots-first");
+        let second = scratch("search-panel-two-roots-second");
+        fs::write(first.join("a.txt"), "the needle is here\n").unwrap();
+        fs::write(second.join("b.txt"), "the needle is there\n").unwrap();
+
+        let mut panel = SearchPanel::new(vec![first.clone(), second.clone()], "needle");
+        panel.start_search();
+        wait_for_the_search(&mut panel);
+
+        assert_eq!(panel.hits().len(), 2, "both roots are searched");
+        assert!(
+            panel.hits().iter().any(|hit| hit.path == first.join("a.txt")),
+            "the first root is searched"
+        );
+        assert!(
+            panel.hits().iter().any(|hit| hit.path == second.join("b.txt")),
+            "the second root is searched"
+        );
+    }
+
+    #[test]
+    fn the_root_of_a_place_is_the_folder_it_is_in() {
+        let first = scratch("search-panel-root-of-first");
+        let second = scratch("search-panel-root-of-second");
+        let panel = SearchPanel::new(vec![first.clone(), second.clone()], "needle");
+
+        assert_eq!(panel.root_of(&first.join("a.txt")), Some(first.as_path()));
+        assert_eq!(panel.root_of(&second.join("b.txt")), Some(second.as_path()));
+        assert_eq!(
+            panel.root_of(&PathBuf::from("C:\\somewhere\\else.txt")),
+            None,
+            "a file that is in no root has no root"
+        );
+    }
+
+    #[test]
+    fn the_place_is_told_relative_to_the_root_it_is_in() {
+        let first = scratch("search-panel-place-first");
+        let second = scratch("search-panel-place-second");
+        let panel = SearchPanel::new(vec![first.clone(), second.clone()], "needle");
+
+        let hit = SearchHit {
+            path: second.join("src").join("main.rs"),
+            line: 12,
+            text: "the needle is here".to_owned(),
+        };
+
+        assert_eq!(
+            panel.place_of(&hit),
+            format!("{}:12", Path::new("src").join("main.rs").display())
+        );
+    }
+
+    #[test]
     fn the_case_of_the_letters_can_be_asked_for() {
         let root = scratch("search-panel-counts-the-case");
         fs::write(root.join("a.txt"), "The Needle\nthe needle\n").unwrap();
 
-        let mut panel = SearchPanel::new(root.clone(), "needle");
+        let mut panel = SearchPanel::new(vec![root.clone()], "needle");
         panel.start_search();
         wait_for_the_search(&mut panel);
         assert_eq!(panel.hits().len(), 2, "the case does not count by default");
@@ -1130,7 +1218,7 @@ mod tests {
         let root = scratch("search-panel-finds-the-whole-word");
         fs::write(root.join("a.txt"), "the cat sat\nthe catalog is here\n").unwrap();
 
-        let mut panel = SearchPanel::new(root.clone(), "cat");
+        let mut panel = SearchPanel::new(vec![root.clone()], "cat");
         panel.start_search();
         wait_for_the_search(&mut panel);
         assert_eq!(panel.hits().len(), 2);
@@ -1143,7 +1231,7 @@ mod tests {
 
     #[test]
     fn the_alt_c_key_turns_the_case_rule_on() {
-        let mut panel = SearchPanel::new(PathBuf::from("C:\\project"), "needle");
+        let mut panel = SearchPanel::new(vec![PathBuf::from("C:\\project")], "needle");
         assert!(!panel.is_case_sensitive());
 
         panel.handle_key(&character("c"), None, false, true);
@@ -1153,7 +1241,7 @@ mod tests {
 
     #[test]
     fn the_alt_w_key_turns_the_whole_word_rule_on() {
-        let mut panel = SearchPanel::new(PathBuf::from("C:\\project"), "needle");
+        let mut panel = SearchPanel::new(vec![PathBuf::from("C:\\project")], "needle");
         assert!(!panel.is_whole_word());
 
         panel.handle_key(&character("w"), None, false, true);
@@ -1163,7 +1251,7 @@ mod tests {
 
     #[test]
     fn the_rules_that_are_in_force_are_said_out_loud() {
-        let mut panel = SearchPanel::new(PathBuf::from("C:\\project"), "needle");
+        let mut panel = SearchPanel::new(vec![PathBuf::from("C:\\project")], "needle");
         panel.toggle_case_sensitive();
         wait_for_the_search(&mut panel);
         panel.toggle_whole_word();
@@ -1179,7 +1267,7 @@ mod tests {
         let root = scratch("search-panel-picks-the-places");
         fs::write(root.join("a.txt"), "needle\nneedle\n").unwrap();
 
-        let mut panel = SearchPanel::new(root.clone(), "needle");
+        let mut panel = SearchPanel::new(vec![root.clone()], "needle");
         panel.start_search();
         for _ in 0..200 {
             if panel.pump() {
@@ -1205,7 +1293,7 @@ mod tests {
         let root = scratch("search-panel-opens-the-place");
         fs::write(root.join("a.txt"), "the needle is here\n").unwrap();
 
-        let mut panel = SearchPanel::new(root.clone(), "needle");
+        let mut panel = SearchPanel::new(vec![root.clone()], "needle");
         panel.start_search();
         for _ in 0..200 {
             if panel.pump() {

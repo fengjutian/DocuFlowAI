@@ -21,7 +21,7 @@ pub mod tree;
 pub mod watch;
 
 pub use search::{SearchHit, SearchOptions, SearchResults};
-pub use tree::{FileTree, NodeKind, TreeNode};
+pub use tree::{FileForest, FileTree, NodeKind, TreeNode};
 pub use watch::{ChangeDetector, ExternalChange};
 
 use std::{

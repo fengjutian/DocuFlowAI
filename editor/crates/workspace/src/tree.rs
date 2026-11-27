@@ -228,6 +228,169 @@ impl FileTree {
     }
 }
 
+/// Several folders under one workspace.
+///
+/// A workspace file can name more than one folder. The file panel then shows
+/// one row for each folder, and the files of that folder below it. A forest
+/// of one folder shows the files of that folder directly, the way a project
+/// of one folder is shown: there is no row for the folder itself.
+#[derive(Clone, Debug)]
+pub struct FileForest {
+    /// One tree per folder, in the order the folders are named.
+    trees: Vec<FileTree>,
+    /// The name of each folder and whether it is open.
+    ///
+    /// A forest of one folder has no row for its folder, so it has no names
+    /// here either.
+    folders: Vec<FolderRow>,
+    /// The rows of the forest, in the order they are drawn.
+    visible: Vec<TreeNode>,
+}
+
+/// The row of a folder of a forest.
+#[derive(Clone, Debug)]
+struct FolderRow {
+    /// The name the folder is shown with.
+    name: String,
+    /// Whether the folder is open. A folder that is closed shows no files.
+    open: bool,
+}
+
+impl FileForest {
+    /// A forest of one folder: the files of the folder are shown directly.
+    pub fn single(root: impl Into<PathBuf>) -> Self {
+        let tree = FileTree::new(root);
+        let mut forest = FileForest {
+            trees: vec![tree],
+            folders: Vec::new(),
+            visible: Vec::new(),
+        };
+        forest.rebuild();
+        forest
+    }
+
+    /// A forest of several folders: each of them has a row of its own.
+    ///
+    /// The name of a folder is the one the workspace file gives it; the path is
+    /// where the folder is on disk.
+    pub fn many(folders: Vec<(String, PathBuf)>) -> Self {
+        let trees: Vec<FileTree> = folders
+            .iter()
+            .map(|(_, path)| FileTree::new(path.clone()))
+            .collect();
+        let rows = folders
+            .iter()
+            .map(|(name, _)| FolderRow {
+                name: name.clone(),
+                open: true,
+            })
+            .collect();
+        let mut forest = FileForest {
+            trees,
+            folders: rows,
+            visible: Vec::new(),
+        };
+        forest.rebuild();
+        forest
+    }
+
+    /// The rows of the forest, in the order they are drawn.
+    pub fn nodes(&self) -> &[TreeNode] {
+        &self.visible
+    }
+
+    /// The folders of the forest, in the order they are named.
+    pub fn roots(&self) -> Vec<&Path> {
+        self.trees.iter().map(|tree| tree.root()).collect()
+    }
+
+    /// Whether the path is one of the folders or a file inside one of them.
+    pub fn contains(&self, path: &Path) -> bool {
+        self.trees.iter().any(|tree| tree.contains(path))
+    }
+
+    /// Opens a folder of the forest or closes it, and opens or closes a
+    /// directory inside one of them. Returns true when the forest changed.
+    ///
+    /// The folder of a forest of one folder is not a row: it cannot be closed,
+    /// because there would be nothing left to show.
+    pub fn toggle(&mut self, path: &Path) -> bool {
+        if let Some(index) = self.index_of_the_folder(path)
+            && !self.folders.is_empty()
+        {
+            self.folders[index].open = !self.folders[index].open;
+            self.rebuild();
+            return true;
+        }
+
+        let Some(index) = self
+            .trees
+            .iter()
+            .position(|tree| is_inside(tree.root(), path))
+        else {
+            return false;
+        };
+        let changed = self.trees[index].toggle(path);
+        if changed {
+            self.rebuild();
+        }
+        changed
+    }
+
+    /// Reads the folders that are open again, so that files that appeared or
+    /// disappeared show up. Returns an error when a folder cannot be read.
+    pub fn refresh(&mut self) -> io::Result<()> {
+        let mut first_error = None;
+        for tree in &mut self.trees {
+            if let Err(error) = tree.refresh()
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        self.rebuild();
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// The index of the folder that is that path.
+    fn index_of_the_folder(&self, path: &Path) -> Option<usize> {
+        self.trees
+            .iter()
+            .position(|tree| same_path(tree.root(), path))
+    }
+
+    /// Builds the rows of the forest from the trees.
+    fn rebuild(&mut self) {
+        self.visible.clear();
+        if self.folders.is_empty() {
+            // One folder: its files are shown directly, without a row for the
+            // folder itself.
+            if let Some(tree) = self.trees.first() {
+                self.visible.extend(tree.nodes().iter().cloned());
+            }
+            return;
+        }
+        for (index, tree) in self.trees.iter().enumerate() {
+            let folder = &self.folders[index];
+            if !folder.open {
+                continue;
+            }
+            self.visible.push(TreeNode {
+                name: folder.name.clone(),
+                path: tree.root().to_path_buf(),
+                kind: NodeKind::Directory,
+                children: Vec::new(),
+                expanded: true,
+                depth: 0,
+            });
+            self.visible.extend(tree.nodes().iter().cloned());
+        }
+    }
+}
+
 /// Reads the children of a directory, sorted and filtered.
 fn read_children(directory: &Path, depth: usize, ignored: &[String]) -> io::Result<Vec<TreeNode>> {
     let mut children = Vec::new();
@@ -402,6 +565,26 @@ fn same_path(left: &Path, right: &Path) -> bool {
     #[cfg(not(windows))]
     {
         left == right
+    }
+}
+
+/// Whether a path is inside a folder.
+///
+/// Windows file names are not case sensitive, so a path that arrives with a
+/// different case is still inside the folder. The separator is part of the
+/// test, so that `C:\a` is not the folder of `C:\ab`.
+fn is_inside(folder: &Path, path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        let mut folder = folder.to_string_lossy().to_lowercase();
+        if !folder.ends_with(std::path::MAIN_SEPARATOR) {
+            folder.push(std::path::MAIN_SEPARATOR);
+        }
+        path.to_string_lossy().to_lowercase().starts_with(&folder)
+    }
+    #[cfg(not(windows))]
+    {
+        path.starts_with(folder)
     }
 }
 
@@ -661,5 +844,124 @@ mod tests {
         assert!(tree.toggle(&source));
         assert!(tree.contains(&file));
         assert!(!tree.contains(&outside));
+    }
+
+    /// The names of the rows of a forest.
+    fn forest_names(forest: &FileForest) -> Vec<&str> {
+        forest.nodes().iter().map(|node| node.name.as_str()).collect()
+    }
+
+    /// A folder with a file in it.
+    fn folder_with_a_file(name: &str) -> PathBuf {
+        let root = scratch(&format!("forest-{name}"));
+        fs::create_dir_all(&root).unwrap();
+        write_file(&root.join("main.rs"), "fn main() {}\n");
+        root
+    }
+
+    #[test]
+    fn a_forest_of_one_folder_shows_its_files_without_a_row_for_the_folder() {
+        let root = folder_with_a_file("single");
+
+        let forest = FileForest::single(&root);
+
+        assert_eq!(forest_names(&forest), vec!["main.rs"]);
+        assert!(
+            !forest_names(&forest).contains(&root.file_name().unwrap().to_str().unwrap()),
+            "the folder itself is not a row"
+        );
+    }
+
+    #[test]
+    fn a_forest_of_several_folders_has_a_row_for_each_of_them() {
+        let first = folder_with_a_file("first");
+        let second = folder_with_a_file("second");
+
+        let forest = FileForest::many(vec![
+            ("甲".to_owned(), first.clone()),
+            ("乙".to_owned(), second.clone()),
+        ]);
+
+        assert_eq!(forest_names(&forest), vec!["甲", "main.rs", "乙", "main.rs"]);
+        assert_eq!(forest.nodes()[0].depth, 0, "the folder is the first level");
+        assert_eq!(forest.nodes()[1].depth, 1, "the files are below it");
+    }
+
+    #[test]
+    fn a_folder_that_is_closed_shows_no_files() {
+        let first = folder_with_a_file("closed");
+        let second = folder_with_a_file("closed-other");
+
+        let mut forest = FileForest::many(vec![
+            ("甲".to_owned(), first.clone()),
+            ("乙".to_owned(), second.clone()),
+        ]);
+
+        assert!(forest.toggle(&first));
+        assert_eq!(forest_names(&forest), vec!["乙", "main.rs"]);
+
+        // The folder can be opened again.
+        assert!(forest.toggle(&first));
+        assert_eq!(forest_names(&forest), vec!["甲", "main.rs", "乙", "main.rs"]);
+    }
+
+    #[test]
+    fn the_folder_of_a_forest_of_one_cannot_be_closed() {
+        let root = folder_with_a_file("only-one");
+
+        let mut forest = FileForest::single(&root);
+
+        assert!(!forest.toggle(&root));
+        assert_eq!(forest_names(&forest), vec!["main.rs"]);
+    }
+
+    #[test]
+    fn a_directory_inside_a_folder_is_opened_and_closed() {
+        let root = folder_with_a_file("inside");
+        let source = root.join("src");
+        fs::create_dir_all(&source).unwrap();
+        write_file(&source.join("lib.rs"), "pub fn f() {}\n");
+
+        let mut forest = FileForest::many(vec![("甲".to_owned(), root.clone())]);
+
+        assert_eq!(forest_names(&forest), vec!["甲", "src", "main.rs"]);
+        assert!(forest.toggle(&source));
+        assert_eq!(
+            forest_names(&forest),
+            vec!["甲", "src", "lib.rs", "main.rs"]
+        );
+        assert!(forest.toggle(&source));
+        assert_eq!(forest_names(&forest), vec!["甲", "src", "main.rs"]);
+    }
+
+    #[test]
+    fn the_roots_of_the_forest_are_the_folders() {
+        let first = folder_with_a_file("roots-first");
+        let second = folder_with_a_file("roots-second");
+
+        let forest = FileForest::many(vec![
+            ("甲".to_owned(), first.clone()),
+            ("乙".to_owned(), second.clone()),
+        ]);
+
+        assert_eq!(forest.roots(), vec![first.as_path(), second.as_path()]);
+        assert!(forest.contains(&first));
+        assert!(!forest.contains(&root_that_is_not_in_the_forest()));
+    }
+
+    /// A folder that is not in any forest.
+    fn root_that_is_not_in_the_forest() -> PathBuf {
+        scratch("forest-outside")
+    }
+
+    #[test]
+    fn a_forest_that_is_refreshed_reads_its_folders_again() {
+        let root = folder_with_a_file("refresh");
+        let mut forest = FileForest::many(vec![("甲".to_owned(), root.clone())]);
+
+        write_file(&root.join("new.rs"), "new\n");
+        forest.refresh().unwrap();
+
+        assert_eq!(forest_names(&forest), vec!["甲", "main.rs", "new.rs"]);
     }
 }

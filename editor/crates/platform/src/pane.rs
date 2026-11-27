@@ -23,6 +23,7 @@ use codeweaver_workbench::TabId;
 
 use crate::breadcrumbs;
 use crate::editor_view::{EditorView, Mark};
+use crate::multicursor::ColumnSelection;
 
 /// One open document.
 pub struct EditorPane {
@@ -70,6 +71,11 @@ pub struct EditorPane {
     /// The path belongs to the file and not to the window: two columns show
     /// two files, and each of them has its own path above the text.
     pub crumbs: Vec<breadcrumbs::Crumb>,
+    /// The box of text that is being selected, when there is one.
+    ///
+    /// A box is the same columns of several lines. It belongs to the file:
+    /// the box of one file is not the box of another.
+    pub column: Option<ColumnSelection>,
 }
 
 impl EditorPane {
@@ -91,6 +97,7 @@ impl EditorPane {
             server_version: None,
             asked: None,
             crumbs: Vec::new(),
+            column: None,
         }
     }
 
@@ -116,6 +123,7 @@ impl EditorPane {
             server_version: None,
             asked: None,
             crumbs: Vec::new(),
+            column: None,
         }
     }
 

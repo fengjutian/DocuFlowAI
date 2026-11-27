@@ -23,6 +23,7 @@ mod keybindings;
 mod layout;
 mod lsp;
 mod minimap;
+mod multicursor;
 mod pane;
 mod paths;
 mod rename;
@@ -34,6 +35,7 @@ mod status_bar;
 mod task;
 #[cfg(test)]
 mod testing;
+pub mod workspace_file;
 pub mod zoom;
 
 use std::{ops::Range, path::{Path, PathBuf}, sync::Arc, time::{Duration, Instant}};
@@ -54,7 +56,7 @@ use codeweaver_syntax::Language;
 use codeweaver_text::{Bias, TextOffset};
 use codeweaver_ui::TextMeasurer;
 use codeweaver_workspace::{
-    ChangeDetector, Document, ExternalChange, FileTree, SearchHit, Workspace,
+    ChangeDetector, Document, ExternalChange, FileForest, SearchHit, Workspace,
 };
 use codeweaver_workbench::{close_decision, CloseDecision, Tab, TabBar, TabId};
 use code_action::ActionPopup;
@@ -232,7 +234,16 @@ pub struct NativeApplication {
     /// asked of them, not remembered apart.
     groups: Groups,
     /// The files of the workspace, as a tree.
-    tree: Option<FileTree>,
+    ///
+    /// A project of one folder has one tree; a workspace that names several
+    /// folders has one tree for each of them.
+    tree: Option<FileForest>,
+    /// The workspace that is open, when there is one.
+    ///
+    /// A workspace is a file that names the folders of a project. While one is
+    /// open, the file tree is its tree and not the folder of the file that
+    /// happens to be open.
+    open_workspace: Option<workspace_file::Workspace>,
     /// The files that are watched for changes outside the editor.
     detector: ChangeDetector,
     /// The question the window is asking the user, if it is asking one.
@@ -472,8 +483,17 @@ impl NativeApplication {
         let mut server = None;
         let mut detector = ChangeDetector::new();
         let mut tree = None;
+        // A workspace file is not a text file: it is opened as a workspace, and
+        // that happens once the window is there, so that what went wrong can
+        // be said out loud.
+        let mut workspace_file_to_open = None;
 
         match path {
+            Some(path) if workspace_file::is_workspace_file(&path) => {
+                let tab = tabs.open_scratch("untitled");
+                panes.push(EditorPane::scratch(tab, None));
+                workspace_file_to_open = Some(path);
+            }
             Some(path) => {
                 let opened = workspace
                     .open(&path)
@@ -505,7 +525,7 @@ impl NativeApplication {
                     detector.watch(document.path(), document.fingerprint());
                 }
                 // The tree of files shows the folder the open file is in.
-                tree = path.parent().map(|root| FileTree::new(root.to_path_buf()));
+                tree = path.parent().map(|root| FileForest::single(root.to_path_buf()));
                 panes.push(pane);
             }
             None => {
@@ -609,6 +629,7 @@ impl NativeApplication {
             panes,
             groups,
             tree,
+            open_workspace: None,
             detector,
             prompt: None,
             settings: None,
@@ -645,6 +666,11 @@ impl NativeApplication {
         application.refresh_crumbs_of(0);
         // The text is drawn at the size the person chose.
         application.apply_the_zoom();
+        // A workspace that was named on the command line is opened now: the
+        // window is there, so what went wrong can be said out loud.
+        if let Some(path) = workspace_file_to_open {
+            application.open_the_workspace(&path);
+        }
 
         // What happened while the editor started is in the log too: a run
         // that failed to start is the run one wants to read about most.
@@ -786,6 +812,10 @@ impl NativeApplication {
     /// A file that is already open is not opened twice: the tab that is
     /// already there comes to the front instead.
     fn open_file(&mut self, path: &Path) -> bool {
+        // A workspace file is not a text file: it opens a workspace.
+        if workspace_file::is_workspace_file(path) {
+            return self.open_the_workspace(path);
+        }
         let before = self.tabs.len();
         let tab = self.tabs.open(path.to_path_buf(), shell::title_of(path));
         let index = self.tabs
@@ -891,6 +921,108 @@ impl NativeApplication {
         // The file that is opened is drawn at the size the window has.
         self.apply_the_zoom();
         self.status = Some(format!("窗口分成了 {} 栏", self.groups.len()));
+    }
+
+    /// Ends the box of text, if there is one.
+    ///
+    /// The box is over when the keys that made it are let go: what is left is
+    /// a plain selection on every line of the box.
+    fn end_the_column_selection(&mut self) {
+        self.panes[front_tab(&self.groups)].column = None;
+    }
+
+    /// Cancels the selection: one caret is left.
+    ///
+    /// The escape key does that, and the box of text goes with it.
+    fn cancel_the_selection(&mut self) {
+        let pane = &mut self.panes[front_tab(&self.groups)];
+        pane.editor.collapse_to_primary();
+        pane.column = None;
+    }
+
+    /// Opens a box of text, or moves the one that is open.
+    ///
+    /// A box is the same columns of several lines: the corner that moves says
+    /// how far the box reaches. The box belongs to the file that is on screen,
+    /// so it is where it was when the file is left and come back to.
+    fn column_select(&mut self, direction: multicursor::Direction) -> bool {
+        let tab = front_tab(&self.groups);
+        let pane = &mut self.panes[tab];
+        let caret = pane.editor.caret().0;
+        // The box opens at the caret, or the box that is open moves one step
+        // further.
+        let mut box_ = match pane.column {
+            Some(box_) => box_,
+            None => multicursor::ColumnSelection::of(pane.editor.buffer(), caret),
+        };
+        if !box_.move_current(direction, pane.editor.buffer()) {
+            // The edge of the text is the end of the road.
+            return false;
+        }
+        let ranges = multicursor::ranges(pane.editor.buffer(), &box_);
+        pane.editor.set_selection_ranges(&ranges);
+        pane.column = Some(box_);
+        self.status = Some(format!("列选择：{} 行", ranges.len()));
+        true
+    }
+
+    /// Adds a caret on the next place the same word appears.
+    ///
+    /// The first press takes the word under the caret; every press after that
+    /// adds the next place the word appears. The word is the one the rename
+    /// uses: a run of letters, digits and underscores.
+    fn add_the_next_word(&mut self) -> bool {
+        let tab = front_tab(&self.groups);
+        let pane = &mut self.panes[tab];
+        let buffer = pane.editor.buffer();
+        let primary = *pane.editor.selection();
+        let taken: Vec<Range<usize>> = pane
+            .editor
+            .selections()
+            .iter()
+            .map(|selection| {
+                let range = selection.range(buffer);
+                range.start.0..range.end.0
+            })
+            .collect();
+        // The word that is already selected, or the word under the caret.
+        let word = if primary.is_empty(buffer) {
+            rename::word_at_caret(buffer, primary.head(buffer).0)
+        } else {
+            let range = primary.range(buffer);
+            Some((range.start.0, range.end.0))
+        };
+        let Some((start, end)) = word else {
+            self.status = Some("光标处没有词".to_owned());
+            return false;
+        };
+        // Everything that is read from the text is read before the text is
+        // changed: the borrow of the buffer and the change cannot live
+        // together.
+        let text = buffer.slice(TextOffset(start)..TextOffset(end));
+        let empty = primary.is_empty(buffer);
+        let from = primary.range(buffer).end.0;
+        if empty {
+            // The first press only takes the word: the next press is the one
+            // that looks for the next place.
+            pane.editor.select_range(TextOffset(start), TextOffset(end));
+            self.status = Some(format!("选中了 {text}"));
+            return true;
+        }
+        let Some(found) = multicursor::next_occurrence(buffer, &text, from, &taken) else {
+            self.status = Some("没有下一个了".to_owned());
+            return false;
+        };
+        // The new place is selected like the others: editing then reaches all
+        // of them at once.
+        let mut ranges: Vec<Range<TextOffset>> = taken
+            .iter()
+            .map(|range| TextOffset(range.start)..TextOffset(range.end))
+            .collect();
+        ranges.push(TextOffset(found.start)..TextOffset(found.end));
+        pane.editor.set_selection_ranges(&ranges);
+        self.status = Some(format!("又选中了一处 {text}"));
+        true
     }
 
     /// Closes a tab.
@@ -1094,18 +1226,112 @@ impl NativeApplication {
     /// Makes the file tree show the directory of a file.
     ///
     /// The tree follows the file that was opened: a tree of the folder of the
-    /// file in front of the user is the tree they are working in.
+    /// file in front of the user is the tree they are working in. A workspace
+    /// that is open holds the tree instead: the folders it names do not change
+    /// because another file was opened.
     fn show_tree_of(&mut self, path: &Path) {
+        if self.open_workspace.is_some() {
+            return;
+        }
         let Some(root) = path.parent() else {
             return;
         };
         let follows = self
             .tree
             .as_ref()
-            .map(|tree| tree.root() == root)
-            .unwrap_or(false);
+            .and_then(|tree| tree.roots().first().copied())
+            == Some(root);
         if !follows {
-            self.tree = Some(FileTree::new(root.to_path_buf()));
+            self.tree = Some(FileForest::single(root.to_path_buf()));
+        }
+    }
+
+    /// Opens a workspace file.
+    ///
+    /// The file names the folders of the project, and the tree of files
+    /// becomes the tree of those folders. What went wrong is said out loud: a
+    /// workspace that cannot be read is not a project that silently has no
+    /// files in it.
+    fn open_the_workspace(&mut self, path: &Path) -> bool {
+        match workspace_file::Workspace::open(path) {
+            Ok(workspace) => {
+                let roots = workspace
+                    .roots
+                    .iter()
+                    .map(|root| (root.name.clone(), root.path.clone()))
+                    .collect();
+                self.tree = Some(FileForest::many(roots));
+                let missing: Vec<String> = workspace
+                    .missing()
+                    .iter()
+                    .map(|root| root.name.clone())
+                    .collect();
+                let name = workspace.name.clone();
+                let count = workspace.roots.len();
+                self.open_workspace = Some(workspace);
+                let mut said = format!("工作区 {name} 打开了 {count} 个文件夹");
+                if !missing.is_empty() {
+                    said.push_str(&format!("，其中的 {} 不在了", missing.join("、")));
+                }
+                self.status = Some(said);
+                true
+            }
+            Err(error) => {
+                self.status = Some(format!("打不开工作区：{error}"));
+                false
+            }
+        }
+    }
+
+    /// The folder the project is in: the first root of the tree of files, or
+    /// the folder of the file that is open.
+    fn the_root_of_the_project(&self) -> Option<PathBuf> {
+        if let Some(tree) = self.tree.as_ref()
+            && let Some(root) = tree.roots().first()
+        {
+            return Some((*root).to_path_buf());
+        }
+        self.panes
+            .get(front_tab(&self.groups))
+            .and_then(|pane| pane.document.as_ref())
+            .and_then(|document| document.path().parent())
+            .map(Path::to_path_buf)
+    }
+
+    /// Saves the workspace.
+    ///
+    /// A workspace that is open is written back into the file it was read
+    /// from. A project that has no workspace file yet gets one of its own,
+    /// named after the folder and put next to it.
+    fn save_the_workspace(&mut self) {
+        let (path, contents) = match self.open_workspace.clone() {
+            Some(workspace) => (workspace.path.clone(), workspace.contents()),
+            None => {
+                let Some(root) = self.the_root_of_the_project() else {
+                    self.status = Some("还没有工程可以保存：先打开一个文件夹".to_owned());
+                    return;
+                };
+                let Some(name) = root
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                else {
+                    self.status = Some(format!("{} 没有名字，存不成工作区", root.display()));
+                    return;
+                };
+                let path = root.join(format!("{name}{}", workspace_file::SUFFIX));
+                let contents = workspace_file::Contents {
+                    folders: vec![workspace_file::Folder {
+                        path: ".".to_owned(),
+                        name: None,
+                    }],
+                    settings: std::collections::BTreeMap::new(),
+                };
+                (path, contents)
+            }
+        };
+        match workspace_file::write(&path, &contents) {
+            Ok(()) => self.status = Some(format!("工作区写到 {}", path.display())),
+            Err(error) => self.status = Some(format!("工作区写不进去：{error}")),
         }
     }
 
@@ -1561,9 +1787,11 @@ impl NativeApplication {
             return;
         }
         // The folder of the path: the tree of files goes there, and the side
-        // bar shows it.
+        // bar shows it. The workspace that was open let go of the tree: the
+        // tree is that folder now, not the folders of the workspace.
         self.sidebar.show(Activity::Files);
-        self.tree = Some(FileTree::new(crumb.path.clone()));
+        self.tree = Some(FileForest::single(crumb.path.clone()));
+        self.open_workspace = None;
         self.status = Some(format!("文件树现在看的是 {}", crumb.path.display()));
     }
 
@@ -3674,6 +3902,11 @@ impl NativeApplication {
         } else {
             String::new()
         };
+        // A workspace says which one is open: the tree of files is its tree.
+        let workspace = match self.open_workspace.as_ref() {
+            Some(workspace) => format!(" · 工作区 {}", workspace.name),
+            None => String::new(),
+        };
         StatusBar {
             left: self.status_line(),
             middle: format!(
@@ -3685,7 +3918,7 @@ impl NativeApplication {
                 pane.editor.cursor_count(),
             ),
             right: format!(
-                "行 {line}，列 {column} · {}{place}",
+                "行 {line}，列 {column} · {}{place}{workspace}",
                 self.zoom.label()
             ),
         }
@@ -3700,6 +3933,18 @@ impl NativeApplication {
         let start = buffer.line_range(line).start.0;
         let column = buffer.slice(TextOffset(start)..TextOffset(caret)).chars().count();
         (line + 1, column + 1)
+    }
+
+    /// The title of the section of the side bar that is on screen.
+    ///
+    /// The section of the files is the resource manager, unless a workspace is
+    /// open: then the title is the name of the workspace, so that the person
+    /// sees which project the files belong to.
+    fn sidebar_title(&self) -> String {
+        match (self.open_workspace.as_ref(), self.sidebar.section) {
+            (Some(workspace), Activity::Files) => workspace.name.clone(),
+            _ => self.sidebar.section.label().to_owned(),
+        }
     }
 
     /// The rows of the section of the side bar that is on screen.
@@ -5130,10 +5375,26 @@ impl NativeApplication {
                 }
             }
             "workbench.closeTab" => self.request_close(front_tab(&self.groups)),
+            "workspace.save" => self.save_the_workspace(),
             "editor.format" => self.request_format(),
             "editor.rename" => self.open_rename_box(),
             "editor.codeAction" => self.request_code_action(),
             "editor.find" => self.open_find(false),
+            "editor.columnSelectDown" => {
+                self.column_select(multicursor::Direction::Down);
+            }
+            "editor.columnSelectUp" => {
+                self.column_select(multicursor::Direction::Up);
+            }
+            "editor.columnSelectRight" => {
+                self.column_select(multicursor::Direction::Right);
+            }
+            "editor.columnSelectLeft" => {
+                self.column_select(multicursor::Direction::Left);
+            }
+            "editor.addWordCursor" => {
+                self.add_the_next_word();
+            }
             "search.findInFiles" => self.open_search_panel(false),
             "search.replaceInFiles" => self.open_search_panel(true),
             "terminal.toggle" => self.open_terminal(),
@@ -5478,8 +5739,8 @@ impl NativeApplication {
                 return true;
             }
             SearchCommand::Open(hit) => {
-                let root = panel.root().to_path_buf();
-                self.open_search_hit(&hit, &root);
+                let root = panel.root_of(&hit.path).map(Path::to_path_buf);
+                self.open_search_hit(&hit, root.as_deref());
                 return true;
             }
             SearchCommand::ReplaceAll { needle, replacement } => {
@@ -5513,32 +5774,63 @@ impl NativeApplication {
     /// Opens the panel that finds text in the files of the project.
     ///
     /// The files that are searched are the ones of the project the open file
-    /// belongs to: the folder that holds the manifest of the project.
+    /// belongs to: the folder that holds the manifest of the project. A
+    /// workspace that is open names more than one folder, and the search looks
+    /// in all of them.
     ///
     /// With `replacing` the panel has a box for the text that takes the
     /// place of what is found: it replaces as well as it finds.
     fn open_search_panel(&mut self, replacing: bool) {
+        let roots = self.the_roots_to_search();
+        if roots.is_empty() {
+            self.status = Some("没有打开的文件，不知道在哪儿找".to_owned());
+            return;
+        }
+        let needle = self.search_needle.clone();
+        // A workspace that names more than one folder is searched in all of
+        // them, and the person is told so.
+        let where_ = if roots.len() > 1 {
+            format!("在 {} 个文件夹里找：", roots.len())
+        } else {
+            String::new()
+        };
+        self.take_the_keyboard_from_the_terminal();
+        self.search = Some(if replacing {
+            SearchPanel::with_replace(roots, &needle)
+        } else {
+            SearchPanel::new(roots, &needle)
+        });
+        self.status = Some(if replacing {
+            format!("{where_}写要找的文字，回车开始找；Tab 换到替换那一栏")
+        } else {
+            format!("{where_}写要找的文字，回车开始找")
+        });
+    }
+
+    /// The folders the search looks in.
+    ///
+    /// A workspace that is open names the folders of the project, and the
+    /// search looks in every one of them. A project without a workspace has
+    /// one folder: the one the open file belongs to.
+    fn the_roots_to_search(&self) -> Vec<PathBuf> {
+        if let Some(workspace) = self.open_workspace.as_ref() {
+            let roots: Vec<PathBuf> = workspace
+                .roots
+                .iter()
+                .map(|root| root.path.clone())
+                .collect();
+            if !roots.is_empty() {
+                return roots;
+            }
+        }
         let Some(path) = self.panes[front_tab(&self.groups)]
             .document
             .as_ref()
             .map(|document| document.path().to_path_buf())
         else {
-            self.status = Some("没有打开的文件，不知道在哪儿找".to_owned());
-            return;
+            return Vec::new();
         };
-        let root = lsp::workspace_root(&path);
-        let needle = self.search_needle.clone();
-        self.take_the_keyboard_from_the_terminal();
-        self.search = Some(if replacing {
-            SearchPanel::with_replace(root, &needle)
-        } else {
-            SearchPanel::new(root, &needle)
-        });
-        self.status = Some(if replacing {
-            "写要找的文字，回车开始找；Tab 换到替换那一栏".to_owned()
-        } else {
-            "写要找的文字，回车开始找".to_owned()
-        });
+        vec![lsp::workspace_root(&path)]
     }
 
     /// Replaces everything that was found with something else.
@@ -5651,8 +5943,9 @@ impl NativeApplication {
     /// Opens the file of a place the search found, and puts the caret there.
     ///
     /// The caret is on the line that was found: the place is the point of
-    /// the whole search.
-    fn open_search_hit(&mut self, hit: &SearchHit, root: &Path) {
+    /// the whole search. The root is the folder the place is in, when there is
+    /// one: the path that starts at the drive of the machine says less.
+    fn open_search_hit(&mut self, hit: &SearchHit, root: Option<&Path>) {
         if !self.open_file(&hit.path) {
             return;
         }
@@ -5670,12 +5963,15 @@ impl NativeApplication {
         self.keep_caret_visible(scale_factor);
         // The place is said in words that are inside the project: the path
         // that starts at the drive of the machine says less.
-        let place = hit
-            .path
-            .strip_prefix(root)
-            .unwrap_or(&hit.path)
-            .display()
-            .to_string();
+        let place = match root {
+            Some(root) => hit
+                .path
+                .strip_prefix(root)
+                .unwrap_or(&hit.path)
+                .display()
+                .to_string(),
+            None => hit.path.display().to_string(),
+        };
         self.status = Some(format!("打开了 {place} 的第 {} 行", hit.line));
     }
 
@@ -5803,7 +6099,17 @@ impl ApplicationHandler for NativeApplication {
                 }
                 window.request_redraw();
             }
-            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                    self.modifiers = modifiers.state();
+                    // A box of text is over when the keys that made it are let
+                    // go: what is left is a plain selection on every line.
+                    if !(self.modifiers.control_key()
+                        && self.modifiers.shift_key()
+                        && self.modifiers.alt_key())
+                    {
+                        self.end_the_column_selection();
+                    }
+                }
             WindowEvent::CursorMoved { position, .. } => {
                 let scale_factor = window.scale_factor();
                 self.cursor = Some(Point {
@@ -6037,7 +6343,9 @@ impl ApplicationHandler for NativeApplication {
                         Ok(())
                     }
                     Key::Named(NamedKey::Escape) => {
-                        self.panes[front_tab(&self.groups)].editor.collapse_to_primary();
+                        // The escape key cancels the selection and the box of
+                        // text with it: one caret is left.
+                        self.cancel_the_selection();
                         Ok(())
                     }
                     Key::Named(NamedKey::Home) => {
@@ -6153,6 +6461,9 @@ impl ApplicationHandler for NativeApplication {
                 let size = self.window_size(scale_factor);
                 let layout = self.window_layout(size);
                 let sidebar_rows = self.sidebar_rows(layout.sidebar_content());
+                // The title of the side bar is worked out before the renderer
+                // is borrowed, like the rows are.
+                let sidebar_title = self.sidebar_title();
                 let badges = self.badges();
                 // The columns of the window: each of them shows a file of its
                 // own. They are worked out before the renderer is borrowed.
@@ -6174,6 +6485,8 @@ impl ApplicationHandler for NativeApplication {
                         })
                         .collect(),
                 });
+                // The title of the side bar is worked out before the scene is
+                // built: the scene borrows the panes of the window.
                 let scene = build_scene(
                     renderer,
                     layout,
@@ -6185,6 +6498,7 @@ impl ApplicationHandler for NativeApplication {
                         agent_error: self.agent_error.as_deref(),
                         status,
                         sidebar: self.sidebar,
+                        sidebar_title,
                         sidebar_rows: &sidebar_rows,
                         badges,
                         find: self.find.as_ref(),
@@ -6318,6 +6632,11 @@ struct Chrome<'a> {
     status: StatusBar,
     /// The section of the side bar that is on screen.
     sidebar: SideBar,
+    /// The title of that section.
+    ///
+    /// It is the name of the section, unless a workspace is open: then it is
+    /// the name of the workspace.
+    sidebar_title: String,
     /// The rows of that section.
     sidebar_rows: &'a [SideBarRow],
     /// The numbers that are drawn on the activities.
@@ -6755,7 +7074,7 @@ fn build_scene(
             &mut scene,
             viewport,
             layout.sidebar,
-            chrome.sidebar.section.label(),
+            &chrome.sidebar_title,
             chrome.sidebar_rows,
             &mut ui_measurer,
         );
@@ -8009,7 +8328,9 @@ mod tests {
             .tree
             .as_ref()
             .expect("the tree of files is there")
-            .root()
+            .roots()
+            .first()
+            .expect("the tree looks at one folder")
             .to_path_buf();
         assert_eq!(root, folder, "the tree looks at the folder of the path");
         assert!(app.sidebar.is_open(), "the side bar shows the files");
@@ -8389,6 +8710,67 @@ mod tests {
             app.editor().caret().0,
             expected,
             "the caret is on the line that was found"
+        );
+    }
+
+    #[test]
+    fn a_search_in_a_workspace_looks_in_every_root() {
+        let (directory, file) = a_workspace_file("search-in-a-workspace");
+        fs::write(directory.join("first").join("one.txt"), "the needle is here\n").unwrap();
+        fs::write(directory.join("second").join("two.txt"), "the needle is there\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.search_needle = "needle".to_owned();
+        app.open_search_panel(false);
+        let panel = app.search.as_mut().expect("the panel of the search is open");
+        panel.start_search();
+
+        // The answer comes in on the thread of the search.
+        for _ in 0..200 {
+            if app.pump_search() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let panel = app.search.as_ref().expect("the panel is open");
+        let names: Vec<&str> = panel
+            .hits()
+            .iter()
+            .filter_map(|hit| hit.path.file_name())
+            .filter_map(|name| name.to_str())
+            .collect();
+        assert_eq!(names.len(), 2, "both roots are searched, got {names:?}");
+        assert!(names.contains(&"one.txt"), "the first root is searched");
+        assert!(names.contains(&"two.txt"), "the second root is searched");
+    }
+
+    #[test]
+    fn a_search_without_a_workspace_looks_in_the_project_of_the_open_file() {
+        let project = scratch_project("search-without-a-workspace");
+        let file = project.join("notes.txt");
+        fs::write(&file, "the needle is here\n").unwrap();
+        let other = project.join("more");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("two.txt"), "the needle is there\n").unwrap();
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        app.search_needle = "needle".to_owned();
+        app.open_search_panel(false);
+        let panel = app.search.as_mut().expect("the panel of the search is open");
+        panel.start_search();
+        for _ in 0..200 {
+            if app.pump_search() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let panel = app.search.as_ref().expect("the panel is open");
+        assert_eq!(
+            panel.hits().len(),
+            2,
+            "the whole project is searched, not one folder"
         );
     }
 
@@ -9156,7 +9538,7 @@ mod tests {
 
         let app = NativeApplication::new(Some(file)).expect("the application starts");
         let tree = app.tree.as_ref().expect("the tree of files is there");
-        assert_eq!(tree.root(), directory.as_path());
+        assert_eq!(tree.roots(), vec![directory.as_path()]);
     }
 
     #[test]
@@ -9173,6 +9555,176 @@ mod tests {
             names.contains(&"one.txt") && names.contains(&"two.txt"),
             "the tree shows the files of the folder, got {names:?}"
         );
+    }
+
+    /// A workspace file with two folders in it, and the folders themselves.
+    ///
+    /// The folders are called `first` and `second`, and the second one is
+    /// given the name 乙 in the workspace file.
+    fn a_workspace_file(name: &str) -> (PathBuf, PathBuf) {
+        let directory = scratch_dir(name);
+        let first = directory.join("first");
+        let second = directory.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("one.txt"), "one\n").unwrap();
+        fs::write(second.join("two.txt"), "two\n").unwrap();
+        let file = directory.join("project.code-workspace");
+        fs::write(
+            &file,
+            "{ \"folders\": [ { \"path\": \"first\" }, { \"path\": \"second\", \"name\": \"乙\" } ] }",
+        )
+        .unwrap();
+        (directory, file)
+    }
+
+    /// The names of the rows of the tree of files.
+    fn the_names_of_the_tree(app: &NativeApplication) -> Vec<String> {
+        app.tree
+            .as_ref()
+            .expect("the tree of files is there")
+            .nodes()
+            .iter()
+            .map(|node| node.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_workspace_file_that_is_opened_names_the_folders_of_the_project() {
+        let (_, file) = a_workspace_file("workspace-open");
+        let mut app = NativeApplication::new(None).expect("the application starts");
+
+        assert!(app.open_file(&file));
+
+        assert_eq!(
+            the_names_of_the_tree(&app),
+            vec!["first", "one.txt", "乙", "two.txt"]
+        );
+        let said = app.status.clone().expect("the editor says what happened");
+        assert!(said.contains("project"), "got {said}");
+        assert!(said.contains("2 个文件夹"), "got {said}");
+    }
+
+    #[test]
+    fn a_workspace_file_is_not_opened_as_a_text_file() {
+        let (_, file) = a_workspace_file("workspace-not-text");
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        let before = app.tabs.len();
+
+        app.open_file(&file);
+
+        assert_eq!(app.tabs.len(), before, "the workspace is not a tab of text");
+    }
+
+    #[test]
+    fn the_side_bar_says_the_name_of_the_workspace() {
+        let (_, file) = a_workspace_file("workspace-title");
+        let mut app = NativeApplication::new(None).expect("the application starts");
+
+        app.open_file(&file);
+
+        assert_eq!(app.sidebar_title(), "project");
+    }
+
+    #[test]
+    fn the_status_bar_says_which_workspace_is_open() {
+        let (_, file) = a_workspace_file("workspace-status");
+        let mut app = NativeApplication::new(None).expect("the application starts");
+
+        app.open_file(&file);
+
+        let status = app.status_bar_text();
+        assert!(
+            status.right.contains("工作区 project"),
+            "got {}",
+            status.right
+        );
+    }
+
+    #[test]
+    fn a_workspace_that_cannot_be_read_says_why() {
+        let directory = scratch_dir("workspace-broken");
+        let file = directory.join("project.code-workspace");
+        fs::write(&file, "{ not json").unwrap();
+        let mut app = NativeApplication::new(None).expect("the application starts");
+
+        assert!(!app.open_file(&file));
+
+        let said = app.status.clone().expect("the editor says what is wrong");
+        assert!(said.contains("JSON"), "got {said}");
+    }
+
+    #[test]
+    fn a_folder_of_the_workspace_that_is_not_there_is_said_to_be_missing() {
+        let directory = scratch_dir("workspace-missing-folder");
+        let file = directory.join("project.code-workspace");
+        fs::write(&file, "{ \"folders\": [ { \"path\": \"nowhere\" } ] }").unwrap();
+        let mut app = NativeApplication::new(None).expect("the application starts");
+
+        app.open_file(&file);
+
+        let said = app.status.clone().expect("the editor says what happened");
+        assert!(said.contains("nowhere"), "got {said}");
+        assert!(said.contains("不在了"), "got {said}");
+    }
+
+    #[test]
+    fn the_tree_of_a_workspace_does_not_follow_the_file_that_is_opened() {
+        let (directory, file) = a_workspace_file("workspace-tree");
+        let other = directory.join("other.txt");
+        fs::write(&other, "other\n").unwrap();
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.open_file(&file);
+        let before = the_names_of_the_tree(&app);
+
+        app.open_file(&other);
+
+        assert_eq!(the_names_of_the_tree(&app), before);
+    }
+
+    #[test]
+    fn the_workspace_is_written_back_into_its_own_file() {
+        let (_, file) = a_workspace_file("workspace-save");
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.open_file(&file);
+
+        assert!(app.run_named_command("workspace.save"));
+
+        let said = app.status.clone().expect("the editor says what happened");
+        assert!(said.contains("project.code-workspace"), "got {said}");
+        let contents = workspace_file::read(&file).expect("the file is read");
+        assert_eq!(contents.folders.len(), 2);
+        assert_eq!(contents.folders[0].path, "first");
+        assert_eq!(contents.folders[1].name.as_deref(), Some("乙"));
+    }
+
+    #[test]
+    fn a_project_without_a_workspace_gets_one_of_its_own() {
+        let directory = scratch_dir("workspace-create");
+        fs::write(directory.join("one.txt"), "one\n").unwrap();
+        let file = directory.join("one.txt");
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+
+        assert!(app.run_named_command("workspace.save"));
+
+        let written = directory.join(format!("workspace-create{}", workspace_file::SUFFIX));
+        assert!(written.exists(), "the workspace file is there");
+        let contents = workspace_file::read(&written).expect("the file is read");
+        assert_eq!(contents.folders.len(), 1);
+        assert_eq!(contents.folders[0].path, ".");
+    }
+
+    #[test]
+    fn a_workspace_that_is_opened_on_the_command_line_is_the_tree_of_the_window() {
+        let (_, file) = a_workspace_file("workspace-argument");
+
+        let app = NativeApplication::new(Some(file)).expect("the application starts");
+
+        assert_eq!(
+            the_names_of_the_tree(&app),
+            vec!["first", "one.txt", "乙", "two.txt"]
+        );
+        assert_eq!(app.sidebar_title(), "project");
     }
 
     /// An application whose body is laid out, so the highlighter has a range
@@ -10703,5 +11255,134 @@ mod tests {
         app.close_tab_by_id(id);
         assert_eq!(app.groups.len(), 1, "the column went away with its tab");
         assert_eq!(front_tab(&app.groups), 0, "the file that is left is on screen");
+    }
+
+    /// The three keys of the column selection.
+    fn column_keys() -> ModifiersState {
+        ModifiersState::CONTROL | ModifiersState::SHIFT | ModifiersState::ALT
+    }
+
+    #[test]
+    fn the_column_selection_takes_the_same_column_on_two_lines() {
+        let mut app = app_with_body("abcd\nefgh\n");
+        // The caret is in the second column of the first line.
+        app.pane_mut().editor.set_carets(&[TextOffset(1)]);
+        app.modifiers = column_keys();
+        assert!(app.run_the_command_of_the_key(&named(NamedKey::ArrowDown)));
+
+        assert_eq!(app.editor().cursor_count(), 2, "the box covers two lines");
+        let buffer = app.editor().buffer();
+        let ranges: Vec<_> = app
+            .editor()
+            .selections()
+            .iter()
+            .map(|selection| selection.range(buffer))
+            .collect();
+        assert_eq!(ranges[0], TextOffset(1)..TextOffset(1));
+        assert_eq!(ranges[1], TextOffset(6)..TextOffset(6));
+    }
+
+    #[test]
+    fn the_column_selection_grows_with_every_press() {
+        let mut app = app_with_body("abcd\nefgh\nijkl\n");
+        app.pane_mut().editor.set_carets(&[TextOffset(1)]);
+        app.modifiers = column_keys();
+        assert!(app.run_the_command_of_the_key(&named(NamedKey::ArrowDown)));
+        assert!(app.run_the_command_of_the_key(&named(NamedKey::ArrowDown)));
+        assert_eq!(app.editor().cursor_count(), 3, "the box covers three lines");
+
+        // The box gets wider: the same columns on every line.
+        assert!(app.run_the_command_of_the_key(&named(NamedKey::ArrowRight)));
+        let buffer = app.editor().buffer();
+        let ranges: Vec<_> = app
+            .editor()
+            .selections()
+            .iter()
+            .map(|selection| selection.range(buffer))
+            .collect();
+        assert_eq!(ranges[0], TextOffset(1)..TextOffset(2));
+        assert_eq!(ranges[1], TextOffset(6)..TextOffset(7));
+        assert_eq!(ranges[2], TextOffset(11)..TextOffset(12));
+    }
+
+    #[test]
+    fn the_column_selection_needs_the_three_keys() {
+        let mut app = app_with_body("abcd\nefgh\n");
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert!(!app.run_the_command_of_the_key(&named(NamedKey::ArrowDown)));
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::ALT;
+        assert!(!app.run_the_command_of_the_key(&named(NamedKey::ArrowDown)));
+    }
+
+    #[test]
+    fn the_column_selection_is_over_when_the_keys_are_let_go() {
+        let mut app = app_with_body("abcd\nefgh\n");
+        app.modifiers = column_keys();
+        assert!(app.run_the_command_of_the_key(&named(NamedKey::ArrowDown)));
+        assert!(app.pane_mut().column.is_some(), "the box is open");
+
+        // The keys are let go: what is left is a plain selection.
+        app.modifiers = ModifiersState::default();
+        app.end_the_column_selection();
+        assert!(app.pane_mut().column.is_none(), "the box is over");
+        assert_eq!(app.editor().cursor_count(), 2, "the selection is still there");
+    }
+
+    #[test]
+    fn the_escape_key_cancels_the_column_selection() {
+        let mut app = app_with_body("abcd\nefgh\n");
+        app.modifiers = column_keys();
+        assert!(app.run_the_command_of_the_key(&named(NamedKey::ArrowDown)));
+        assert!(app.pane_mut().column.is_some(), "the box is open");
+
+        app.modifiers = ModifiersState::default();
+        app.cancel_the_selection();
+        assert!(app.pane_mut().column.is_none(), "the box is over");
+        assert_eq!(app.editor().cursor_count(), 1, "one caret is left");
+    }
+
+    #[test]
+    fn the_word_cursor_takes_the_next_place_of_the_same_word() {
+        let mut app = app_with_body("one two one");
+        app.pane_mut().editor.set_carets(&[TextOffset(1)]);
+        app.modifiers = ModifiersState::CONTROL;
+
+        // The first press takes the word under the caret.
+        assert!(app.run_the_command_of_the_key(&character("d")));
+        assert_eq!(app.editor().cursor_count(), 1, "the word is selected");
+        assert_eq!(
+            app.editor().selection().range(app.editor().buffer()),
+            TextOffset(0)..TextOffset(3)
+        );
+
+        // The second press adds the next place of that word.
+        assert!(app.run_the_command_of_the_key(&character("d")));
+        assert_eq!(app.editor().cursor_count(), 2, "the next place has a caret too");
+        let buffer = app.editor().buffer();
+        let places: Vec<_> = app
+            .editor()
+            .selections()
+            .iter()
+            .map(|selection| selection.range(buffer))
+            .collect();
+        assert_eq!(places[0], TextOffset(0)..TextOffset(3));
+        assert_eq!(places[1], TextOffset(8)..TextOffset(11));
+    }
+
+    #[test]
+    fn the_word_cursor_says_when_there_is_no_next_one() {
+        let mut app = app_with_body("one two");
+        app.pane_mut().editor.set_carets(&[TextOffset(1)]);
+        app.modifiers = ModifiersState::CONTROL;
+        assert!(app.run_the_command_of_the_key(&character("d")));
+        assert!(app.run_the_command_of_the_key(&character("d")));
+        assert_eq!(app.editor().cursor_count(), 1, "there is only one place");
+        assert!(
+            app.status
+                .as_ref()
+                .expect("the editor says something")
+                .contains("没有下一个"),
+            "the editor has to say that there is no next one"
+        );
     }
 }

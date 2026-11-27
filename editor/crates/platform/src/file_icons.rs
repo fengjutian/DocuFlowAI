@@ -30,6 +30,8 @@ pub enum Kind {
     Text,
     /// A picture.
     Picture,
+    /// The file that names the folders of a project.
+    Workspace,
     /// Something the editor does not know.
     Other,
 }
@@ -52,6 +54,7 @@ impl Kind {
             | "properties" | "lock" => Kind::Setting,
             "md" | "txt" | "log" | "rst" | "adoc" | "csv" => Kind::Text,
             "png" | "jpg" | "jpeg" | "gif" | "bmp" | "svg" | "ico" | "webp" => Kind::Picture,
+            "code-workspace" => Kind::Workspace,
             _ => Kind::Other,
         }
     }
@@ -63,6 +66,7 @@ impl Kind {
             Kind::Setting => "配置",
             Kind::Text => "文本",
             Kind::Picture => "图片",
+            Kind::Workspace => "工作区",
             Kind::Other => "文件",
         }
     }
@@ -78,6 +82,7 @@ pub fn color_of(kind: Kind) -> Color {
         Kind::Setting => Color::rgb(0.95, 0.70, 0.30),
         Kind::Text => Color::rgb(0.44, 0.78, 0.56),
         Kind::Picture => Color::rgb(0.82, 0.50, 0.86),
+        Kind::Workspace => Color::rgb(0.40, 0.78, 0.80),
         Kind::Other => Color::rgb(0.55, 0.59, 0.67),
     }
 }
@@ -114,6 +119,21 @@ pub fn draw(scene: &mut FrameScene, viewport: Rect, rect: Rect, kind: Kind) {
         }
         Kind::Picture => {
             icons::outline(scene, viewport, rect, 1.0, color);
+        }
+        Kind::Workspace => {
+            // A frame with a bar down the middle: a window that shows two
+            // things at once, which is what a workspace is.
+            icons::outline(scene, viewport, rect, 1.0, color);
+            scene.push_quad(
+                Rect::new(
+                    rect.origin.x + rect.size.width / 2.0 - 0.5,
+                    rect.origin.y,
+                    1.0,
+                    rect.size.height,
+                ),
+                color,
+                viewport,
+            );
         }
         Kind::Other => {
             icons::triangle(
@@ -160,12 +180,19 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_file_has_a_mark_of_its_own() {
+        assert_eq!(kind_of("project.code-workspace"), Kind::Workspace);
+        assert_eq!(kind_of("PROJECT.CODE-WORKSPACE"), Kind::Workspace);
+    }
+
+    #[test]
     fn every_kind_has_a_colour_of_its_own() {
         let kinds = [
             Kind::Code,
             Kind::Setting,
             Kind::Text,
             Kind::Picture,
+            Kind::Workspace,
             Kind::Other,
         ];
         for (index, kind) in kinds.iter().enumerate() {
@@ -185,6 +212,7 @@ mod tests {
             Kind::Setting,
             Kind::Text,
             Kind::Picture,
+            Kind::Workspace,
             Kind::Other,
         ] {
             let before = scene.quads.len();
@@ -203,6 +231,7 @@ mod tests {
             Kind::Setting,
             Kind::Text,
             Kind::Picture,
+            Kind::Workspace,
             Kind::Other,
         ] {
             let mut scene = FrameScene::default();
