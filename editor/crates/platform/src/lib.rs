@@ -11049,6 +11049,22 @@ mod tests {
     }
 
     #[test]
+    fn the_git_branch_command_opens_the_branches() {
+        let Some((_, file)) = git_project("git-branch-command") else {
+            return;
+        };
+
+        let mut app = NativeApplication::new(Some(file)).expect("the application starts");
+        // Ctrl+Alt+B is the key of the command that shows the branches.
+        app.modifiers = ModifiersState::CONTROL | ModifiersState::ALT;
+        assert!(app.run_the_command_of_the_key(&character("b")));
+        app.modifiers = ModifiersState::default();
+
+        let panel = app.git.as_ref().expect("the panel is open");
+        assert_eq!(panel.view(), GitView::Branches, "the branches are shown");
+    }
+
+    #[test]
     fn the_git_branch_view_shows_the_branches_and_the_remotes() {
         let Some((_, file)) = git_project_with_a_remote("git-branch-view") else {
             return;

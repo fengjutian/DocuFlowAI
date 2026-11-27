@@ -463,8 +463,10 @@ try {
         $ground = Count-In $branches 0 0 $branches.Width $branches.Height $GROUND_RGB 4
         Check 'the branches are on the screen' ($ground -gt 100000) "$ground pixels of the ground"
 
-        # The branch the program is on is in green, with a mark in front of it.
-        $current = Count-In $branches $listLeft $rowTop $listWidth $rowHeight $CURRENT_RGB 12
+        # The branch the program is on is in green, with a mark in front of
+        # it. The whole list is looked at: the branch that is on is not
+        # always the first one.
+        $current = Count-In $branches $listLeft $rowTop $listWidth ($rowHeight * 6) $CURRENT_RGB 12
         Write-Host "pixels of the branch the program is on: $current"
         Check 'the panel says which branch the program is on' ($current -gt 20) "$current pixels of the branch"
 
@@ -506,7 +508,7 @@ try {
         Write-Host "the branches after the new one: $branches"
         Check 'the name in the box is a branch' ($branches -match 'the-new') "$branches"
 
-        $current = Count-In $made $listLeft $rowTop $listWidth $rowHeight $CURRENT_RGB 12
+        $current = Count-In $made $listLeft $rowTop $listWidth ($rowHeight * 6) $CURRENT_RGB 12
         Write-Host "pixels of the branch the program is on: $current"
         Check 'the program is on the branch that was made' ($current -gt 20) "$current pixels of the branch"
 
@@ -549,7 +551,7 @@ try {
         Write-Host "pixels of the ground of the panel: $ground"
         Check 'the command of the key opens the branches' ($ground -gt 100000) "$ground pixels of the ground"
 
-        $current = Count-In $command $listLeft $rowTop $listWidth $rowHeight $CURRENT_RGB 12
+        $current = Count-In $command $listLeft $rowTop $listWidth ($rowHeight * 6) $CURRENT_RGB 12
         Write-Host "pixels of the branch the program is on: $current"
         Check 'the branches are on the screen' ($current -gt 20) "$current pixels of the branch"
     }

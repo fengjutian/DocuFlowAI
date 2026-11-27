@@ -219,6 +219,7 @@ Git 面板现在只有「改过的文件」与「最近的提交」两块。VS C
     - 远端用 `git remote -v` 读：**fetch 与 push 两行合成一个远端**，两个地址不一样时两个都留着。
   - `branches` / `remotes` / `current_branch`：问 git 要那三样东西。
   - `switch_to` / `create_branch`：`git switch`（旧版 git 退回 `git checkout`）。
+  - **`switch_to_a_remote`**：**远端上的分支不是「切过去」就行的**——`git switch origin/main` 会说「那是个远端的分支」，而 `git checkout origin/main` 更糟：它把仓库丢进 **detached HEAD**（程序在一个谁也不是的地方）。这里的做法是 VS Code 的那个：**建一个跟着它的本地分支**（`origin/main` → 本地的 `main`），再切到那个本地分支；本地已经有了就只是切过去。
   - `fetch` / `pull` / `push`：`run()` 把 **stdin 接成 null**——远端要密码时不会把编辑器挂死，git 会自己说「问不出来」。
   - **`pull(root, remote, branch)`**：**把远端与分支说清楚**。分支还没跟着远端时，光一个 `git pull` 只会说「不知道该合并哪个」；说清楚之后快进就快进、快进不了就**明说**（`--ff-only`：合并会弹自己的窗口，编辑器没有那个窗口）。
   - `GitView`（文件 / 提交 / 分支三个视图）**取代** `showing_commits: bool`。
@@ -233,11 +234,12 @@ Git 面板现在只有「改过的文件」与「最近的提交」两块。VS C
 - **渲染层接线（`Chrome` 多了一个 `git_box`）**：**问 git 的那只盒子原来根本没画**——按 `N` 会「对着空气打字」。现在它跟别的盒子一样浮在面板上（面板打开时**只画地面**，面板的字不会盖在盒子上）。
 - 窗口脚本 **`editor/tools/git-branch-check.ps1`**（本轮新写，**只做了静态校验，没有运行**：运行会抢桌面）。
 
-单测（**+17**：git.rs 10 + 应用层 7）：
+单测（**+19**：git.rs 11 + 应用层 8）：
 
 - git.rs **4 条纯解析**（不要 git）：分支读对了、git 说的话里没有分支时就是没有、远端读对了、远端没有自己的地址时用读回来的那个。
 - git.rs **6 条真 git**（要 git，**在工作区之外跑**）：分支读得出来、切得过去、建得出来、远端读得出来、推得出去、**远端有的能取回来**。
-- 应用层 **7 条**：分支视图看得见分支与远端、`B` 能回到改过的文件、**状态栏写着当前分支**、面板里能建分支、面板里能切分支、**推送先要确认**、**没有远端时明说**。这 7 条的名字里都有 `git`，所以 `tools/git-unit-check.ps1` 的过滤（名字里有 `git`）**也覆盖得到**。
+- git.rs **1 条远端分支**（要 git）：**远端上的分支是「建一个跟着它的本地分支」再切过去**——不是 detached HEAD。
+- 应用层 **8 条**：分支视图看得见分支与远端、`B` 能回到改过的文件、**状态栏写着当前分支**、面板里能建分支、面板里能切分支、**推送先要确认**、**没有远端时明说**、**`Ctrl+Alt+B` 直接开分支视图**。这 8 条的名字里都有 `git`，所以 `tools/git-unit-check.ps1` 的过滤（名字里有 `git`）**也覆盖得到**。
 
 已知边界（本版本内不做，写在 §7 结转里）：**没有 `launch.json` 那样的 git 配置**（分支名、远端名都是命令行给的）；**没有图形化的冲突解决**；**不能删分支、不能删远端**；**合并与变基不做**；**拉取与推送不认凭据的交互**（要输密码的远端不行）。
 
@@ -360,19 +362,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\
 
 | 检查 | 命令 | 结果 |
 |---|---|---|
-| 编辑器全量单元测试 | `cargo test --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --message-format=short` | **824 项全过，0 失败**（本轮 +17：git.rs 10（4 条纯解析 + 6 条真 git）+ 应用层 7） |
+| 编辑器全量单元测试 | `cargo test --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --message-format=short` | **826 项全过，0 失败**（本轮 +19：git.rs 11（4 条纯解析 + 7 条真 git）+ 应用层 8） |
 | 编辑器静态检查 | `cargo clippy --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace --all-targets` | **0 告警**，exit 0 |
 | 编辑器构建 | `cargo build --manifest-path D:\github\DocuFlowAI\editor\Cargo.toml --workspace` | **成功**，版本仍是 `0.9.0` |
-| git 模块单元检查（工作区之外跑） | `powershell -NoProfile -ExecutionPolicy Bypass -File editor\tools\git-unit-check.ps1` | **29 项全过，0 失败**（上一轮 12 项 + 本轮 17 项：git.rs 10 + 应用层 7） |
+| git 模块单元检查（工作区之外跑） | `powershell -NoProfile -ExecutionPolicy Bypass -File editor\tools\git-unit-check.ps1` | **31 项全过，0 失败**（上一轮 12 项 + 本轮 19 项：git.rs 11 + 应用层 8） |
 | 运行时测试 | `cd codeweaver-hermes-lab; npm test` | **689 项，688 过 / 1 跳过 / 0 失败**，exit 0 |
 | 控制台构建 | `cd codeweaver-workspace; npm run build` | **成功**（`tsc && vite build`） |
 | 窗口级验收 | `editor\tools\git-branch-check.ps1`（本轮新写） | **未跑**：脚本会抢桌面。本轮只做了静态解析校验：**0 解析错误、无 BOM、无非 ASCII 字节** |
 
-本轮修掉的三个真问题：
+本轮修掉的四个真问题：
 
 - **命令表的键位不能空**。命令表里每条命令都必须有键（`every_command_of_the_editor_has_a_key`），而且**不能有两个命令抢同一个键**。新加的四条命令第一版键位写的是空字符串，`command(...)` 直接 panic——**一整片应用层测试跟着变红**（命令表是在构造应用时就建的）。最后定在 `Ctrl+Alt+B/F/U/P`：**与面板里那四个字母一一对应**，也不撞任何已有的键。
 - **`git pull` 不会自己知道该合并哪个**。分支还没跟着远端时，`git pull --ff-only` 只会说「不知道该合并哪个」——**这句话在编辑器里等于没做事**。改成**把远端与分支说清楚**（`git pull --ff-only <远端> <分支>`）之后，快进就快进、快进不了就明说。
 - **问 git 的那只盒子根本没画**。`GitBox`（新分支的名字、推送的确认）**处理了按键，却没有被画出来**——按 `N` 会「对着空气打字」。渲染层（`Chrome`）多了一个 `git_box`，盒子现在跟别的盒子一样浮在面板上。
+- **远端上的分支不能直接切**。`git switch origin/main` 会说「那是个远端的分支」，而退回的 `git checkout origin/main` 更糟：它把仓库丢进 **detached HEAD**——**程序在一个谁也不是的地方**（状态栏会写「分支 HEAD」）。改成 VS Code 的做法：**建一个跟着它的本地分支**（`origin/main` → `main`）再切过去。
 
 本轮记下来的两件事，是为了下一个人别再踩：
 
@@ -388,12 +391,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\
 
 ### 6.4 待跑的验收
 
-- V0.8.0、V0.7.0 与 V0.6.0 留下来的窗口级脚本都还没跑；本期补三个（`workspace-check.ps1` 5 项、`search-roots-check.ps1` 4 项、`git-branch-check.ps1` 12 项），随统一回归一起跑。
+- V0.8.0、V0.7.0 与 V0.6.0 留下来的窗口级脚本都还没跑；本期补三个（`workspace-check.ps1` 5 项、`search-roots-check.ps1` 4 项、`git-branch-check.ps1` 13 项），随统一回归一起跑。
 - **`workspace-check.ps1` 起两个编辑器**：一个用普通文件打开（标题是「资源管理器」、状态栏没有工作区），一个用工作区文件打开（标题是工作区名、状态栏有「· 工作区 proj」）。两者的**标题那一块**和**状态栏右边那一块**比一比，像素不一样就说明它变了。这么比是因为**没法读屏幕上的字**——只能比像素。
 - 行的位置是**算出来的**：侧边栏从 48 开始，段标题 28 高，一行 22 高，一级缩进 14，记号占 15。所以第一个根在第 0 行（y=28）、它的文件在第 1 行（y=50）、第二个根在第 2 行（y=72）、它的文件在第 3 行（y=94）。点第一个根之后行会往上挪一格，所以「第二个根下面那个文件」的位置会空出来——这就是「点一下能收起」的证据。
 - **`search-roots-check.ps1` 量的是「地方的列」**：搜索面板的框在 (16,16)，「找到几处」那行在 y=66，地方那一列从 y=90 开始，一行 22 高。地方的字色是 `rgb(0.62,0.70,0.86)`——**文字不用 sRGB 换算**（`To-Bytes`，不是 `To-Pixel`）。两个根各有一处时，第一行和第二行**都**该有字；只搜一个根时第二行是空的。
 - **`git-branch-check.ps1` 数的是分支视图里的四种颜色**：列表从 x=16 起，第一行在 y=42，一行 22 高；**当前分支是绿的**（`rgb(0.42,0.78,0.56)`，`●` 在前）、**远端的名字是橙的**（`rgb(0.93,0.74,0.42)`，占前 96 像素）、**远端的地址是蓝的**（`rgb(0.62,0.70,0.86)`，从 x=116 起）、**挑中的那一行背后有一块自己的颜色**（`rgb(0.18,0.30,0.52)`）。**文字不用 sRGB 换算，块要换算**（`To-Bytes` 与 `To-Pixel` 的区别）。那只问 git 的盒子浮在面板上（`rgb(0.10,0.12,0.16)`，在 (244,86) 380×40），面板打开时**只画地面**，盒子的地才算数。
-- 本轮新写的两个脚本只做了**静态**校验（PowerShell 解析 0 错误、无 BOM、无非 ASCII 字节），**没有运行**——运行会抢桌面。
+- 本轮新写的三个脚本只做了**静态**校验（PowerShell 解析 0 错误、无 BOM、无非 ASCII 字节），**没有运行**——运行会抢桌面。
 - **本轮的 `dap-real-check.ps1` 是跑过的**（第三轮）：它**不碰桌面**——不起窗口、不抢焦点、不动指针——所以它跟那些窗口级脚本不是一回事，**本地就能跑**。它跑的是**协议与会话这一层**（进程之间的对话），不是窗口上的东西。真适配器那一层的证据因此是**可追溯的**（`editor\.dev-logs\dap-real-check.{log,json}`）。
 
 ## 7. 本期结转
@@ -412,4 +415,4 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\github\DocuFlowAI\editor\
 - **分支与远端只有「做」没有「改」**：能列、能切、能建、能取回/更新/推送，但**不能删分支、不能删远端、不能改名**；**没有图形化的冲突解决**。
 - **合并与变基不做**：`pull` 只快进（`--ff-only`）——分支走散了时 git **明说**并且**什么都不改**。编辑器没有合并冲突的那扇窗。
 - **远端的凭据不交互**：要输密码的远端（走 HTTPS 且要口令）**推不了**——git 的 stdin 是接成 null 的，它会自己说「问不出来」，编辑器不会挂死，也不会偷偷把密码记下来。
-- **远端分支切不过去**：面板里远端的分支（`origin/main`）是**看的，不是能切的**——要切先得在本地建一个跟着它的分支。
+- **远端上的分支切过去时会多一个本地分支**：挑 `origin/main` 再回车，会建一个跟着它的本地分支 `main` 并切过去（**不是 detached HEAD**）。这是 VS Code 的做法，也是唯一不把仓库丢在「谁也不是的地方」的做法。
