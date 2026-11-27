@@ -125,6 +125,55 @@ impl Workspace {
             settings: self.settings.clone(),
         }
     }
+
+    /// Adds a folder to the workspace.
+    ///
+    /// The path is taken from the folder of the workspace file itself, unless
+    /// it is absolute: a path that is written down in the file means the same
+    /// thing wherever the file is.
+    ///
+    /// A folder that is not on disk is **not added**: a root that is not there
+    /// is a row in the tree that is always empty, and the person has to be
+    /// told that the folder is missing rather than shown an empty row.
+    ///
+    /// A folder that is already in the workspace is not added a second time.
+    pub fn add_root(&mut self, path: &str) -> Result<String, String> {
+        let base = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let path = resolve(base, path.trim());
+        if !path.is_dir() {
+            return Err(format!("{} 不在了", path.display()));
+        }
+        if self.roots.iter().any(|root| root.path == path) {
+            return Err(format!(
+                "{} 已经在工作区里了",
+                root_name(&path)
+            ));
+        }
+        let name = root_name(&path);
+        self.roots.push(Root {
+            name: name.clone(),
+            path,
+            there: true,
+        });
+        Ok(name)
+    }
+
+    /// Takes a folder out of the workspace.
+    ///
+    /// The folder itself is not touched: only the workspace stops naming it.
+    pub fn remove_root(&mut self, path: &Path) -> Result<String, String> {
+        let Some(index) = self.roots.iter().position(|root| root.path == path) else {
+            return Err("这个文件夹不在工作区里".to_owned());
+        };
+        Ok(self.roots.remove(index).name)
+    }
+}
+
+/// The name a folder is shown with: the name of the folder itself.
+fn root_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 impl Contents {
@@ -486,5 +535,86 @@ mod tests {
         let file = directory.join("project.code-workspace");
         let said = Workspace::open(&file).expect_err("the workspace is not opened");
         assert!(said.contains("project.code-workspace"), "got {said}");
+    }
+
+    #[test]
+    fn a_folder_can_be_added_to_the_workspace() {
+        let directory = scratch_dir("workspace-add-root");
+        let folder = directory.join("editor");
+        fs::create_dir_all(&folder).expect("the folder can be created");
+        let file = write_file(
+            &directory,
+            "project.code-workspace",
+            r#"{ "folders": [ { "path": "nowhere" } ] }"#,
+        );
+        let mut workspace = Workspace::open(&file).expect("the workspace is opened");
+
+        // The path is taken from the folder of the workspace file itself.
+        let name = workspace.add_root("editor").expect("the folder is added");
+        assert_eq!(name, "editor");
+        assert_eq!(workspace.roots.len(), 2);
+        assert_eq!(workspace.roots[1].path, folder);
+        assert!(workspace.roots[1].there, "the folder is there");
+
+        // The file is written again with the folder in it.
+        let contents = workspace.contents();
+        assert_eq!(contents.folders.len(), 2);
+        assert_eq!(contents.folders[1].path, "editor");
+    }
+
+    #[test]
+    fn a_folder_that_is_not_there_is_not_added() {
+        let directory = scratch_dir("workspace-add-missing");
+        let file = write_file(
+            &directory,
+            "project.code-workspace",
+            r#"{ "folders": [] }"#,
+        );
+        let mut workspace = Workspace::open(&file).expect("the workspace is opened");
+
+        let said = workspace.add_root("nowhere").expect_err("the folder is not there");
+        assert!(said.contains("不在了"), "got {said}");
+        assert!(workspace.roots.is_empty(), "nothing was added");
+    }
+
+    #[test]
+    fn a_folder_that_is_already_there_is_not_added_again() {
+        let directory = scratch_dir("workspace-add-twice");
+        let folder = directory.join("editor");
+        fs::create_dir_all(&folder).expect("the folder can be created");
+        let file = write_file(
+            &directory,
+            "project.code-workspace",
+            r#"{ "folders": [ { "path": "editor" } ] }"#,
+        );
+        let mut workspace = Workspace::open(&file).expect("the workspace is opened");
+
+        let said = workspace.add_root("editor").expect_err("it is already there");
+        assert!(said.contains("已经"), "got {said}");
+        assert_eq!(workspace.roots.len(), 1);
+    }
+
+    #[test]
+    fn a_folder_can_be_taken_out_of_the_workspace() {
+        let directory = scratch_dir("workspace-remove-root");
+        let folder = directory.join("editor");
+        fs::create_dir_all(&folder).expect("the folder can be created");
+        let file = write_file(
+            &directory,
+            "project.code-workspace",
+            r#"{ "folders": [ { "path": "editor" }, { "path": "console" } ] }"#,
+        );
+        let mut workspace = Workspace::open(&file).expect("the workspace is opened");
+
+        let name = workspace.remove_root(&folder).expect("the folder is taken out");
+        assert_eq!(name, "editor");
+        assert_eq!(workspace.roots.len(), 1);
+        assert_eq!(workspace.contents().folders.len(), 1);
+
+        // A folder that is not in the workspace cannot be taken out.
+        let said = workspace
+            .remove_root(&folder)
+            .expect_err("it is not in the workspace");
+        assert!(said.contains("不在"), "got {said}");
     }
 }

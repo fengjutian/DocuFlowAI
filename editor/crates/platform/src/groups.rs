@@ -121,6 +121,46 @@ impl Groups {
         }
     }
 
+    /// The columns of a window that is put back the way it was.
+    ///
+    /// The columns come as the tabs they show, in the order of the tab strip,
+    /// and the one in front of each. Two rules make a shape that a window can
+    /// actually show:
+    ///
+    /// * a column that shows nothing is not a column — it is dropped;
+    /// * a tab is in one column at a time — a place that is named twice stays
+    ///   in the first column that names it.
+    ///
+    /// The front of a column and the active column stay inside what is there:
+    /// a file that is gone must not leave the window pointing at a column that
+    /// is not.
+    pub fn from_columns(columns: &[(Vec<usize>, usize)], active: usize) -> Self {
+        let mut groups = Groups::new();
+        for (tabs, front) in columns {
+            let mut group = Group::default();
+            for tab in tabs {
+                if groups.columns.iter().any(|column| column.holds(*tab)) {
+                    continue;
+                }
+                if group.holds(*tab) {
+                    continue;
+                }
+                group.push(*tab);
+            }
+            if group.is_empty() {
+                continue;
+            }
+            // A front that is past the column is nowhere: the first tab is
+            // in front instead, which is what a window with no front shows.
+            group.front = if *front < group.tabs.len() { *front } else { 0 };
+            groups.columns.push(group);
+        }
+        if !groups.columns.is_empty() {
+            groups.active = active.min(groups.columns.len() - 1);
+        }
+        groups
+    }
+
     /// The number of columns.
     pub fn len(&self) -> usize {
         self.columns.len()
@@ -373,5 +413,38 @@ mod tests {
         // The tab that was the third one moved one place forward in the tab
         // bar of the window, because the second one closed.
         assert_eq!(groups.front(), Some(1));
+    }
+
+    #[test]
+    fn a_window_that_is_put_back_keeps_its_columns_and_its_fronts() {
+        // Two columns: the first shows the first tab, the second shows the
+        // second one and has it in front.
+        let groups = Groups::from_columns(&[(vec![0], 0), (vec![1, 2], 1)], 1);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.tabs_of(0), &[0]);
+        assert_eq!(groups.tabs_of(1), &[1, 2]);
+        assert_eq!(groups.front_of(1), Some(2));
+        assert_eq!(groups.active(), 1);
+    }
+
+    #[test]
+    fn a_column_that_shows_nothing_is_not_put_back() {
+        let groups = Groups::from_columns(&[(vec![], 0), (vec![0], 0)], 1);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups.active(), 0, "the active column moved with the rest");
+    }
+
+    #[test]
+    fn a_tab_that_is_named_twice_stays_in_the_first_column() {
+        let groups = Groups::from_columns(&[(vec![0, 1], 0), (vec![1], 0)], 0);
+        assert_eq!(groups.tabs_of(0), &[0, 1]);
+        assert_eq!(groups.tabs_of(1), &[] as &[usize]);
+        assert_eq!(groups.len(), 1);
+    }
+
+    #[test]
+    fn a_front_that_is_past_its_column_is_brought_back() {
+        let groups = Groups::from_columns(&[(vec![0, 1], 9)], 0);
+        assert_eq!(groups.front(), Some(0));
     }
 }

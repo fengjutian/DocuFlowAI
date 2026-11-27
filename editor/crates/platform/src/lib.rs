@@ -28,6 +28,7 @@ mod pane;
 mod paths;
 mod rename;
 mod search;
+mod session;
 mod settings;
 mod shell;
 mod sidebar;
@@ -80,6 +81,7 @@ use layout::{ColumnLayout, WindowLayout, SEPARATOR};
 use pane::EditorPane;
 use rename::RenameBox;
 use search::{SearchCommand, SearchPanel};
+use session::Session;
 use settings::{KeyRow, Kind as SettingKind, Settings};
 use sidebar::{Action as SideBarAction, Row as SideBarRow};
 use status_bar::StatusBar;
@@ -368,6 +370,12 @@ pub struct NativeApplication {
     /// point it somewhere else: a test that changes the size must not write
     /// into the settings of the person who runs the tests.
     zoom_path: Option<PathBuf>,
+    /// Where the shape of the window is remembered.
+    ///
+    /// It is `None` until the entry point of the editor says otherwise: a
+    /// test that opens an empty window must not read or write the session of
+    /// the person who runs the tests.
+    session_path: Option<PathBuf>,
     /// Whether the keyboard is on the activity bar.
     ///
     /// The keyboard is on one thing at a time: the terminal has it, the find
@@ -690,6 +698,7 @@ impl NativeApplication {
             user_zoom: zoom,
             settings_in_force: workspace_settings::Resolved::default(),
             zoom_path,
+            session_path: None,
             activity_focus: false,
         };
 
@@ -902,6 +911,7 @@ impl NativeApplication {
         } else {
             self.current_branch = None;
         }
+        self.save_session();
         true
     }
 
@@ -935,7 +945,10 @@ impl NativeApplication {
             return;
         }
         let column = self.groups.column_of(index);
-        if column == Some(self.groups.active()) && self.groups.front() == Some(index) {
+        if column == Some(self.groups.active())
+            && self.groups.front() == Some(index)
+            && self.tabs.active_index() == Some(index)
+        {
             return;
         }
         // The tab belongs to a column: it comes to the front there, and that
@@ -948,6 +961,7 @@ impl NativeApplication {
         // The change waiting for the user is the one about the file that is
         // now in front.
         self.note_new_diff();
+        self.save_session();
     }
 
     /// Opens a column to the right of the active one.
@@ -966,6 +980,223 @@ impl NativeApplication {
         // The file that is opened is drawn at the size the window has.
         self.apply_the_zoom();
         self.status = Some(format!("窗口分成了 {} 栏", self.groups.len()));
+        self.save_session();
+    }
+
+    /// Where the shape of the window is remembered.
+    ///
+    /// The entry point of the editor sets this; a test leaves it alone, and
+    /// then nothing is read and nothing is written.
+    pub fn set_session_path(&mut self, path: PathBuf) {
+        self.session_path = Some(path);
+    }
+
+    /// The shape of the window right now.
+    ///
+    /// A tab that shows a buffer with no name cannot be put back — there is
+    /// no file to open — so it is left out, and the places in the columns are
+    /// renumbered around it.
+    pub fn session(&self) -> Session {
+        let mut places: Vec<Option<usize>> = vec![None; self.panes.len()];
+        let mut files = Vec::new();
+        for (index, pane) in self.panes.iter().enumerate() {
+            if let Some(document) = pane.document.as_ref() {
+                places[index] = Some(files.len());
+                files.push(document.path().to_string_lossy().to_string());
+            }
+        }
+        let mut columns = Vec::new();
+        let mut active = 0;
+        for column in 0..self.groups.len() {
+            let tabs: Vec<usize> = self
+                .groups
+                .tabs_of(column)
+                .iter()
+                .filter_map(|tab| places.get(*tab).copied().flatten())
+                .collect();
+            if tabs.is_empty() {
+                continue;
+            }
+            let front = self
+                .groups
+                .front_of(column)
+                .and_then(|tab| places.get(tab).copied().flatten())
+                .and_then(|file| tabs.iter().position(|tab| *tab == file))
+                .unwrap_or(0);
+            if column == self.groups.active() {
+                active = columns.len();
+            }
+            columns.push(session::Column { tabs, front });
+        }
+        let workspace = self
+            .open_workspace
+            .as_ref()
+            .map(|workspace| workspace.path.to_string_lossy().to_string());
+        Session {
+            workspace,
+            files,
+            columns,
+            active,
+        }
+    }
+
+    /// Puts the window back the way a session says.
+    ///
+    /// The files that are there are opened in the order of the tab strip; the
+    /// ones that are gone are skipped and named. Returns what could not be
+    /// put back.
+    pub fn resume(&mut self, session: &Session) -> Vec<String> {
+        let mut notes = Vec::new();
+        if let Some(path) = &session.workspace {
+            let path = PathBuf::from(path);
+            if path.is_file() {
+                self.open_the_workspace(&path);
+            } else {
+                notes.push(format!("会话里的工作区 {} 不在了", path.display()));
+            }
+        }
+        // The editor starts on an empty tab. A window that is being put back
+        // does not need it: the files take its place.
+        self.drop_the_empty_start();
+        let mut places: Vec<Option<usize>> = Vec::new();
+        for file in &session.files {
+            let path = PathBuf::from(file);
+            if !path.is_file() {
+                notes.push(format!("会话里的 {} 不在了", path.display()));
+                places.push(None);
+                continue;
+            }
+            let before = self.tabs.len();
+            self.open_file(&path);
+            if self.tabs.len() == before {
+                // The file was already open before the session asked for it:
+                // its place is the tab that is already there.
+                let place = self
+                    .tabs
+                    .tabs()
+                    .iter()
+                    .position(|tab| tab.path.as_deref() == Some(path.as_path()));
+                places.push(place);
+            } else {
+                places.push(Some(self.tabs.len() - 1));
+            }
+        }
+        if !session.columns.is_empty() {
+            let mut columns = Vec::new();
+            for column in &session.columns {
+                let mut tabs = Vec::new();
+                let mut front = 0;
+                for (place, file) in column.tabs.iter().enumerate() {
+                    let Some(Some(tab)) = places.get(*file).copied() else {
+                        continue;
+                    };
+                    if place == column.front {
+                        front = tabs.len();
+                    }
+                    tabs.push(tab);
+                }
+                if tabs.is_empty() {
+                    continue;
+                }
+                columns.push((tabs, front));
+            }
+            if !columns.is_empty() {
+                self.groups = Groups::from_columns(&columns, session.active);
+            }
+        }
+        if self.panes.is_empty() {
+            // A session with a workspace and no file still needs something to
+            // type into.
+            let tab = self.tabs.open_scratch("untitled");
+            self.panes.push(EditorPane::scratch(tab, None));
+            self.groups = Groups::new();
+            self.groups.add(0);
+        } else if let Some(front) = self.groups.front() {
+            self.activate_tab(front);
+        }
+        self.save_session();
+        notes
+    }
+
+    /// Starts remembering the shape of the window in the file of the user.
+    ///
+    /// The entry point calls this when the command line named a file: the
+    /// window is not the one of the last run, but it is the window the next
+    /// run (which names no file) wants back.
+    pub fn record_the_session(&mut self) {
+        let Some(path) = session::user_path() else {
+            return;
+        };
+        self.set_session_path(path);
+        self.save_session();
+    }
+
+    /// Puts back the window of the last run, when there is one.
+    ///
+    /// This is what the entry point calls when the command line named no
+    /// file: the shape of the last window is read from the folder the
+    /// settings live in, and put back. Returns whether anything was put back.
+    pub fn resume_the_session(&mut self) -> bool {
+        let Some(path) = session::user_path() else {
+            return false;
+        };
+        self.set_session_path(path.clone());
+        let loaded = session::read(&path);
+        let mut said: Vec<String> = loaded.errors.clone();
+        if loaded.session.is_empty() {
+            // A file that is not there is the first run; one that is there
+            // and empty is a session where nothing was open.
+            if path.is_file() {
+                said.push("上次没有开着的文件".to_owned());
+            }
+            if !said.is_empty() {
+                self.status = Some(said.join("；"));
+            }
+            return false;
+        }
+        let notes = self.resume(&loaded.session);
+        let files = loaded.session.files.len();
+        let columns = loaded.session.columns.len().max(1);
+        let mut message = format!("恢复了 {files} 个文件（{columns} 栏）");
+        for line in &notes {
+            message.push_str(&format!("；{line}"));
+        }
+        for error in &loaded.errors {
+            message.push_str(&format!("；{error}"));
+        }
+        self.status = Some(message);
+        true
+    }
+
+    /// Drops the empty tab the editor starts on, when it is the only one.
+    ///
+    /// A window that is being put back does not need the tab it was born
+    /// with: it would sit in front of every file of the session.
+    fn drop_the_empty_start(&mut self) {
+        if self.tabs.len() != 1 || self.panes.len() != 1 {
+            return;
+        }
+        if self.panes[0].document.is_some() || self.panes[0].is_dirty() {
+            return;
+        }
+        let tab = self.tabs.tabs()[0].id;
+        self.panes.clear();
+        self.tabs.close(tab);
+        self.groups = Groups::new();
+    }
+
+    /// Writes the shape of the window into the session file.
+    ///
+    /// It is called whenever the shape changes. A window that is remembered
+    /// only on a clean exit forgets everything a crash took with it.
+    fn save_session(&mut self) {
+        let Some(path) = self.session_path.clone() else {
+            return;
+        };
+        let session = self.session();
+        if let Err(said) = session::write(&path, &session) {
+            self.status = Some(format!("窗口的样子没有记住：{said}"));
+        }
     }
 
     /// Ends the box of text, if there is one.
@@ -1092,12 +1323,14 @@ impl NativeApplication {
             self.panes.push(EditorPane::scratch(tab, None));
             self.groups = Groups::new();
             self.groups.add(0);
+            self.save_session();
             return;
         }
         // The tab in front of the active column is the one that is on screen.
         if let Some(front) = self.groups.front() {
             self.tabs.activate_index(front);
         }
+        self.save_session();
     }
 
     /// Closes the tab with the given id, wherever it is.
@@ -1331,6 +1564,7 @@ impl NativeApplication {
                     said.push_str(&format!("，{key} 这个设置编辑器还不认"));
                 }
                 self.status = Some(said);
+                self.save_session();
                 true
             }
             Err(error) => {
@@ -12075,5 +12309,176 @@ mod tests {
                 .contains("没有下一个"),
             "the editor has to say that there is no next one"
         );
+    }
+
+    #[test]
+    fn resuming_a_session_opens_its_files_in_its_columns() {
+        let directory = scratch_dir("session-resume");
+        let first = directory.join("first.txt");
+        let second = directory.join("second.txt");
+        fs::write(&first, "one\n").expect("the file is written");
+        fs::write(&second, "two\n").expect("the file is written");
+
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.set_session_path(directory.join(session::FILE_NAME));
+        let session = Session {
+            workspace: None,
+            files: vec![
+                first.to_string_lossy().to_string(),
+                second.to_string_lossy().to_string(),
+            ],
+            columns: vec![session::Column {
+                tabs: vec![0, 1],
+                front: 0,
+            }],
+            active: 0,
+        };
+        let notes = app.resume(&session);
+        assert!(notes.is_empty(), "got {notes:?}");
+        assert_eq!(app.tabs.len(), 2, "the empty start is gone");
+        assert_eq!(app.groups.len(), 1);
+        assert_eq!(
+            app.tabs.active_index(),
+            Some(0),
+            "the tab that was in front is active"
+        );
+        assert_eq!(
+            app.document().map(|document| document.path().to_path_buf()),
+            Some(first.clone()),
+            "the file that was in front is in front again"
+        );
+    }
+
+    #[test]
+    fn resuming_keeps_the_columns_of_the_window() {
+        let directory = scratch_dir("session-columns");
+        let first = directory.join("first.txt");
+        let second = directory.join("second.txt");
+        fs::write(&first, "one\n").expect("the file is written");
+        fs::write(&second, "two\n").expect("the file is written");
+
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        let session = Session {
+            workspace: None,
+            files: vec![
+                first.to_string_lossy().to_string(),
+                second.to_string_lossy().to_string(),
+            ],
+            columns: vec![
+                session::Column {
+                    tabs: vec![0],
+                    front: 0,
+                },
+                session::Column {
+                    tabs: vec![1],
+                    front: 0,
+                },
+            ],
+            active: 1,
+        };
+        let notes = app.resume(&session);
+        assert!(notes.is_empty(), "got {notes:?}");
+        assert_eq!(app.groups.len(), 2, "the window is split again");
+        assert_eq!(app.groups.active(), 1);
+        assert_eq!(
+            app.document().map(|document| document.path().to_path_buf()),
+            Some(second),
+            "the active column is the one that had the keyboard"
+        );
+    }
+
+    #[test]
+    fn the_session_of_the_window_says_what_is_open() {
+        let directory = scratch_dir("session-shape");
+        let first = directory.join("first.txt");
+        let second = directory.join("second.txt");
+        fs::write(&first, "one\n").expect("the file is written");
+        fs::write(&second, "two\n").expect("the file is written");
+
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.open_file(&first);
+        app.open_file(&second);
+
+        let session = app.session();
+        assert_eq!(session.files.len(), 2);
+        assert_eq!(session.columns.len(), 1);
+        assert_eq!(session.columns[0].tabs, vec![0, 1]);
+        assert_eq!(session.columns[0].front, 1, "the second file is in front");
+        assert_eq!(session.active, 0);
+    }
+
+    #[test]
+    fn a_file_of_the_session_that_is_gone_is_left_out_and_named() {
+        let directory = scratch_dir("session-gone");
+        let there = directory.join("there.txt");
+        fs::write(&there, "here\n").expect("the file is written");
+        let missing = directory.join("gone.txt");
+
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        let session = Session {
+            workspace: None,
+            files: vec![
+                missing.to_string_lossy().to_string(),
+                there.to_string_lossy().to_string(),
+            ],
+            columns: vec![session::Column {
+                tabs: vec![0, 1],
+                front: 0,
+            }],
+            active: 0,
+        };
+        let notes = app.resume(&session);
+        assert_eq!(notes.len(), 1, "got {notes:?}");
+        assert!(notes[0].contains("gone.txt"), "got {notes:?}");
+        assert_eq!(app.tabs.len(), 1, "the file that is there is open");
+    }
+
+    #[test]
+    fn opening_a_file_writes_the_session_when_there_is_a_place_for_it() {
+        let directory = scratch_dir("session-write");
+        let file = directory.join("notes.txt");
+        fs::write(&file, "one\n").expect("the file is written");
+        let path = directory.join(session::FILE_NAME);
+
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.set_session_path(path.clone());
+        app.open_file(&file);
+
+        let loaded = session::read(&path);
+        assert!(loaded.errors.is_empty(), "got {:?}", loaded.errors);
+        assert_eq!(
+            loaded.session.files,
+            vec![file.to_string_lossy().to_string()]
+        );
+    }
+
+    #[test]
+    fn a_window_with_no_place_for_a_session_writes_nothing() {
+        let directory = scratch_dir("session-nowhere");
+        let file = directory.join("notes.txt");
+        fs::write(&file, "one\n").expect("the file is written");
+
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.open_file(&file);
+        assert!(
+            !directory.join(session::FILE_NAME).exists(),
+            "nothing was written"
+        );
+    }
+
+    #[test]
+    fn a_session_that_cannot_be_written_is_said_out_loud() {
+        let directory = scratch_dir("session-unwritable");
+        let file = directory.join("notes.txt");
+        fs::write(&file, "one\n").expect("the file is written");
+        // The place of the session is a folder: writing there cannot work.
+        let path = directory.join("a-folder");
+        fs::create_dir_all(&path).expect("the folder is made");
+
+        let mut app = NativeApplication::new(None).expect("the application starts");
+        app.set_session_path(path);
+        app.open_file(&file);
+        let said = app.status.clone().unwrap_or_default();
+        assert!(said.contains("没有记住"), "got {said}");
     }
 }

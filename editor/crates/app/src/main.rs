@@ -37,6 +37,16 @@ fn main() -> Result<()> {
     let options = Options::parse(std::env::args_os().skip(1));
 
     let mut application = build_application(&options)?;
+    // A window that is opened without a file is the window of the last run:
+    // the files, the columns and the workspace are put back the way they
+    // were. A file on the command line is the person saying what to open, so
+    // the session stays out of it — but the window it makes is the one the
+    // next run gets back.
+    if options.path.is_none() {
+        application.resume_the_session();
+    } else {
+        application.record_the_session();
+    }
     if let Some(program) = options.adapter.clone() {
         application.set_debug_adapter(AdapterConfig::new(program, options.adapter_args.clone()));
     }
