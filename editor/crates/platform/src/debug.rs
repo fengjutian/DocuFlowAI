@@ -9,11 +9,18 @@
 //! frame, the way the output of the agent and of a task is read.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use codeweaver_dap::protocol::{StackFrame, Variable};
-use codeweaver_dap::{AdapterConfig, Client, DapError};
+use codeweaver_dap::handshake::{Handshake, Step};
+use codeweaver_dap::protocol::{LaunchRequest, StackFrame, Variable};
+use codeweaver_dap::{AdapterConfig, Client, DapError, DapEvent};
 use codeweaver_text::{Anchor, Buffer};
+
+/// A breakpoint as the adapter is told about it.
+///
+/// The line the program is to stop at, and what has to be true for it to
+/// stop there.
+pub use codeweaver_dap::protocol::BreakpointRequest;
 
 /// The height of the panel of the debugger.
 pub const DEBUG_PANEL_HEIGHT: f32 = 220.0;
@@ -297,13 +304,6 @@ impl Breakpoints {
     }
 }
 
-/// A breakpoint as the adapter is told about it.
-///
-/// The line the program is to stop at, and what has to be true for it to
-/// stop there. A breakpoint without a condition stops the program every time
-/// it comes to that line.
-pub type BreakpointRequest = (u32, Option<String>);
-
 /// A breakpoint as the window draws it.
 ///
 /// The window draws the breakpoints of the file that is on screen in its
@@ -321,6 +321,13 @@ pub struct BreakpointMark {
 pub struct Debugger {
     /// The connection to the adapter.
     pub client: Client,
+    /// The order of the requests of the session.
+    ///
+    /// The order is the business of the handshake; the session only says
+    /// when each step is due.
+    handshake: Handshake,
+    /// What the adapter is told when the program starts.
+    launch: LaunchRequest,
     /// What the session is doing.
     pub state: DebugState,
     /// The thread the program is on.
@@ -358,13 +365,26 @@ pub struct Debugger {
 impl Debugger {
     /// Starts the adapter and says hello to it.
     ///
-    /// The adapter says that it is ready when it is; the breakpoints go
-    /// after that, and then the program starts.
-    pub fn start(config: &AdapterConfig, program: &str) -> Result<Self, DapError> {
+    /// The program starts once the adapter has answered the hello, and the
+    /// breakpoints go once the adapter has said that it is ready for them.
+    /// That is the order of VS Code, and the one debugpy wants.
+    pub fn start(config: &AdapterConfig, program: &Path) -> Result<Self, DapError> {
         let client = Client::start(config)?;
-        client.initialize()?;
+        // The hello is the first step of the handshake: the order of the
+        // steps is the business of the handshake, not of the session.
+        let handshake = Handshake::new();
+        client.send_step(&handshake.first())?;
+        let launch = LaunchRequest::new(path_for_the_adapter(program));
+        // The program is started in the folder it is in: a program that
+        // looks for its own files finds them there.
+        let launch = match program.parent() {
+            Some(folder) => launch.in_folder(path_for_the_adapter(folder)),
+            None => launch,
+        };
         Ok(Debugger {
             client,
+            handshake: Handshake::new(),
+            launch,
             state: DebugState::Starting,
             thread_id: 0,
             output: Vec::new(),
@@ -374,8 +394,232 @@ impl Debugger {
             frames: Vec::new(),
             selected_frame: 0,
             evaluating: Vec::new(),
-            program: program.to_owned(),
+            program: path_for_the_adapter(program),
         })
+    }
+
+    /// Collects what the adapter has said, and sends what is due.
+    ///
+    /// The adapter talks on a thread of its own, so what it says is
+    /// collected once per frame, the way the output of the task is.
+    ///
+    /// The breakpoints are the ones the editor has at this moment, by the
+    /// address of the file they are in.
+    pub fn pump(&mut self, breakpoints: &[(String, Vec<BreakpointRequest>)]) -> bool {
+        let mut changed = false;
+        // The adapter is given the paths of the files: it reads them from
+        // the disk, and an address of the editor is of no use to it.
+        let files = for_the_adapter(breakpoints);
+
+        // The adapter answered the hello: the program starts.
+        //
+        // The program starts before the breakpoints go: an adapter that is
+        // to be told where the breakpoints are needs to know how the
+        // program is started first.
+        for answer in self.client.drain_hello() {
+            changed = true;
+            match answer {
+                Ok(_) => {
+                    let steps = self.handshake.after_the_hello(&self.launch, &files);
+                    self.send_steps(&steps);
+                }
+                Err(error) => self.push_output(&format!("适配器没有答应：{error}")),
+            }
+        }
+
+        for event in self.client.drain_events() {
+            changed = true;
+            match event {
+                DapEvent::Initialized => {
+                    // The adapter is ready: the breakpoints go, and then
+                    // everything is set up.
+                    if files.is_empty() {
+                        self.push_output("一个断点都没有，程序不会停");
+                    }
+                    let steps = self.handshake.when_it_is_ready(&files);
+                    self.send_steps(&steps);
+                }
+                DapEvent::Stopped { thread_id, .. } => {
+                    self.thread_id = thread_id;
+                    self.state = DebugState::Stopped;
+                    self.variables.clear();
+                    self.frame = None;
+                    self.frame_id = None;
+                    // The stack of the program is read again: the program
+                    // walked on, and the stack it is in is another one.
+                    self.frames.clear();
+                    self.selected_frame = 0;
+                    if let Err(error) = self.client.stack_trace(thread_id) {
+                        self.push_output(&format!("栈帧读不到：{error}"));
+                    }
+                }
+                DapEvent::Continued { .. } => {
+                    self.state = DebugState::Running;
+                }
+                DapEvent::Output { text, .. } => self.push_output(&text),
+                DapEvent::Breakpoint {
+                    verified,
+                    line,
+                    message,
+                } => {
+                    // The adapter says what it thinks of the breakpoint: a
+                    // condition it does not accept is said out loud, not
+                    // swallowed.
+                    let place = line
+                        .map(|line| format!("第 {line} 行"))
+                        .unwrap_or_else(|| "有一处".to_owned());
+                    if let Some(message) = message {
+                        self.push_output(&format!("{place}的断点：{message}"));
+                    } else if !verified {
+                        self.push_output(&format!("{place}的断点放不下"));
+                    }
+                }
+                DapEvent::Terminated => {
+                    self.state = DebugState::Finished;
+                    self.push_output("调试结束了");
+                }
+                DapEvent::Exited { code } => {
+                    self.state = DebugState::Finished;
+                    self.push_output(&format!("程序退出了，退出码 {code}"));
+                }
+                DapEvent::Disconnected { reason } => {
+                    self.state = DebugState::Finished;
+                    self.push_output(&reason);
+                }
+            }
+        }
+
+        // What the adapter says about the breakpoints it was told.
+        //
+        // The answer of the adapter is where a condition it does not accept
+        // is said out loud: a condition that is swallowed is a condition the
+        // person never learns about.
+        for answer in self.client.drain_breakpoints() {
+            match answer {
+                Ok(breakpoints) => {
+                    for breakpoint in breakpoints {
+                        if let Some(message) = breakpoint.message {
+                            self.push_output(&format!("断点：{message}"));
+                        }
+                    }
+                }
+                Err(error) => self.push_output(&format!("断点放不下：{error}")),
+            }
+        }
+
+        // What the adapter says about the worth of an expression.
+        //
+        // The answer does not carry the expression, so the one that was
+        // asked is taken off the list of the ones that are waiting.
+        for answer in self.client.drain_evaluations() {
+            let expression = self.evaluating.pop().unwrap_or_default();
+            match answer {
+                Ok(value) => self.push_output(&value.line(&expression)),
+                Err(error) => self.push_output(&format!("{expression} 求不了：{error}")),
+            }
+        }
+
+        // The frames of the stack, and then the variables of the frame that
+        // is picked.
+        for answer in self.client.drain_stack_traces() {
+            match answer {
+                Ok(frames) => {
+                    self.frames = frames;
+                    self.selected_frame = 0;
+                    match self.frames.first() {
+                        Some(frame) => {
+                            self.frame = Some(frame.name.clone());
+                            // The number of the frame is kept: an
+                            // expression is asked about in a frame.
+                            self.frame_id = Some(frame.id);
+                            if let Err(error) = self.client.scopes(frame.id) {
+                                self.push_output(&format!("变量读不到：{error}"));
+                            }
+                        }
+                        None => {
+                            self.frame = None;
+                            self.frame_id = None;
+                        }
+                    }
+                }
+                Err(error) => self.push_output(&format!("栈帧读不到：{error}")),
+            }
+        }
+        for answer in self.client.drain_scopes() {
+            match answer {
+                Ok((frame_id, scopes)) => {
+                    // The groups of a frame that is not the one on the
+                    // screen are of no use: the frame was picked again
+                    // while the answer was on its way.
+                    if !the_answer_is_about_this_frame(frame_id, self.frame_id) {
+                        continue;
+                    }
+                    // The variables of the frame are cleared before its
+                    // groups are asked for: the groups of a frame come one
+                    // after another, and they are all shown.
+                    self.variables.clear();
+                    for scope in &scopes {
+                        if let Err(error) =
+                            self.client.variables(frame_id, scope.variables_reference)
+                        {
+                            self.push_output(&format!("变量读不到：{error}"));
+                        }
+                    }
+                }
+                Err(error) => self.push_output(&format!("变量读不到：{error}")),
+            }
+        }
+        for answer in self.client.drain_variables() {
+            match answer {
+                Ok((frame_id, variables)) => {
+                    // The variables of a frame that is not the one on the
+                    // screen would say something that is not true.
+                    if the_answer_is_about_this_frame(frame_id, self.frame_id) {
+                        // A frame may have more than one group of variables
+                        // (局部变量、参数、全局变量): they are all shown,
+                        // not only the last one that came.
+                        self.variables.extend(variables);
+                    }
+                }
+                Err(error) => self.push_output(&format!("变量读不到：{error}")),
+            }
+        }
+        changed
+    }
+
+    /// Tells the adapter that a breakpoint changed.
+    ///
+    /// The adapter is given the path of the file: it reads the file from
+    /// the disk, and an address of the editor is of no use to it.
+    pub fn tell_about_the_breakpoints(
+        &mut self,
+        uri: &str,
+        breakpoints: &[BreakpointRequest],
+    ) {
+        let Some(path) = codeweaver_lsp::protocol::uri_to_path(uri) else {
+            self.push_output(&format!("{uri} 不是编辑器能写的文件，断点放不了"));
+            return;
+        };
+        let path = path_for_the_adapter(&path);
+        if let Err(error) = self
+            .client
+            .set_breakpoints_with_conditions(&path, breakpoints)
+        {
+            self.push_output(&format!("断点放不下：{error}"));
+        }
+    }
+
+    /// Sends the steps of the handshake.
+    fn send_steps(&mut self, steps: &[Step]) {
+        let mut errors = Vec::new();
+        for step in steps {
+            if let Err(error) = self.client.send_step(step) {
+                errors.push(error.to_string());
+            }
+        }
+        for error in errors {
+            self.push_output(&format!("请求没有过去：{error}"));
+        }
     }
 
     /// Picks a frame of the stack.
@@ -423,6 +667,38 @@ impl Debugger {
             self.output.drain(..self.output.len() - limit);
         }
     }
+}
+
+/// The path of a file, as the adapter is to read it.
+///
+/// The adapter reads the file of the program from the disk: it is given the
+/// path of the file and not the address that the editor keeps it under.
+///
+/// The path is written the way the system writes it, so that the adapter and
+/// the editor are talking about the same file.
+pub fn path_for_the_adapter(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if cfg!(windows) {
+        text.replace('/', "\\")
+    } else {
+        text.into_owned()
+    }
+}
+
+/// The files that have breakpoints, as the adapter is to be told about them.
+///
+/// The addresses of the editor are turned into paths: the adapter reads the
+/// files from the disk, and an address of the editor is of no use to it.
+fn for_the_adapter(
+    breakpoints: &[(String, Vec<BreakpointRequest>)],
+) -> Vec<(String, Vec<BreakpointRequest>)> {
+    breakpoints
+        .iter()
+        .filter_map(|(uri, list)| {
+            let path = codeweaver_lsp::protocol::uri_to_path(uri)?;
+            Some((path_for_the_adapter(&path), list.clone()))
+        })
+        .collect()
 }
 
 /// The file and the line a frame is in.

@@ -14,6 +14,7 @@
 //! are driven from there.
 
 pub mod framing;
+pub mod handshake;
 pub mod protocol;
 
 use std::{
@@ -31,7 +32,10 @@ use std::{
 use serde_json::{Value, json};
 
 use crate::framing::{FrameReader, serialize};
-use crate::protocol::{Breakpoint, EvaluateResult, Scope, StackFrame, Variable};
+use crate::handshake::Step;
+use crate::protocol::{
+    Breakpoint, BreakpointRequest, EvaluateResult, LaunchRequest, Scope, StackFrame, Variable,
+};
 
 /// Something went wrong while talking to the adapter.
 #[derive(Debug, thiserror::Error)]
@@ -97,8 +101,11 @@ impl AdapterConfig {
 
 /// A request that is waiting for its answer.
 enum Pending {
-    /// The answer goes back to the caller that asked for it.
-    Answer(Sender<Result<Value, DapError>>),
+    /// The answer of the hello goes back to the caller that asked for it.
+    ///
+    /// The hello has an answer of its own: the program starts once the
+    /// adapter has answered it, and the driver has to know when that was.
+    Hello(Sender<Result<Value, DapError>>),
     /// The answer of `setBreakpoints` is the list of the breakpoints that
     /// were placed.
     Breakpoints(Sender<Result<Vec<Breakpoint>, DapError>>),
@@ -207,10 +214,19 @@ fn parse_event(value: &Value) -> Option<DapEvent> {
         "continued" => Some(DapEvent::Continued {
             thread_id: number("threadId"),
         }),
-        "output" => Some(DapEvent::Output {
-            category: text("category"),
-            text: text("output"),
-        }),
+        "output" => {
+            let category = text("category");
+            // The telemetry of the adapter is not for the person: debugpy
+            // says what it is and what it does in it, and the panel of the
+            // debugger is not the place for that.
+            if category == "telemetry" {
+                return None;
+            }
+            Some(DapEvent::Output {
+                category,
+                text: text("output"),
+            })
+        }
         "breakpoint" => Some(DapEvent::Breakpoint {
             verified: body
                 .and_then(|body| body.get("verified"))
@@ -240,7 +256,6 @@ pub struct Client {
     /// and the client keeps one for the requests it sends.
     senders: Senders,
     events: Receiver<DapEvent>,
-    responses: Receiver<Result<Value, DapError>>,
     breakpoints: Receiver<Result<Vec<Breakpoint>, DapError>>,
     stack_traces: Receiver<Result<Vec<StackFrame>, DapError>>,
     scopes: Receiver<Result<(i64, Vec<Scope>), DapError>>,
@@ -250,6 +265,8 @@ pub struct Client {
     ready: Arc<AtomicBool>,
     /// Whether the adapter is still there.
     running: Arc<AtomicBool>,
+    /// The answer of the hello.
+    hello: Receiver<Result<Value, DapError>>,
     reader: Option<JoinHandle<()>>,
     child: Option<Child>,
 }
@@ -257,8 +274,8 @@ pub struct Client {
 /// The channels the reader thread writes to.
 #[derive(Clone)]
 struct Senders {
+    hello: Sender<Result<Value, DapError>>,
     events: Sender<DapEvent>,
-    responses: Sender<Result<Value, DapError>>,
     breakpoints: Sender<Result<Vec<Breakpoint>, DapError>>,
     stack_traces: Sender<Result<Vec<StackFrame>, DapError>>,
     scopes: Sender<Result<(i64, Vec<Scope>), DapError>>,
@@ -286,15 +303,15 @@ impl Client {
         let stdout = child.stdout.take().expect("stdout was piped");
 
         let (event_sender, events) = channel();
-        let (response_sender, responses) = channel();
+        let (hello_sender, hello) = channel();
         let (breakpoint_sender, breakpoints) = channel();
         let (stack_trace_sender, stack_traces) = channel();
         let (scope_sender, scopes) = channel();
         let (variable_sender, variables) = channel();
         let (evaluation_sender, evaluations) = channel();
         let senders = Senders {
+            hello: hello_sender,
             events: event_sender,
-            responses: response_sender,
             breakpoints: breakpoint_sender,
             stack_traces: stack_trace_sender,
             scopes: scope_sender,
@@ -323,7 +340,7 @@ impl Client {
             pending,
             senders,
             events,
-            responses,
+            hello,
             breakpoints,
             stack_traces,
             scopes,
@@ -348,8 +365,8 @@ impl Client {
 
     /// Starts the handshake of the protocol.
     ///
-    /// The adapter answers with what it can do, and then says that it is
-    /// ready: the breakpoints go after that.
+    /// The adapter answers with what it can do. The program starts after
+    /// that answer, not before: see [`crate::handshake`].
     pub fn initialize(&self) -> Result<(), DapError> {
         self.request(
             "initialize",
@@ -361,19 +378,35 @@ impl Client {
                 "columnsStartAt1": true,
                 "supportsVariableType": true,
             }),
-            Some(Pending::Answer(self.responses_sender())),
+            Some(Pending::Hello(self.hello_sender())),
         )
+    }
+
+    /// Sends one step of the handshake.
+    ///
+    /// The order of the steps is the business of [`crate::handshake`]; this
+    /// only says what one step means on the wire.
+    pub fn send_step(&self, step: &Step) -> Result<(), DapError> {
+        match step {
+            Step::Initialize => self.initialize(),
+            Step::Launch(request) => self.launch(request),
+            Step::SetBreakpoints {
+                path,
+                breakpoints,
+            } => self.set_breakpoints_with_conditions(path, breakpoints),
+            Step::ConfigurationDone => self.configuration_done(),
+        }
     }
 
     /// Tells the adapter where the breakpoints are.
     pub fn set_breakpoints(
         &self,
-        uri: &str,
+        path: &str,
         lines: &[u32],
     ) -> Result<(), DapError> {
-        let breakpoints: Vec<(u32, Option<String>)> =
+        let breakpoints: Vec<BreakpointRequest> =
             lines.iter().map(|line| (*line, None)).collect();
-        self.set_breakpoints_with_conditions(uri, &breakpoints)
+        self.set_breakpoints_with_conditions(path, &breakpoints)
     }
 
     /// Tells the adapter where the breakpoints are, and what has to be true
@@ -382,17 +415,21 @@ impl Client {
     /// A breakpoint without a condition stops the program every time it comes
     /// to that line. A breakpoint with one stops it only when the condition
     /// is true, which is what the adapter has to work out.
+    ///
+    /// The path is the path of the file on the disk: an adapter reads the
+    /// file of the program from there, and an address of the editor
+    /// (`file:///...`) is of no use to it.
     pub fn set_breakpoints_with_conditions(
         &self,
-        uri: &str,
-        breakpoints: &[(u32, Option<String>)],
+        path: &str,
+        breakpoints: &[BreakpointRequest],
     ) -> Result<(), DapError> {
         let source_breakpoints: Vec<crate::protocol::SourceBreakpoint> = breakpoints
             .iter()
             .map(|(line, condition)| crate::protocol::SourceBreakpoint {
                 line: *line,
                 source: Some(crate::protocol::Source {
-                    path: Some(uri.to_owned()),
+                    path: Some(path.to_owned()),
                     name: None,
                 }),
                 condition: condition.clone(),
@@ -402,7 +439,7 @@ impl Client {
         self.request(
             "setBreakpoints",
             json!({
-                "source": { "path": uri },
+                "source": { "path": path },
                 "breakpoints": source_breakpoints,
                 "lines": lines,
             }),
@@ -416,16 +453,8 @@ impl Client {
     }
 
     /// Starts the program.
-    pub fn launch(&self, program: &str, args: &[String]) -> Result<(), DapError> {
-        self.request(
-            "launch",
-            json!({
-                "program": program,
-                "args": args,
-                "stopOnEntry": false,
-            }),
-            None,
-        )
+    pub fn launch(&self, request: &LaunchRequest) -> Result<(), DapError> {
+        self.request("launch", request.to_arguments(), None)
     }
 
     /// Runs one line and does not go into what it calls.
@@ -515,9 +544,12 @@ impl Client {
         drain(&self.events)
     }
 
-    /// The answers of the requests that are not about breakpoints or frames.
-    pub fn drain_responses(&self) -> Vec<Result<Value, DapError>> {
-        drain(&self.responses)
+    /// The answers of the hello.
+    ///
+    /// The program starts once the adapter has answered the hello, so the
+    /// driver has to know when that was.
+    pub fn drain_hello(&self) -> Vec<Result<Value, DapError>> {
+        drain(&self.hello)
     }
 
     /// The answers of the requests for the breakpoints.
@@ -614,10 +646,9 @@ impl Client {
         Ok(())
     }
 
-    /// A channel for the answers of the requests that are not about
-    /// breakpoints or frames.
-    fn responses_sender(&self) -> Sender<Result<Value, DapError>> {
-        self.senders.responses.clone()
+    /// A channel for the answers of the hello.
+    fn hello_sender(&self) -> Sender<Result<Value, DapError>> {
+        self.senders.hello.clone()
     }
 
     /// A channel for the answers of the requests for the breakpoints.
@@ -723,7 +754,7 @@ fn dispatch(
                 })
             };
             match waiting {
-                Pending::Answer(sender) => {
+                Pending::Hello(sender) => {
                     let _ = sender.send(match error {
                         Some(error) => Err(error),
                         None => Ok(body),

@@ -4,7 +4,78 @@
 //! the stack, the groups of variables and the variables themselves. The rest
 //! of the protocol is the adapter's business.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+/// A breakpoint as the adapter is told about it.
+///
+/// The line the program is to stop at, and what has to be true for it to
+/// stop there. A breakpoint without a condition stops the program every time
+/// it comes to that line.
+pub type BreakpointRequest = (u32, Option<String>);
+
+/// What the adapter is told when the program starts.
+///
+/// The adapter needs to know what to start and where to start it. Some
+/// adapters want more than that: the fields that belong to the adapter alone
+/// go into `extra`, and they are put into the request as they are.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LaunchRequest {
+    /// The program that is to be debugged.
+    pub program: String,
+    /// The arguments of the program.
+    pub args: Vec<String>,
+    /// The folder the program is started in.
+    ///
+    /// Without it the adapter decides, and the program may look for its own
+    /// files somewhere else than where it is.
+    pub cwd: Option<String>,
+    /// The fields that belong to the adapter alone.
+    pub extra: BTreeMap<String, Value>,
+}
+
+impl LaunchRequest {
+    /// A request for one program.
+    pub fn new(program: impl Into<String>) -> Self {
+        LaunchRequest {
+            program: program.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Starts the program in a folder.
+    pub fn in_folder(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Adds a field that belongs to the adapter alone.
+    ///
+    /// The field is put into the request as it is: the editor does not know
+    /// what every adapter wants, and it says what it wants.
+    pub fn with(mut self, name: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(name.into(), value);
+        self
+    }
+
+    /// The request as the adapter is to receive it.
+    pub fn to_arguments(&self) -> Value {
+        let mut arguments = json!({
+            "program": self.program,
+            "args": self.args,
+            "stopOnEntry": false,
+        });
+        if let Some(cwd) = &self.cwd {
+            arguments["cwd"] = json!(cwd);
+        }
+        for (name, value) in &self.extra {
+            arguments[name] = value.clone();
+        }
+        arguments
+    }
+}
 
 /// A file of the program that is being debugged.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,5 +378,36 @@ mod tests {
             .expect("the answer is read");
         assert_eq!(answer.type_, None);
         assert_eq!(answer.line("name"), "name = greeting");
+    }
+
+    #[test]
+    fn a_launch_says_what_to_start() {
+        let request = LaunchRequest::new("C:\\work\\main.py");
+        let arguments = request.to_arguments();
+        assert_eq!(arguments["program"], "C:\\work\\main.py");
+        assert_eq!(arguments["stopOnEntry"], false);
+        assert!(
+            arguments.get("cwd").is_none(),
+            "the folder is only said when it is known: {arguments}"
+        );
+    }
+
+    #[test]
+    fn a_launch_says_the_folder_it_starts_in() {
+        let request = LaunchRequest::new("main.py").in_folder("C:\\work");
+        let arguments = request.to_arguments();
+        assert_eq!(arguments["cwd"], "C:\\work");
+    }
+
+    #[test]
+    fn a_launch_carries_the_fields_of_the_adapter() {
+        let request = LaunchRequest::new("main.py")
+            .with("justMyCode", json!(false))
+            .with("python", json!("C:\\Python\\python.exe"));
+        let arguments = request.to_arguments();
+        assert_eq!(arguments["justMyCode"], false);
+        assert_eq!(arguments["python"], "C:\\Python\\python.exe");
+        // The fields of the editor are still there.
+        assert_eq!(arguments["program"], "main.py");
     }
 }

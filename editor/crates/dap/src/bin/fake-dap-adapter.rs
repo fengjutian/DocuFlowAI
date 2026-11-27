@@ -5,7 +5,9 @@
 //!
 //! - `initialize` says what the adapter can do, and then that it is ready;
 //! - `setBreakpoints` answers with the breakpoints that were asked for;
-//! - `launch` starts the program, says what it printed and that it stopped;
+//! - `launch` starts the program, and `configurationDone` says that
+//!   everything is set up; the program begins when both of them have been
+//!   said, the way a real adapter does it;
 //! - `stackTrace` answers with three frames, `scopes` with one group of
 //!   variables, and `variables` with two variables; every frame has
 //!   variables of its own, so that the frame the editor asks about can be
@@ -56,6 +58,12 @@ struct Adapter {
     /// The adapter does not work the condition out: it only says what it was
     /// told, so that the editor can be checked against the protocol.
     conditions: BTreeMap<u32, String>,
+    /// Whether the program was asked to start.
+    launched: bool,
+    /// Whether everything was set up.
+    configured: bool,
+    /// Whether the program has begun.
+    started: bool,
 }
 
 impl Adapter {
@@ -106,23 +114,13 @@ impl Adapter {
             }
             "configurationDone" => {
                 self.answer(output, seq, json!({}));
+                self.configured = true;
+                self.start_the_program(output);
             }
             "launch" => {
                 self.answer(output, seq, json!({}));
-                self.event(
-                    output,
-                    "output",
-                    json!({ "category": "stdout", "output": "the program started\n" }),
-                );
-                self.event(
-                    output,
-                    "stopped",
-                    json!({
-                        "reason": "breakpoint",
-                        "threadId": 1,
-                        "allThreadsStopped": true,
-                    }),
-                );
+                self.launched = true;
+                self.start_the_program(output);
             }
             "stackTrace" => {
                 // The program stopped at the first breakpoint that was set.
@@ -257,6 +255,33 @@ impl Adapter {
                 );
             }
         }
+    }
+
+    /// Starts the program, when everything that has to be said was said.
+    ///
+    /// The program begins when the editor has started it and has said that
+    /// everything is set up. The order of the two does not matter: a real
+    /// adapter waits for the setup, and debugpy waits for the program to be
+    /// named.
+    fn start_the_program(&mut self, output: &mut impl Write) {
+        if self.started || !self.launched || !self.configured {
+            return;
+        }
+        self.started = true;
+        self.event(
+            output,
+            "output",
+            json!({ "category": "stdout", "output": "the program started\n" }),
+        );
+        self.event(
+            output,
+            "stopped",
+            json!({
+                "reason": "breakpoint",
+                "threadId": 1,
+                "allThreadsStopped": true,
+            }),
+        );
     }
 
     /// Answers a request of the editor.

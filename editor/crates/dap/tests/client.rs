@@ -11,6 +11,8 @@
 
 use std::time::{Duration, Instant};
 
+use codeweaver_dap::handshake::Handshake;
+use codeweaver_dap::protocol::LaunchRequest;
 use codeweaver_dap::{AdapterConfig, Client, DapEvent};
 
 /// Starts the fake adapter and says hello to it.
@@ -25,12 +27,14 @@ fn client() -> Client {
 fn running_client() -> Client {
     let client = client();
     client
-        .set_breakpoints("file:///tmp/main.rs", &[7])
+        .set_breakpoints("/tmp/main.rs", &[7])
         .expect("the breakpoints go through");
     client
         .configuration_done()
         .expect("the setup goes through");
-    client.launch("main", &[]).expect("the program starts");
+    client
+        .launch(&LaunchRequest::new("main"))
+        .expect("the program starts");
     client
 }
 
@@ -73,11 +77,93 @@ fn the_client_says_hello_and_the_adapter_answers() {
     assert!(events.contains(&DapEvent::Initialized));
 }
 
+/// Runs a session in the order of the handshake, the way the editor does.
+///
+/// The order is: the hello, the program, the breakpoints, and then the end
+/// of the setup. The adapter of the tests answers the hello right away, but
+/// the program starts before the breakpoints go, and debugpy wants it that
+/// way.
+fn session_in_the_order_of_the_handshake() -> Client {
+    let config = AdapterConfig::new(env!("CARGO_BIN_EXE_fake-dap-adapter"), Vec::new());
+    let client = Client::start(&config).expect("the adapter starts");
+    let mut handshake = Handshake::new();
+    let launch = LaunchRequest::new("main");
+    let breakpoints = vec![("/tmp/main.rs".to_owned(), vec![(7, None)])];
+
+    client
+        .send_step(&handshake.first())
+        .expect("the hello goes through");
+
+    // The adapter answered the hello: the program starts.
+    wait_for(|| (!client.drain_hello().is_empty()).then_some(()));
+    for step in handshake.after_the_hello(&launch, &breakpoints) {
+        client.send_step(&step).expect("the step goes through");
+    }
+
+    // The adapter is ready: the breakpoints go.
+    let mut events = Vec::new();
+    wait_for(|| {
+        events.extend(client.drain_events());
+        events
+            .iter()
+            .any(|event| matches!(event, DapEvent::Initialized))
+            .then_some(())
+    });
+    for step in handshake.when_it_is_ready(&breakpoints) {
+        client.send_step(&step).expect("the step goes through");
+    }
+    client
+}
+
+#[test]
+fn the_session_runs_in_the_order_of_the_handshake() {
+    let client = session_in_the_order_of_the_handshake();
+
+    // The program stops at the breakpoint that was asked for.
+    let events = events_until(&client, |event| {
+        matches!(event, DapEvent::Stopped { .. })
+    });
+    assert!(
+        events.contains(&DapEvent::Stopped {
+            reason: "breakpoint".to_owned(),
+            thread_id: 1,
+            all_threads_stopped: true,
+        }),
+        "the program stops at the breakpoint: {events:?}"
+    );
+
+    // The adapter says that the breakpoint is where it was asked for.
+    let answer = wait_for(|| {
+        let mut answers = client.drain_breakpoints();
+        (!answers.is_empty()).then(|| answers.remove(0))
+    });
+    let breakpoints = answer.expect("the adapter answered");
+    assert_eq!(breakpoints.len(), 1);
+    assert!(breakpoints[0].verified);
+    assert_eq!(breakpoints[0].line, Some(7));
+}
+
+#[test]
+fn the_stack_of_the_program_that_stopped_in_the_order_of_the_handshake_is_known() {
+    let client = session_in_the_order_of_the_handshake();
+    events_until(&client, |event| matches!(event, DapEvent::Stopped { .. }));
+
+    client.stack_trace(1).expect("the request goes through");
+    let answer = wait_for(|| {
+        let mut answers = client.drain_stack_traces();
+        (!answers.is_empty()).then(|| answers.remove(0))
+    });
+    let frames = answer.expect("the adapter answered");
+    // The frame is on the line of the breakpoint: the breakpoints were in
+    // place before the program began.
+    assert_eq!(frames[0].line, Some(7));
+}
+
 #[test]
 fn a_breakpoint_is_placed_where_it_was_asked_for() {
     let client = client();
     client
-        .set_breakpoints("file:///tmp/main.rs", &[7])
+        .set_breakpoints("/tmp/main.rs", &[7])
         .expect("the breakpoints go through");
 
     let answer = wait_for(|| {
@@ -95,7 +181,7 @@ fn the_condition_of_a_breakpoint_reaches_the_adapter() {
     let client = client();
     client
         .set_breakpoints_with_conditions(
-            "file:///tmp/main.rs",
+            "/tmp/main.rs",
             &[(7, Some("count > 3".to_owned())), (9, None)],
         )
         .expect("the breakpoints go through");
@@ -202,7 +288,7 @@ fn the_stack_of_the_stopped_program_is_known() {
             .source
             .as_ref()
             .and_then(|source| source.path.as_deref()),
-        Some("file:///tmp/helper.rs")
+        Some("/tmp/helper.rs")
     );
     // Every frame has a number of its own: the variables are asked for by
     // it.

@@ -7,7 +7,7 @@ mod command_palette;
 mod commands;
 mod completion;
 mod context;
-mod debug;
+pub mod debug;
 mod developer;
 mod devlog;
 mod diff_review;
@@ -43,7 +43,7 @@ use std::{ops::Range, path::{Path, PathBuf}, sync::Arc, time::{Duration, Instant
 use anyhow::{Context, Result};
 use codeweaver_agent_acp::ToolStatus;
 use codeweaver_agent_ui::{ContextItem, HunkDecision};
-use codeweaver_dap::{AdapterConfig, DapEvent};
+use codeweaver_dap::AdapterConfig;
 use codeweaver_editor_core::Editor;
 use codeweaver_lsp::{
     Client as LspClient, LspEvent, ServerConfig,
@@ -4781,15 +4781,11 @@ impl NativeApplication {
     /// The conditions go with them: a condition the adapter does not know
     /// about is a condition that is not worked out.
     fn tell_the_adapter_about_the_breakpoints(&mut self, uri: &str) {
-        if self.debug.is_none() {
+        let Some(debug) = self.debug.as_mut() else {
             return;
-        }
+        };
         let breakpoints = self.breakpoints.with_conditions_of(uri);
-        if let Some(debug) = self.debug.as_mut()
-            && let Err(error) = debug.client.set_breakpoints_with_conditions(uri, &breakpoints)
-        {
-            eprintln!("could not tell the adapter about the breakpoints: {error}");
-        }
+        debug.tell_about_the_breakpoints(uri, &breakpoints);
     }
 
     /// Moves the breakpoints of the open files to the lines the text is on.
@@ -4841,13 +4837,12 @@ impl NativeApplication {
             self.status = Some("这个文件不属于任何工程，没有可以调试的程序".to_owned());
             return;
         };
-        let program = path.to_string_lossy().to_string();
         let warning = if self.breakpoints.is_empty() {
             Some("没有断点，程序不会停（按 F9 放一个）".to_owned())
         } else {
             None
         };
-        match Debugger::start(&config, &program) {
+        match Debugger::start(&config, &path) {
             Ok(debugger) => {
                 self.debug = Some(debugger);
                 self.status = Some(
@@ -4900,6 +4895,9 @@ impl NativeApplication {
     ///
     /// The adapter talks on a thread of its own, so what it says is
     /// collected once per frame, the way the output of the task is.
+    ///
+    /// The session itself is in the debug component: this only hands it the
+    /// breakpoints of the editor.
     fn pump_debug(&mut self) -> bool {
         if self.debug.is_none() {
             return false;
@@ -4910,172 +4908,7 @@ impl NativeApplication {
         let Some(debug) = self.debug.as_mut() else {
             return false;
         };
-        let mut changed = false;
-
-        for event in debug.client.drain_events() {
-            changed = true;
-            match event {
-                DapEvent::Initialized => {
-                    // The breakpoints go first, and then the program starts.
-                    if breakpoints.is_empty() {
-                        debug.push_output("一个断点都没有，程序不会停");
-                    }
-                    for (uri, marks) in &breakpoints {
-                        if let Err(error) = debug.client.set_breakpoints_with_conditions(uri, marks)
-                        {
-                            debug.push_output(&format!("断点放不下：{error}"));
-                        }
-                    }
-                    if let Err(error) = debug.client.configuration_done() {
-                        debug.push_output(&format!("配置没完：{error}"));
-                    }
-                    if let Err(error) = debug.client.launch(&debug.program.clone(), &[]) {
-                        debug.push_output(&format!("程序起不来：{error}"));
-                    }
-                    debug.state = DebugState::Running;
-                }
-                DapEvent::Stopped { thread_id, .. } => {
-                    debug.thread_id = thread_id;
-                    debug.state = DebugState::Stopped;
-                    debug.variables.clear();
-                    debug.frame = None;
-                    debug.frame_id = None;
-                    // The stack of the program is read again: the program
-                    // walked on, and the stack it is in is another one.
-                    debug.frames.clear();
-                    debug.selected_frame = 0;
-                    if let Err(error) = debug.client.stack_trace(thread_id) {
-                        debug.push_output(&format!("栈帧读不到：{error}"));
-                    }
-                }
-                DapEvent::Continued { .. } => {
-                    debug.state = DebugState::Running;
-                }
-                DapEvent::Output { text, .. } => debug.push_output(&text),
-                DapEvent::Breakpoint { verified, line, message } => {
-                    // The adapter says what it thinks of the breakpoint: a
-                    // condition it does not accept is said out loud, not
-                    // swallowed.
-                    let place = line
-                        .map(|line| format!("第 {line} 行"))
-                        .unwrap_or_else(|| "有一处".to_owned());
-                    if let Some(message) = message {
-                        debug.push_output(&format!("{place}的断点：{message}"));
-                    } else if !verified {
-                        debug.push_output(&format!("{place}的断点放不下"));
-                    }
-                }
-                DapEvent::Terminated => {
-                    debug.state = DebugState::Finished;
-                    debug.push_output("调试结束了");
-                }
-                DapEvent::Exited { code } => {
-                    debug.state = DebugState::Finished;
-                    debug.push_output(&format!("程序退出了，退出码 {code}"));
-                }
-                DapEvent::Disconnected { reason } => {
-                    debug.state = DebugState::Finished;
-                    debug.push_output(&reason);
-                }
-            }
-        }
-
-        // What the adapter says about the breakpoints it was told.
-        //
-        // The answer of the adapter is where a condition it does not accept
-        // is said out loud: a condition that is swallowed is a condition the
-        // person never learns about.
-        for answer in debug.client.drain_breakpoints() {
-            match answer {
-                Ok(breakpoints) => {
-                    for breakpoint in breakpoints {
-                        if let Some(message) = breakpoint.message {
-                            debug.push_output(&format!("断点：{message}"));
-                        }
-                    }
-                }
-                Err(error) => debug.push_output(&format!("断点放不下：{error}")),
-            }
-        }
-
-        // What the adapter says about the worth of an expression.
-        //
-        // The answer does not carry the expression, so the one that was
-        // asked is taken off the list of the ones that are waiting.
-        for answer in debug.client.drain_evaluations() {
-            let expression = debug.evaluating.pop().unwrap_or_default();
-            match answer {
-                Ok(value) => debug.push_output(&value.line(&expression)),
-                Err(error) => debug.push_output(&format!("{expression} 求不了：{error}")),
-            }
-        }
-
-        // The frames of the stack, and then the variables of the frame that
-        // is picked.
-        for answer in debug.client.drain_stack_traces() {
-            match answer {
-                Ok(frames) => {
-                    debug.frames = frames;
-                    debug.selected_frame = 0;
-                    match debug.frames.first() {
-                        Some(frame) => {
-                            debug.frame = Some(frame.name.clone());
-                            // The number of the frame is kept: an
-                            // expression is asked about in a frame.
-                            debug.frame_id = Some(frame.id);
-                            if let Err(error) = debug.client.scopes(frame.id) {
-                                debug.push_output(&format!("变量读不到：{error}"));
-                            }
-                        }
-                        None => {
-                            debug.frame = None;
-                            debug.frame_id = None;
-                        }
-                    }
-                }
-                Err(error) => debug.push_output(&format!("栈帧读不到：{error}")),
-            }
-        }
-        for answer in debug.client.drain_scopes() {
-            match answer {
-                Ok((frame_id, scopes)) => {
-                    // The groups of a frame that is not the one on the
-                    // screen are of no use: the frame was picked again
-                    // while the answer was on its way.
-                    if !debug::the_answer_is_about_this_frame(frame_id, debug.frame_id) {
-                        continue;
-                    }
-                    // The variables of the frame are cleared before its
-                    // groups are asked for: the groups of a frame come one
-                    // after another, and they are all shown.
-                    debug.variables.clear();
-                    for scope in &scopes {
-                        if let Err(error) =
-                            debug.client.variables(frame_id, scope.variables_reference)
-                        {
-                            debug.push_output(&format!("变量读不到：{error}"));
-                        }
-                    }
-                }
-                Err(error) => debug.push_output(&format!("变量读不到：{error}")),
-            }
-        }
-        for answer in debug.client.drain_variables() {
-            match answer {
-                Ok((frame_id, variables)) => {
-                    // The variables of a frame that is not the one on the
-                    // screen would say something that is not true.
-                    if debug::the_answer_is_about_this_frame(frame_id, debug.frame_id) {
-                        // A frame may have more than one group of variables
-                        // (局部变量、参数、全局变量): they are all shown,
-                        // not only the last one that came.
-                        debug.variables.extend(variables);
-                    }
-                }
-                Err(error) => debug.push_output(&format!("变量读不到：{error}")),
-            }
-        }
-        changed
+        debug.pump(&breakpoints)
     }
 
     /// Opens the panel that lists the commands.
