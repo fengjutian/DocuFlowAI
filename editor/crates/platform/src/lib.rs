@@ -87,7 +87,7 @@ use settings::{KeyRow, Kind as SettingKind, Settings};
 use sidebar::{Action as SideBarAction, Row as SideBarRow};
 use status_bar::StatusBar;
 use task::{Task, TaskOutput, TaskPanel, TaskState};
-use workspace_box::{RootItem, WorkspaceBox};
+use workspace_box::{RootBox, RootItem};
 use zoom::Zoom;
 use winit::{
     application::ApplicationHandler,
@@ -264,7 +264,7 @@ pub struct NativeApplication {
     ///
     /// A workspace may name several folders, so "take one out" cannot be
     /// answered by a name that is already known: the box lists the roots.
-    remove_root_box: Option<WorkspaceBox>,
+    remove_root_box: Option<RootBox>,
     /// The files that are watched for changes outside the editor.
     detector: ChangeDetector,
     /// The question the window is asking the user, if it is asking one.

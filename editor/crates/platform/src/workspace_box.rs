@@ -20,17 +20,17 @@ pub struct RootItem {
 
 /// The box that asks which folder of the workspace is taken out.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkspaceBox {
+pub struct RootBox {
     /// The folders of the workspace, in the order the workspace has them.
     roots: Vec<RootItem>,
     /// Which one is picked, counted from the first one.
     selected: usize,
 }
 
-impl WorkspaceBox {
+impl RootBox {
     /// Opens the box with the folders of a workspace.
     pub fn new(roots: Vec<RootItem>) -> Self {
-        WorkspaceBox { roots, selected: 0 }
+        RootBox { roots, selected: 0 }
     }
 
     /// The folders the box shows.
@@ -73,8 +73,8 @@ mod tests {
     use super::*;
 
     /// A box with two folders in it.
-    fn a_box() -> WorkspaceBox {
-        WorkspaceBox::new(vec![
+    fn a_box() -> RootBox {
+        RootBox::new(vec![
             RootItem {
                 name: "editor".to_owned(),
                 path: PathBuf::from("C:/work/editor"),
@@ -121,7 +121,7 @@ mod tests {
 
     #[test]
     fn a_box_with_one_folder_in_it_stays_where_it_is() {
-        let mut box_ = WorkspaceBox::new(vec![RootItem {
+        let mut box_ = RootBox::new(vec![RootItem {
             name: "editor".to_owned(),
             path: PathBuf::from("C:/work/editor"),
         }]);
@@ -133,7 +133,7 @@ mod tests {
 
     #[test]
     fn a_box_with_nothing_in_it_picks_nothing() {
-        let box_ = WorkspaceBox::new(Vec::new());
+        let box_ = RootBox::new(Vec::new());
         assert!(box_.selected_root().is_none());
         assert!(box_.roots().is_empty());
     }
