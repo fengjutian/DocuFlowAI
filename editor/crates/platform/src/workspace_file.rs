@@ -143,7 +143,7 @@ impl Workspace {
         if !path.is_dir() {
             return Err(format!("{} 不在了", path.display()));
         }
-        if self.roots.iter().any(|root| root.path == path) {
+        if self.roots.iter().any(|root| same_folder(&root.path, &path)) {
             return Err(format!(
                 "{} 已经在工作区里了",
                 root_name(&path)
@@ -174,6 +174,22 @@ fn root_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Whether two paths name the same folder on disk.
+///
+/// A path in the file is written the way a person wrote it, so the same
+/// folder can be written down in more than one way: `editor`, `./editor` and
+/// the whole path of it are one folder. The folders are compared by what
+/// they are on disk, not by the way they are written.
+fn same_folder(one: &Path, other: &Path) -> bool {
+    if one == other {
+        return true;
+    }
+    match (one.canonicalize(), other.canonicalize()) {
+        (Ok(one), Ok(other)) => one == other,
+        _ => false,
+    }
 }
 
 impl Contents {

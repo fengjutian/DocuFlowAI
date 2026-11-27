@@ -140,6 +140,8 @@ pub enum When {
     HasNameAtCaret,
     /// The file belongs to a repository, so the changes of it can be shown.
     HasRepository,
+    /// A workspace is open, so its folders can be changed.
+    HasWorkspace,
 }
 
 /// What the commands may ask about.
@@ -154,6 +156,8 @@ pub struct Context {
     pub has_name_at_caret: bool,
     /// Whether the open file belongs to a repository.
     pub has_repository: bool,
+    /// Whether a workspace is open.
+    pub has_workspace: bool,
 }
 
 impl When {
@@ -164,6 +168,7 @@ impl When {
             When::HasFile => context.has_file,
             When::HasNameAtCaret => context.has_name_at_caret,
             When::HasRepository => context.has_repository,
+            When::HasWorkspace => context.has_workspace,
         }
     }
 }
@@ -350,6 +355,8 @@ pub fn default_registry() -> CommandRegistry {
         command("workbench.save", "保存文件", "文件", "ctrl+s", When::HasFile),
         command("workbench.closeTab", "关闭标签页", "文件", "ctrl+w", When::Always),
         command("workspace.save", "保存工作区", "文件", "ctrl+shift+s", When::Always),
+        command("workspace.addFolder", "把文件夹加进工作区", "文件", "ctrl+shift+a", When::HasWorkspace),
+        command("workspace.removeFolder", "把文件夹拿出工作区", "文件", "ctrl+shift+r", When::HasWorkspace),
         command("editor.format", "格式化文档", "编辑", "alt+shift+f", When::HasFile),
         command("editor.rename", "重命名", "编辑", "f2", When::HasNameAtCaret),
         command("editor.codeAction", "代码操作", "编辑", "alt+enter", When::HasFile),

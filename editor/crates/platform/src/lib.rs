@@ -36,6 +36,7 @@ mod status_bar;
 mod task;
 #[cfg(test)]
 mod testing;
+mod workspace_box;
 pub mod workspace_file;
 pub mod workspace_settings;
 pub mod zoom;
@@ -86,6 +87,7 @@ use settings::{KeyRow, Kind as SettingKind, Settings};
 use sidebar::{Action as SideBarAction, Row as SideBarRow};
 use status_bar::StatusBar;
 use task::{Task, TaskOutput, TaskPanel, TaskState};
+use workspace_box::{RootItem, WorkspaceBox};
 use zoom::Zoom;
 use winit::{
     application::ApplicationHandler,
@@ -254,6 +256,15 @@ pub struct NativeApplication {
     /// open, the file tree is its tree and not the folder of the file that
     /// happens to be open.
     open_workspace: Option<workspace_file::Workspace>,
+    /// The box that asks for the path of the folder to add to the workspace.
+    ///
+    /// The path is a text, so the box is the one that asks for a name.
+    add_folder_box: Option<RenameBox>,
+    /// The box that asks which folder of the workspace is taken out.
+    ///
+    /// A workspace may name several folders, so "take one out" cannot be
+    /// answered by a name that is already known: the box lists the roots.
+    remove_root_box: Option<WorkspaceBox>,
     /// The files that are watched for changes outside the editor.
     detector: ChangeDetector,
     /// The question the window is asking the user, if it is asking one.
@@ -669,6 +680,8 @@ impl NativeApplication {
             groups,
             tree,
             open_workspace: None,
+            add_folder_box: None,
+            remove_root_box: None,
             detector,
             prompt: None,
             settings: None,
