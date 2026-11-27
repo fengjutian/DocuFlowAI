@@ -1639,6 +1639,209 @@ impl NativeApplication {
         }
     }
 
+    /// Builds the tree of files of the workspace that is open.
+    ///
+    /// The tree of a workspace is the tree of the folders it names: a folder
+    /// that is added or taken out changes it.
+    fn rebuild_the_tree_of_the_workspace(&mut self) {
+        let Some(workspace) = self.open_workspace.as_ref() else {
+            return;
+        };
+        let roots = workspace
+            .roots
+            .iter()
+            .map(|root| (root.name.clone(), root.path.clone()))
+            .collect();
+        self.tree = Some(FileForest::many(roots));
+    }
+
+    /// Writes the workspace that is open back into its file.
+    ///
+    /// The workspace file is the truth of a workspace: a folder that is only
+    /// on the screen is not a folder of the project.
+    fn write_the_workspace_back(&self) -> Result<(), String> {
+        let Some(workspace) = self.open_workspace.as_ref() else {
+            return Err("还没有工作区".to_owned());
+        };
+        workspace_file::write(&workspace.path, &workspace.contents())
+    }
+
+    /// Asks for the path of the folder to add to the workspace.
+    ///
+    /// The path is taken from the folder of the workspace file itself, unless
+    /// it is absolute: a path that is written down in the file means the same
+    /// thing wherever the file is.
+    fn open_the_add_folder_box(&mut self) {
+        if self.open_workspace.is_none() {
+            self.status = Some("还没有工作区，先打开一个工作区文件".to_owned());
+            return;
+        }
+        // The panels that take every key give up their place: the box needs
+        // the keyboard, and a box nobody can see is a box nobody can use.
+        self.git = None;
+        self.search = None;
+        self.add_folder_box = Some(RenameBox::message(
+            "要加进工作区的文件夹（相对工作区文件所在目录，或写全路径）",
+        ));
+        self.status = Some("写文件夹的路径，回车确认，Esc 取消".to_owned());
+    }
+
+    /// Asks which folder of the workspace is taken out.
+    ///
+    /// A workspace may name several folders, so "take one out" cannot be
+    /// answered by a name that is already known: the roots are listed and one
+    /// of them is picked.
+    fn open_the_remove_root_box(&mut self) {
+        let Some(workspace) = self.open_workspace.as_ref() else {
+            self.status = Some("还没有工作区，先打开一个工作区文件".to_owned());
+            return;
+        };
+        if workspace.roots.is_empty() {
+            self.status = Some("这个工作区里没有文件夹可以拿掉".to_owned());
+            return;
+        }
+        let roots = workspace
+            .roots
+            .iter()
+            .map(|root| RootItem {
+                name: root.name.clone(),
+                path: root.path.clone(),
+            })
+            .collect();
+        self.git = None;
+        self.search = None;
+        self.remove_root_box = Some(RootBox::new(roots));
+        self.status = Some("挑一个要拿掉的文件夹，回车确认，Esc 取消".to_owned());
+    }
+
+    /// Adds a folder to the workspace that is open.
+    ///
+    /// Returns whether the folder was added: a folder that is not there is
+    /// said out loud and not added, and the box stays open so that the path
+    /// can be written again.
+    fn add_a_folder_to_the_workspace(&mut self, path: &str) -> bool {
+        let Some(mut workspace) = self.open_workspace.take() else {
+            self.status = Some("还没有工作区，先打开一个工作区文件".to_owned());
+            return false;
+        };
+        let name = match workspace.add_root(path) {
+            Ok(name) => name,
+            Err(reason) => {
+                self.open_workspace = Some(workspace);
+                self.status = Some(reason);
+                return false;
+            }
+        };
+        self.open_workspace = Some(workspace);
+        self.rebuild_the_tree_of_the_workspace();
+        match self.write_the_workspace_back() {
+            Ok(()) => self.status = Some(format!("把 {name} 加进工作区了")),
+            // The tree is already new: the file that could not be written is
+            // said out loud, and the person is not held back by it.
+            Err(error) => self.status = Some(format!("加进来了，但工作区文件写不进去：{error}")),
+        }
+        true
+    }
+
+    /// Takes a folder out of the workspace that is open.
+    fn remove_a_folder_from_the_workspace(&mut self, path: &Path) {
+        let Some(mut workspace) = self.open_workspace.take() else {
+            self.status = Some("还没有工作区，先打开一个工作区文件".to_owned());
+            return;
+        };
+        let name = match workspace.remove_root(path) {
+            Ok(name) => name,
+            Err(reason) => {
+                self.open_workspace = Some(workspace);
+                self.status = Some(reason);
+                return;
+            }
+        };
+        self.open_workspace = Some(workspace);
+        self.rebuild_the_tree_of_the_workspace();
+        match self.write_the_workspace_back() {
+            Ok(()) => self.status = Some(format!("把 {name} 从工作区拿掉了")),
+            Err(error) => self.status = Some(format!("拿掉了，但工作区文件写不进去：{error}")),
+        }
+    }
+
+    /// Gives a key to the boxes that change the folders of the workspace.
+    ///
+    /// While one of them is open it takes every key: a path that is typed
+    /// into the document is not a path, and a folder that is picked out of the
+    /// document is not a folder of the workspace.
+    fn handle_workspace_box_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
+        if self.add_folder_box.is_some() {
+            return self.handle_add_folder_box_key(key, text);
+        }
+        if self.remove_root_box.is_some() {
+            return self.handle_remove_root_box_key(key);
+        }
+        false
+    }
+
+    /// Gives a key to the box that asks for the path of a folder.
+    fn handle_add_folder_box_key<T: AsRef<str>>(&mut self, key: &Key<T>, text: Option<&str>) -> bool {
+        let Some(mut box_) = self.add_folder_box.take() else {
+            return false;
+        };
+        // Whether the box stays open.
+        let mut keep = true;
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.status = Some("算了，没有加文件夹".to_owned());
+                keep = false;
+            }
+            Key::Named(NamedKey::Enter) => {
+                let path = box_.text().trim().to_owned();
+                if path.is_empty() {
+                    self.status = Some("要写文件夹的路径".to_owned());
+                } else if self.add_a_folder_to_the_workspace(&path) {
+                    keep = false;
+                }
+            }
+            _ => {
+                box_.handle_key(key, text, self.modifiers.control_key());
+            }
+        }
+        if keep {
+            self.add_folder_box = Some(box_);
+        }
+        true
+    }
+
+    /// Gives a key to the box that asks which folder is taken out.
+    fn handle_remove_root_box_key<T: AsRef<str>>(&mut self, key: &Key<T>) -> bool {
+        let Some(mut box_) = self.remove_root_box.take() else {
+            return false;
+        };
+        // Whether the box stays open.
+        let mut keep = true;
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                self.status = Some("算了，没有拿掉文件夹".to_owned());
+                keep = false;
+            }
+            Key::Named(NamedKey::ArrowDown) => box_.select_next(),
+            Key::Named(NamedKey::ArrowUp) => box_.select_previous(),
+            Key::Named(NamedKey::Enter) => {
+                keep = false;
+                match box_.selected_root() {
+                    Some(root) => {
+                        let path = root.path.clone();
+                        self.remove_a_folder_from_the_workspace(&path);
+                    }
+                    None => self.status = Some("没有文件夹可以拿掉".to_owned()),
+                }
+            }
+            _ => {}
+        }
+        if keep {
+            self.remove_root_box = Some(box_);
+        }
+        true
+    }
+
     /// Draws the text at the size the window has.
     ///
     /// The size belongs to the window and not to a file: every file is drawn
@@ -4247,8 +4450,14 @@ impl NativeApplication {
             String::new()
         };
         // A workspace says which one is open: the tree of files is its tree.
+        // The number of its folders is said too: the folders are what the
+        // workspace is made of, and they can be added and taken out.
         let workspace = match self.open_workspace.as_ref() {
-            Some(workspace) => format!(" · 工作区 {}", workspace.name),
+            Some(workspace) => format!(
+                " · 工作区 {} · {} 个文件夹",
+                workspace.name,
+                workspace.roots.len()
+            ),
             None => String::new(),
         };
         // The branch the repository is on is said first: where the program
@@ -4633,6 +4842,8 @@ impl NativeApplication {
             || self.breakpoint_condition.is_some()
             || self.debug_expression.is_some()
             || self.git_box.is_some()
+            || self.add_folder_box.is_some()
+            || self.remove_root_box.is_some()
     }
 
     /// Handles the keys of the panel of the changes.
@@ -5874,6 +6085,7 @@ impl NativeApplication {
             has_file: pane.document.is_some(),
             has_name_at_caret,
             has_repository,
+            has_workspace: self.open_workspace.is_some(),
         }
     }
 
@@ -5919,6 +6131,7 @@ impl NativeApplication {
                 Some(When::HasFile) => "没有打开的文件，这条命令用不了".to_owned(),
                 Some(When::HasNameAtCaret) => "光标处没有名字，这条命令用不了".to_owned(),
                 Some(When::HasRepository) => "这个文件不在仓库里，这条命令用不了".to_owned(),
+                Some(When::HasWorkspace) => "还没有工作区，先打开一个工作区文件".to_owned(),
                 _ => format!("命令 {id} 现在用不了"),
             });
             return false;
@@ -5963,6 +6176,8 @@ impl NativeApplication {
             }
             "workbench.closeTab" => self.request_close(front_tab(&self.groups)),
             "workspace.save" => self.save_the_workspace(),
+            "workspace.addFolder" => self.open_the_add_folder_box(),
+            "workspace.removeFolder" => self.open_the_remove_root_box(),
             "editor.format" => self.request_format(),
             "editor.rename" => self.open_rename_box(),
             "editor.codeAction" => self.request_code_action(),
@@ -6760,6 +6975,13 @@ impl ApplicationHandler for NativeApplication {
                     window.request_redraw();
                     return;
                 }
+                // The boxes that change the folders of the workspace take every
+                // key while they are open: a path that is typed into the
+                // document is not a path.
+                if self.handle_workspace_box_key(&event.logical_key.as_ref(), event.text.as_deref()) {
+                    window.request_redraw();
+                    return;
+                }
                 // The panel that lists the commands takes every key while it
                 // is open.
                 if self.handle_palette_key(&event.logical_key.as_ref(), event.text.as_deref()) {
@@ -7106,6 +7328,8 @@ impl ApplicationHandler for NativeApplication {
                         command: self.command_box.as_ref().map(|box_| box_.field()),
                         condition: self.breakpoint_condition.as_ref().map(|box_| box_.field()),
                         expression: self.debug_expression.as_ref().map(|box_| box_.field()),
+                        add_folder: self.add_folder_box.as_ref(),
+                        remove_root: self.remove_root_box.as_ref(),
                         search: self.search.as_ref(),
                         palette: self.palette.as_ref(),
                         developer: self.developer.as_ref(),
@@ -7269,6 +7493,13 @@ struct Chrome<'a> {
     condition: Option<&'a RenameBox>,
     /// The box that asks for an expression, when it is open.
     expression: Option<&'a RenameBox>,
+    /// The box that asks for the path of the folder to add to the workspace.
+    add_folder: Option<&'a RenameBox>,
+    /// The box that asks which folder of the workspace is taken out.
+    ///
+    /// It is a list of the roots of the workspace, and the one that is picked
+    /// is the one that goes.
+    remove_root: Option<&'a RootBox>,
     /// The panel that finds text in the files, when it is open.
     search: Option<&'a SearchPanel>,
     /// The panel that lists the commands, when it is open.
@@ -7705,8 +7936,9 @@ fn build_scene(
 
     // The box that asks for the new name floats over the body. The box that
     // asks for a command, the box that asks for the condition of a
-    // breakpoint, the box that asks for an expression and the box that asks
-    // git something are the same box, and only one of them is open.
+    // breakpoint, the box that asks for an expression, the box that asks
+    // git something and the box that asks for the path of a folder to add are
+    // the same box, and only one of them is open.
     push_rename_box(
         &mut scene,
         size,
@@ -7716,9 +7948,15 @@ fn build_scene(
             .or(chrome.command)
             .or(chrome.condition)
             .or(chrome.expression)
-            .or(chrome.git_box.map(|box_| &box_.input)),
+            .or(chrome.git_box.map(|box_| &box_.input))
+            .or(chrome.add_folder),
         &mut ui_measurer,
     );
+
+    // The box that asks which folder of the workspace is taken out floats over
+    // the body as well: it is a list of the roots, and the picked one is the
+    // one that goes.
+    push_root_box(&mut scene, size, body, chrome.remove_root, &mut ui_measurer);
 
     // The list of completions floats under the caret. It belongs to the column
     // that has the keyboard: the caret is in that column.
