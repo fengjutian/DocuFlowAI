@@ -55,6 +55,170 @@ pub struct GitStatus {
     pub entries: Vec<GitEntry>,
 }
 
+/// One branch of the repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Branch {
+    /// The name of the branch.
+    ///
+    /// A local branch is named by itself (`main`); a branch on a remote
+    /// carries the name of its remote in front (`origin/main`).
+    pub name: String,
+    /// Whether the program is on this branch right now.
+    pub current: bool,
+    /// Whether the branch is on a remote rather than here.
+    pub remote: bool,
+    /// The branch on the remote that this one follows, when it follows one.
+    ///
+    /// Git writes it as `origin/main`: the name of the remote is the part
+    /// in front of the slash.
+    pub upstream: Option<String>,
+}
+
+impl Branch {
+    /// The remote that this branch follows, when it follows one.
+    pub fn remote_of(&self) -> Option<&str> {
+        remote_of(self.upstream.as_deref()?)
+    }
+}
+
+/// One remote of the repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Remote {
+    /// The name of the remote.
+    pub name: String,
+    /// The address it is read from.
+    pub fetch_url: String,
+    /// The address it is written to.
+    ///
+    /// It is the same as the address it is read from unless the remote says
+    /// otherwise.
+    pub push_url: String,
+}
+
+impl Remote {
+    /// The address the branch is written to.
+    ///
+    /// A remote that has no address of its own for writing is written to the
+    /// address it is read from.
+    pub fn address_to_write_to(&self) -> &str {
+        if self.push_url.is_empty() {
+            &self.fetch_url
+        } else {
+            &self.push_url
+        }
+    }
+}
+
+/// The remote that a branch follows.
+///
+/// The upstream of a branch is written as `origin/main`: the name of the
+/// remote is the part in front of the slash.
+pub fn remote_of(upstream: &str) -> Option<&str> {
+    upstream.split_once('/').map(|(remote, _)| remote)
+}
+
+/// One thing in the list of the branches and the remotes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BranchItem {
+    /// A branch of the repository.
+    Branch(Branch),
+    /// A remote of the repository.
+    Remote(Remote),
+}
+
+/// Reads the branches out of what git said.
+///
+/// The reading is a pure calculation: git is not asked anything, and the
+/// words of git are turned into branches. That way the rules of the reading
+/// can be checked without a repository and without git.
+pub fn parse_branches(output: &str) -> Vec<Branch> {
+    let mut branches = Vec::new();
+    for line in output.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        // Every line is the mark of the current branch, the whole name of
+        // the reference, and the branch it follows.
+        let mut parts = line.split('|');
+        let mark = parts.next().unwrap_or_default().trim();
+        let reference = parts.next().unwrap_or_default().trim();
+        let upstream = parts.next().unwrap_or_default().trim();
+        let current = mark == "*";
+        if let Some(name) = reference.strip_prefix("refs/heads/") {
+            branches.push(Branch {
+                name: name.to_owned(),
+                current,
+                remote: false,
+                upstream: if upstream.is_empty() {
+                    None
+                } else {
+                    Some(upstream.to_owned())
+                },
+            });
+        } else if let Some(name) = reference.strip_prefix("refs/remotes/") {
+            // The pointer of the remote is not a branch: `origin/HEAD` is
+            // the branch the remote was on, and it moves under the feet of
+            // the person who reads it.
+            if name.ends_with("/HEAD") {
+                continue;
+            }
+            branches.push(Branch {
+                name: name.to_owned(),
+                current,
+                remote: true,
+                upstream: None,
+            });
+        }
+    }
+    branches
+}
+
+/// Reads the remotes out of what git said.
+///
+/// Git writes one line for reading and one line for writing, and the two
+/// are the same address unless the remote says otherwise.
+pub fn parse_remotes(output: &str) -> Vec<Remote> {
+    let mut remotes: Vec<Remote> = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, rest)) = line.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let rest = rest.trim();
+        let (address, kind) = match rest.strip_suffix("(fetch)") {
+            Some(address) => (address.trim(), "fetch"),
+            None => match rest.strip_suffix("(push)") {
+                Some(address) => (address.trim(), "push"),
+                None => (rest, ""),
+            },
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let index = match remotes.iter().position(|remote| remote.name == name) {
+            Some(index) => index,
+            None => {
+                remotes.push(Remote {
+                    name: name.to_owned(),
+                    fetch_url: String::new(),
+                    push_url: String::new(),
+                });
+                remotes.len() - 1
+            }
+        };
+        match kind {
+            "fetch" => remotes[index].fetch_url = address.to_owned(),
+            "push" => remotes[index].push_url = address.to_owned(),
+            _ => {}
+        }
+    }
+    remotes
+}
+
 /// The root of the repository the given path belongs to.
 ///
 /// The root is the folder that holds the `.git` directory. A file that
@@ -215,11 +379,112 @@ pub fn commit(root: &Path, message: &str) -> Result<String, String> {
     )
 }
 
+/// The branches of the repository: the ones that are here and the ones that
+/// are on the remotes.
+pub fn branches(root: &Path) -> Result<Vec<Branch>, String> {
+    let output = run(
+        root,
+        &[
+            "branch".to_owned(),
+            "-a".to_owned(),
+            "--format=%(HEAD)|%(refname)|%(upstream:short)".to_owned(),
+        ],
+    )?;
+    Ok(parse_branches(&output))
+}
+
+/// The remotes of the repository.
+pub fn remotes(root: &Path) -> Result<Vec<Remote>, String> {
+    let output = run(root, &["remote".to_owned(), "-v".to_owned()])?;
+    Ok(parse_remotes(&output))
+}
+
+/// The branch the program is on.
+///
+/// There is no branch yet in a repository that has no commit; that is said
+/// by an empty name, and not by an error.
+pub fn current_branch(root: &Path) -> Result<String, String> {
+    let output = run(
+        root,
+        &["rev-parse".to_owned(), "--abbrev-ref".to_owned(), "HEAD".to_owned()],
+    )?;
+    let name = output.trim();
+    Ok(if name == "HEAD" {
+        String::new()
+    } else {
+        name.to_owned()
+    })
+}
+
+/// Goes to another branch.
+///
+/// `git switch` needs git 2.23; the older way of saying the same thing is
+/// the checkout, and it is tried when the switch is refused.
+pub fn switch_to(root: &Path, name: &str) -> Result<(), String> {
+    match run(root, &["switch".to_owned(), name.to_owned()]) {
+        Ok(_) => Ok(()),
+        Err(_) => run(root, &["checkout".to_owned(), name.to_owned()]).map(|_| ()),
+    }
+}
+
+/// Makes a branch and goes to it.
+///
+/// The older git has no switch, and the checkout is the way of saying the
+/// same thing there.
+pub fn create_branch(root: &Path, name: &str) -> Result<(), String> {
+    match run(root, &["switch".to_owned(), "-c".to_owned(), name.to_owned()]) {
+        Ok(_) => Ok(()),
+        Err(_) => run(
+            root,
+            &["checkout".to_owned(), "-b".to_owned(), name.to_owned()],
+        )
+        .map(|_| ()),
+    }
+}
+
+/// Takes what the remotes have, without changing anything here.
+///
+/// Without a remote, every remote is taken from.
+pub fn fetch(root: &Path, remote: Option<&str>) -> Result<String, String> {
+    match remote {
+        Some(name) => run(root, &["fetch".to_owned(), name.to_owned()]),
+        None => run(root, &["fetch".to_owned(), "--all".to_owned()]),
+    }
+}
+
+/// Brings what the remote has into the branch that is checked out.
+///
+/// Only a fast-forward is done: a merge would open a window of its own to
+/// write the message in, and the editor has no such window. When the
+/// branches have gone apart, git says so and nothing is changed.
+pub fn pull(root: &Path) -> Result<String, String> {
+    run(root, &["pull".to_owned(), "--ff-only".to_owned()])
+}
+
+/// Sends what is here to the remote.
+///
+/// The branch is named so that it goes where the person wants it to go, and
+/// not to whatever the remote thinks the branch is called.
+pub fn push(root: &Path, remote: Option<&str>, branch: &str) -> Result<String, String> {
+    match remote {
+        Some(name) => run(
+            root,
+            &["push".to_owned(), name.to_owned(), branch.to_owned()],
+        ),
+        None => run(root, &["push".to_owned()]),
+    }
+}
+
 /// Runs a git command in the repository and returns what it said.
 pub(crate) fn run(root: &Path, args: &[impl AsRef<str>]) -> Result<String, String> {
     let output = Command::new("git")
         .args(args.iter().map(|argument| argument.as_ref()))
         .current_dir(root)
+        // Git is given nothing to read: a remote that asks for a password
+        // would wait for an answer that never comes, and the editor would
+        // hang with the window open. Without the answer, git says that it
+        // could not ask, and the panel says that back.
+        .stdin(std::process::Stdio::null())
         .output()
         .map_err(|error| format!("git 起不来：{error}"))?;
     if !output.status.success() {
@@ -269,6 +534,66 @@ pub(crate) fn git_is_blocked() -> bool {
     }
 }
 
+/// Which page of the panel of the changes is shown.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GitView {
+    /// The files that changed.
+    #[default]
+    Files,
+    /// The commits of the repository.
+    Commits,
+    /// The branches and the remotes.
+    Branches,
+}
+
+/// What the box of git is asking for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitAsking {
+    /// The name of the branch to make.
+    NewBranch,
+    /// The confirmation of a push: where it goes.
+    Push {
+        /// The remote it goes to.
+        remote: String,
+        /// The branch that goes there.
+        branch: String,
+    },
+}
+
+/// The box that asks git something.
+///
+/// Pushing is a thing that cannot be undone from here, so it is asked for
+/// first: the box says where the branch goes, and the push only happens
+/// when the answer is given.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitBox {
+    /// What is being asked.
+    pub asking: GitAsking,
+    /// The text that is being written.
+    pub input: crate::rename::RenameBox,
+}
+
+impl GitBox {
+    /// A box that asks for the name of a branch to make.
+    pub fn new_branch() -> Self {
+        GitBox {
+            asking: GitAsking::NewBranch,
+            input: crate::rename::RenameBox::message("新分支的名字"),
+        }
+    }
+
+    /// A box that asks whether the branch may be pushed.
+    pub fn confirm_push(remote: &str, branch: &str) -> Self {
+        GitBox {
+            asking: GitAsking::Push {
+                remote: remote.to_owned(),
+                branch: branch.to_owned(),
+            },
+            input: crate::rename::RenameBox::message(format!("推到 {remote} 的 {branch}？回车确认")),
+        }
+    }
+}
+
 /// What the panel of the changes shows.
 ///
 /// The panel is a picture of what git knows: the files that changed, and the
@@ -284,8 +609,12 @@ pub struct GitPanel {
     pub diff: String,
     /// The commits of the repository, the newest first.
     pub commits: Vec<GitCommit>,
-    /// Whether the panel is showing the commits instead of the files.
-    pub showing_commits: bool,
+    /// Which page of the panel is shown.
+    pub view: GitView,
+    /// The branches and the remotes, in the order they are shown.
+    pub branch_items: Vec<BranchItem>,
+    /// The branch the program is on, when there is one.
+    pub current_branch: String,
 }
 
 impl GitPanel {
@@ -297,8 +626,29 @@ impl GitPanel {
             selected: 0,
             diff: String::new(),
             commits: Vec::new(),
-            showing_commits: false,
+            view: GitView::Files,
+            branch_items: Vec::new(),
+            current_branch: String::new(),
         }
+    }
+
+    /// Reads the branches and the remotes of the repository.
+    ///
+    /// The branches come first and the remotes after them: the branches are
+    /// what is worked on, and the remotes are where it goes.
+    pub fn load_branches(&mut self) -> Result<(), String> {
+        let branches = branches(&self.root)?;
+        let remotes = remotes(&self.root)?;
+        self.current_branch = current_branch(&self.root)?;
+        let mut items: Vec<BranchItem> = branches.into_iter().map(BranchItem::Branch).collect();
+        items.extend(remotes.into_iter().map(BranchItem::Remote));
+        self.branch_items = items;
+        Ok(())
+    }
+
+    /// Which page of the panel is shown.
+    pub fn view(&self) -> GitView {
+        self.view
     }
 
     /// The file that is picked.
@@ -311,31 +661,42 @@ impl GitPanel {
         self.commits.get(self.selected)
     }
 
+    /// The branch that is picked.
+    pub fn selected_branch(&self) -> Option<&Branch> {
+        match self.branch_items.get(self.selected) {
+            Some(BranchItem::Branch(branch)) => Some(branch),
+            _ => None,
+        }
+    }
+
+    /// The remote that is picked.
+    pub fn selected_remote(&self) -> Option<&Remote> {
+        match self.branch_items.get(self.selected) {
+            Some(BranchItem::Remote(remote)) => Some(remote),
+            _ => None,
+        }
+    }
+
     /// Which one is picked, counted from the first one.
     pub fn selected(&self) -> usize {
         self.selected
     }
 
-    /// Whether the panel is showing the commits instead of the files.
-    pub fn is_showing_commits(&self) -> bool {
-        self.showing_commits
-    }
-
     /// The keys the panel takes, said at the bottom of it.
     pub fn hint(&self) -> &'static str {
-        if self.showing_commits {
-            COMMIT_HINT
-        } else {
-            HINT
+        match self.view {
+            GitView::Files => HINT,
+            GitView::Commits => COMMIT_HINT,
+            GitView::Branches => BRANCH_HINT,
         }
     }
 
     /// How many things there are to pick from.
     fn count(&self) -> usize {
-        if self.showing_commits {
-            self.commits.len()
-        } else {
-            self.entries.len()
+        match self.view {
+            GitView::Files => self.entries.len(),
+            GitView::Commits => self.commits.len(),
+            GitView::Branches => self.branch_items.len(),
         }
     }
 
@@ -370,6 +731,8 @@ const LIST_WIDTH: f32 = 360.0;
 const LABEL_WIDTH: f32 = 92.0;
 /// The width of the column that says which commit it is.
 const COMMIT_ID_WIDTH: f32 = 72.0;
+/// The width of the column that says the name of the remote.
+const REMOTE_NAME_WIDTH: f32 = 96.0;
 
 /// The ground the panel of the changes stands on.
 ///
@@ -400,14 +763,37 @@ pub fn draw_panel(
 
     draw_background(scene, viewport);
 
-    // The list of the files that changed, or of the commits.
+    // The list of the files that changed, or of the commits, or of the
+    // branches.
     let list = Rect::new(16.0, 16.0, LIST_WIDTH, size.height - 60.0);
+    let (title, empty) = match panel.view() {
+        GitView::Files => (
+            "改过的文件",
+            if panel.entries.is_empty() {
+                Some("没有改动")
+            } else {
+                None
+            },
+        ),
+        GitView::Commits => (
+            "最近的提交",
+            if panel.commits.is_empty() {
+                Some("还没有提交")
+            } else {
+                None
+            },
+        ),
+        GitView::Branches => (
+            "分支与远端",
+            if panel.branch_items.is_empty() {
+                Some("没有分支")
+            } else {
+                None
+            },
+        ),
+    };
     scene.push_text(
-        if panel.is_showing_commits() {
-            "最近的提交".to_owned()
-        } else {
-            "改过的文件".to_owned()
-        },
+        title.to_owned(),
         Rect::new(list.origin.x, list.origin.y, list.size.width, 20.0),
         TextStyle {
             clip: viewport,
@@ -418,21 +804,9 @@ pub fn draw_panel(
         },
     );
 
-    if panel.is_showing_commits() && panel.commits.is_empty() {
+    if let Some(empty) = empty {
         scene.push_text(
-            "还没有提交".to_owned(),
-            Rect::new(list.origin.x, list.origin.y + 26.0, list.size.width, 20.0),
-            TextStyle {
-                clip: viewport,
-                color: Color::rgb(0.52, 0.57, 0.66),
-                font_size: 13.0,
-                line_height: 18.0,
-                family: TextFamily::SansSerif,
-            },
-        );
-    } else if !panel.is_showing_commits() && panel.entries.is_empty() {
-        scene.push_text(
-            "没有改动".to_owned(),
+            empty.to_owned(),
             Rect::new(list.origin.x, list.origin.y + 26.0, list.size.width, 20.0),
             TextStyle {
                 clip: viewport,
@@ -445,7 +819,80 @@ pub fn draw_panel(
     }
 
     let room = ((list.size.height - 30.0) / ROW_HEIGHT).floor().max(1.0) as usize;
-    if panel.is_showing_commits() {
+    if panel.view() == GitView::Branches {
+        // The branches, and then the remotes.
+        let shown = panel.branch_items.len().min(room);
+        let first = panel
+            .selected()
+            .saturating_sub(shown - 1)
+            .min(panel.branch_items.len().saturating_sub(1));
+        for (index, item) in panel.branch_items.iter().enumerate().skip(first).take(shown) {
+            let row = index - first;
+            let y = list.origin.y + 26.0 + row as f32 * ROW_HEIGHT;
+            if index == panel.selected() {
+                scene.push_quad(
+                    Rect::new(list.origin.x - 4.0, y, list.size.width, ROW_HEIGHT),
+                    Color::rgb(0.18, 0.30, 0.52),
+                    viewport,
+                );
+            }
+            match item {
+                BranchItem::Branch(branch) => {
+                    // The branch that is checked out is in a colour of its
+                    // own and has a mark in front of it: where the program
+                    // is, is something a person has to see.
+                    let (text, color) = if branch.current {
+                        (format!("● {}", branch.name), Color::rgb(0.42, 0.78, 0.56))
+                    } else if branch.remote {
+                        (branch.name.clone(), Color::rgb(0.52, 0.57, 0.66))
+                    } else {
+                        (branch.name.clone(), Color::rgb(0.86, 0.89, 0.94))
+                    };
+                    scene.push_text(
+                        text,
+                        Rect::new(list.origin.x, y + 1.0, list.size.width, 20.0),
+                        TextStyle {
+                            clip: viewport,
+                            color,
+                            font_size: 13.0,
+                            line_height: 18.0,
+                            family: TextFamily::SansSerif,
+                        },
+                    );
+                }
+                BranchItem::Remote(remote) => {
+                    // The name of the remote, and where it is.
+                    scene.push_text(
+                        remote.name.clone(),
+                        Rect::new(list.origin.x, y + 1.0, REMOTE_NAME_WIDTH, 20.0),
+                        TextStyle {
+                            clip: viewport,
+                            color: Color::rgb(0.93, 0.74, 0.42),
+                            font_size: 13.0,
+                            line_height: 18.0,
+                            family: TextFamily::SansSerif,
+                        },
+                    );
+                    scene.push_text(
+                        remote.fetch_url.clone(),
+                        Rect::new(
+                            list.origin.x + REMOTE_NAME_WIDTH + 4.0,
+                            y + 1.0,
+                            (list.size.width - REMOTE_NAME_WIDTH - 8.0).max(1.0),
+                            20.0,
+                        ),
+                        TextStyle {
+                            clip: viewport,
+                            color: Color::rgb(0.62, 0.70, 0.86),
+                            font_size: 13.0,
+                            line_height: 18.0,
+                            family: TextFamily::SansSerif,
+                        },
+                    );
+                }
+            }
+        }
+    } else if panel.view() == GitView::Commits {
         // The commits, the newest first.
         let shown = panel.commits.len().min(room);
         let first = panel
@@ -544,15 +991,44 @@ pub fn draw_panel(
         }
     }
 
-    // The diff of the file that is picked.
+    // The diff of the file that is picked, or what is known about the branch
+    // or the remote that is picked.
     let diff = Rect::new(
         LIST_WIDTH + 32.0,
         16.0,
         (size.width - LIST_WIDTH - 48.0).max(1.0),
         size.height - 60.0,
     );
+    let details = match panel.view() {
+        GitView::Branches => match (panel.selected_branch(), panel.selected_remote()) {
+            (Some(branch), _) => {
+                let mut lines = vec![format!("分支：{}", branch.name)];
+                lines.push(match branch.upstream.as_deref() {
+                    Some(upstream) => format!("跟着：{upstream}"),
+                    None => "没有跟着哪个分支".to_owned(),
+                });
+                lines.push(if branch.remote {
+                    "在远端上".to_owned()
+                } else {
+                    "在这个仓库里".to_owned()
+                });
+                lines
+            }
+            (_, Some(remote)) => vec![
+                format!("远端：{}", remote.name),
+                format!("取回：{}", remote.fetch_url),
+                format!("推送：{}", remote.address_to_write_to()),
+            ],
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
     scene.push_text(
-        "差别".to_owned(),
+        if panel.view() == GitView::Branches {
+            "详情".to_owned()
+        } else {
+            "差别".to_owned()
+        },
         Rect::new(diff.origin.x, diff.origin.y, diff.size.width, 20.0),
         TextStyle {
             clip: viewport,
@@ -563,7 +1039,11 @@ pub fn draw_panel(
         },
     );
 
-    let lines: Vec<&str> = panel.diff.lines().collect();
+    let lines: Vec<&str> = if details.is_empty() {
+        panel.diff.lines().collect()
+    } else {
+        details.iter().map(String::as_str).collect()
+    };
     let room = ((diff.size.height - 26.0) / ROW_HEIGHT).floor().max(1.0) as usize;
     let shown = lines.len().min(room);
     let first = lines.len() - shown;
@@ -614,6 +1094,10 @@ pub const HINT: &str = "↑↓ 挑文件 · S 暂存 · U 取消暂存 · C 提�
 /// The keys the panel takes when it is showing the commits.
 pub const COMMIT_HINT: &str = "↑↓ 挑提交 · Esc 回到改过的文件";
 
+/// The keys the panel takes when it is showing the branches and the remotes.
+pub const BRANCH_HINT: &str =
+    "↑↓ 挑分支 · Enter 切过去 · N 新建分支 · F 取回 · U 更新 · P 推送 · B 回到改过的文件";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +1116,29 @@ mod tests {
         run(&directory, &["config", "user.email", "check@example.com"])
             .expect("the email is set");
         run(&directory, &["config", "user.name", "check"]).expect("the name is set");
+        Some(directory)
+    }
+
+    /// A repository of its own, with one commit in it.
+    fn repository_with_a_commit(name: &str) -> Option<PathBuf> {
+        let directory = repository(name)?;
+        write(&directory, "notes.txt", "the first line\n");
+        run(&directory, &["add", "notes.txt"]).expect("the file is added");
+        run(&directory, &["commit", "-m", "the first one"]).expect("the commit is made");
+        Some(directory)
+    }
+
+    /// A remote of its own: a bare repository is one that has nothing in it
+    /// but the history, and it is what a remote is.
+    ///
+    /// The remote is a folder on this machine: the checks push to it and
+    /// pull from it without asking anything of the network.
+    fn remote_repository(name: &str) -> Option<PathBuf> {
+        let directory = scratch_dir(name);
+        if git_is_blocked() {
+            return None;
+        }
+        run(&directory, &["init", "--quiet", "--bare"]).expect("the remote is made");
         Some(directory)
     }
 
@@ -824,11 +1331,11 @@ mod tests {
                 staged: false,
             }],
         );
-        assert!(!panel.is_showing_commits());
+        assert_eq!(panel.view(), GitView::Files);
         assert_eq!(panel.hint(), HINT);
 
         let mut panel = panel;
-        panel.showing_commits = true;
+        panel.view = GitView::Commits;
         panel.commits = vec![
             GitCommit {
                 id: "abc1234".to_owned(),
@@ -839,7 +1346,7 @@ mod tests {
                 message: "the second one".to_owned(),
             },
         ];
-        assert!(panel.is_showing_commits());
+        assert_eq!(panel.view(), GitView::Commits);
         assert_eq!(panel.hint(), COMMIT_HINT);
         assert_eq!(panel.selected_commit().map(|commit| commit.id.as_str()), Some("abc1234"));
 
@@ -848,5 +1355,195 @@ mod tests {
         assert_eq!(panel.selected_commit().map(|commit| commit.id.as_str()), Some("def5678"));
         panel.select_next();
         assert_eq!(panel.selected_commit().map(|commit| commit.id.as_str()), Some("abc1234"));
+    }
+
+    #[test]
+    fn the_branches_are_read_out_of_what_git_said() {
+        let said = " |refs/heads/feature/one||a6c78ab\n\
+                    *|refs/heads/main|origin/main|41356b7\n\
+                     |refs/remotes/origin/HEAD||41356b7\n\
+                     |refs/remotes/origin/main||41356b7\n";
+        let branches = parse_branches(said);
+        assert_eq!(branches.len(), 3, "the pointer of the remote is not a branch");
+
+        assert_eq!(branches[0].name, "feature/one");
+        assert!(!branches[0].current, "the program is not on it");
+        assert!(!branches[0].remote, "it is here");
+        assert_eq!(branches[0].upstream, None);
+
+        assert_eq!(branches[1].name, "main");
+        assert!(branches[1].current, "the program is on it");
+        assert_eq!(branches[1].upstream.as_deref(), Some("origin/main"));
+        assert_eq!(branches[1].remote_of(), Some("origin"));
+
+        assert_eq!(branches[2].name, "origin/main");
+        assert!(branches[2].remote, "it is on the remote");
+        assert!(!branches[2].current);
+    }
+
+    #[test]
+    fn nothing_that_git_said_is_no_branch() {
+        assert!(parse_branches("").is_empty());
+        assert!(parse_branches("\n\n").is_empty());
+        // A reference that is neither here nor on a remote is not a branch.
+        assert!(parse_branches(" |refs/tags/v1||a6c78ab\n").is_empty());
+    }
+
+    #[test]
+    fn the_remotes_are_read_out_of_what_git_said() {
+        let said = "origin\thttps://github.com/x/y.git (fetch)\n\
+                    origin\thttps://github.com/x/y.git (push)\n\
+                    other\tC:\\work\\other.git (fetch)\n\
+                    other\tC:\\work\\other.git (push)\n";
+        let remotes = parse_remotes(said);
+        assert_eq!(remotes.len(), 2, "the two lines of one remote are one remote");
+
+        assert_eq!(remotes[0].name, "origin");
+        assert_eq!(remotes[0].fetch_url, "https://github.com/x/y.git");
+        assert_eq!(remotes[0].push_url, "https://github.com/x/y.git");
+        assert_eq!(remotes[0].address_to_write_to(), "https://github.com/x/y.git");
+
+        assert_eq!(remotes[1].name, "other");
+        assert_eq!(remotes[1].fetch_url, "C:\\work\\other.git");
+    }
+
+    #[test]
+    fn a_remote_that_has_no_address_of_its_own_is_written_to_the_one_it_is_read_from() {
+        let remotes = parse_remotes("origin\thttps://github.com/x/y.git (fetch)\n");
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes[0].push_url, "");
+        assert_eq!(
+            remotes[0].address_to_write_to(),
+            "https://github.com/x/y.git"
+        );
+    }
+
+    #[test]
+    fn the_branches_of_the_repository_are_known() {
+        let Some(directory) = repository_with_a_commit("git-branches") else {
+            return;
+        };
+        run(&directory, &["branch", "feature"]).expect("the branch is made");
+
+        let branches = branches(&directory).expect("the branches are read");
+        assert_eq!(branches.len(), 2, "got {branches:?}");
+        let current = branches.iter().find(|branch| branch.current).expect("one is current");
+        assert!(!current.name.is_empty(), "the current branch has a name");
+        assert!(
+            branches.iter().any(|branch| branch.name == "feature"),
+            "the other branch is there: {branches:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn another_branch_can_be_went_to() {
+        let Some(directory) = repository_with_a_commit("git-switch") else {
+            return;
+        };
+        run(&directory, &["branch", "feature"]).expect("the branch is made");
+
+        switch_to(&directory, "feature").expect("the branch is gone to");
+        assert_eq!(current_branch(&directory).expect("the branch is known"), "feature");
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_branch_can_be_made_and_gone_to() {
+        let Some(directory) = repository_with_a_commit("git-create-branch") else {
+            return;
+        };
+
+        create_branch(&directory, "made-here").expect("the branch is made");
+        assert_eq!(
+            current_branch(&directory).expect("the branch is known"),
+            "made-here"
+        );
+        let branches = branches(&directory).expect("the branches are read");
+        assert!(
+            branches.iter().any(|branch| branch.name == "made-here"),
+            "the branch is there: {branches:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn the_remotes_of_the_repository_are_known() {
+        let Some(directory) = repository_with_a_commit("git-remotes") else {
+            return;
+        };
+        let Some(remote) = remote_repository("git-remotes-remote") else {
+            return;
+        };
+        let address = remote.to_string_lossy().to_string();
+        run(&directory, &["remote", "add", "origin", &address]).expect("the remote is added");
+
+        let remotes = remotes(&directory).expect("the remotes are read");
+        assert_eq!(remotes.len(), 1, "got {remotes:?}");
+        assert_eq!(remotes[0].name, "origin");
+        assert_eq!(remotes[0].fetch_url, address);
+        assert_eq!(remotes[0].push_url, address);
+
+        let _ = std::fs::remove_dir_all(&directory);
+        let _ = std::fs::remove_dir_all(&remote);
+    }
+
+    #[test]
+    fn what_is_here_can_be_pushed_to_the_remote() {
+        let Some(directory) = repository_with_a_commit("git-push") else {
+            return;
+        };
+        let Some(remote) = remote_repository("git-push-remote") else {
+            return;
+        };
+        let address = remote.to_string_lossy().to_string();
+        run(&directory, &["remote", "add", "origin", &address]).expect("the remote is added");
+
+        let branch = current_branch(&directory).expect("the branch is known");
+        push(&directory, Some("origin"), &branch).expect("the branch is pushed");
+
+        // The remote has the commit now: it is read back from the remote.
+        let said = run(&remote, &["log", "--format=%s"]).expect("the remote is read");
+        assert!(said.contains("the first one"), "got {said}");
+
+        let _ = std::fs::remove_dir_all(&directory);
+        let _ = std::fs::remove_dir_all(&remote);
+    }
+
+    #[test]
+    fn what_the_remote_has_can_be_brought_in() {
+        let Some(directory) = repository_with_a_commit("git-pull") else {
+            return;
+        };
+        let Some(remote) = remote_repository("git-pull-remote") else {
+            return;
+        };
+        let address = remote.to_string_lossy().to_string();
+        run(&directory, &["remote", "add", "origin", &address]).expect("the remote is added");
+        let branch = current_branch(&directory).expect("the branch is known");
+        push(&directory, Some("origin"), &branch).expect("the branch is pushed");
+
+        // Another clone of the same remote gets a commit that is not here.
+        let Some(other) = repository("git-pull-other") else {
+            return;
+        };
+        run(&other, &["remote", "add", "origin", &address]).expect("the remote is added");
+        run(&other, &["fetch", "origin"]).expect("the remote is read");
+        write(&other, "notes.txt", "the second line\n");
+        run(&other, &["add", "notes.txt"]).expect("the file is added");
+        run(&other, &["commit", "-m", "the second one"]).expect("the commit is made");
+        run(&other, &["push", "origin", "HEAD:refs/heads/main"]).expect("the commit is pushed");
+
+        // The change is brought in here.
+        pull(&directory).expect("the remote is brought in");
+        let text = std::fs::read_to_string(directory.join("notes.txt")).expect("the file is read");
+        assert!(text.contains("the second line"), "got {text}");
+
+        let _ = std::fs::remove_dir_all(&directory);
+        let _ = std::fs::remove_dir_all(&remote);
+        let _ = std::fs::remove_dir_all(&other);
     }
 }
